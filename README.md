@@ -93,7 +93,7 @@ Numbered concretely so you can grep logs for each step.
 5. **Workspace** — `sandbox.ensure_workspace`:
    - Idempotent shared clone (`--filter=blob:none`) under `/data/workspaces/_pool/<owner>__<repo>`.
    - Worktree at `/data/workspaces/<owner>__<repo>__<n>/repo` on a deterministic branch `farm/<8hex>/<slug>` derived from `(repo, number)`.
-   - `git remote set-url origin` always re-set with the credentialed URL (rotates with PAT).
+   - `git remote set-url origin` always re-set with the plain HTTPS clone URL. In **gh-proxy mode** the URL is credential-free (the proxy injects auth per push via `git -c http.extraheader`); in **PAT mode** the worker rewrites it to a `https://x-access-token:$PAT@…` form that rotates with the configured PAT.
    - `git config user.email/user.name` set to the configured identity.
 6. **omp subprocess** — `RpcClient(omp --mode rpc, cwd=worktree, session_dir=…, no_session=False)` so follow-ups resume the same conversation/tool history. When `<session_dir>/*.jsonl` already exists (follow-up event or crash-restarted task) the worker passes `--continue` so the agent re-enters its prior reasoning, todos, and tool history from the JSONL transcript. Model is randomly picked from `ROBOMP_MODEL` (CSV pool).
 7. **Agent (Claude / GPT / …)** drives the work via:
@@ -111,13 +111,13 @@ Numbered concretely so you can grep logs for each step.
 | `set_issue_labels` | Append labels later (e.g. add `wontfix`). Never removes existing. | Used for one-off adjustments outside the initial classify call. |
 | `gh_post_comment` | Comment on the originating issue or any specified PR/issue number. | All `gh_*` errors propagate as `RpcCommandError` the agent can recover from. |
 | `repro_record` | Persist a reproduction transcript (command, output, exit code, reproduced flag) under `context/repro/`. | Required before claiming a fix; PR template references the path. |
-| `gh_push_branch` | `git push --set-upstream origin <branch>` from the worktree. | Refuses to push when (a) working tree dirty, (b) any commit's author ≠ configured identity. |
-| `gh_open_pr` | Open a PR from the worktree branch. | Validates body has `## Repro`/`## Cause`/`## Fix`/`## Verification` headers AND `Fixes #N` (or `Closes`/`Resolves`) so GitHub auto-closes the issue on merge. Runs `bun run fix` then `bun check` when the repo defines those scripts: any formatter diff is auto-committed as `style: bun run fix` against the configured bot identity; a `bun check` failure raises a recoverable tool error so the agent fixes the cause and retries. Idempotent push after the gates. Writes `pr.json` artifact + updates `issues.pr_number/state` in sqlite. |
+| `gh_push_branch` | `git push --set-upstream origin <branch>` from the worktree. | Refuses to push when (a) working tree dirty, (b) any commit's author ≠ configured identity. Runs `bun run fix` then `bun check` when the repo defines those scripts: any formatter diff is auto-committed as `style: bun run fix` against the configured bot identity; a `bun check` failure raises a recoverable tool error so the agent fixes the cause and retries. |
+| `gh_open_pr` | Open a PR from the worktree branch. | Validates body has `## Repro`/`## Cause`/`## Fix`/`## Verification` headers AND `Fixes #N` (or `Closes`/`Resolves`) so GitHub auto-closes the issue on merge. Runs the same `bun run fix` then `bun check` gate as `gh_push_branch` (see above) before the (idempotent) push and PR open. Writes `pr.json` artifact + updates `issues.pr_number/state` in sqlite. |
 | `gh_request_review` | Add reviewers / assignees. | Optional. |
 | `mark_unable_to_reproduce` | Close the loop without a PR. Posts a structured "Could not reproduce" comment with diagnosis + info request and marks issue `abandoned`. | Use when reproduction genuinely fails after a real attempt. |
 | `fetch_issue_thread` | Refetch the issue + comments from GitHub mid-task. | For long-running tasks that want fresh context. |
 
-Every host-tool invocation is audited into the `tool_calls` table with timestamps, args, results, and error messages. Tokens never appear in any audited field — `host_tools._audit` only receives the agent-supplied args, and `git push` errors flow through `sandbox.GitCommandError` which redacts `user:password@` from argv and stderr.
+Every host-tool invocation is audited into the `tool_calls` table with timestamps, args, results, and error messages. Tokens never appear in any audited field — `host_tools._audit` only records the agent-supplied args, and credentialed-URL fragments are stripped at the source by `sandbox.redact_credentials` before any `GitCommandError` / `GitHubError` is raised.
 
 ---
 
@@ -135,8 +135,8 @@ Every host-tool invocation is audited into the `tool_calls` table with timestamp
   repro_record           gh_post_comment       in one gh_post_comment
   diagnose               (no PR, no branch)    (no PR; wait for opt-in)
   commit (Fixes #N)
-  gh_push_branch
-  gh_open_pr  ← runs `bun run fix` + `bun check` deterministically
+  gh_push_branch  ← runs `bun run fix` + `bun check`
+  gh_open_pr      ← same gate, then opens the PR
   link comment
 ```
 
@@ -166,12 +166,23 @@ All persona rules live in `src/robomp/prompts/system_append.md` and are appended
 ```bash
 cp .env.example .env
 $EDITOR .env                       # fill in the GitHub fields + commit identity
-openssl rand -hex 32 > /tmp/sec    # generate webhook secret; paste into .env *and* GitHub later
+openssl rand -hex 32                # → ROBOMP_GH_PROXY_HMAC_KEY (shared by both containers)
+openssl rand -hex 32                # → GITHUB_WEBHOOK_SECRET (paste into .env *and* GitHub later)
 
 just build                         # rsync $PI_ROOT → .pi-context/ then docker compose build
 just up                            # docker compose up -d
 curl -fsS http://localhost:8080/healthz   # { "status": "ok" }
 ```
+
+> The bundled `docker-compose.yml` runs in **gh-proxy mode** by default:
+> `GITHUB_TOKEN` is interpolated into the gh-proxy container only, and the
+> orchestrator authenticates to it with `ROBOMP_GH_PROXY_HMAC_KEY` over an
+> internal-only Docker network. If you instead want to run the orchestrator
+> directly (no sidecar, PAT lives in-process) — useful for `python -m robomp.cli`
+> on the host or for tests — comment out `ROBOMP_GH_PROXY_URL` /
+> `ROBOMP_GH_PROXY_HMAC_KEY` in `.env` and uncomment `GITHUB_TOKEN` in the
+> PAT-mode section. The two modes are mutually exclusive (`_validate_proxy_or_pat`
+> in `config.py` rejects a `.env` that sets both).
 
 The image is a multi-stage build:
 
@@ -232,7 +243,7 @@ GitHub fires a `ping` on save; you should see `POST /webhook/github 202` in `doc
 
 ## Configuration reference
 
-All variables are read from `.env` (via `env_file:` in `docker-compose.yml`). Validated by Pydantic at startup; missing required vars fail-fast.
+All variables are read from `.env`. Compose uses per-service explicit `environment:` allowlists (no `env_file:`), so each variable below only reaches the container(s) that explicitly list it; the `Settings` Pydantic model then validates the result and fails fast on missing required vars.
 
 | Variable | Required | Description |
 |---|---|---|
@@ -320,11 +331,11 @@ docker compose logs -f robomp                 # in another shell, watch each too
 
 ### Credential isolation
 
-- **`GITHUB_TOKEN` lives only in the gh-proxy container.** docker-compose injects it via `env_file: .env` into gh-proxy and nowhere else. The orchestrator's startup explicitly refuses to boot if it observes `GITHUB_TOKEN` in its own environment (`_require_proxy_mode` in `cli.py` / `server.py`), so a misconfigured `.env` fails loudly instead of leaking the PAT into the agent subprocess.
+- **`GITHUB_TOKEN` lives only in the gh-proxy container.** `docker-compose.yml` interpolates `${GITHUB_TOKEN}` from `.env` into gh-proxy's explicit `environment:` allowlist and nowhere else (the orchestrator's allowlist deliberately omits it). The orchestrator's startup explicitly refuses to boot if it observes `GITHUB_TOKEN` in its own environment (`_require_proxy_mode` in `cli.py` / `server.py`), so a misconfigured deployment fails loudly instead of leaking the PAT into the agent subprocess.
 - **Orchestrator holds only the HMAC key.** `ROBOMP_GH_PROXY_HMAC_KEY` is the sole credential the orchestrator carries. It signs every proxy request (`proxy_hmac.sign`) with a timestamp + HMAC-SHA256 over the canonical request; gh-proxy verifies with a ±30s skew window and constant-time compare.
 - **Agent subprocess gets neither.** `worker._SCRUBBED_ENV_KEYS` strips `GITHUB_TOKEN`, `ROBOMP_GH_PROXY_HMAC_KEY`, and friends out of the env passed to the omp subprocess; the agent's host tools authenticate to gh-proxy through the orchestrator's in-process `GitHubProxyClient`, never by reading env vars.
 - **`git push` uses `--config-env` PAT injection inside gh-proxy.** The proxy never writes the PAT to disk or to a credentialed remote URL. It invokes `git -c http.extraheader=AUTHORIZATION:basic\ <base64-via-env> push …` so the token is passed through a process env var that lives only for the duration of the push; the remote URL stays token-free in `.git/config`.
-- **Network isolation.** gh-proxy is reachable only on the `robomp_internal` Docker network (`internal: true` — no host port mapping, no external egress allowed into it). The orchestrator joins both the default network (for webhook ingress + the host LLM gateway) and `robomp_internal`. gh-proxy never joins the default network.
+- **Network isolation.** gh-proxy has **no host port mapping** and `robomp_internal` (the orchestrator↔gh-proxy network) is `internal: true` — no ingress from outside the compose project, no egress through that network. gh-proxy DOES join the `default` network for the single purpose of egress to `api.github.com`; this is unavoidable for it to reach GitHub. The orchestrator joins both networks (default for webhook ingress + the host LLM gateway, `robomp_internal` to reach gh-proxy).
 
 ### Request hygiene
 
@@ -347,7 +358,7 @@ docker compose logs -f robomp                 # in another shell, watch each too
 ```
 robomp/
 ├── Dockerfile                  # multi-stage: natives-builder, python-builder, runtime
-├── docker-compose.yml          # mounts, extra_hosts, env_file
+├── docker-compose.yml          # mounts, extra_hosts, per-service env allowlists
 ├── justfile                     # `just build`, `just up`, `just stage`, …
 ├── bin/
 │   └── stage-pi.sh             # rsync $PI_ROOT → .pi-context/ excluding target/runs/etc.
