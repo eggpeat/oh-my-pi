@@ -249,6 +249,20 @@ describe("isOpenAICompletionsProgressChunk", () => {
 			).toBe(true);
 		});
 
+		it("accepts deprecated function_call deltas", () => {
+			expect(
+				isOpenAICompletionsProgressChunk({
+					choices: [
+						{
+							delta: {
+								function_call: { name: "search" },
+							},
+						},
+					],
+				}),
+			).toBe(true);
+		});
+
 		it("accepts reasoning deltas in all three field names", () => {
 			expect(
 				isOpenAICompletionsProgressChunk({

@@ -214,6 +214,10 @@ export function isOpenAICompletionsProgressChunk(chunk: unknown): boolean {
 				reasoning_content?: unknown;
 				reasoning_text?: unknown;
 				refusal?: unknown;
+				function_call?: {
+					arguments?: unknown;
+					name?: unknown;
+				};
 			};
 		}>;
 	};
@@ -227,6 +231,7 @@ export function isOpenAICompletionsProgressChunk(chunk: unknown): boolean {
 	const content = delta.content;
 	if (typeof content === "string" ? content.length > 0 : Array.isArray(content) && content.length > 0) return true;
 	if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) return true;
+	if (choice.delta.function_call) return true;
 	if (typeof delta.reasoning === "string" && delta.reasoning.length > 0) return true;
 	if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) return true;
 	if (typeof delta.reasoning_text === "string" && delta.reasoning_text.length > 0) return true;
@@ -539,10 +544,15 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			// so users don't see raw `<｜...｜>` tokens.
 			const stripDeepseekChatTemplateTokens =
 				/deepseek/i.test(model.id) && (model.provider === "nvidia" || model.provider === "deepseek");
+			type LegacyFunctionCallDelta = {
+				arguments?: string;
+				name?: string;
+			};
 			type ToolCallStreamBlock = ToolCall & { partialArgs?: string; streamIndex?: number; lastParseLen?: number };
 			type OpenAIStreamBlock = TextContent | ThinkingContent | ToolCallStreamBlock;
 			const pendingToolCallBlocks: ToolCallStreamBlock[] = [];
 			const toolCallBlockByIndex = new Map<number, ToolCallStreamBlock>();
+			let legacyFunctionCallBlock: ToolCallStreamBlock | undefined;
 			let currentBlock: OpenAIStreamBlock | undefined;
 			const blockIndex = (block: OpenAIStreamBlock | undefined): number => {
 				if (!block) return Math.max(0, output.content.length - 1);
@@ -560,6 +570,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					delete block.streamIndex;
 				}
 				const pendingIndex = pendingToolCallBlocks.indexOf(block);
+				if (legacyFunctionCallBlock === block) legacyFunctionCallBlock = undefined;
 				if (pendingIndex >= 0) pendingToolCallBlocks.splice(pendingIndex, 1);
 				stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial: output });
 			};
@@ -862,6 +873,51 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 								partial: output,
 							});
 						}
+					}
+
+					const legacyFunctionCall: LegacyFunctionCallDelta | undefined = choice.delta.function_call;
+					if (legacyFunctionCall) {
+						let block = legacyFunctionCallBlock;
+						if (!block) {
+							if (currentBlock?.type !== "toolCall") {
+								finishCurrentBlock(currentBlock);
+							}
+							block = {
+								type: "toolCall",
+								id: "call_legacy_function",
+								name: legacyFunctionCall.name ?? "",
+								arguments: {},
+								partialArgs: "",
+							};
+							legacyFunctionCallBlock = block;
+							pendingToolCallBlocks.push(block);
+							currentBlock = block;
+							output.content.push(block);
+							stream.push({
+								type: "toolcall_start",
+								contentIndex: blockIndex(block),
+								partial: output,
+							});
+						} else {
+							currentBlock = block;
+						}
+
+						if (legacyFunctionCall.name) block.name = legacyFunctionCall.name;
+						const delta = legacyFunctionCall.arguments ?? "";
+						if (delta.length > 0) {
+							block.partialArgs = (block.partialArgs ?? "") + delta;
+							const throttled = parseStreamingJsonThrottled(block.partialArgs, block.lastParseLen ?? 0);
+							if (throttled) {
+								block.arguments = throttled.value;
+								block.lastParseLen = throttled.parsedLen;
+							}
+						}
+						stream.push({
+							type: "toolcall_delta",
+							contentIndex: blockIndex(block),
+							delta,
+							partial: output,
+						});
 					}
 
 					const reasoningDetails = (choice.delta as any).reasoning_details;

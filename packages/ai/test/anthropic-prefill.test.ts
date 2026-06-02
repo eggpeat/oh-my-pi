@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { convertAnthropicMessages } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { transformMessages } from "@oh-my-pi/pi-ai/providers/transform-messages";
-import type { AssistantMessage, Model, UserMessage } from "@oh-my-pi/pi-ai/types";
+import type { AssistantMessage, Model, ToolResultMessage, UserMessage } from "@oh-my-pi/pi-ai/types";
 
 /**
  * Regression: some Anthropic-routed models reject "assistant prefill" requests
@@ -79,6 +79,58 @@ describe("Anthropic assistant-prefill fallback", () => {
 		);
 		expect(params.at(-1)?.role).toBe("user");
 		expect(params.at(-1)?.content).toBe("what now?");
+	});
+
+	it("coalesces parallel tool results into one user message", () => {
+		const user: UserMessage = {
+			role: "user",
+			content: "Check weather and time.",
+			timestamp: 1,
+		};
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			content: [
+				{ type: "toolCall", id: "toolu_weather", name: "get_weather", arguments: { city: "Paris" } },
+				{ type: "toolCall", id: "toolu_time", name: "get_time", arguments: { timezone: "Europe/Paris" } },
+			],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: 2,
+		};
+		const weatherResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "toolu_weather",
+			toolName: "get_weather",
+			content: [{ type: "text", text: "clear" }],
+			isError: false,
+			timestamp: 3,
+		};
+		const timeResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "toolu_time",
+			toolName: "get_time",
+			content: [{ type: "text", text: "09:00" }],
+			isError: false,
+			timestamp: 4,
+		};
+
+		const params = convertAnthropicMessages([user, assistant, weatherResult, timeResult], model, false);
+		const resultParam = params[2];
+		expect(params.map(param => param.role)).toEqual(["user", "assistant", "user"]);
+		expect(Array.isArray(resultParam?.content)).toBe(true);
+		const blocks = resultParam?.content as unknown as Array<Record<string, unknown>>;
+		expect(blocks.map(block => block.type)).toEqual(["tool_result", "tool_result"]);
+		expect(blocks.map(block => block.tool_use_id)).toEqual(["toolu_weather", "toolu_time"]);
 	});
 });
 

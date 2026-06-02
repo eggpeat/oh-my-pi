@@ -7,7 +7,7 @@ import {
 	streamOpenAICompletions,
 } from "../src/providers/openai-completions";
 import { resolveOpenAICompat } from "../src/providers/openai-completions-compat";
-import type { AssistantMessage, Context, Model, OpenAICompat } from "../src/types";
+import type { AssistantMessage, Context, Model, OpenAICompat, ToolCall } from "../src/types";
 
 const originalFetch = global.fetch;
 
@@ -64,6 +64,10 @@ function baseContext(): Context {
 			},
 		],
 	};
+}
+
+function getToolCalls(content: AssistantMessage["content"]): ToolCall[] {
+	return content.filter((block): block is ToolCall => block.type === "toolCall");
 }
 
 describe("openai-completions compatibility", () => {
@@ -524,6 +528,129 @@ describe("openai-completions compatibility", () => {
 		expect(assistantObject).toBeDefined();
 		expect(assistantObject ? Reflect.get(assistantObject, "reasoning_text") : undefined).toBe("inspect tool output");
 		expect(assistantObject ? Reflect.get(assistantObject, "reasoning_content") : undefined).toBeUndefined();
+	});
+	it("reconstructs deprecated streamed function_call deltas into a tool call", async () => {
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+		};
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-legacy-function",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: { function_call: { name: "get_weather" } } }],
+			},
+			{
+				id: "chatcmpl-legacy-function",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: { function_call: { arguments: '{"location":' } } }],
+			},
+			{
+				id: "chatcmpl-legacy-function",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: { function_call: { arguments: '"Paris"}' } } }],
+			},
+			{
+				id: "chatcmpl-legacy-function",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "function_call" }],
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const toolCalls = getToolCalls(result.content);
+		expect(result.stopReason).toBe("toolUse");
+		expect(toolCalls).toHaveLength(1);
+		expect(toolCalls[0]).toMatchObject({
+			id: "call_legacy_function",
+			name: "get_weather",
+			arguments: { location: "Paris" },
+		});
+	});
+
+	it("reconstructs interleaved structured tool_calls by documented index", async () => {
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+		};
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-parallel-tools",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [
+					{
+						index: 0,
+						delta: {
+							tool_calls: [
+								{
+									index: 0,
+									id: "call_weather",
+									type: "function",
+									function: { name: "get_weather", arguments: '{"city":' },
+								},
+								{
+									index: 1,
+									id: "call_time",
+									type: "function",
+									function: { name: "get_time", arguments: '{"timezone":' },
+								},
+							],
+						},
+					},
+				],
+			},
+			{
+				id: "chatcmpl-parallel-tools",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [
+					{
+						index: 0,
+						delta: {
+							tool_calls: [
+								{ index: 1, function: { arguments: '"Europe/Paris"}' } },
+								{ index: 0, function: { arguments: '"Paris"}' } },
+							],
+						},
+					},
+				],
+			},
+			{
+				id: "chatcmpl-parallel-tools",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const toolCalls = getToolCalls(result.content);
+		expect(result.stopReason).toBe("toolUse");
+		expect(toolCalls).toHaveLength(2);
+		expect(toolCalls[0]).toMatchObject({
+			id: "call_weather",
+			name: "get_weather",
+			arguments: { city: "Paris" },
+		});
+		expect(toolCalls[1]).toMatchObject({
+			id: "call_time",
+			name: "get_time",
+			arguments: { timezone: "Europe/Paris" },
+		});
 	});
 });
 
