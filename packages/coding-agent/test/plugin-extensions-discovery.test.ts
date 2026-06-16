@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,20 +10,30 @@ const currentPiExtensionsPath = Bun.resolveSync("@oh-my-pi/pi-coding-agent/exten
 
 describe("plugin extension discovery", () => {
 	let projectDir: TempDir;
-	let tempXdgDataHome = "";
+	let tempHome = "";
 	let originalXdgDataHome: string | undefined;
+	let originalXdgStateHome: string | undefined;
+	let originalXdgCacheHome: string | undefined;
 	const originalAgentDir = getAgentDir();
 
 	beforeEach(() => {
 		projectDir = TempDir.createSync("@pi-plugin-ext-");
 		originalXdgDataHome = process.env.XDG_DATA_HOME;
-		tempXdgDataHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-data-"));
-		fs.mkdirSync(path.join(tempXdgDataHome, "omp"), { recursive: true });
-		process.env.XDG_DATA_HOME = tempXdgDataHome;
-		// Rebuild path caches after changing XDG env so plugin discovery resolves into the temp root.
-		setAgentDir(originalAgentDir);
+		originalXdgStateHome = process.env.XDG_STATE_HOME;
+		originalXdgCacheHome = process.env.XDG_CACHE_HOME;
+		delete process.env.XDG_DATA_HOME;
+		delete process.env.XDG_STATE_HOME;
+		delete process.env.XDG_CACHE_HOME;
+
+		tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-home-"));
+		spyOn(os, "homedir").mockReturnValue(tempHome);
+		setAgentDir(path.join(tempHome, ".omp", "agent"));
 
 		const pluginsDir = getPluginsDir();
+		const relativePluginsDir = path.relative(tempHome, pluginsDir);
+		if (relativePluginsDir.startsWith("..") || path.isAbsolute(relativePluginsDir)) {
+			throw new Error(`Plugin discovery test resolved outside temp home: ${pluginsDir}`);
+		}
 		const pluginDir = path.join(pluginsDir, "node_modules", "@demo", "plugin");
 		fs.mkdirSync(path.join(pluginDir, "dist"), { recursive: true });
 		fs.writeFileSync(
@@ -58,13 +68,24 @@ describe("plugin extension discovery", () => {
 
 	afterEach(() => {
 		projectDir.removeSync();
-		fs.rmSync(tempXdgDataHome, { recursive: true, force: true });
+		spyOn(os, "homedir").mockRestore();
 		if (originalXdgDataHome === undefined) {
 			delete process.env.XDG_DATA_HOME;
 		} else {
 			process.env.XDG_DATA_HOME = originalXdgDataHome;
 		}
+		if (originalXdgStateHome === undefined) {
+			delete process.env.XDG_STATE_HOME;
+		} else {
+			process.env.XDG_STATE_HOME = originalXdgStateHome;
+		}
+		if (originalXdgCacheHome === undefined) {
+			delete process.env.XDG_CACHE_HOME;
+		} else {
+			process.env.XDG_CACHE_HOME = originalXdgCacheHome;
+		}
 		setAgentDir(originalAgentDir);
+		fs.rmSync(tempHome, { recursive: true, force: true });
 	});
 
 	it("loads installed plugin extensions declared in package.json", async () => {

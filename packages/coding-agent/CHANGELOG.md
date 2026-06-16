@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed plugin extension discovery tests on Windows so fixture installs resolve under a temp home instead of writing to and deleting the real `~/.omp/plugins` ([#2721](https://github.com/can1357/oh-my-pi/issues/2721)).
+
 ## [16.0.1] - 2026-06-15
 
 ### Breaking Changes
