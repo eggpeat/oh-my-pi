@@ -170,11 +170,18 @@ describe("createAgentSession session storage isolation", () => {
 				enableLsp: false,
 			};
 
-			const withoutSecrets = await createAgentSession(commonOptions);
+			const existingKeySpy = spyOn(secrets, "getExistingSecretPlaceholderKey").mockImplementation(
+				async () => undefined,
+			);
 			try {
-				expect(withoutSecrets.session.systemPrompt.join("\n")).not.toContain(redactionGuidance);
+				const withoutSecrets = await createAgentSession(commonOptions);
+				try {
+					expect(withoutSecrets.session.systemPrompt.join("\n")).not.toContain(redactionGuidance);
+				} finally {
+					await withoutSecrets.session.dispose();
+				}
 			} finally {
-				await withoutSecrets.session.dispose();
+				existingKeySpy.mockRestore();
 			}
 
 			fs.mkdirSync(path.join(cwd, ".omp"), { recursive: true });
@@ -258,7 +265,7 @@ describe("createAgentSession session storage isolation", () => {
 		});
 	});
 
-	it("requests the placeholder key only when an obfuscate-mode secret is configured", async () => {
+	it("creates the placeholder key only when an obfuscate-mode secret is configured", async () => {
 		await withClearedSecretEnv(async () => {
 			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-secrets-key-${Snowflake.next()}-`));
 			tempDirs.push(tempDir);
@@ -287,6 +294,18 @@ describe("createAgentSession session storage isolation", () => {
 				async () => "existing-placeholder-key",
 			);
 			try {
+				const keyOnly = await createAgentSession(commonOptions);
+				try {
+					expect(keySpy).not.toHaveBeenCalled();
+					expect(existingKeySpy).toHaveBeenCalled();
+					expect(keyOnly.session.obfuscator?.obfuscate("existing-placeholder-key")).not.toContain(
+						"existing-placeholder-key",
+					);
+				} finally {
+					await keyOnly.session.dispose();
+				}
+
+				existingKeySpy.mockClear();
 				// Replace-mode secrets never build a reversible keyed placeholder, so
 				// startup must not create the key file; an existing key is still redacted.
 				fs.writeFileSync(
