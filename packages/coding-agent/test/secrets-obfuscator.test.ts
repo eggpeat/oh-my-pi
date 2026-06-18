@@ -390,6 +390,19 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("abc");
 	});
 
+	it("ignores obfuscate regex matches that partially overlap known placeholders", () => {
+		const obfuscator = new SecretObfuscator([
+			{ type: "plain", content: "secret" },
+			{ type: "regex", content: "P{3}X", friendlyName: "partial" },
+		]);
+
+		const obfuscated = obfuscator.obfuscate("secretX");
+
+		expect(obfuscated).toMatch(/^#[A-Z0-9]+:L#X$/);
+		expect(obfuscated).not.toMatch(/^#PARTIAL_/);
+		expect(obfuscator.deobfuscate(obfuscated)).toBe("secretX");
+	});
+
 	it("does not recursively rewrite plain secrets that look like placeholders", () => {
 		const sharedKey = "D".repeat(43);
 		const firstOnly = new SecretObfuscator(
