@@ -90,6 +90,7 @@ describe("AgentSession retry fallback", () => {
 		authStorage.setRuntimeApiKey("google", "google-test-key");
 		authStorage.setRuntimeApiKey("google-vertex", "google-vertex-test-key");
 		authStorage.setRuntimeApiKey("openrouter", "openrouter-test-key");
+		authStorage.setRuntimeApiKey("openai-codex", "openai-codex-test-key");
 		sharedRegistry = new ModelRegistry(authStorage);
 	});
 
@@ -221,6 +222,52 @@ describe("AgentSession retry fallback", () => {
 			},
 		]);
 	});
+	it("skips same-base default fallback selectors with different thinking suffixes", async () => {
+		const primaryModel = getBundledModel("openai-codex", "gpt-5.5");
+		const fallbackModel = getBundledModel("anthropic", "claude-opus-4-8");
+		if (!primaryModel || !fallbackModel) {
+			throw new Error("Expected bundled test models to exist");
+		}
+
+		const requestedModels: string[] = [];
+		const fallbackAppliedEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		const agent = createFallbackAgent(primaryModel, requestedModels, "quota exceeded");
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_applied") {
+				fallbackAppliedEvents.push(event);
+			}
+		});
+
+		await session.prompt("Skip same-base default fallback");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${fallbackModel.provider}/${fallbackModel.id}`,
+		]);
+		expect(fallbackAppliedEvents).toEqual([
+			{
+				type: "retry_fallback_applied",
+				from: `${primaryModel.provider}/${primaryModel.id}`,
+				to: `${fallbackModel.provider}/${fallbackModel.id}:high`,
+				role: "default",
+			},
+		]);
+	});
+
 	it("falls back on string-form provider authentication errors", async () => {
 		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");

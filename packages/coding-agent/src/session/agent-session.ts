@@ -686,6 +686,10 @@ function formatRetryFallbackSelector(model: Model, thinkingLevel: ThinkingLevel 
 function formatRetryFallbackBaseSelector(selector: RetryFallbackSelector): string {
 	return `${selector.provider}/${selector.id}`;
 }
+function retryFallbackSelectorDedupKeys(selector: RetryFallbackSelector): string[] {
+	const baseSelector = formatRetryFallbackBaseSelector(selector);
+	return selector.raw === baseSelector ? [selector.raw] : [selector.raw, baseSelector];
+}
 
 const EPHEMERAL_REPLY_MAX_BYTES = 4096;
 
@@ -9828,11 +9832,15 @@ export class AgentSession {
 		const primarySelector = this.#getRetryFallbackPrimarySelector(role);
 		if (!primarySelector) return [];
 		const chain = [primarySelector];
-		const seen = new Set<string>([primarySelector.raw]);
+		const seen = new Set<string>(retryFallbackSelectorDedupKeys(primarySelector));
 		for (const selector of this.#getRetryFallbackChains()[role] ?? []) {
 			const parsed = parseRetryFallbackSelector(selector);
-			if (!parsed || seen.has(parsed.raw)) continue;
-			seen.add(parsed.raw);
+			if (!parsed) continue;
+			const keys = retryFallbackSelectorDedupKeys(parsed);
+			if (keys.some(key => seen.has(key))) continue;
+			for (const key of keys) {
+				seen.add(key);
+			}
 			chain.push(parsed);
 		}
 		return chain;

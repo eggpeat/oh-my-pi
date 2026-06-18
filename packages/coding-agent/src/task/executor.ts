@@ -14,6 +14,7 @@ import { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelSelectorValue,
 	formatModelStringWithRouting,
+	resolveAgentModelPatterns,
 	resolveModelOverride,
 	resolveModelOverrideWithAuthFallback,
 } from "../config/model-resolver";
@@ -174,19 +175,20 @@ function pushSubagentRetryFallbackCandidate(
 }
 
 function resolveSubagentRetryFallbackCandidates(
-	modelPatterns: string[],
+	requestedModelPatterns: string[],
+	effectiveModelPatterns: string[],
 	modelRegistry: ModelRegistry,
 	settings: Settings,
 ): SubagentRetryFallbackCandidate[] {
 	const candidates: SubagentRetryFallbackCandidate[] = [];
 	const seen = new Set<string>();
-	for (const pattern of modelPatterns) {
+	for (const pattern of effectiveModelPatterns) {
 		pushSubagentRetryFallbackCandidate(candidates, seen, pattern, modelRegistry, settings);
 	}
 
-	if (modelPatterns.length === 1) {
+	if (requestedModelPatterns.length === 1) {
 		const fallbackChains = settings.get("retry.fallbackChains");
-		const role = modelPatternRole(modelPatterns[0]);
+		const role = modelPatternRole(requestedModelPatterns[0]);
 		const configuredChain = role ? fallbackChains[role] : undefined;
 		const roleChain = configuredChain && configuredChain.length > 0 ? configuredChain : fallbackChains.default;
 		for (const pattern of roleChain ?? []) {
@@ -1835,7 +1837,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		toolNames = Array.from(new Set(expanded));
 	}
 
-	const modelPatterns = normalizeModelPatterns(modelOverride ?? agent.model);
+	const requestedModelPatterns = normalizeModelPatterns(modelOverride ?? agent.model);
+	const resolvedModelPatterns = resolveAgentModelPatterns({
+		settingsOverride: modelOverride,
+		agentModel: agent.model,
+		settings,
+		activeModelPattern: options.parentActiveModelPattern,
+	});
+	const modelPatterns = resolvedModelPatterns.length > 0 ? resolvedModelPatterns : requestedModelPatterns;
 	const sessionFile = subtaskSessionFile ?? null;
 	const spawnsEnv = atMaxDepth
 		? ""
@@ -1964,7 +1973,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const retryFallbackRole = installSubagentRetryFallbackChain({
 				settings: subagentSettings,
 				id,
-				candidates: resolveSubagentRetryFallbackCandidates(modelPatterns, modelRegistry, settings),
+				candidates: resolveSubagentRetryFallbackCandidates(
+					requestedModelPatterns,
+					modelPatterns,
+					modelRegistry,
+					settings,
+				),
 				model,
 				authFallbackUsed,
 			});

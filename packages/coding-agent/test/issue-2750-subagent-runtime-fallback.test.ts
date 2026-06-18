@@ -184,6 +184,49 @@ describe("subagent runtime model fallback", () => {
 			"google-gemini-cli/gemini-3.1-pro-preview",
 		]);
 	});
+	it("resolves pi/task through the parent model before installing the task fallback chain", async () => {
+		const primary = model("openai-codex", "gpt-5.5");
+		const opus = model("anthropic", "claude-opus-4-8");
+		const gemini = model("google-gemini-cli", "gemini-3.1-pro-preview");
+		let childFallbackChains: Record<string, string[]> | undefined;
+		let childModelRoles: Record<string, string> | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			if (!options) throw new Error("Expected createAgentSession options");
+			childFallbackChains = options.settings?.get("retry.fallbackChains") as Record<string, string[]> | undefined;
+			childModelRoles = options.settings?.getModelRoles() as Record<string, string> | undefined;
+			return { session: createYieldingSession(), extensionsResult: {}, setToolUIContext: () => {} } as never;
+		});
+
+		const agent: AgentDefinition = {
+			name: "task",
+			description: "test",
+			systemPrompt: "test",
+			source: "bundled",
+			model: ["pi/task"],
+		};
+
+		await runSubprocess({
+			cwd: "/tmp",
+			agent,
+			task: "work",
+			index: 0,
+			id: "issue-2912-task",
+			parentActiveModelPattern: "openai-codex/gpt-5.5",
+			settings: Settings.isolated(),
+			modelRegistry: {
+				refresh: async () => {},
+				getAvailable: () => [primary, opus, gemini],
+				getApiKey: async () => "test-key",
+			} as never,
+			enableLsp: false,
+		});
+
+		expect(childModelRoles?.["subagent:issue-2912-task"]).toBe("openai-codex/gpt-5.5");
+		expect(childFallbackChains?.["subagent:issue-2912-task"]).toEqual([
+			"anthropic/claude-opus-4-8:high",
+			"google-gemini-cli/gemini-3.1-pro-preview",
+		]);
+	});
 
 	it("uses the default chain for a single concrete model without a role chain", async () => {
 		const primary = model("custom", "primary-model");
