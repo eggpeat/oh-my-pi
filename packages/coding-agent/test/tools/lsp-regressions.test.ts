@@ -378,6 +378,19 @@ describe("lsp regressions", () => {
 			expect(
 				watchedFilesParams.changes?.some(change => change.uri === fileToUri(sourcePath) && change.type !== 3),
 			).toBe(true);
+			await Bun.sleep(100);
+			fs.unlinkSync(sourcePath);
+			const deletedFilesNotification = await server.waitFor(message => {
+				if (message.method !== "workspace/didChangeWatchedFiles") return false;
+				const params = message.params as { changes?: Array<{ uri?: string; type?: number }> };
+				return params.changes?.some(change => change.uri === fileToUri(sourcePath) && change.type === 3) ?? false;
+			}, 2_000);
+			const deletedFilesParams = deletedFilesNotification.params as {
+				changes?: Array<{ uri?: string; type?: number }>;
+			};
+			expect(
+				deletedFilesParams.changes?.some(change => change.uri === fileToUri(sourcePath) && change.type === 3),
+			).toBe(true);
 
 			server.send({
 				jsonrpc: "2.0",

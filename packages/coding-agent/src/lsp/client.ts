@@ -466,6 +466,7 @@ const DID_CHANGE_WATCHED_FILES = "workspace/didChangeWatchedFiles";
 const WATCH_KIND_CREATED = 1;
 const WATCH_KIND_CHANGED = 2;
 const WATCH_KIND_DELETED = 4;
+const FILE_CHANGE_TYPE_DELETED = 3;
 const WATCH_KIND_ALL = WATCH_KIND_CREATED | WATCH_KIND_CHANGED | WATCH_KIND_DELETED;
 const JSON_RPC_INVALID_PARAMS = -32602;
 const JSON_RPC_INTERNAL_ERROR = -32603;
@@ -549,6 +550,10 @@ async function detectWatchedFileChangeType(filePath: string, eventType: string):
 	return (await Bun.file(filePath).exists()) ? WATCH_KIND_CREATED : WATCH_KIND_DELETED;
 }
 
+function fileChangeTypeForWatchKind(watchKind: number): number {
+	return watchKind === WATCH_KIND_DELETED ? FILE_CHANGE_TYPE_DELETED : watchKind;
+}
+
 async function handleWatchedFileEvent(
 	client: LspClient,
 	eventType: string,
@@ -564,7 +569,7 @@ async function handleWatchedFileEvent(
 	if (!shouldNotifyWatchedFile(client, relativePath, changeType)) return;
 
 	await sendNotification(client, DID_CHANGE_WATCHED_FILES, {
-		changes: [{ uri: fileToUri(absolutePath), type: changeType }],
+		changes: [{ uri: fileToUri(absolutePath), type: fileChangeTypeForWatchKind(changeType) }],
 	});
 }
 
