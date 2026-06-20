@@ -10,6 +10,12 @@
 
 - Fixed reversible secret placeholders sharing a case-folded hash base across ASCII case variants, which let a prompt-injected model synthesize a never-provider-visible sibling secret's keyed token by swapping the case hint (`#…:L#` → `#…:U#`) in a tool-call argument. Placeholder bases are now keyed on the exact secret value, so each casing variant gets an independent base and a synthesized sibling token deobfuscates to nothing on live provider/tool-call paths ([#2465](https://github.com/can1357/oh-my-pi/issues/2465)).
 
+## [16.1.7] - 2026-06-20
+
+### Fixed
+
+- Fixed custom `models.yml` providers rejecting the `compat.supportsImageDetailOriginal` override, so Responses-compatible proxies that reject snapcompact's native-resolution image hint can clamp frames to `detail: "auto"`. ([#3092](https://github.com/can1357/oh-my-pi/issues/3092))
+
 ## [16.1.6] - 2026-06-20
 
 ### Added
