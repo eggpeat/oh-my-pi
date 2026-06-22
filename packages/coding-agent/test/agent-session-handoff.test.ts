@@ -264,7 +264,8 @@ describe("AgentSession handoff", () => {
 		expect(result?.document).not.toContain(placeholder);
 	});
 
-	it("obfuscates previous compaction summary and preserve data before forwarding to compact()", async () => {
+	it("obfuscates the previous compaction summary but preserves opaque replay data", async () => {
+		session.settings.set("compaction.strategy", "context-full");
 		const placeholder = obfuscator.obfuscate(HANDOFF_SECRET);
 		const entries = sessionManager.getBranch();
 		const lastEntryId = entries[entries.length - 1]?.id;
@@ -301,12 +302,13 @@ describe("AgentSession handoff", () => {
 		if (!call) throw new Error("Expected compact call");
 		expect(call[0].previousSummary).toBe(`summary ${placeholder}`);
 		expect(call[0].previousSummary).not.toContain(HANDOFF_SECRET);
-		const preserveData = JSON.stringify(call[0].previousPreserveData);
-		expect(preserveData).toContain(placeholder);
-		expect(preserveData).not.toContain(HANDOFF_SECRET);
+		// Opaque provider-replay state (encrypted_content / replacementHistory) must pass through
+		// byte-identical — rewriting it would corrupt OpenAI remote-compaction replay.
+		expect(call[0].previousPreserveData).toBe(fixedPreparation.previousPreserveData);
 	});
 
 	it("runs context maintenance before sending an oversized pending prompt", async () => {
+		session.settings.set("compaction.strategy", "context-full");
 		session.settings.set("compaction.thresholdTokens", 50);
 		session.settings.set("compaction.keepRecentTokens", 1);
 		session.settings.set("contextPromotion.enabled", false);
@@ -336,6 +338,7 @@ describe("AgentSession handoff", () => {
 	});
 
 	it("falls back after one auto-compaction timeout instead of retrying the same model", async () => {
+		session.settings.set("compaction.strategy", "context-full");
 		session.settings.set("compaction.thresholdTokens", 50);
 		session.settings.set("compaction.keepRecentTokens", 1);
 		session.settings.set("contextPromotion.enabled", false);

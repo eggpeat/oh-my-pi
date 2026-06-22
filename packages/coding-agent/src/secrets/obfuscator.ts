@@ -1,6 +1,6 @@
 import * as crypto from "node:crypto";
-import type { Context, Message, Tool } from "@oh-my-pi/pi-ai";
-import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { AssistantMessage, Context, ImageContent, Message, TextContent } from "@oh-my-pi/pi-ai";
 import type { SessionContext } from "../session/session-context";
 import { compileSecretRegex } from "./regex";
 
@@ -16,6 +16,9 @@ export interface SecretEntry {
 	flags?: string;
 	friendlyName?: string;
 }
+
+export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue | undefined };
+export type JsonRecord = { [key: string]: JsonValue | undefined };
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Deterministic replacement generation
@@ -245,11 +248,16 @@ export class SecretObfuscator {
 		// obfuscated (provider-visible) output as a one-way secret.
 		this.#replaceMappings.set(key, this.#generateReplacement(key));
 		let index = 0;
+		let hasRealSec = false;
 		for (const entry of entries) {
 			const mode = entry.mode ?? "obfuscate";
 
 			if (entry.type === "plain") {
 				if (mode === "obfuscate") {
+					if (entry.content.length < 8) {
+						// Tone down short plain secret obfuscation to avoid false matches on small words like "esp"
+						continue;
+					}
 					const placeholder = this.#createPlaceholder(entry.content, entry.friendlyName);
 					this.#legacyDeobfuscateMap.set(buildLegacyPlaceholder(index), {
 						secret: entry.content,
@@ -259,10 +267,12 @@ export class SecretObfuscator {
 					this.#obfuscateMappings.set(index, { secret: entry.content, placeholder });
 					this.#generatedPlaceholders.add(placeholder);
 					index++;
+					hasRealSec = true;
 				} else {
 					// replace mode
 					const replacement = entry.replacement ?? this.#generateReplacement(entry.content);
 					this.#replaceMappings.set(entry.content, replacement);
+					hasRealSec = true;
 				}
 			} else {
 				// regex type — compiled here, matches discovered during obfuscate()
@@ -274,6 +284,7 @@ export class SecretObfuscator {
 						replacement: entry.replacement,
 						friendlyName: entry.friendlyName,
 					});
+					hasRealSec = true;
 				} catch {
 					// Invalid regex — skip silently (validation happens at load time)
 				}
@@ -281,7 +292,7 @@ export class SecretObfuscator {
 		}
 
 		this.#nextIndex = index;
-		this.#hasAny = entries.length > 0;
+		this.#hasAny = hasRealSec;
 	}
 
 	hasSecrets(): boolean {
@@ -367,6 +378,10 @@ export class SecretObfuscator {
 						const obfuscated = this.#obfuscateOutsidePlaceholdersTracked(span, spanOrigin, entry.friendlyName);
 						result = replaceRange(result, match.start, match.end, obfuscated.text);
 						origin = replaceRange(origin, match.start, match.end, obfuscated.origin);
+						continue;
+					}
+					if (match.value.length < 8) {
+						// Tone down short regex match obfuscation to avoid false matches on small words/fragments
 						continue;
 					}
 					// obfuscate mode — get or create stable index
@@ -792,59 +807,225 @@ export class SecretObfuscator {
 	}
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Display restore (inbound, persisted/provider → local display)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Restore secret placeholders for local display. Only message kinds the model
+ * itself authored from obfuscated context carry placeholders — assistant
+ * content and the LLM-written branch/compaction summaries. User, developer, and
+ * tool-result messages are persisted with their literal text, so a literal
+ * `#ABCD#` the operator typed must survive untouched; those roles are never
+ * walked.
+ *
+ * Legacy index-derived aliases (`#XXXX#`) are unkeyed and trivially guessable,
+ * so a prompt-injected model can plant one in any record it influences. Every
+ * agent-feeding path (resume, history rewrite, branch switch) therefore restores
+ * keyed placeholders ONLY (`allowLegacyAliases` false), leaving legacy tokens
+ * inert; display-only transcripts that are never re-obfuscated opt in via
+ * `allowLegacyAliases`.
+ */
 export function deobfuscateSessionContext(
 	sessionContext: SessionContext,
 	obfuscator: SecretObfuscator | undefined,
 	allowLegacyAliases = false,
 ): SessionContext {
 	if (!obfuscator?.hasSecrets()) return sessionContext;
-	// Legacy index-derived aliases (`#XXXX#`) are unkeyed and trivially guessable,
-	// so a prompt-injected model can plant one in ANY stored record it influences
-	// (its own assistant output, or tool results such as bash stdout). On a later
-	// resume/rebuild this would be restored to the raw secret and then re-obfuscated
-	// into a valid keyed placeholder the model can weaponize in a tool argument.
-	// Every agent-feeding path (resume, history rewrite, branch switch) therefore
-	// deobfuscates keyed placeholders ONLY, leaving any legacy token inert. Legacy
-	// aliases are restored solely for display-only transcripts that are never
-	// re-obfuscated or sent to a provider (`buildTranscriptSessionContext`).
-	const messages = allowLegacyAliases
-		? obfuscator.deobfuscateStoredObject(sessionContext.messages)
-		: obfuscator.deobfuscateObject(sessionContext.messages);
+	const messages = deobfuscateAgentMessages(obfuscator, sessionContext.messages, allowLegacyAliases);
 	return messages === sessionContext.messages ? sessionContext : { ...sessionContext, messages };
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Message obfuscation (outbound to LLM)
-// ═══════════════════════════════════════════════════════════════════════════
-
-/** Obfuscate all string content in LLM messages (for outbound interception). */
-export function obfuscateMessages(obfuscator: SecretObfuscator, messages: Message[]): Message[] {
-	return obfuscator.obfuscateObject(messages);
+export function deobfuscateAgentMessages(
+	obfuscator: SecretObfuscator,
+	messages: AgentMessage[],
+	allowLegacyAliases = false,
+): AgentMessage[] {
+	const deob = (text: string): string =>
+		allowLegacyAliases ? obfuscator.deobfuscateStored(text) : obfuscator.deobfuscate(text);
+	let changed = false;
+	const result = messages.map((message): AgentMessage => {
+		switch (message.role) {
+			case "assistant": {
+				const content = deobfuscateAssistantContent(obfuscator, message.content, allowLegacyAliases);
+				if (content === message.content) return message;
+				changed = true;
+				return { ...message, content };
+			}
+			case "branchSummary": {
+				const summary = deob(message.summary);
+				if (summary === message.summary) return message;
+				changed = true;
+				return { ...message, summary };
+			}
+			case "compactionSummary": {
+				const summary = deob(message.summary);
+				const shortSummary = message.shortSummary === undefined ? undefined : deob(message.shortSummary);
+				const blocks =
+					message.blocks === undefined
+						? undefined
+						: deobfuscateTextBlocks(obfuscator, message.blocks, allowLegacyAliases);
+				if (summary === message.summary && shortSummary === message.shortSummary && blocks === message.blocks) {
+					return message;
+				}
+				changed = true;
+				return { ...message, summary, shortSummary, blocks };
+			}
+			default:
+				return message;
+		}
+	});
+	return changed ? result : messages;
 }
 
-/** Obfuscate provider request context without walking live tool schema instances. */
+/**
+ * Restore placeholders in assistant content: visible text, thinking text, and
+ * tool-call arguments/intent/rawBlock. Signatures and redacted-thinking bytes
+ * are opaque provider-replay data and pass through byte-identical.
+ */
+export function deobfuscateAssistantContent(
+	obfuscator: SecretObfuscator,
+	content: AssistantMessage["content"],
+	allowLegacyAliases = false,
+): AssistantMessage["content"] {
+	if (!obfuscator.hasSecrets()) return content;
+	const deob = (text: string): string =>
+		allowLegacyAliases ? obfuscator.deobfuscateStored(text) : obfuscator.deobfuscate(text);
+	let changed = false;
+	const result = content.map((block): AssistantMessage["content"][number] => {
+		if (block.type === "text") {
+			const text = deob(block.text);
+			if (text === block.text) return block;
+			changed = true;
+			return { ...block, text };
+		}
+		if (block.type === "thinking") {
+			const thinking = deob(block.thinking);
+			if (thinking === block.thinking) return block;
+			changed = true;
+			return { ...block, thinking };
+		}
+		if (block.type === "toolCall") {
+			const args = deobfuscateToolArguments(obfuscator, block.arguments, allowLegacyAliases);
+			const intent = block.intent === undefined ? undefined : deob(block.intent);
+			const rawBlock = block.rawBlock === undefined ? undefined : deob(block.rawBlock);
+			if (args === block.arguments && intent === block.intent && rawBlock === block.rawBlock) return block;
+			changed = true;
+			return { ...block, arguments: args, intent, rawBlock };
+		}
+		return block;
+	});
+	return changed ? result : content;
+}
+
+/**
+ * Restore placeholders inside a tool call's arguments. Arguments are arbitrary
+ * model-authored JSON, so tool-call arguments are the ONLY place a recursive
+ * JSON walk runs.
+ */
+export function deobfuscateToolArguments(
+	obfuscator: SecretObfuscator,
+	args: Record<string, unknown>,
+	allowLegacyAliases = false,
+): Record<string, unknown> {
+	if (!obfuscator.hasSecrets()) return args;
+	const deob = (text: string): string =>
+		allowLegacyAliases ? obfuscator.deobfuscateStored(text) : obfuscator.deobfuscate(text);
+	return mapJsonStrings(args as JsonValue, deob) as Record<string, unknown>;
+}
+
+/** Redact secrets inside a tool call's arguments (same JSON-walk exception as {@link deobfuscateToolArguments}). */
+export function obfuscateToolArguments(
+	obfuscator: SecretObfuscator,
+	args: Record<string, unknown>,
+): Record<string, unknown> {
+	if (!obfuscator.hasSecrets()) return args;
+	return mapJsonStrings(args as JsonValue, s => obfuscator.obfuscate(s)) as Record<string, unknown>;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Outbound obfuscation (local → provider)
+// ═══════════════════════════════════════════════════════════════════════════
+
+type UserFacingMessage = Extract<Message, { role: "user" | "developer" | "toolResult" }>;
+
+/** Obfuscate `text` blocks of a content array; image and other blocks pass through. */
+function obfuscateTextBlocks(
+	obfuscator: SecretObfuscator,
+	content: (TextContent | ImageContent)[],
+): (TextContent | ImageContent)[] {
+	let changed = false;
+	const result = content.map((block): TextContent | ImageContent => {
+		if (block.type !== "text") return block;
+		const text = obfuscator.obfuscate(block.text);
+		if (text === block.text) return block;
+		changed = true;
+		return { ...block, text };
+	});
+	return changed ? result : content;
+}
+
+/** Restore placeholders in `text` blocks of a content array; image and other blocks pass through. */
+function deobfuscateTextBlocks(
+	obfuscator: SecretObfuscator,
+	content: (TextContent | ImageContent)[],
+	allowLegacyAliases = false,
+): (TextContent | ImageContent)[] {
+	const deob = (text: string): string =>
+		allowLegacyAliases ? obfuscator.deobfuscateStored(text) : obfuscator.deobfuscate(text);
+	let changed = false;
+	const result = content.map((block): TextContent | ImageContent => {
+		if (block.type !== "text") return block;
+		const text = deob(block.text);
+		if (text === block.text) return block;
+		changed = true;
+		return { ...block, text };
+	});
+	return changed ? result : content;
+}
+
+/**
+ * Redact secrets from outbound messages. Opt-in by origin: only user messages,
+ * tool results, and user-authored developer messages (e.g. `@file` mentions)
+ * can carry operator secrets. System prompts, tool schemas, and assistant
+ * output are author-controlled or model-generated and pass through untouched.
+ * Within a targeted message only `text` blocks are rewritten — inline image
+ * bytes are never walked.
+ */
+export function obfuscateMessages(obfuscator: SecretObfuscator, messages: Message[]): Message[] {
+	if (!obfuscator.hasSecrets()) return messages;
+	let changed = false;
+	const result = messages.map((message): Message => {
+		if (
+			message.role !== "user" &&
+			message.role !== "toolResult" &&
+			!(message.role === "developer" && message.attribution === "user")
+		) {
+			return message;
+		}
+		const target = message as UserFacingMessage;
+		if (typeof target.content === "string") {
+			const content = obfuscator.obfuscate(target.content);
+			if (content === target.content) return message;
+			changed = true;
+			return { ...target, content } as Message;
+		}
+		const content = obfuscateTextBlocks(obfuscator, target.content);
+		if (content === target.content) return message;
+		changed = true;
+		return { ...target, content } as Message;
+	});
+	return changed ? result : messages;
+}
+
+/**
+ * Redact outbound provider context. Only conversation messages are rewritten;
+ * the static system prompt and tool schemas pass through unchanged.
+ */
 export function obfuscateProviderContext(obfuscator: SecretObfuscator | undefined, context: Context): Context {
 	if (!obfuscator?.hasSecrets()) return context;
-	return {
-		...context,
-		systemPrompt: obfuscator.obfuscateObject(context.systemPrompt),
-		messages: obfuscator.obfuscateObject(context.messages),
-		tools: obfuscateProviderTools(obfuscator, context.tools),
-	};
-}
-
-/** Convert tool schemas to wire JSON Schema before obfuscating provider-visible strings. */
-export function obfuscateProviderTools(
-	obfuscator: SecretObfuscator | undefined,
-	tools: Tool[] | undefined,
-): Tool[] | undefined {
-	if (!tools || !obfuscator?.hasSecrets()) return tools;
-	return tools.map(tool => ({
-		...tool,
-		description: obfuscator.obfuscate(tool.description),
-		parameters: obfuscator.obfuscateObject(toolWireSchema(tool)),
-		customFormat: tool.customFormat ? obfuscator.obfuscateObject(tool.customFormat) : undefined,
-	}));
+	const messages = obfuscateMessages(obfuscator, context.messages);
+	return messages === context.messages ? context : { ...context, messages };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1097,4 +1278,35 @@ function deepWalkStrings<T>(obj: T, transform: (s: string) => string): T {
 function isPlainRecord(obj: object): obj is Record<string, unknown> {
 	const prototype = Object.getPrototypeOf(obj);
 	return prototype === Object.prototype || prototype === null;
+}
+
+/**
+ * Map every string in arbitrary JSON. Used ONLY for tool-call arguments, whose
+ * shape is model-authored and not known ahead of time. No other caller may walk
+ * untyped data: every message/content path is handled by a typed transformer.
+ */
+function mapJsonStrings(value: JsonValue, fn: (s: string) => string): JsonValue {
+	if (typeof value === "string") return fn(value);
+	if (Array.isArray(value)) {
+		let changed = false;
+		const out = value.map(item => {
+			const next = mapJsonStrings(item, fn);
+			if (next !== item) changed = true;
+			return next;
+		});
+		return changed ? out : value;
+	}
+	if (value !== null && typeof value === "object") {
+		let changed = false;
+		const out: JsonRecord = {};
+		for (const key of Object.keys(value)) {
+			const item = value[key];
+			if (item === undefined) continue;
+			const next = mapJsonStrings(item, fn);
+			if (next !== item) changed = true;
+			out[key] = next;
+		}
+		return changed ? out : value;
+	}
+	return value;
 }

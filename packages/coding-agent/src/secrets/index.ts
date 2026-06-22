@@ -94,9 +94,9 @@ type RawSecretEntry = Omit<SecretEntry, "friendlyName"> & { friendlyName?: unkno
 
 export {
 	deobfuscateSessionContext,
+	deobfuscateToolArguments,
 	obfuscateMessages,
 	obfuscateProviderContext,
-	obfuscateProviderTools,
 	type SecretEntry,
 	SecretObfuscator,
 } from "./obfuscator";

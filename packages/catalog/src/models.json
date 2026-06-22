@@ -69284,8 +69284,7 @@
 			"baseUrl": "https://api.code.umans.ai",
 			"reasoning": true,
 			"input": [
-				"text",
-				"image"
+				"text"
 			],
 			"cost": {
 				"input": 0,
@@ -69327,8 +69326,7 @@
 				]
 			},
 			"input": [
-				"text",
-				"image"
+				"text"
 			],
 			"cost": {
 				"input": 0,
@@ -77587,64 +77585,6 @@
 					"high",
 					"xhigh"
 				]
-			}
-		}
-	},
-	"wafer-pass": {
-		"GLM-5.1": {
-			"id": "GLM-5.1",
-			"name": "GLM-5.1",
-			"api": "openai-completions",
-			"provider": "wafer-pass",
-			"baseUrl": "https://pass.wafer.ai/v1",
-			"reasoning": true,
-			"input": [
-				"text"
-			],
-			"cost": {
-				"input": 0,
-				"output": 0,
-				"cacheRead": 0,
-				"cacheWrite": 0
-			},
-			"contextWindow": 202752,
-			"maxTokens": 65536,
-			"compat": {
-				"supportsDeveloperRole": false,
-				"thinkingFormat": "zai",
-				"reasoningContentField": "reasoning_content"
-			},
-			"thinking": {
-				"mode": "effort",
-				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high"
-				]
-			}
-		},
-		"Qwen3.5-397B-A17B": {
-			"id": "Qwen3.5-397B-A17B",
-			"name": "Qwen3.5-397B-A17B",
-			"api": "openai-completions",
-			"provider": "wafer-pass",
-			"baseUrl": "https://pass.wafer.ai/v1",
-			"reasoning": false,
-			"input": [
-				"text",
-				"image"
-			],
-			"cost": {
-				"input": 0,
-				"output": 0,
-				"cacheRead": 0,
-				"cacheWrite": 0
-			},
-			"contextWindow": 262144,
-			"maxTokens": 65536,
-			"compat": {
-				"supportsDeveloperRole": false
 			}
 		}
 	},

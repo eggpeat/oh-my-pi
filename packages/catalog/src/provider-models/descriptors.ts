@@ -41,7 +41,6 @@ import {
 	veniceModelManagerOptions,
 	vercelAiGatewayModelManagerOptions,
 	vllmModelManagerOptions,
-	waferPassModelManagerOptions,
 	waferServerlessModelManagerOptions,
 	xaiModelManagerOptions,
 	xaiOAuthModelManagerOptions,
@@ -219,7 +218,9 @@ export const CATALOG_PROVIDERS = [
 	{
 		id: "moonshot",
 		defaultModel: "kimi-k2.7-code",
-		envVars: ["MOONSHOT_API_KEY"],
+		// KIMI_API_KEY is the most intuitive name for a Kimi/Moonshot key; accept it
+		// as a fallback so China users need not learn MOONSHOT_API_KEY. (#2883)
+		envVars: ["MOONSHOT_API_KEY", "KIMI_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => moonshotModelManagerOptions(config),
 		catalogDiscovery: { label: "Moonshot" },
 	},
@@ -346,13 +347,6 @@ export const CATALOG_PROVIDERS = [
 		envVars: ["VLLM_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => vllmModelManagerOptions(config),
 		catalogDiscovery: { label: "vLLM", allowUnauthenticated: true },
-	},
-	{
-		id: "wafer-pass",
-		defaultModel: "GLM-5.1",
-		envVars: ["WAFER_PASS_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => waferPassModelManagerOptions(config),
-		catalogDiscovery: { label: "Wafer Pass", oauthProvider: "wafer-pass" },
 	},
 	{
 		id: "wafer-serverless",

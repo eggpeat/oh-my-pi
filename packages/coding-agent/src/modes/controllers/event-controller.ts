@@ -296,8 +296,15 @@ export class EventController {
 			this.#resetReadGroup();
 			this.#resolveDisplaceablePoll();
 			const wasOptimistic = this.ctx.optimisticUserMessageSignature === signature;
-			const wasLocallySubmitted = this.ctx.locallySubmittedUserSignatures.delete(signature) || wasOptimistic;
-			if (!wasOptimistic) {
+			const matchedLocalSubmission = this.ctx.locallySubmittedUserSignatures.delete(signature);
+			const replacesOptimistic =
+				this.ctx.optimisticUserMessageSignature !== undefined && !wasOptimistic && !matchedLocalSubmission;
+			const wasLocallySubmitted = matchedLocalSubmission || wasOptimistic || replacesOptimistic;
+			if (wasOptimistic) {
+				this.ctx.clearOptimisticUserMessage();
+			} else if (replacesOptimistic) {
+				this.ctx.replaceOptimisticUserMessage(event.message);
+			} else {
 				// Append synchronously: #emit dispatches to this listener fire-and-forget
 				// (see AgentSession.#emit), so any await between the user message_start and
 				// addMessageToChat lets later events (assistant message_start, tool execution
@@ -305,9 +312,6 @@ export class EventController {
 				// live-region block boundaries. addMessageToChat materializes clickable image
 				// links via the synchronous putBlobSync fallback, so no await is needed here.
 				this.ctx.addMessageToChat(event.message);
-			}
-			if (wasOptimistic) {
-				this.ctx.optimisticUserMessageSignature = undefined;
 			}
 
 			// Clear the editor only when the submission did not originate from a
@@ -738,6 +742,26 @@ export class EventController {
 			this.ctx.chatContainer.addChild(component);
 			this.ctx.pendingTools.set(event.toolCallId, component);
 			this.ctx.ui.requestRender();
+		} else {
+			// The tool is about to run, so its arguments are final and validated.
+			// A pending component created while args streamed (message_update) may
+			// still show a mid-reveal prefix — or, when the closing full-args
+			// `message_update` never lands (smooth-streaming off leaving the
+			// throttled `arguments` stale, an owned-dialect projector, or a
+			// superseded/aborted turn that still executes the call), a stale body
+			// the result render then freezes at its `…` placeholder. Reconcile the
+			// authoritative args here and drop any live reveal so a late tick can't
+			// re-truncate them: tool_execution_start is the one event every
+			// execution path emits with the full args immediately before the result.
+			this.#toolArgsReveal.finish(event.toolCallId);
+			const component = this.ctx.pendingTools.get(event.toolCallId);
+			if (component && typeof component.updateArgs === "function") {
+				component.updateArgs(event.args, event.toolCallId);
+				if (typeof component.setArgsComplete === "function") {
+					component.setArgsComplete(event.toolCallId);
+				}
+				this.ctx.ui.requestRender();
+			}
 		}
 	}
 

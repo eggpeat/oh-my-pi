@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [16.1.10] - 2026-06-21
+
+### Fixed
+
+- Fixed labeled user interrupts retaining incomplete streamed tool calls before `toolcall_end`, which could persist malformed tool-call IDs into replay.
+
+## [16.1.8] - 2026-06-20
+
+### Breaking Changes
+
+- Changed `transformProviderContext` and `buildSideRequestContext` to return a Promise
+
 ### Added
 
 - Added `buildSideRequestContext` to the `Agent` class to build prompt-cache-friendly provider Contexts for side-channels or ephemeral requests.
