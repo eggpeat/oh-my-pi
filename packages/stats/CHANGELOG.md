@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [16.1.15] - 2026-06-22
+
+### Added
+
+- Added token usage breakdown by agent type (Main, Subagents, Advisor) to the overview dashboard
+
 ## [16.0.10] - 2026-06-18
 
 ### Changed

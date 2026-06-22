@@ -116,6 +116,13 @@ export declare class Shell {
    * Returns `Ok(())` even when no commands are running.
    */
   abort(): Promise<void>
+  /**
+   * Count live background jobs (`&`/`nohup` children still running) on this
+   * session. Completed jobs are reaped first. The host uses this to retain a
+   * per-call shell whose background processes are still running instead of
+   * dropping it (which would SIGKILL them via kill-on-drop).
+   */
+  liveBackgroundJobCount(): Promise<number>
 }
 
 /**
@@ -155,7 +162,7 @@ export declare function __ompInstallTokioRuntime(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV16_1_14(): void
+export declare function __piNativesV16_1_15(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.

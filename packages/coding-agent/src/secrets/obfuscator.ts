@@ -947,9 +947,9 @@ export function deobfuscateAgentMessages(
 }
 
 /**
- * Restore placeholders in assistant content: visible text, thinking text, and
- * tool-call arguments/intent/rawBlock. Signatures and redacted-thinking bytes
- * are opaque provider-replay data and pass through byte-identical.
+ * Restore placeholders in assistant content: visible text and tool-call
+ * arguments/intent/rawBlock. Thinking and signatures are opaque
+ * provider-replay/hidden-reasoning data and pass through byte-identical.
  */
 export function deobfuscateAssistantContent(
 	obfuscator: SecretObfuscator,
@@ -967,12 +967,7 @@ export function deobfuscateAssistantContent(
 			changed = true;
 			return { ...block, text };
 		}
-		if (block.type === "thinking") {
-			const thinking = deob(block.thinking);
-			if (thinking === block.thinking) return block;
-			changed = true;
-			return { ...block, thinking };
-		}
+
 		if (block.type === "toolCall") {
 			const args = deobfuscateToolArguments(obfuscator, block.arguments, allowLegacyAliases);
 			const intent = block.intent === undefined ? undefined : deob(block.intent);

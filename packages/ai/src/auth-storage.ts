@@ -10,9 +10,9 @@
 import { Database, type Statement } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getAgentDbPath, logger } from "@oh-my-pi/pi-utils";
+import { extractHttpStatusFromError, getAgentDbPath, logger } from "@oh-my-pi/pi-utils";
 import type { ApiKeyResolver } from "./auth-retry";
-import { isUsageLimitError } from "./rate-limit-utils";
+import { isUsageLimitOutcome } from "./rate-limit-utils";
 import { getProviderDefinition } from "./registry";
 import { getOAuthApiKey, getOAuthProvider, refreshOAuthToken } from "./registry/oauth";
 import type { OAuthController, OAuthCredentials, OAuthProvider, OAuthProviderId } from "./registry/oauth/types";
@@ -1845,14 +1845,9 @@ export class AuthStorage {
 				return;
 			}
 			const newCredential: ApiKeyCredential = { type: "api_key", key: result };
-			const appendApiKeyLogin = "appendApiKeyLogin" in def && def.appendApiKeyLogin === true;
-			const stored = appendApiKeyLogin
-				? this.#store.upsertAuthCredentialRemote
-					? await this.#store.upsertAuthCredentialRemote(provider, newCredential)
-					: this.#store.upsertAuthCredentialForProvider(provider, newCredential)
-				: this.#store.replaceAuthCredentialsRemote
-					? await this.#store.replaceAuthCredentialsRemote(provider, [newCredential])
-					: this.#store.replaceAuthCredentialsForProvider(provider, [newCredential]);
+			const stored = this.#store.upsertAuthCredentialRemote
+				? await this.#store.upsertAuthCredentialRemote(provider, newCredential)
+				: this.#store.upsertAuthCredentialForProvider(provider, newCredential);
 			this.#setStoredCredentials(
 				provider,
 				stored.map(entry => ({ id: entry.id, credential: entry.credential })),
@@ -4089,8 +4084,9 @@ export class AuthStorage {
 		if (!sessionCredential) return false;
 
 		const error = options?.error;
+		const status = extractHttpStatusFromError(error);
 		const message = error instanceof Error ? error.message : typeof error === "string" ? error : undefined;
-		if (message && isUsageLimitError(message)) {
+		if (isUsageLimitOutcome(status, message)) {
 			return (
 				await this.markUsageLimitReached(provider, sessionId, {
 					modelId: options?.modelId,
