@@ -80,12 +80,11 @@ function findNonMatchingReplacement(value: string, regex: RegExp): string | unde
 	const len = value.length;
 	if (len === 0) return undefined;
 	const base = NONMATCHING_REPLACEMENT_CHARS.length;
-	// Exhaust every 1–2 char candidate (the only realistic trigger). Longer
+	// Exhaust every 1–3 char candidate (the only realistic trigger). Longer
 	// collisions stay bounded to avoid pathological sweeps, but enumerate with
 	// the LEFTMOST position varying fastest so early attempts still sample every
-	// leading character class (e.g. `!AA` for a 3-char candidate space) before
-	// the cap is hit.
-	const maxAttempts = Math.max(4096, len <= 2 ? base ** len : 0);
+	// leading character class before the cap is hit.
+	const maxAttempts = len <= 3 ? base ** len : 4096;
 	const chars = new Array<string>(len);
 	for (let n = 0; n < maxAttempts; n++) {
 		let q = n;
