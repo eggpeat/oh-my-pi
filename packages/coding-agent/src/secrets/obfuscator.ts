@@ -619,14 +619,6 @@ export class SecretObfuscator {
 						origin = replaceRange(origin, match.start, match.end, "I".repeat(replacement.length));
 					}
 				} else {
-					if (match.preserveInputPlaceholders) {
-						const span = result.slice(match.start, match.end);
-						const spanOrigin = origin.slice(match.start, match.end);
-						const obfuscated = this.#obfuscateOutsidePlaceholdersTracked(span, spanOrigin, entry.friendlyName);
-						result = replaceRange(result, match.start, match.end, obfuscated.text);
-						origin = replaceRange(origin, match.start, match.end, obfuscated.origin);
-						continue;
-					}
 					if (match.scanMatchLength < MIN_OBFUSCATE_SECRET_LEN) {
 						// Tone down short regex match obfuscation to avoid false matches on
 						// small words/fragments. Measure the regex's own match length in the
@@ -634,9 +626,21 @@ export class SecretObfuscator {
 						// source span: a match that straddles an already-emitted `#…#` token
 						// has its range extended to cover the whole token, so both the source
 						// span and the expanded canonical overstate how much content the
-						// regex actually matched. Without this a sub-threshold match could
-						// slip through and re-placeholder across the token, corrupting
-						// round-trip deobfuscation.
+						// regex actually matched. This MUST run before the
+						// preserve-input-placeholders branch below: on a re-obfuscation pass
+						// a sub-threshold match that straddles a prior placeholder would
+						// otherwise rewrite its surrounding context into fresh placeholders,
+						// breaking the obfuscate() fixed point (and drifting provider-visible
+						// history / prompt-cache prefixes), or re-placeholder across the token
+						// and corrupt round-trip deobfuscation.
+						continue;
+					}
+					if (match.preserveInputPlaceholders) {
+						const span = result.slice(match.start, match.end);
+						const spanOrigin = origin.slice(match.start, match.end);
+						const obfuscated = this.#obfuscateOutsidePlaceholdersTracked(span, spanOrigin, entry.friendlyName);
+						result = replaceRange(result, match.start, match.end, obfuscated.text);
+						origin = replaceRange(origin, match.start, match.end, obfuscated.origin);
 						continue;
 					}
 					// obfuscate mode — get or create stable index

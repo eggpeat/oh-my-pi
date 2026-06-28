@@ -412,6 +412,10 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(obfuscated.startsWith("XX")).toBe(true);
 		expect(obfuscated.endsWith("YY")).toBe(true);
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("XXSECRETUVYY");
+		// Re-obfuscation MUST be a fixed point: a sub-threshold match straddling the
+		// now-input placeholder must not rewrite the surrounding context into fresh
+		// placeholders, or provider-visible history and prompt-cache prefixes drift.
+		expect(obfuscator.obfuscate(obfuscated)).toBe(obfuscated);
 	});
 
 	it("keeps regex placeholders stable when inner friendly names change", () => {
