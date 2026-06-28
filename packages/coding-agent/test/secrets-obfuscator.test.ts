@@ -857,6 +857,25 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(obf.obfuscate(out)).toBe(out);
 	});
 
+	it("redacts a replace regex that also matches all-space and all-tab runs via a mixed marker", () => {
+		// `(?:\S{5}| {5}|\t{5})` matches every non-whitespace run AND a full space or
+		// tab run, so neither the punctuation candidates nor a full whitespace run is a
+		// stable redaction. A mixed marker (one whitespace byte among filler, e.g.
+		// ` AAAA`) breaks every fixed-length run, so the colliding sentinel value is
+		// still redacted to a stable nonmatching value instead of shipped raw.
+		const obf = new SecretObfuscator(
+			[{ type: "regex", mode: "replace", content: "(?:\\S{5}| {5}|\\t{5})" }],
+			"Q".repeat(43),
+		);
+
+		const out = obf.obfuscate("ZZLB6");
+
+		expect(out).not.toBe("ZZLB6");
+		expect(out).toHaveLength(5);
+		expect(/(?:\S{5}| {5}|\t{5})/.test(out)).toBe(false);
+		expect(obf.obfuscate(out)).toBe(out);
+	});
+
 	it("keeps the sentinel only when no same-length value avoids the regex", () => {
 		// A match-everything regex has no nonmatching same-length redaction, so the
 		// search exhausts and the sentinel is kept as the sole fixed point. Such a

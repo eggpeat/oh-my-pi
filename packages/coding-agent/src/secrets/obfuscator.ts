@@ -26,13 +26,11 @@ export type JsonRecord = { [key: string]: JsonValue | undefined };
 
 const REPLACEMENT_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 const NONMATCHING_REPLACEMENT_CHARS = `${REPLACEMENT_CHARS}!#$%&()*+,-./:;<=>?@[]^_{|}~`;
-// Last-resort redaction bytes for a default replace regex that matches every
-// non-whitespace candidate (e.g. `\S{n}`): a same-length run of a single
-// whitespace byte is still a stable nonmatching redaction, so the secret is
-// replaced rather than shipped raw. Only `space`/`tab` are used — never a line
-// terminator — so a `.`-style match-everything regex (which matches space and
-// tab but not `\n`) still exhausts to the sentinel instead of redacting to a
-// newline run.
+// Whitespace bytes used to build last-resort redactions for a default replace
+// regex that matches every non-whitespace candidate (e.g. `\S{n}`). Only
+// `space`/`tab` are used — never a line terminator — so a `.`-style
+// match-everything regex (which matches space and tab but not `\n`) still
+// exhausts to the sentinel instead of redacting to a newline run.
 const WHITESPACE_REPLACEMENT_CHARS = " \t";
 
 /** Generate a deterministic same-length replacement string from a secret value. */
@@ -81,11 +79,11 @@ function ensureDistinctReplacement(replacement: string, secret: string): string 
  * punctuation fallback bytes when the regex covers every alphanumeric candidate.
  * This keeps the common case readable while still finding a nonmatching
  * same-length redaction for patterns such as `[A-Za-z0-9]{2}`. When the regex
- * covers every non-whitespace candidate (e.g. `\S{n}`), a same-length run of a
- * single whitespace byte (space/tab) is tried as a last resort. The sweep is
- * bounded so a match-everything regex (`.`/`[\s\S]`, which also matches space and
- * tab) terminates, returning undefined to let the caller keep the sentinel as the
- * only available fixed point.
+ * covers every non-whitespace candidate (e.g. `\S{n}`), whitespace markers
+ * (a full space/tab run, then a single whitespace byte among non-whitespace
+ * filler) are tried as a last resort. The sweep is bounded so a match-everything
+ * regex (`.`/`[\s\S]`, which also matches space and tab) terminates, returning
+ * undefined to let the caller keep the sentinel as the only available fixed point.
  */
 function findNonMatchingReplacement(value: string, regex: RegExp): string | undefined {
 	const len = value.length;
@@ -135,18 +133,30 @@ function findNonMatchingReplacement(value: string, regex: RegExp): string | unde
 
 /**
  * Last-resort fallback for a default replace regex that matches every
- * non-whitespace candidate: a same-length run of one whitespace byte (space, then
- * tab) is a stable nonmatching redaction. `space` already covers the common
- * `\S`-style case; `tab` extends it to space-only exclusions. A match-everything
- * regex (`.`/`[\s\S]`) also matches both, so this still returns undefined there,
- * keeping the caller's sentinel as the sole fixed point.
+ * non-whitespace candidate. Builds same-length whitespace markers the regex
+ * cannot match: first a full space/tab run (handles `\S`-class patterns), then a
+ * single whitespace byte among non-whitespace filler (` AAAA`, `A AAA`, …). The
+ * mixed marker defeats regexes that ALSO match all-space/all-tab runs, e.g.
+ * `(?:\S{n}| {n}|\t{n})`, because the lone whitespace byte breaks every
+ * fixed-length run. A genuine match-everything regex (`.`/`[\s\S]`) matches the
+ * filler and the whitespace alike, so this still returns undefined there, keeping
+ * the caller's sentinel as the sole fixed point.
  */
 function findWhitespaceFallbackReplacement(value: string, regex: RegExp): string | undefined {
-	for (const ch of WHITESPACE_REPLACEMENT_CHARS) {
-		const candidate = ch.repeat(value.length);
-		if (candidate === value) continue;
-		regex.lastIndex = 0;
-		if (!regex.test(candidate)) return candidate;
+	const len = value.length;
+	const filler = NONMATCHING_REPLACEMENT_CHARS[0];
+	for (const ws of WHITESPACE_REPLACEMENT_CHARS) {
+		const full = ws.repeat(len);
+		if (full !== value) {
+			regex.lastIndex = 0;
+			if (!regex.test(full)) return full;
+		}
+		for (let pos = 0; pos < len; pos++) {
+			const candidate = `${filler.repeat(pos)}${ws}${filler.repeat(len - pos - 1)}`;
+			if (candidate === value) continue;
+			regex.lastIndex = 0;
+			if (!regex.test(candidate)) return candidate;
+		}
 	}
 	return undefined;
 }
