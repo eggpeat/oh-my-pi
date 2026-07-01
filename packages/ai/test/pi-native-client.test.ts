@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, type Mock, mock, spyOn } from "bun:test";
+import { afterEach, describe, expect, it, type Mock, mock, spyOn, vi } from "bun:test";
 import { streamPiNative } from "@oh-my-pi/pi-ai/providers/pi-native-client";
 import type {
 	AssistantMessage,
@@ -48,12 +48,31 @@ function stalledBody(bytes: Uint8Array[] = []): ReadableStream<Uint8Array> {
 }
 
 function delayedBody(chunks: Array<{ atMs: number; bytes: Uint8Array }>): ReadableStream<Uint8Array> {
+	const timers: Timer[] = [];
+	let closed = false;
 	return new ReadableStream<Uint8Array>({
 		start(controller) {
+			const enqueue = (bytes: Uint8Array): void => {
+				if (closed) return;
+				controller.enqueue(bytes);
+			};
 			for (const chunk of chunks) {
-				setTimeout(() => controller.enqueue(chunk.bytes), chunk.atMs);
+				timers.push(setTimeout(() => enqueue(chunk.bytes), chunk.atMs));
 			}
-			setTimeout(() => controller.close(), Math.max(...chunks.map(chunk => chunk.atMs)) + 1);
+			timers.push(
+				setTimeout(
+					() => {
+						if (closed) return;
+						closed = true;
+						controller.close();
+					},
+					Math.max(...chunks.map(chunk => chunk.atMs)) + 1,
+				),
+			);
+		},
+		cancel() {
+			closed = true;
+			for (const timer of timers) clearTimeout(timer);
 		},
 	});
 }
@@ -117,6 +136,7 @@ async function collectEvents(stream: AsyncIterable<AssistantMessageEvent>): Prom
 
 afterEach(() => {
 	mock.restore();
+	vi.useRealTimers();
 });
 
 describe("streamPiNative request shape", () => {
@@ -332,12 +352,13 @@ describe("streamPiNative event flow", () => {
 	});
 
 	it("does not time out a healthy pi-native stream that keeps making semantic progress", async () => {
+		vi.useFakeTimers({ now: 0 });
 		const final = baseAssistant({ content: [{ type: "text", text: "hello world" }] });
 		const chunks = [
 			{ atMs: 0, bytes: sseEventBytes({ type: "start", partial: baseAssistant() }) },
-			{ atMs: 15, bytes: sseEventBytes({ type: "text_delta", contentIndex: 0, delta: "hello", partial: final }) },
-			{ atMs: 35, bytes: sseEventBytes({ type: "text_delta", contentIndex: 0, delta: " world", partial: final }) },
-			{ atMs: 55, bytes: sseEventBytes({ type: "done", reason: "stop", message: final }) },
+			{ atMs: 50, bytes: sseEventBytes({ type: "text_delta", contentIndex: 0, delta: "hello", partial: final }) },
+			{ atMs: 180, bytes: sseEventBytes({ type: "text_delta", contentIndex: 0, delta: " world", partial: final }) },
+			{ atMs: 310, bytes: sseEventBytes({ type: "done", reason: "stop", message: final }) },
 		];
 		const fetchImpl: FetchImpl = (async () =>
 			new Response(delayedBody(chunks), {
@@ -348,11 +369,17 @@ describe("streamPiNative event flow", () => {
 		const stream = streamPiNative(fakeModel(), baseContext, {
 			apiKey: "k",
 			fetch: fetchImpl,
-			streamFirstEventTimeoutMs: 40,
-			streamIdleTimeoutMs: 30,
+			streamFirstEventTimeoutMs: 150,
+			streamIdleTimeoutMs: 200,
 		});
 
-		const result = await stream.result();
+		const resultPromise = stream.result();
+		await Promise.resolve();
+		for (const elapsedMs of [0, 50, 130, 130]) {
+			vi.advanceTimersByTime(elapsedMs);
+			await Promise.resolve();
+		}
+		const result = await resultPromise;
 		expect(result.stopReason).toBe("stop");
 		expect(result.content).toEqual([{ type: "text", text: "hello world" }]);
 	});
