@@ -1357,6 +1357,44 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		}
 	});
 
+	it("keeps a whole-match default replace regex idempotent when no candidate avoids the regex", () => {
+		// `[\s\S]{8}` matches every possible 8-byte value (unlike `\S{n}` above, it
+		// also matches whitespace and line terminators), so `findNonMatchingReplacement`
+		// exhausts for a value of length >= 3 — the content-hash path the length-1
+		// sentinel test above cannot reach, since 1-2 char values hardcode to `Z`/`ZZ`
+		// regardless of content. Regression: the whole-match default-replace fallback
+		// kept the content-hash replacement as-is. That replacement is derived from a
+		// hash of the bytes being replaced, so once it is emitted and re-scanned on the
+		// next obfuscate() pass, hashing ITS OWN bytes (not the original secret)
+		// produced a DIFFERENT same-length value — the marker churned forever instead
+		// of reaching a fixed point. The fix falls back to the key+length-only marker,
+		// which is stable because it depends on nothing the marker's own regeneration changes.
+		const obf = new SecretObfuscator([{ type: "regex", mode: "replace", content: "[\\s\\S]{8}" }], "Q".repeat(43));
+
+		const out = obf.obfuscate("SECRET12");
+
+		expect(out).toHaveLength(8);
+		expect(obf.obfuscate(out)).toBe(out);
+		expect(obf.obfuscate(obf.obfuscate(out))).toBe(out);
+	});
+
+	it("keeps a whole-match default replace regex stable across restart when no candidate avoids the regex", () => {
+		// Cross-restart counterpart to the previous test. The key+length-only fallback
+		// marker depends only on the persisted key and the value's length, so a fresh
+		// obfuscator with the same key reproduces the IDENTICAL marker and persisted
+		// text never drifts. Regression: the old content-hash fallback depended on the
+		// bytes of the already-redacted marker, so a fresh obfuscator re-hashed those
+		// marker bytes into a different value, drifting persisted obfuscated text — and
+		// the provider prompt-cache prefix it anchors — across every restart.
+		const key = "R".repeat(43);
+		const entries = [{ type: "regex" as const, mode: "replace" as const, content: "[\\s\\S]{8}" }];
+		const first = new SecretObfuscator(entries, key);
+		const persisted = first.obfuscate("SECRET12");
+
+		const restarted = new SecretObfuscator(entries, key);
+		expect(restarted.obfuscate(persisted)).toBe(persisted);
+	});
+
 	it("redacts a context-sensitive replace regex to a value stable in place", () => {
 		// A replace-mode regex with lookbehind matches a value only in context, so a
 		// candidate tested in isolation can be accepted yet re-match once substituted

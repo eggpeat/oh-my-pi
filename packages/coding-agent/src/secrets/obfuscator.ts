@@ -901,9 +901,17 @@ export class SecretObfuscator {
 	 * search same-length candidates IN CONTEXT for one the regex does not re-match:
 	 * that value is a stable fixed point and cannot re-leak. A single perturbation is
 	 * not enough — it may also match (e.g. `B`, not `A`, for `Z|A`) — so the search
-	 * tries further candidates before giving up. Only when no candidate avoids the
-	 * regex (a pathological match-everything config such as `.`/`[\s\S]`) keep the
-	 * deterministic value as the sole available fixed point.
+	 * tries further candidates before giving up. When no candidate avoids the regex (a
+	 * pathological match-everything config such as `.`/`[\s\S]`), the content-hash
+	 * deterministic value is NOT usable as a fallback: it will itself be re-matched on
+	 * the next pass, and because it is derived from the bytes being replaced, rehashing
+	 * those bytes (the marker itself, not the original secret) produces a DIFFERENT
+	 * value — churning the redaction, and the provider prompt-cache prefix it anchors,
+	 * across every re-obfuscation. Fall back instead to the same key+length-only marker
+	 * `#generateReplacement` uses for chunk redactions: it depends on nothing but
+	 * `this.#key` and the value's length, so re-matching and re-redacting it reproduces
+	 * the IDENTICAL marker every time, which the pathological case requires since no
+	 * value can escape the regex at all.
 	 */
 	#generateRegexReplacement(value: string, regex: RegExp, context: RegexMatchContext): string {
 		let replacement = generateDeterministicReplacement(value);
@@ -914,7 +922,7 @@ export class SecretObfuscator {
 		// secret. Search for a candidate the regex does not re-match in place.
 		if (replacement === value || regexRematchesInContext(replacement, regex, context)) {
 			const stable = findNonMatchingReplacement(value, regex, context);
-			if (stable !== undefined) replacement = stable;
+			replacement = stable ?? this.#generateReplacement(value);
 			regex.lastIndex = 0;
 		}
 		this.#generatedReplaceChunks.add(replacement);
