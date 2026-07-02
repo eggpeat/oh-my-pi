@@ -890,6 +890,15 @@ const EXTENSION_GRAPH_SPECIFIER_REGEX = /(?:from\s+|import\s+|import\s*\(\s*)["'
 // so we register at most one hook per entry.
 const hookedExtensionEntries = new Set<string>();
 
+// Source read while walking each entry's graph, keyed by entry realpath, so
+// the rewrite hook can consume it during the entry's synchronous initial load
+// instead of re-reading the same file. `loadLegacyPiModule` populates the
+// inner map immediately before its `await import(...)` and clears it in a
+// `finally` — lazy `import()`s that fire after that window fall through to a
+// fresh disk read so file edits between startup and the eventual dynamic
+// import are never masked by stale startup source.
+const extensionSourceCache = new Map<string, Map<string, string>>();
+
 /** Resolve symlinks in a path, falling back to the input if realpath fails. */
 async function realpathOrSelf(p: string): Promise<string> {
 	try {
@@ -951,28 +960,36 @@ async function collectExtensionModules(entryRealPath: string): Promise<Map<strin
  * never matches the host, other extensions, `node_modules` deps, or unrelated
  * project source.
  */
-async function ensureExtensionGraphHook(entryRealPath: string): Promise<void> {
+async function ensureExtensionGraphHook(entryRealPath: string): Promise<Map<string, string> | null> {
 	if (hookedExtensionEntries.has(entryRealPath)) {
-		return;
+		// Hook is already installed; the graph walk would only re-read every
+		// module for a cache that Bun's module cache already short-circuits on
+		// repeat loads. Return `null` so the caller skips the extra reads.
+		return null;
 	}
+	const moduleSources = await collectExtensionModules(entryRealPath);
 	hookedExtensionEntries.add(entryRealPath);
 
-	const moduleSources = await collectExtensionModules(entryRealPath);
 	const alternation = [...moduleSources.keys()].map(escapeRegExp).join("|");
 	const filter = new RegExp(`^(?:${alternation})$`);
 	Bun.plugin({
 		name: `omp:legacy-pi-ext:${Bun.hash(entryRealPath).toString(36)}`,
 		setup(build) {
 			build.onLoad({ filter, namespace: "file" }, async args => {
-				const hasCachedSource = moduleSources.has(args.path);
-				const raw = hasCachedSource ? (moduleSources.get(args.path) ?? "") : await Bun.file(args.path).text();
-				if (hasCachedSource) {
-					moduleSources.delete(args.path);
+				const cache = extensionSourceCache.get(entryRealPath);
+				const cached = cache?.get(args.path);
+				let raw: string;
+				if (cached !== undefined) {
+					raw = cached;
+					cache?.delete(args.path);
+				} else {
+					raw = await Bun.file(args.path).text();
 				}
 				return { contents: await rewriteLegacyExtensionSource(raw, args.path), loader: getLoader(args.path) };
 			});
 		},
 	});
+	return moduleSources;
 }
 
 /**
@@ -991,9 +1008,20 @@ export async function loadLegacyPiModule(resolvedPath: string): Promise<unknown>
 	// `bun link`/pnpm installs) so the rewrite filter matches the path Bun
 	// actually hands the hook.
 	const entryRealPath = await realpathOrSelf(path.resolve(resolvedPath));
-	await ensureExtensionGraphHook(entryRealPath);
-	// `?mtime` busts Bun's module cache so repeat loads pick up edited source.
-	return import(`${toImportSpecifier(entryRealPath)}?mtime=${Date.now()}`);
+	const moduleSources = await ensureExtensionGraphHook(entryRealPath);
+	if (moduleSources !== null) {
+		extensionSourceCache.set(entryRealPath, moduleSources);
+	}
+	try {
+		// `?mtime` busts Bun's module cache so repeat loads pick up edited source.
+		return await import(`${toImportSpecifier(entryRealPath)}?mtime=${Date.now()}`);
+	} finally {
+		// The synchronous entry evaluation just resolved. Any source still in
+		// the cache belongs to a lazy `import()` reachable from the graph but
+		// not yet triggered — drop it so its eventual `onLoad` re-reads fresh
+		// from disk instead of serving startup-time bytes.
+		extensionSourceCache.delete(entryRealPath);
+	}
 }
 
 function getLoader(path: string): "js" | "jsx" | "ts" | "tsx" {

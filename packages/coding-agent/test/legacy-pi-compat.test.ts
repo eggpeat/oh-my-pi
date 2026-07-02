@@ -13,6 +13,14 @@ function isLoadedFixtureModule(value: unknown): value is LoadedFixtureModule {
 	return typeof value === "object" && value !== null && "loaded" in value && typeof value.loaded === "number";
 }
 
+interface LazyFixtureModule {
+	loadChild: () => Promise<number>;
+}
+
+function isLazyFixtureModule(value: unknown): value is LazyFixtureModule {
+	return typeof value === "object" && value !== null && "loadChild" in value && typeof value.loadChild === "function";
+}
+
 describe("legacy Pi extension source graph", () => {
 	const tempDirs: string[] = [];
 
@@ -55,5 +63,28 @@ describe("legacy Pi extension source graph", () => {
 		} finally {
 			fileSpy.mockRestore();
 		}
+	});
+
+	it("re-reads lazily imported modules edited after startup", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "legacy-pi-lazy-import-test-"));
+		tempDirs.push(root);
+		const entry = path.join(root, "entry.ts");
+		const child = path.join(root, "child.ts");
+		await Bun.write(
+			entry,
+			`export async function loadChild() {\n\tconst mod = await import("./child");\n\treturn (mod as { value: number }).value;\n}\n`,
+		);
+		await Bun.write(child, `export const value = 1;\n`);
+
+		const loaded = await loadLegacyPiModule(entry);
+		if (!isLazyFixtureModule(loaded)) {
+			throw new Error("Legacy Pi fixture did not export loadChild");
+		}
+
+		// Simulate an update between the entry's initial load and the eventual
+		// dynamic import: the hook must see the edited source, not the copy
+		// buffered during the startup graph walk.
+		await Bun.write(child, `export const value = 2;\n`);
+		expect(await loaded.loadChild()).toBe(2);
 	});
 });
