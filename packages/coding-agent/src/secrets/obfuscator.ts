@@ -1254,7 +1254,14 @@ export class SecretObfuscator {
 				// the full expanded scan text so right-hand context supplied by the
 				// placeholder still satisfies lookahead/alternatives, then clamp the
 				// accepted match to the prefix boundary. If no prefix is available, redact
-				// the outside suffix that was covered by the full-context match.
+				// the outside suffix that was covered by the full-context match. Every
+				// resume point computed below is chained through
+				// `extendPastAdjacentPlaceholders`: a resume position that lands exactly on
+				// the START of ANOTHER placeholder must skip that one too before a fresh
+				// `regex.exec` attempt runs there, so a run of adjacent placeholders resolves
+				// identically whether its LEADING member is raw text this call is about to
+				// placeholder or is already a placeholder from a prior call/pass (see that
+				// helper's doc for the cross-call drift this prevents).
 				const cutResumeIndex = mapped.cutResumeIndex;
 				const prefixScanEnd = mapped.firstPlaceholderScanStart;
 				let handledOutside = false;
@@ -1271,7 +1278,7 @@ export class SecretObfuscator {
 							scanMatchValue = scanText.slice(prefixStart, prefixEnd);
 							scanMatchLength = scanMatchValue.length;
 							mapped = prefixMapped;
-							regex.lastIndex = prefixEnd;
+							regex.lastIndex = extendPastAdjacentPlaceholders(regexScan.segments, prefixEnd);
 							handledOutside = true;
 						}
 					}
@@ -1286,12 +1293,12 @@ export class SecretObfuscator {
 						scanMatchValue = scanText.slice(suffixStart, suffixEnd);
 						scanMatchLength = match[0].length;
 						mapped = suffixMapped;
-						regex.lastIndex = suffixEnd;
+						regex.lastIndex = extendPastAdjacentPlaceholders(regexScan.segments, suffixEnd);
 						handledOutside = true;
 					}
 				}
 				if (!handledOutside) {
-					regex.lastIndex = cutResumeIndex;
+					regex.lastIndex = extendPastAdjacentPlaceholders(regexScan.segments, cutResumeIndex);
 					continue;
 				}
 			}
@@ -1801,6 +1808,36 @@ function findScanSegment(segments: ReadonlyArray<RegexScanSegment>, scanIndex: n
 		if (scanIndex >= segment.scanStart && scanIndex < segment.scanEnd) return segment;
 	}
 	throw new Error("regex match did not map to source text");
+}
+
+/**
+ * Extend a scan-space resume position past a consecutive run of generated
+ * placeholder segments starting exactly at it, with no raw gap in between. A
+ * cut-resolution resume point that happens to land precisely on the START of
+ * ANOTHER placeholder must not stop there and hand it to a fresh `regex.exec`
+ * attempt — the same content, scanned as an opaque adjacent placeholder run,
+ * must resolve identically whether the run's LEADING member is still raw text
+ * (this call is about to placeholder it) or is ALREADY a placeholder from a
+ * prior call or an earlier pass of this same call. Without this, a bounded
+ * regex whose reach spans two adjacent secrets plus trailing spillover bytes
+ * (e.g. `[A-Z]{9}` over `ABCDEFGH` + `SECRETUV` + `A`) resolves the leading
+ * secret as its own independent redaction on the FIRST obfuscate() call (a
+ * genuinely raw prefix gets its own match, then the discard for the rest
+ * resumes right after it), but on a LATER call — once that prefix is itself a
+ * placeholder — the very first match attempt starts already inside the
+ * placeholder run, cannot be prefix-narrowed at all, and its discard resume
+ * point lands mid-run instead of past it, exposing a shorter tail (`SECRETUV`
+ * + `A`) to a clean, un-cut match the first call never attempted. Chaining the
+ * resume point through every immediately-adjacent placeholder makes both
+ * calls land on the exact same next scan position.
+ */
+function extendPastAdjacentPlaceholders(segments: ReadonlyArray<RegexScanSegment>, index: number): number {
+	let cursor = index;
+	for (;;) {
+		const segment = segments.find(candidate => candidate.scanStart === cursor && candidate.generatedPlaceholder);
+		if (!segment) return cursor;
+		cursor = segment.scanEnd;
+	}
 }
 
 // Apply a fixed custom replacement across a matched span while preserving any

@@ -556,6 +556,46 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(first).not.toContain("ABCDEFGH");
 	});
 
+	it("first obfuscate() call already matches later calls when a bounded exact-quantifier regex spills past two adjacent placeholders", () => {
+		// `[A-Z]{9}` (an EXACT quantifier, unlike the `{8,12}` RANGE case above) over
+		// `ABCDEFGH` + `SECRETUV` + trailing raw `A`: the placeholder's OWN value
+		// (`SECRETUV`, 8 chars) does NOT independently satisfy `{9}`, so this exercises
+		// a different path than the independently-matching-spillover case. Previously
+		// a cut-resolution resume point that landed exactly on the START of the
+		// SECRETUV placeholder was handed straight to a fresh regex.exec instead of
+		// being chained past it too: the FIRST obfuscate() call treated the still-raw
+		// ABCDEFGH prefix as its own match and resumed right after it, leaving the
+		// trailing `A` untouched — but a SECOND call, with ABCDEFGH already a
+		// placeholder, started its match attempt inside the placeholder run, could not
+		// be prefix-narrowed, and resumed mid-run instead of past it, exposing the
+		// shorter tail `SECRETUV` + `A` to a clean match the first call never
+		// attempted, minting a brand-new placeholder for `A` and drifting
+		// provider-visible history / the prompt-cache prefix across the call-1-to-2
+		// transition. The fix chains the resume point through every immediately
+		// adjacent generated-placeholder segment, so both calls land on the same
+		// resolution from the very first pass.
+		const obf = new SecretObfuscator(
+			[
+				{ type: "plain", content: "ABCDEFGH" },
+				{ type: "plain", content: "SECRETUV" },
+				{ type: "regex", content: "[A-Z]{9}" },
+			],
+			"Q".repeat(43),
+		);
+		const first = obf.obfuscate("ZZZZZZZZABCDEFGHSECRETUVA");
+
+		// The trailing `A` must survive the FIRST pass verbatim.
+		expect(first.endsWith("A")).toBe(true);
+		// Core regression: re-obfuscation must already be a fixed point from the
+		// very first call — this used to be false, turning `A` into a new placeholder
+		// on the second call.
+		expect(obf.obfuscate(first)).toBe(first);
+		// Stable across multiple passes.
+		expect(obf.obfuscate(obf.obfuscate(first))).toBe(first);
+		// Round-trip must restore every byte of the original input.
+		expect(obf.deobfuscate(first)).toBe("ZZZZZZZZABCDEFGHSECRETUVA");
+	});
+
 	it("redacts a two-sided independently matching chunk instead of leaking it as spillover", () => {
 		// `\b[A-Z]{8}\b|[A-Z]{17}` union regex, prior-call placeholder for `SECRETUV`
 		// flanked by prefix `ABCDEFGH` (independently matches `\b[A-Z]{8}\b`) and
