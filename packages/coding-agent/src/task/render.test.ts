@@ -157,6 +157,32 @@ describe("task live progress rendering", () => {
 		).toBe(true);
 	});
 
+	it("requests timed repaints when a nested task snapshot is wall-clock-only", () => {
+		const idleParent = makeProgress([]);
+		const nestedRetry: AgentProgress = {
+			...makeProgress([]),
+			id: "NestedChild",
+			retryState: {
+				attempt: 2,
+				maxAttempts: 5,
+				delayMs: 60_000,
+				errorMessage: "429",
+				startedAtMs: Date.now(),
+			},
+		};
+		const nestedDetails: TaskToolDetails = {
+			projectAgentsDir: null,
+			results: [],
+			totalDurationMs: 0,
+			progress: [nestedRetry],
+		};
+
+		expect(taskNeedsTimedRepaint({ ...idleParent, inflightTaskDetails: nestedDetails })).toBe(true);
+		expect(
+			taskNeedsTimedRepaint({ ...idleParent, extractedToolData: { task: [nestedDetails] } }),
+		).toBe(true);
+	});
+
 	it("renders running progress identically across spinner frames", () => {
 		const progress = makeProgress([]);
 		const details: TaskToolDetails = {

@@ -14,15 +14,27 @@ function isRecord(value: unknown): value is UnknownRecord {
 }
 
 function hasTimeBasedProgress(value: unknown): boolean {
-	if (!isRecord(value) || value.status !== "running") return false;
-	if (isRecord(value.retryState)) return true;
-	return typeof value.currentTool === "string" && typeof value.currentToolStartMs === "number";
+	if (!isRecord(value)) return false;
+	if (value.status === "running") {
+		if (isRecord(value.retryState)) return true;
+		if (typeof value.currentTool === "string" && typeof value.currentToolStartMs === "number") return true;
+	}
+	// Nested `task` snapshots inherit their own time-based rows: a running child
+	// with a retry countdown or elapsed current tool must keep the parent's
+	// repaint timer alive even when the parent row itself is quiescent.
+	const nested = isRecord(value.extractedToolData) ? value.extractedToolData.task : undefined;
+	if (Array.isArray(nested) && nested.some(hasTimeBasedTaskDetails)) return true;
+	if (hasTimeBasedTaskDetails(value.inflightTaskDetails)) return true;
+	return false;
+}
+
+function hasTimeBasedTaskDetails(value: unknown): boolean {
+	if (!isRecord(value) || !Array.isArray(value.progress)) return false;
+	return value.progress.some(hasTimeBasedProgress);
 }
 
 function timeBasedPartialResult(_args: unknown, result: { details?: unknown }): boolean {
-	const details = result.details;
-	if (!isRecord(details) || !Array.isArray(details.progress)) return false;
-	return details.progress.some(hasTimeBasedProgress);
+	return hasTimeBasedTaskDetails(result.details);
 }
 
 export const taskToolRenderer = {
