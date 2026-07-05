@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `error.notify` so failed model turns can emit distinct terminal/desktop notifications without changing completion notifications ([#2691](https://github.com/can1357/oh-my-pi/issues/2691)).
+
 ## [16.3.8] - 2026-07-05
 
 ### Fixed
@@ -202,10 +206,6 @@
 - Fixed an unhandled `EPIPE: broken pipe, write` rejection at the end of speech playback: the streaming player's `stop()` raced an un-awaited `FileSink.end()` against the backend SIGKILL, and mid-session writes never awaited the flush. Writes now await the flush (so a dead backend is detected and the chunk replays on the next candidate or the per-file path) and `stop()` swallows the expected teardown rejection.
 
 ## [16.3.0] - 2026-07-02
-
-### Added
-
-- Added `error.notify` so failed model turns can emit distinct terminal/desktop notifications without changing completion notifications ([#2691](https://github.com/can1357/oh-my-pi/issues/2691)).
 
 ### Added
 
