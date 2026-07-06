@@ -2211,6 +2211,39 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(obfuscator.deobfuscate(bravoPlaceholder)).toBe(secretB);
 	});
 
+	it("rejects a forged alias wrapper whose prefix only matches a case-variant regex-discovered secret", () => {
+		// Regression: the forged-prefix checks above only ever scanned EXACT
+		// previously-DISCOVERED secret strings (`#configuredSecretValues` and
+		// `#obfuscateMappings`), recorded in whatever casing they first turned
+		// up in. A case-insensitive (or other flag-variant) regex — e.g.
+		// `{ type: "regex", content: "tok[a-z0-9]+", flags: "i" }` — only ever
+		// records the ONE casing it actually discovered (lowercase
+		// `tokabc123`) in `#obfuscateMappings`. A forged token wrapping a
+		// DIFFERENTLY-cased occurrence of that same secret-shaped text
+		// (`TOKABC123`) around a real bare-alias suffix matched neither exact-
+		// string check, so it sailed through #isGeneratedPlaceholder as an
+		// already-generated placeholder and the uppercase secret text leaked
+		// verbatim. The fix also tests the dropped prefix directly against the
+		// configured regex's own pattern, which matches regardless of the
+		// casing the secret was first discovered under.
+		const obf = new SecretObfuscator([{ type: "regex", content: "tok[a-z0-9]+", flags: "i" }], "Q".repeat(43));
+
+		// Discover the secret in lowercase, minting a real bare placeholder and
+		// registering `tokabc123` (not `TOKABC123`) in `#obfuscateMappings`.
+		const real = obf.obfuscate("use tokabc123 now");
+		expect(real).not.toContain("tokabc123");
+		const suffix = /#([A-Z0-9]{4,}(?::[ULCM])?)#/.exec(real)?.[1];
+		expect(suffix).toBeDefined();
+
+		// Forge a token wrapping an UPPERCASE variant of the secret around the
+		// real bare-alias suffix — differently cased from what was actually
+		// discovered, so it cannot match either exact-string check, only the
+		// regex pattern itself.
+		const forged = `see #TOKABC123_${suffix}# here`;
+		const out = obf.obfuscate(forged);
+		expect(out).not.toContain("TOKABC123");
+	});
+
 	it("drops a friendly name that contains another configured secret's literal value", () => {
 		// Regression: a friendlyName is baked verbatim into every placeholder
 		// minted for its secret (`#NAME_hash:hint#`) via an EXACT

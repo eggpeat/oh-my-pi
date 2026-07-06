@@ -1212,12 +1212,17 @@ export class SecretObfuscator {
 	// suffix elsewhere in the transcript could wrap it around a DIFFERENT
 	// real secret's plaintext to make the whole token look pre-redacted and
 	// smuggle that secret through untouched. Refuse the alias fallback when the
-	// dropped prefix contains a configured plain secret's literal value OR any
+	// dropped prefix contains a configured plain secret's literal value, any
 	// regex-discovered secret's value this instance has ever minted a
 	// placeholder for (`#obfuscateMappings` — regex secrets are found
-	// dynamically, so they are never in `#configuredSecretValues`), so the
-	// plain-secret/regex pass still catches it instead of skipping the whole
-	// span.
+	// dynamically, so they are never in `#configuredSecretValues`), OR is
+	// itself matched by a configured regex pattern directly — a case- or
+	// flag-variant occurrence (e.g. `content: "tok[a-z0-9]+", flags: "i"`
+	// discovering lowercase `tokabc123`) never lands in `#obfuscateMappings`
+	// under its differently-cased form, but the pattern itself still flags it,
+	// so a forged `#TOKABC123_<observed-suffix>#` must not be waved through as
+	// already-redacted. Either check means the plain-secret/regex pass still
+	// catches it instead of skipping the whole span.
 	#isGeneratedPlaceholder(placeholder: string): boolean {
 		if (this.#deobfuscateMap.has(placeholder)) return true;
 		const match = /^#([A-Z0-9]+)_([A-Z0-9]{4,}(?::[ULCM])?)#$/.exec(placeholder);
@@ -1228,6 +1233,12 @@ export class SecretObfuscator {
 		}
 		for (const { secret } of this.#obfuscateMappings.values()) {
 			if (secret.length > 0 && prefix.includes(secret)) return false;
+		}
+		for (const entry of this.#regexEntries) {
+			entry.regex.lastIndex = 0;
+			const matches = entry.regex.test(prefix);
+			entry.regex.lastIndex = 0;
+			if (matches) return false;
 		}
 		return this.#deobfuscateMap.has(`#${match[2]}#`);
 	}
