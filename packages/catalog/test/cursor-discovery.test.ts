@@ -7,18 +7,18 @@ import { fetchCursorUsableModels } from "../src/discovery/cursor";
 import { GetUsableModelsResponseSchema, ModelDetailsSchema } from "../src/discovery/cursor-gen/agent_pb";
 import type { ModelSpec } from "../src/types";
 
-const FIXTURE_MODEL_IDS = [
+const FIXTURE_MODELS: { modelId: string; maxMode?: boolean }[] = [
 	// Reference-less ids from families whose native catalogs are multimodal.
-	"claude-opus-4-8-99999999",
-	"gpt-5.5-codex-20991231",
-	"gemini-4-pro-exp",
+	{ modelId: "claude-opus-4-8-99999999", maxMode: true },
+	{ modelId: "gpt-5.5-codex-20991231" },
+	{ modelId: "gemini-4-pro-exp" },
 	// Reference-less ids from text-only families.
-	"composer-3",
-	"grok-code-fast-2",
+	{ modelId: "composer-3", maxMode: false },
+	{ modelId: "grok-code-fast-2" },
 	// Bundled-reference ids: the reference stays authoritative.
-	"claude-4.5-opus-high",
-	"claude-4.6-opus-high",
-	"composer-1",
+	{ modelId: "claude-4.5-opus-high", maxMode: true },
+	{ modelId: "claude-4.6-opus-high" },
+	{ modelId: "composer-1", maxMode: false },
 ];
 
 let server: http2.Http2Server;
@@ -26,7 +26,7 @@ let baseUrl: string;
 
 beforeAll(async () => {
 	const response = create(GetUsableModelsResponseSchema, {
-		models: FIXTURE_MODEL_IDS.map(modelId => create(ModelDetailsSchema, { modelId })),
+		models: FIXTURE_MODELS.map(details => create(ModelDetailsSchema, details)),
 	});
 	const payload = Buffer.from(toBinary(GetUsableModelsResponseSchema, response));
 
@@ -82,6 +82,14 @@ describe("cursor discovery input modalities (issue #4726)", () => {
 		expect(byId.get("claude-4.5-opus-high")?.input).toEqual(["text", "image"]);
 		expect(byId.get("claude-4.6-opus-high")?.input).toEqual(["text"]);
 		expect(byId.get("composer-1")?.input).toEqual(["text"]);
+	});
+
+	it("preserves Cursor max-mode flags from discovery metadata", async () => {
+		const byId = await discover();
+		expect(byId.get("claude-opus-4-8-99999999")?.maxMode).toBe(true);
+		expect(byId.get("claude-4.5-opus-high")?.maxMode).toBe(true);
+		expect(byId.get("composer-3")?.maxMode).toBe(false);
+		expect(byId.get("composer-1")?.maxMode).toBe(false);
 	});
 
 	it("preserves fallback defaults for reference-less models", async () => {

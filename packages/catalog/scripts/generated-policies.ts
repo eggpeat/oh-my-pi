@@ -61,6 +61,7 @@ const COPILOT_GENERATED_LIMITS: Record<string, { contextWindow: number; maxToken
 	"gpt-5.4-mini": { contextWindow: 272000, maxTokens: 128000 },
 	"grok-code-fast-1": { contextWindow: 192000, maxTokens: 64000 },
 };
+const CURSOR_MAX_MODE_FALLBACK_PATTERNS = [/-max(?:-|$)/i, /-xhigh(?:-|$)/i, /-extra-high(?:-|$)/i, /^gpt-5\.[45]-/i];
 
 /**
  * Apply upstream metadata corrections to a mutable array of models, then
@@ -70,6 +71,7 @@ const COPILOT_GENERATED_LIMITS: Record<string, { contextWindow: number; maxToken
 export function applyGeneratedModelPolicies(models: ModelSpec<Api>[]): void {
 	for (const model of models) {
 		applyGeneratedModelPolicy(model);
+		applyCursorMaxModeFallback(model);
 		rebakeModelThinking(model);
 	}
 }
@@ -199,6 +201,15 @@ export function applyCanonicalLimitFallback(models: ModelSpec<Api>[]): void {
 				break;
 			}
 		}
+	}
+}
+
+function applyCursorMaxModeFallback(model: ModelSpec<Api>): void {
+	if (model.provider !== "cursor" || model.maxMode !== undefined) {
+		return;
+	}
+	if (CURSOR_MAX_MODE_FALLBACK_PATTERNS.some(pattern => pattern.test(model.id))) {
+		model.maxMode = true;
 	}
 }
 

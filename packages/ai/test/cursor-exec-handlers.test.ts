@@ -34,9 +34,9 @@ const cursorModel: Model<"cursor-agent"> = buildModel({
 	maxTokens: 1,
 });
 
-function captureCursorPayload(context: Context): Promise<AgentRunRequest> {
+function captureCursorPayload(context: Context, model: Model<"cursor-agent"> = cursorModel): Promise<AgentRunRequest> {
 	const { promise, resolve, reject } = Promise.withResolvers<AgentRunRequest>();
-	streamCursor(cursorModel, context, {
+	streamCursor(model, context, {
 		apiKey: "test-token",
 		onPayload: payload => {
 			if (isAgentRunRequest(payload)) {
@@ -206,6 +206,32 @@ describe("Cursor request action encoding", () => {
 			throw new Error("Expected Cursor selected image data");
 		}
 		expect(Array.from(selectedImage.dataOrBlobId.value)).toEqual(Array.from(Buffer.from(imageData, "base64")));
+	});
+
+	it("serializes max-mode models in both Cursor model fields", async () => {
+		const maxModeModel: Model<"cursor-agent"> = buildModel({
+			id: "cursor-claude-4.5-opus-high-max",
+			name: "Cursor Claude 4.5 Opus Max",
+			api: "cursor-agent",
+			provider: "cursor",
+			baseUrl: "",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1,
+			maxTokens: 1,
+			maxMode: true,
+		});
+		const payload = await captureCursorPayload(
+			{
+				messages: [{ role: "user", content: "continue", timestamp: 0 }],
+			},
+			maxModeModel,
+		);
+
+		expect(payload.modelDetails?.maxMode).toBe(true);
+		expect(payload.requestedModel?.modelId).toBe(maxModeModel.id);
+		expect(payload.requestedModel?.maxMode).toBe(true);
 	});
 });
 

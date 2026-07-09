@@ -21,6 +21,7 @@ const DEFAULT_MAX_TOKENS = 64_000;
 const CURSOR_MULTIMODAL_ID_PATTERN = /claude|gemini|gpt-|codex/;
 
 const OptionalDisplayNameSchema = type("unknown").pipe(raw => (typeof raw === "string" ? raw : undefined));
+const CursorMaxModeSchema = type("unknown").pipe(raw => (typeof raw === "boolean" ? raw : undefined));
 const CursorAliasesSchema = type("unknown").pipe(raw => {
 	if (Array.isArray(raw)) {
 		return raw.filter((alias: unknown): alias is string => typeof alias === "string");
@@ -34,6 +35,7 @@ const CursorModelDetailsSchema = type({
 	displayNameShort: OptionalDisplayNameSchema.default(undefined),
 	displayModelId: OptionalDisplayNameSchema.default(undefined),
 	aliases: CursorAliasesSchema.default(() => []),
+	maxMode: CursorMaxModeSchema.default(undefined),
 	"thinkingDetails?": "unknown",
 });
 
@@ -282,6 +284,7 @@ function normalizeCursorModel(
 	const name = pickModelDisplayName(details, id);
 	const reference = references.get(id);
 	const reasoning = Boolean(details.thinkingDetails) || reference?.reasoning === true;
+	const maxMode = details.maxMode ?? reference?.maxMode;
 
 	if (reference) {
 		return {
@@ -290,6 +293,7 @@ function normalizeCursorModel(
 			name,
 			baseUrl: baseUrlOverride ?? reference.baseUrl,
 			reasoning,
+			...(maxMode !== undefined ? { maxMode } : {}),
 		};
 	}
 	return {
@@ -299,6 +303,7 @@ function normalizeCursorModel(
 		provider: "cursor",
 		baseUrl: baseUrlOverride ?? CURSOR_DEFAULT_BASE_URL,
 		reasoning,
+		...(maxMode !== undefined ? { maxMode } : {}),
 		input: inferInputFromCursorId(id),
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: DEFAULT_CONTEXT_WINDOW,

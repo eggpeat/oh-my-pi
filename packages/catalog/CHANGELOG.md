@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Cursor model discovery and bundled fallbacks to preserve max-mode metadata for max-mode-only models. ([#4969](https://github.com/can1357/oh-my-pi/issues/4969))
+
 ## [16.3.14] - 2026-07-09
 
 ### Added

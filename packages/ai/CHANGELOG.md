@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Cursor max-mode model requests to send the required max_mode flags in both Cursor proto fields. ([#4969](https://github.com/can1357/oh-my-pi/issues/4969))
+
 ## [16.3.14] - 2026-07-09
 
 ### Changed

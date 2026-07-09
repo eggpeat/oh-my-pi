@@ -76,6 +76,7 @@ import {
 	RequestContextResultSchema,
 	RequestContextSchema,
 	RequestContextSuccessSchema,
+	RequestedModelSchema,
 	ResumeActionSchema,
 	SelectedContextSchema,
 	SelectedImageSchema,
@@ -2797,16 +2798,19 @@ function buildGrpcRequest(
 		turns,
 	});
 
+	const maxMode = model.maxMode ?? false;
 	const modelDetails = create(ModelDetailsSchema, {
 		modelId: model.id,
 		displayModelId: model.id,
 		displayName: model.name,
+		maxMode,
 	});
 
 	const runRequest = create(AgentRunRequestSchema, {
 		conversationState,
 		action,
 		modelDetails,
+		requestedModel: create(RequestedModelSchema, { modelId: model.id, maxMode }),
 		conversationId: state.conversationId,
 	});
 
