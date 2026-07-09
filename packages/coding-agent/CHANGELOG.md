@@ -2,18 +2,9 @@
 
 ## [Unreleased]
 
-### Added
-
-- `/guided-goal` now injects project context files (AGENTS.md and the like) as an untrusted `<repository-context>` system block so interview questions and drafted objectives ground in the real repo. Failures and empty projects keep the previous context-free behavior.
-
 ### Changed
 
 - Rewrote the `/guided-goal` interviewer rubric around loop-engineering: deterministic success criteria, verification commands, attempt caps, scope boundaries, and stop conditions. Ready objectives must use the five-section structured markdown form.
-
-### Fixed
-
-- Fixed extension `sendUserMessage` throwing `Agent is already processing…` while the agent is streaming: without `deliverAs`, busy messages now queue as a steer. ACP/RPC skill invocations pass `streamingBehavior: "steer"` so they can land mid-turn the same way TUI skill commands do.
-- Fixed autolearn auto-continue firing a capture turn after an aborted stop (Esc/cancel): the controller now skips any `agent_end` whose last assistant message has `stopReason: "aborted"`.
 
 ## [16.3.12] - 2026-07-08
 
