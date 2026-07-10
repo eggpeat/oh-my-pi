@@ -1529,6 +1529,7 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 				customCallIds,
 				options.preserveAssistantMessageIds,
 				supportsCustomToolCalls,
+				options.context.tools,
 			);
 			const outputItems = suppressHiddenEmptyFallback
 				? sanitizeOpenAIResponsesAssistantFallbackItemsForReplay(convertedOutputItems)
@@ -1578,6 +1579,7 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 	customCallIds?: Set<string>,
 	preserveMessageIds = false,
 	supportsCustomToolCalls = true,
+	tools?: readonly Tool[],
 ): ResponseInput {
 	const outputItems: ResponseInput = [];
 	let unsignedTextBlocks = 0;
@@ -1661,11 +1663,15 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 			} as ResponseInput[number]);
 			continue;
 		}
+		const functionName =
+			block.customWireName && !supportsCustomToolCalls
+				? resolveReplayCustomToolName(block.customWireName, tools)
+				: block.name;
 		outputItems.push({
 			type: "function_call",
 			...(itemId ? { id: itemId } : {}),
 			call_id: normalized.callId,
-			name: block.name,
+			name: functionName,
 			arguments: JSON.stringify(block.arguments),
 		});
 	}
