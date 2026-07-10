@@ -244,6 +244,33 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		}
 	});
 
+	test("deferred subagent fallback injection preserves unrelated modelRoles entries, including malformed objects", async () => {
+		const settings = Settings.isolated({
+			modelRoles: {
+				unrelatedRole: "runtime-provider/runtime-model",
+				malformedRole: { strategy: "invalid-strategy", candidates: [] } as unknown,
+			},
+		});
+
+		const { session } = await createAgentSession({
+			...(await buildSessionOptions(["runtime-provider/runtime-model", "runtime-provider/runtime-reasoning-model"])),
+			modelPatternFallbackRole: "subagent:deferred",
+			settings,
+		});
+
+		try {
+			expect(session.model?.provider).toBe("runtime-provider");
+			expect(session.model?.id).toBe("runtime-model");
+
+			const finalModelRoles = session.settings.get("modelRoles") as Record<string, unknown>;
+			expect(finalModelRoles.unrelatedRole).toBe("runtime-provider/runtime-model");
+			expect(finalModelRoles.malformedRole).toEqual({ strategy: "invalid-strategy", candidates: [] });
+			expect(finalModelRoles["subagent:deferred"]).toBe("runtime-provider/runtime-model");
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	test("splits deferred comma-delimited modelPattern and installs fallback chain", async () => {
 		const { session } = await createAgentSession({
 			...(await buildSessionOptions("runtime-provider/runtime-model,runtime-provider/runtime-reasoning-model")),

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a typed, model-scoped OAuth usage-health query with per-account quota-window summaries ([#5017](https://github.com/can1357/oh-my-pi/issues/5017), [#5018](https://github.com/can1357/oh-my-pi/issues/5018)).
+
 ## [16.4.0] - 2026-07-10
 
 ### Added

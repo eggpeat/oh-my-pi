@@ -1003,24 +1003,98 @@ export interface AgentModelPatternResolutionOptions {
 	fallbackModelPattern?: string;
 }
 
+export interface AgentModelRequest {
+	patterns: string[];
+	candidateRole?: ModelRole;
+}
+
+export function resolveAgentModelRequest(options: AgentModelPatternResolutionOptions): AgentModelRequest {
+	return resolveAgentModelRequestInternal(options, true);
+}
+
 export function resolveAgentModelPatterns(options: AgentModelPatternResolutionOptions): string[] {
+	return resolveAgentModelRequestInternal(options, false).patterns;
+}
+
+function tryResolveCandidatePolicy(pattern: string, settings: Settings | undefined): AgentModelRequest | undefined {
+	const { base: aliasCandidate, level: thinkingLevel } = splitThinkingSuffix(
+		pattern,
+		PREFIX_MODEL_ROLE.length,
+		MAX_THINKING_SUFFIX_OPTIONS,
+	);
+	const role = getModelRoleAlias(aliasCandidate);
+	if (role && role !== "default") {
+		const candidatesSettings = settings?.getModelRoleCandidates(role);
+		if (candidatesSettings) {
+			const candidatePatterns: string[] = [];
+			let expansionFailed = false;
+
+			for (const c of candidatesSettings.candidates) {
+				const expanded = resolveConfiguredModelPatterns(c.model, settings);
+				if (expanded.length !== 1) {
+					expansionFailed = true;
+					break;
+				}
+				const expandedPattern = expanded[0];
+				const { base: candidateBase } = splitThinkingSuffix(expandedPattern, -1, MAX_THINKING_SUFFIX_OPTIONS);
+				const patternWithSuffix = thinkingLevel ? `${candidateBase}:${thinkingLevel}` : expandedPattern;
+				candidatePatterns.push(patternWithSuffix);
+			}
+
+			if (!expansionFailed && candidatePatterns.length > 0) {
+				return {
+					patterns: candidatePatterns,
+					candidateRole: role,
+				};
+			}
+		}
+	}
+	return undefined;
+}
+
+function resolveAgentModelRequestInternal(
+	options: AgentModelPatternResolutionOptions,
+	includeCandidatePolicy: boolean,
+): AgentModelRequest {
 	const { settingsOverride, agentModel, settings, activeModelPattern, fallbackModelPattern } = options;
 
-	const overridePatterns = resolveConfiguredModelPatterns(settingsOverride, settings);
-	if (overridePatterns.length > 0) return overridePatterns;
+	const normalizedOverridePatterns = normalizeModelPatternList(settingsOverride);
+	if (normalizedOverridePatterns.length > 0) {
+		if (includeCandidatePolicy && normalizedOverridePatterns.length === 1) {
+			const resolved = tryResolveCandidatePolicy(normalizedOverridePatterns[0], settings);
+			if (resolved) return resolved;
+		}
+		const overridePatterns = resolveConfiguredModelPatterns(settingsOverride, settings);
+		if (overridePatterns.length > 0) {
+			return { patterns: overridePatterns, candidateRole: undefined };
+		}
+	}
 
 	const normalizedAgentPatterns = normalizeModelPatternList(agentModel);
 	const configuredAgentPatterns = resolveConfiguredModelPatterns(agentModel, settings);
 	const singleAgentPattern = normalizedAgentPatterns.length === 1 ? normalizedAgentPatterns[0] : undefined;
 	const agentInheritsSessionModel = singleAgentPattern ? isSessionInheritedAgentPattern(singleAgentPattern) : false;
+
+	if (includeCandidatePolicy && singleAgentPattern) {
+		const resolved = tryResolveCandidatePolicy(singleAgentPattern, settings);
+		if (resolved) return resolved;
+	}
+
 	if (configuredAgentPatterns.length > 0) {
-		if (!agentInheritsSessionModel) return configuredAgentPatterns;
-		if (singleAgentPattern === "pi/task") return configuredAgentPatterns;
+		if (!agentInheritsSessionModel) {
+			return { patterns: configuredAgentPatterns, candidateRole: undefined };
+		}
+		if (singleAgentPattern === "pi/task") {
+			return { patterns: configuredAgentPatterns, candidateRole: undefined };
+		}
 	}
 
 	const fallback =
 		activeModelPattern?.trim() || fallbackModelPattern?.trim() || settings?.getModelRole("default")?.trim() || "";
-	return resolveConfiguredModelPatterns(fallback, settings);
+	return {
+		patterns: resolveConfiguredModelPatterns(fallback, settings),
+		candidateRole: undefined,
+	};
 }
 
 /**

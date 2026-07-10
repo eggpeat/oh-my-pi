@@ -466,4 +466,89 @@ describe("task spawn routing", () => {
 			expect(unboundedTool.description).not.toContain("Concurrency cap");
 		}
 	});
+
+	it("transports full ordered patterns plus modelCandidateRole for exact role policy after semaphore acquisition", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [{ ...taskAgent, model: ["pi/task"] }],
+			projectAgentsDir: null,
+		});
+
+		let capturedOptions: unknown;
+		const runSpy = vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			capturedOptions = options;
+			return makeResult(options.id ?? "?");
+		});
+
+		const manager = createManager();
+		const settings = {
+			modelRoles: {
+				task: {
+					strategy: "ordered" as const,
+					candidates: [{ model: "primary-candidate" }, { model: "fallback-candidate" }],
+				},
+			},
+		};
+		const tool = await TaskTool.create(createSession({ manager, settings }));
+
+		const result = await tool.execute("tc-exact-role", {
+			agent: "task",
+			id: "ExactRoleAgent",
+			description: "role policy task",
+			assignment: "Do the thing.",
+		} as TaskParams);
+
+		const jobId = result.details?.async?.jobId;
+		expect(jobId).toBeTruthy();
+		const job = manager.getJob(jobId!);
+		await job!.promise;
+
+		expect(runSpy).toHaveBeenCalledTimes(1);
+		expect(capturedOptions).toBeDefined();
+		const opts = capturedOptions as Record<string, unknown>;
+		expect(opts.modelOverride).toEqual(["primary-candidate", "fallback-candidate"]);
+		expect(opts.modelCandidateRole).toBe("task");
+	});
+
+	it("transports concrete override patterns without modelCandidateRole", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [{ ...taskAgent, model: ["pi/task"] }],
+			projectAgentsDir: null,
+		});
+
+		let capturedOptions: unknown;
+		const runSpy = vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			capturedOptions = options;
+			return makeResult(options.id ?? "?");
+		});
+
+		const manager = createManager();
+		const settings = {
+			modelRoles: {
+				task: {
+					strategy: "ordered" as const,
+					candidates: [{ model: "primary-candidate" }, { model: "fallback-candidate" }],
+				},
+			},
+			"task.agentModelOverrides.task": "concrete-override",
+		};
+		const tool = await TaskTool.create(createSession({ manager, settings }));
+
+		const result = await tool.execute("tc-concrete-override", {
+			agent: "task",
+			id: "ConcreteOverrideAgent",
+			description: "concrete override task",
+			assignment: "Do the thing.",
+		} as TaskParams);
+
+		const jobId = result.details?.async?.jobId;
+		expect(jobId).toBeTruthy();
+		const job = manager.getJob(jobId!);
+		await job!.promise;
+
+		expect(runSpy).toHaveBeenCalledTimes(1);
+		expect(capturedOptions).toBeDefined();
+		const opts = capturedOptions as Record<string, unknown>;
+		expect(opts.modelOverride).toEqual(["concrete-override"]);
+		expect(opts.modelCandidateRole).toBeUndefined();
+	});
 });

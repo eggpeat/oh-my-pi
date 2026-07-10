@@ -47,6 +47,7 @@ import {
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
 import { buildServiceTierByFamily } from "./config/service-tier";
 import { Settings, type SkillsSettings } from "./config/settings";
+import type { ModelRolesSettings } from "./config/settings-schema";
 import { CursorExecHandlers } from "./cursor";
 import "./discovery";
 import { initializeWithSettings } from "./discovery";
@@ -2034,14 +2035,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						fallbackSelectors.push(fallbackSelector);
 					}
 					if (fallbackSelectors.length > 0) {
-						const modelRoles: Record<string, string> = {};
-						const existingRoles = settings.getModelRoles();
-						for (const role in existingRoles) {
-							const selector = existingRoles[role];
-							if (selector) {
-								modelRoles[role] = selector;
-							}
-						}
+						const rawModelRoles = settings.get("modelRoles");
+						const modelRoles: ModelRolesSettings =
+							typeof rawModelRoles === "object" && rawModelRoles !== null && !Array.isArray(rawModelRoles)
+								? { ...rawModelRoles }
+								: {};
 						modelRoles[options.modelPatternFallbackRole] = primarySelector;
 						settings.override("modelRoles", modelRoles);
 						const fallbackChains: Record<string, string[]> = {

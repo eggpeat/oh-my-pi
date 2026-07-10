@@ -17,10 +17,11 @@ import {
 	resolveModelOverride,
 	resolveModelOverrideWithAuthFallback,
 } from "../config/model-resolver";
+import type { ModelRole } from "../config/model-roles";
 import type { PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily, resolveSubagentServiceTier } from "../config/service-tier";
 import { Settings } from "../config/settings";
-import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
+import { type ModelRolesSettings, SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
 import type { ToolPathWithSource } from "../extensibility/custom-tools";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
@@ -177,14 +178,11 @@ function installSubagentRetryFallbackChain(args: {
 	if (fallbackSelectors.length === 0) return undefined;
 
 	const role = `${SUBAGENT_RETRY_FALLBACK_ROLE_PREFIX}${id}`;
-	const modelRoles: Record<string, string> = {};
-	const existingRoles = settings.getModelRoles();
-	for (const existingRole in existingRoles) {
-		const selector = existingRoles[existingRole];
-		if (selector) {
-			modelRoles[existingRole] = selector;
-		}
-	}
+	const rawModelRoles = settings.get("modelRoles");
+	const modelRoles: ModelRolesSettings =
+		typeof rawModelRoles === "object" && rawModelRoles !== null && !Array.isArray(rawModelRoles)
+			? { ...rawModelRoles }
+			: {};
 	modelRoles[role] = candidates[selectedIndex].selector;
 	settings.override("modelRoles", modelRoles);
 	const fallbackChains: Record<string, string[]> = {
@@ -301,6 +299,7 @@ export interface ExecutorOptions {
 	 */
 	detached?: boolean;
 	modelOverride?: string | string[];
+	modelCandidateRole?: ModelRole;
 	/**
 	 * Active model selector of the parent session, used as an auth-aware fallback
 	 * if the resolved subagent model has no working credentials. See #985.
@@ -2105,6 +2104,43 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 			checkAbort();
 
+			let effectiveModelPatterns = modelPatterns;
+			if (options.modelCandidateRole) {
+				const resolvedPatterns = modelPatterns.map(pattern => {
+					const resolved = resolveModelOverride([pattern], modelRegistry, settings);
+					return { pattern, resolved };
+				});
+				const staticResolved = resolvedPatterns.filter(item => item.resolved.model !== undefined);
+
+				if (staticResolved.length > 0) {
+					let selectedIndex = -1;
+					for (let i = 0; i < staticResolved.length; i++) {
+						const item = staticResolved[i];
+						const model = item.resolved.model!;
+						if (modelRegistry.hasExplicitProviderApiKey(model.provider)) {
+							selectedIndex = i;
+							break;
+						}
+						const health = await awaitAbortable(
+							modelRegistry.authStorage.getModelUsageHealth(model.provider, {
+								modelId: model.id,
+								baseUrl: model.baseUrl,
+								signal: abortSignal,
+							}),
+						);
+						if (health.state !== "depleted") {
+							selectedIndex = i;
+							break;
+						}
+					}
+					if (selectedIndex !== -1) {
+						effectiveModelPatterns = staticResolved.slice(selectedIndex).map(item => item.pattern);
+					} else {
+						effectiveModelPatterns = staticResolved.map(item => item.pattern);
+					}
+				}
+			}
+
 			const {
 				model,
 				thinkingLevel: resolvedThinkingLevel,
@@ -2112,7 +2148,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				authFallbackUsed,
 			} = await awaitAbortable(
 				resolveModelOverrideWithAuthFallback(
-					modelPatterns,
+					effectiveModelPatterns,
 					options.parentActiveModelPattern,
 					modelRegistry,
 					settings,
@@ -2129,7 +2165,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const retryFallbackRole = installSubagentRetryFallbackChain({
 				settings: subagentSettings,
 				id,
-				candidates: resolveSubagentRetryFallbackCandidates(modelPatterns, modelRegistry, settings),
+				candidates: resolveSubagentRetryFallbackCandidates(effectiveModelPatterns, modelRegistry, settings),
 				model,
 				authFallbackUsed,
 			});
@@ -2213,7 +2249,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				modelRegistry,
 				settings: subagentSettings,
 				model,
-				modelPattern: model || modelOverride === undefined ? undefined : modelPatterns,
+				modelPattern: model || modelOverride === undefined ? undefined : effectiveModelPatterns,
 				modelPatternAuthFallback:
 					model || modelOverride === undefined ? undefined : options.parentActiveModelPattern,
 				modelPatternFallbackRole:

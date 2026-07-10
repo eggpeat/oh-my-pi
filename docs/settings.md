@@ -306,6 +306,19 @@ enabledModels:
   - claude-sonnet-4-5
 ```
 
+For ordered fallback selection, you can also declare candidate lists for specific roles:
+
+```yaml
+modelRoles:
+  task:
+    strategy: ordered
+    candidates:
+      - model: anthropic/claude-sonnet-4-5
+      - model: openai-codex/gpt-5.6-sol
+```
+
+In this mode, only TaskTool launches whose winning selector is one exact `pi/<role>` use ordered health filtering; skip only known-depleted OAuth candidates; unknown/no usage data and explicit provider API-key overrides remain selectable; all-depleted candidates retain candidate 0 best-effort; scalar/comma/list roles and eval/dashboard behavior stay unchanged; each candidate is one direct selector and nested roles are invalid.
+
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `modelRoles` | record | `{}` | Map of role name -> model id. Built-in roles: `default`, `smol`, `slow`, `vision`, `plan`, `designer`, `commit`, `tiny`, `task`, `advisor`. The `tiny` role overrides the online model for lightweight background tasks (titles, memory, auto-thinking, unexpected-stop), else `pi/smol`. Per-role env/flags exist only for `--model`/`--smol`/`--slow`/`--plan`; configure the advisor with `modelRoles.advisor`. |

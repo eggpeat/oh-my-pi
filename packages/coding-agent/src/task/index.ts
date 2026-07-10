@@ -20,7 +20,7 @@ import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@oh-my
 import type { Usage } from "@oh-my-pi/pi-ai";
 import { $env, logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "..";
-import { resolveAgentModelPatterns } from "../config/model-resolver";
+import { resolveAgentModelRequest } from "../config/model-resolver";
 import { MCPManager } from "../mcp/manager";
 import type { Theme } from "../modes/theme/theme";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
@@ -1139,13 +1139,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const agentModelOverrides = this.session.settings.get("task.agentModelOverrides");
 		const settingsModelOverride = agentModelOverrides[agentName];
 		const parentActiveModelPattern = this.session.getActiveModelString?.();
-		const modelOverride = resolveAgentModelPatterns({
+		const modelRequest = resolveAgentModelRequest({
 			settingsOverride: settingsModelOverride,
 			agentModel: effectiveAgent.model,
 			settings: this.session.settings,
 			activeModelPattern: parentActiveModelPattern,
 			fallbackModelPattern: this.session.getModelString?.(),
 		});
+		const modelOverride = modelRequest.patterns;
+		const modelCandidateRole = modelRequest.candidateRole;
 		const thinkingLevelOverride = effectiveAgent.thinkingLevel;
 
 		// Output schema priority: agent frontmatter > inherited parent session.
@@ -1301,6 +1303,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				invokedAt: launchTiming?.invokedAt,
 				acquiredAt: launchTiming?.acquiredAt,
 				modelOverride,
+				modelCandidateRole,
 				parentActiveModelPattern,
 				thinkingLevel: thinkingLevelOverride,
 				outputSchema: effectiveOutputSchema,

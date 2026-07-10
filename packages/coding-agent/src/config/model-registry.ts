@@ -1927,9 +1927,7 @@ export class ModelRegistry {
 		return model => {
 			let available = byProvider.get(model.provider);
 			if (available === undefined) {
-				available =
-					!disabledProviders.has(model.provider) &&
-					(this.#keylessProviders.has(model.provider) || this.authStorage.hasAuth(model.provider));
+				available = !disabledProviders.has(model.provider) && this.hasConfiguredAuth(model);
 				byProvider.set(model.provider, available);
 			}
 			return available;
@@ -1967,6 +1965,10 @@ export class ModelRegistry {
 			this.#keylessProviders.has(model.provider) ||
 			this.authStorage.hasAuth(model.provider)
 		);
+	}
+
+	hasExplicitProviderApiKey(provider: string): boolean {
+		return this.#customProviderApiKeys.has(provider);
 	}
 
 	getDiscoverableProviders(): string[] {

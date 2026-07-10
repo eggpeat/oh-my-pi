@@ -28,18 +28,22 @@ import {
 } from "@oh-my-pi/pi-utils";
 import { JSONC, YAML } from "bun";
 import { type Settings as SettingsCapabilityItem, settingsCapability } from "../capability/settings";
-import type { ModelRole } from "../config/model-roles";
 import { loadCapability } from "../discovery";
 import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset } from "../modes/theme/theme";
 import { AgentStorage } from "../session/agent-storage";
+import { AUTO_THINKING, parseThinkingLevel } from "../thinking";
 import { normalizeToolName } from "../tools/builtin-names";
 import { type EditMode, normalizeEditMode } from "../utils/edit-mode";
 import { withFileLock } from "./file-lock";
+import { MODEL_ROLE_IDS, type ModelRole } from "./model-roles";
 import {
 	type BashInterceptorRule,
 	type GroupPrefix,
 	type GroupTypeMap,
 	getDefault,
+	type ModelRoleCandidateSettings,
+	type ModelRoleCandidatesSettings,
+	type ModelRolesSettings,
 	SETTINGS_SCHEMA,
 	type SettingPath,
 	type SettingValue,
@@ -588,19 +592,55 @@ export class Settings {
 		return this.get("bashInterceptor.patterns");
 	}
 
-	#modelRolesFromLayer(layer: RawSettings): Record<string, string> {
+	#modelRolesFromLayer(layer: RawSettings): ModelRolesSettings {
 		const value = getByPath(layer, ["modelRoles"]);
 		if (!isRecord(value)) return {};
+		return { ...value } as ModelRolesSettings;
+	}
 
-		const roles: Record<string, string> = {};
-		for (const role in value) {
-			if (!Object.hasOwn(value, role)) continue;
-			const modelId = modelRoleValueFromUnknown(value[role]);
-			if (modelId !== undefined) {
-				roles[role] = modelId;
+	/**
+	 * Get model role candidates (helper for modelRoles record with ordered object policy).
+	 */
+	getModelRoleCandidates(role: string): ModelRoleCandidatesSettings | undefined {
+		const roles: unknown = this.get("modelRoles");
+		if (!isRecord(roles)) return undefined;
+
+		const val = roles[role];
+		if (!isRecord(val)) return undefined;
+
+		if (val.strategy !== "ordered") return undefined;
+		if (!Array.isArray(val.candidates) || val.candidates.length === 0) return undefined;
+
+		const validCandidates: ModelRoleCandidateSettings[] = [];
+
+		for (const c of val.candidates) {
+			if (!c || typeof c !== "object" || Array.isArray(c)) return undefined;
+			if (!("model" in c) || typeof c.model !== "string") return undefined;
+			const trimmed = c.model.trim();
+			if (trimmed === "") return undefined;
+			if (trimmed.includes(",")) return undefined;
+
+			// Check for default / pi/<known role> with or without trailing thinking suffix
+			const lastColon = trimmed.lastIndexOf(":");
+			let base = trimmed;
+			if (lastColon !== -1) {
+				const suffix = trimmed.slice(lastColon + 1);
+				if (suffix === AUTO_THINKING || parseThinkingLevel(suffix) !== undefined) {
+					base = trimmed.slice(0, lastColon);
+				}
 			}
+
+			if (base === "default" || (base.startsWith("pi/") && MODEL_ROLE_IDS.includes(base.slice(3) as ModelRole))) {
+				return undefined;
+			}
+
+			validCandidates.push({ model: trimmed });
 		}
-		return roles;
+
+		return {
+			strategy: "ordered",
+			candidates: validCandidates,
+		};
 	}
 
 	/**
@@ -631,6 +671,10 @@ export class Settings {
 	getModelRole(role: ModelRole | string): string | undefined {
 		const roles: unknown = this.get("modelRoles");
 		if (!isRecord(roles)) return undefined;
+		const candidates = this.getModelRoleCandidates(role as string);
+		if (candidates) {
+			return candidates.candidates[0].model;
+		}
 		return modelRoleValueFromUnknown(roles[role]);
 	}
 
@@ -644,9 +688,14 @@ export class Settings {
 		const normalized: Record<string, string> = {};
 		for (const role in roles) {
 			if (!Object.hasOwn(roles, role)) continue;
-			const modelId = modelRoleValueFromUnknown(roles[role]);
-			if (modelId !== undefined) {
-				normalized[role] = modelId;
+			const candidates = this.getModelRoleCandidates(role);
+			if (candidates) {
+				normalized[role] = candidates.candidates[0].model;
+			} else {
+				const modelId = modelRoleValueFromUnknown(roles[role]);
+				if (modelId !== undefined) {
+					normalized[role] = modelId;
+				}
 			}
 		}
 		return normalized;

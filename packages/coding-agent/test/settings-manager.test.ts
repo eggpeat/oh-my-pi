@@ -18,6 +18,7 @@ import {
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
+import type { ModelRolesSettings } from "../src/config/settings-schema";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
 function context(): Context {
@@ -450,6 +451,92 @@ describe("Settings", () => {
 			settings.clearOverride("modelRoles");
 
 			expect(settings.getModelRole("default")).toBe("anthropic/claude-opus-4-5");
+		});
+
+		it("projects candidate 0 for valid ordered object modelRoles configurations", () => {
+			const settings = Settings.isolated({
+				modelRoles: {
+					task: {
+						strategy: "ordered",
+						candidates: [{ model: "anthropic/claude-sonnet-4-5" }, { model: "openai/gpt-4o" }],
+					},
+					default: "local/fallback",
+				},
+			});
+
+			expect(settings.getModelRole("task")).toBe("anthropic/claude-sonnet-4-5");
+			expect(settings.getModelRoles().task).toBe("anthropic/claude-sonnet-4-5");
+			expect(settings.getModelRole("default")).toBe("local/fallback");
+		});
+
+		it("preserves unrelated raw values including malformed and valid objects during setModelRole", () => {
+			const rawModelRoles: Record<string, unknown> = {
+				task: {
+					strategy: "ordered",
+					candidates: [{ model: "anthropic/claude-sonnet-4-5" }, { model: "openai/gpt-4o" }],
+				},
+				malformed: {
+					strategy: "unordered",
+					candidates: [],
+				},
+				scalar: "openai/gpt-4o",
+			};
+
+			const settings = Settings.isolated({
+				modelRoles: rawModelRoles as unknown as ModelRolesSettings,
+			});
+
+			settings.setModelRole("smol", "local/llama");
+
+			const currentRoles = settings.get("modelRoles");
+			expect(currentRoles).toBeDefined();
+			expect(currentRoles).toEqual({
+				task: {
+					strategy: "ordered",
+					candidates: [{ model: "anthropic/claude-sonnet-4-5" }, { model: "openai/gpt-4o" }],
+				},
+				malformed: {
+					strategy: "unordered",
+					candidates: [],
+				},
+				scalar: "openai/gpt-4o",
+				smol: "local/llama",
+			} as unknown as ModelRolesSettings);
+		});
+
+		it("preserves unrelated raw values including malformed and valid objects during overrideModelRoles", () => {
+			const rawModelRoles: Record<string, unknown> = {
+				task: {
+					strategy: "ordered",
+					candidates: [{ model: "anthropic/claude-sonnet-4-5" }, { model: "openai/gpt-4o" }],
+				},
+				malformed: {
+					strategy: "unordered",
+					candidates: [],
+				},
+				scalar: "openai/gpt-4o",
+			};
+
+			const settings = Settings.isolated({
+				modelRoles: rawModelRoles as unknown as ModelRolesSettings,
+			});
+
+			settings.overrideModelRoles({ smol: "local/llama" });
+
+			const currentRoles = settings.get("modelRoles");
+			expect(currentRoles).toBeDefined();
+			expect(currentRoles).toEqual({
+				task: {
+					strategy: "ordered",
+					candidates: [{ model: "anthropic/claude-sonnet-4-5" }, { model: "openai/gpt-4o" }],
+				},
+				malformed: {
+					strategy: "unordered",
+					candidates: [],
+				},
+				scalar: "openai/gpt-4o",
+				smol: "local/llama",
+			} as unknown as ModelRolesSettings);
 		});
 	});
 

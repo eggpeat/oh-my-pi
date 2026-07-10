@@ -39,6 +39,7 @@ import type {
 	UsageLogger,
 	UsageProvider,
 	UsageReport,
+	UsageStatus,
 } from "./usage";
 import { resolveUsedFraction } from "./usage";
 import { claudeRankingStrategy, claudeUsageProvider } from "./usage/claude";
@@ -256,6 +257,36 @@ export interface CheckCredentialsOptions {
 	completionProbe?: CompletionProbe;
 	/** Per-credential completion probe timeout (ms). Defaults to `timeoutMs`. */
 	completionTimeoutMs?: number;
+}
+
+export type ModelUsageHealthState = "eligible" | "unknown" | "depleted";
+
+export interface ModelUsageWindowHealth {
+	readonly id: string;
+	readonly label: string;
+	readonly status?: UsageStatus;
+	readonly usedFraction?: number;
+	readonly resetsAt?: number;
+	readonly durationMs?: number;
+}
+
+export interface UsageAccountHealth {
+	readonly credentialId: number;
+	readonly state: ModelUsageHealthState;
+	readonly fetchedAt?: number;
+	readonly primary?: ModelUsageWindowHealth;
+	readonly secondary?: ModelUsageWindowHealth;
+}
+
+export interface ModelUsageHealth {
+	readonly state: ModelUsageHealthState;
+	readonly accounts: readonly UsageAccountHealth[];
+}
+
+export interface ModelUsageHealthOptions {
+	modelId: string;
+	baseUrl?: string;
+	signal?: AbortSignal;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1005,6 +1036,65 @@ type RankedOAuthCandidate = OAuthCandidate & {
 	primaryDrainRate: number;
 	orderPos: number;
 };
+
+function safeResolveUsedFraction(limit: UsageLimit): number | undefined {
+	const amount = limit.amount;
+	if (amount.usedFraction !== undefined) {
+		return Number.isFinite(amount.usedFraction) ? amount.usedFraction : undefined;
+	}
+	if (amount.used !== undefined && amount.limit !== undefined) {
+		if (!Number.isFinite(amount.used) || !Number.isFinite(amount.limit) || amount.limit <= 0) {
+			return undefined;
+		}
+		const fraction = amount.used / amount.limit;
+		return Number.isFinite(fraction) ? fraction : undefined;
+	}
+	if (amount.unit === "percent" && amount.used !== undefined) {
+		return Number.isFinite(amount.used) ? amount.used / 100 : undefined;
+	}
+	if (amount.remainingFraction !== undefined) {
+		if (!Number.isFinite(amount.remainingFraction)) {
+			return undefined;
+		}
+		const fraction = 1 - amount.remainingFraction;
+		return Number.isFinite(fraction) ? Math.max(0, fraction) : undefined;
+	}
+	return undefined;
+}
+
+function buildWindowSummary(limit: UsageLimit | undefined): ModelUsageWindowHealth | undefined {
+	if (!limit) return undefined;
+	const usedFraction = safeResolveUsedFraction(limit);
+	const resetsAt = limit.window?.resetsAt;
+	const durationMs = limit.window?.durationMs;
+
+	return {
+		id: limit.id,
+		label: limit.label,
+		...(limit.status !== undefined ? { status: limit.status } : {}),
+		...(usedFraction !== undefined && Number.isFinite(usedFraction) ? { usedFraction } : {}),
+		...(resetsAt !== undefined && Number.isFinite(resetsAt) ? { resetsAt } : {}),
+		...(durationMs !== undefined && Number.isFinite(durationMs) && durationMs > 0 ? { durationMs } : {}),
+	};
+}
+
+function buildModelUsageHealth(accounts: UsageAccountHealth[]): ModelUsageHealth {
+	let state: ModelUsageHealthState = "unknown";
+	if (accounts.length > 0) {
+		const states = accounts.map(a => a.state);
+		if (states.includes("eligible")) {
+			state = "eligible";
+		} else if (states.includes("unknown")) {
+			state = "unknown";
+		} else if (states.every(s => s === "depleted")) {
+			state = "depleted";
+		}
+	}
+	return {
+		state,
+		accounts,
+	};
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AuthStorage Class
@@ -2797,11 +2887,25 @@ export class AuthStorage {
 	#isUsageLimitExhausted(limit: UsageLimit): boolean {
 		if (limit.status === "exhausted") return true;
 		const amount = limit.amount;
-		if (amount.usedFraction !== undefined && amount.usedFraction >= 1) return true;
-		if (amount.remainingFraction !== undefined && amount.remainingFraction <= 0) return true;
-		if (amount.used !== undefined && amount.limit !== undefined && amount.used >= amount.limit) return true;
-		if (amount.remaining !== undefined && amount.remaining <= 0) return true;
-		if (amount.unit === "percent" && amount.used !== undefined && amount.used >= 100) return true;
+		if (amount.usedFraction !== undefined && Number.isFinite(amount.usedFraction) && amount.usedFraction >= 1)
+			return true;
+		if (
+			amount.remainingFraction !== undefined &&
+			Number.isFinite(amount.remainingFraction) &&
+			amount.remainingFraction <= 0
+		)
+			return true;
+		if (
+			amount.used !== undefined &&
+			Number.isFinite(amount.used) &&
+			amount.limit !== undefined &&
+			Number.isFinite(amount.limit) &&
+			amount.used >= amount.limit
+		)
+			return true;
+		if (amount.remaining !== undefined && Number.isFinite(amount.remaining) && amount.remaining <= 0) return true;
+		if (amount.unit === "percent" && amount.used !== undefined && Number.isFinite(amount.used) && amount.used >= 100)
+			return true;
 		return false;
 	}
 
@@ -4260,6 +4364,298 @@ export class AuthStorage {
 			projectId: selection.credential.projectId,
 			enterpriseUrl: selection.credential.enterpriseUrl,
 		}));
+	}
+
+	/**
+	 * Returns the usage health state and account statuses for the specified provider and model.
+	 */
+	async getModelUsageHealth(provider: Provider, options: ModelUsageHealthOptions): Promise<ModelUsageHealth> {
+		if (options.signal?.aborted) {
+			return Promise.reject(options.signal.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+		}
+		if (this.#runtimeOverrides.has(provider) || this.#configOverrides.has(provider)) {
+			return { state: "unknown", accounts: [] };
+		}
+		const selections = this.#getStoredOAuthSelections(provider);
+		if (selections.length === 0) {
+			return { state: "unknown", accounts: [] };
+		}
+		const strategy = this.#rankingStrategyResolver?.(provider);
+		if (!strategy) {
+			return { state: "unknown", accounts: [] };
+		}
+
+		const context: CredentialRankingContext = { modelId: options.modelId };
+		const blockScope = strategy.blockScope?.(context);
+		const providerKey = this.#getProviderTypeKey(provider, "oauth");
+
+		// Snapshot active OAuth blocks before concurrent probes.
+		const snapshotBlocks = selections.map(selection => {
+			const blockedUntil = this.#getCredentialBlockedUntil(provider, providerKey, selection.index, blockScope);
+			return {
+				credentialId: selection.credentialId,
+				isBlockedInitially: blockedUntil !== undefined,
+				blockedUntilInitially: blockedUntil,
+			};
+		});
+
+		// Create Promise.withResolvers to manage the overall result, abort, and aggregate timeout.
+		const {
+			promise: overallPromise,
+			resolve: resolveOverall,
+			reject: rejectOverall,
+		} = Promise.withResolvers<ModelUsageHealth>();
+
+		// Handle caller AbortSignal
+		let abortListener: (() => void) | undefined;
+		if (options.signal) {
+			if (options.signal.aborted) {
+				return Promise.reject(
+					options.signal.reason ?? new DOMException("The operation was aborted.", "AbortError"),
+				);
+			}
+			abortListener = () => {
+				rejectFinal(options.signal!.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+			};
+			options.signal.addEventListener("abort", abortListener);
+		}
+
+		// Set up aggregate timeout
+		const aggregateTimeoutMs = Math.max(5000, this.#usageRequestTimeoutMs * 1.5);
+		const timeoutTimer = setTimeout(() => {
+			resolveWithCurrentProgress();
+		}, aggregateTimeoutMs);
+
+		// unref the timer if supported (Bun/Node)
+		if (typeof timeoutTimer.unref === "function") {
+			timeoutTimer.unref();
+		}
+
+		const cleanup = () => {
+			if (timeoutTimer) {
+				clearTimeout(timeoutTimer);
+			}
+			if (options.signal && abortListener) {
+				options.signal.removeEventListener("abort", abortListener);
+			}
+		};
+
+		let completed = false;
+		const resolveFinal = (result: ModelUsageHealth) => {
+			if (completed) return;
+			completed = true;
+			cleanup();
+			resolveOverall(result);
+		};
+
+		const rejectFinal = (err: unknown) => {
+			if (completed) return;
+			completed = true;
+			cleanup();
+			rejectOverall(err);
+		};
+
+		const probeResults: Array<UsageAccountHealth | undefined> = new Array(selections.length).fill(undefined);
+
+		const resolveWithCurrentProgress = () => {
+			const finalAccounts: UsageAccountHealth[] = selections.map((selection, index) => {
+				if (probeResults[index] !== undefined) {
+					return probeResults[index]!;
+				}
+				// It is in flight, so it timed out. Check block status.
+				const currentIdx = this.#getStoredCredentials(provider).findIndex(
+					entry => entry.id === selection.credentialId,
+				);
+				if (currentIdx === -1) {
+					return {
+						credentialId: selection.credentialId,
+						state: "unknown",
+					};
+				}
+				const blockedUntil = this.#getCredentialBlockedUntil(provider, providerKey, currentIdx, blockScope);
+				const isBlockedCurrently = blockedUntil !== undefined;
+				const snap = snapshotBlocks[index];
+				const remainsBlocked =
+					isBlockedCurrently ||
+					(!isBlockedCurrently &&
+						snap.blockedUntilInitially !== undefined &&
+						snap.blockedUntilInitially > Date.now() &&
+						provider !== "openai-codex");
+
+				return {
+					credentialId: selection.credentialId,
+					state: remainsBlocked ? "depleted" : "unknown",
+				};
+			});
+
+			resolveFinal(buildModelUsageHealth(finalAccounts));
+		};
+
+		const resolveWithResults = () => {
+			const finalAccounts = probeResults.map((r, index) => {
+				if (r !== undefined) return r;
+				return {
+					credentialId: selections[index].credentialId,
+					state: "unknown" as const,
+				};
+			});
+			resolveFinal(buildModelUsageHealth(finalAccounts));
+		};
+
+		// Query every snapshot in parallel.
+		const probePromises = selections.map(async (selection, index) => {
+			let report: UsageReport | null = null;
+			let fetchFailed = false;
+
+			const snap = snapshotBlocks[index];
+			const shouldFetch = !snap.isBlockedInitially || provider === "openai-codex";
+
+			if (shouldFetch) {
+				try {
+					if (options.signal?.aborted) {
+						throw options.signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
+					}
+					report = await this.#getUsageReport(provider, selection.credential, {
+						baseUrl: options.baseUrl,
+						timeoutMs: this.#usageRequestTimeoutMs,
+						signal: options.signal,
+					});
+				} catch (error) {
+					if (options.signal?.aborted) {
+						throw error;
+					}
+					fetchFailed = true;
+				}
+			}
+
+			const currentIdx = this.#getStoredCredentials(provider).findIndex(
+				entry => entry.id === selection.credentialId,
+			);
+			if (currentIdx === -1) {
+				return {
+					credentialId: selection.credentialId,
+					state: "unknown" as const,
+				};
+			}
+
+			const blockedUntil = this.#getCredentialBlockedUntil(provider, providerKey, currentIdx, blockScope);
+			const isBlockedCurrently = blockedUntil !== undefined;
+
+			if (report === null || fetchFailed) {
+				const remainsBlocked =
+					isBlockedCurrently ||
+					(!isBlockedCurrently &&
+						snap.blockedUntilInitially !== undefined &&
+						snap.blockedUntilInitially > Date.now() &&
+						provider !== "openai-codex");
+				return {
+					credentialId: selection.credentialId,
+					state: remainsBlocked ? ("depleted" as const) : ("unknown" as const),
+				};
+			}
+
+			// For non-null report
+			const scopedLimits = this.#getScopedUsageLimits(strategy, report, context);
+			const exhaustedScopedLimits = scopedLimits.filter(limit => this.#isUsageLimitReached([limit]));
+			const now = Date.now();
+			const allExhaustedScopedStale =
+				exhaustedScopedLimits.length > 0 &&
+				exhaustedScopedLimits.every(limit => {
+					const resetsAt = limit.window?.resetsAt;
+					if (resetsAt !== undefined && Number.isFinite(resetsAt) && resetsAt <= now) {
+						const fetchedAt = report.fetchedAt;
+						const hasFreshFetch = fetchedAt !== undefined && Number.isFinite(fetchedAt) && fetchedAt >= resetsAt;
+						return !hasFreshFetch;
+					}
+					return false;
+				});
+
+			const windows = strategy.findWindowLimits(report, context);
+			const primary = windows.primary;
+			const secondary = windows.secondary;
+
+			const primarySummary = buildWindowSummary(primary);
+			const secondarySummary = buildWindowSummary(secondary);
+
+			const isDepleted = isBlockedCurrently || (exhaustedScopedLimits.length > 0 && !allExhaustedScopedStale);
+
+			let accountState: ModelUsageHealthState;
+			if (isDepleted) {
+				accountState = "depleted";
+			} else {
+				const isPrimaryExhausted = primary ? this.#isUsageLimitReached([primary]) : false;
+				const isSecondaryExhausted = secondary ? this.#isUsageLimitReached([secondary]) : false;
+				const isPrimaryInScope = primary ? scopedLimits.some(limit => limit.id === primary.id) : false;
+				const isSecondaryInScope = secondary ? scopedLimits.some(limit => limit.id === secondary.id) : false;
+				const hasUnconfirmedExhaustion =
+					(isPrimaryExhausted && !isPrimaryInScope) || (isSecondaryExhausted && !isSecondaryInScope);
+
+				const hasStaleExhaustion = exhaustedScopedLimits.length > 0 && allExhaustedScopedStale;
+
+				if (hasUnconfirmedExhaustion || hasStaleExhaustion) {
+					accountState = "unknown";
+				} else {
+					accountState = "eligible";
+				}
+			}
+
+			const accountHealth: UsageAccountHealth = {
+				credentialId: selection.credentialId,
+				state: accountState,
+				...(report.fetchedAt !== undefined && Number.isFinite(report.fetchedAt)
+					? { fetchedAt: report.fetchedAt }
+					: {}),
+				...(primarySummary ? { primary: primarySummary } : {}),
+				...(secondarySummary ? { secondary: secondarySummary } : {}),
+			};
+
+			return accountHealth;
+		});
+
+		selections.forEach((selection, index) => {
+			probePromises[index].then(
+				result => {
+					probeResults[index] = result;
+					if (probeResults.every(r => r !== undefined)) {
+						resolveWithResults();
+					}
+				},
+				_error => {
+					if (options.signal?.aborted) {
+						return;
+					}
+					const currentIdx = this.#getStoredCredentials(provider).findIndex(
+						entry => entry.id === selection.credentialId,
+					);
+					if (currentIdx === -1) {
+						probeResults[index] = {
+							credentialId: selection.credentialId,
+							state: "unknown",
+						};
+					} else {
+						const blockedUntil = this.#getCredentialBlockedUntil(provider, providerKey, currentIdx, blockScope);
+						const isBlockedCurrently = blockedUntil !== undefined;
+						const snap = snapshotBlocks[index];
+						const remainsBlocked =
+							isBlockedCurrently ||
+							(!isBlockedCurrently &&
+								snap.blockedUntilInitially !== undefined &&
+								snap.blockedUntilInitially > Date.now() &&
+								provider !== "openai-codex");
+
+						probeResults[index] = {
+							credentialId: selection.credentialId,
+							state: remainsBlocked ? "depleted" : "unknown",
+						};
+					}
+					if (probeResults.every(r => r !== undefined)) {
+						resolveWithResults();
+					}
+				},
+			);
+		});
+
+		return overallPromise;
 	}
 
 	/**

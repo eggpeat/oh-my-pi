@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added usage-aware ordered model role candidates with account- and model-scoped quota health checks ([#5017](https://github.com/can1357/oh-my-pi/issues/5017), [#5018](https://github.com/can1357/oh-my-pi/issues/5018)).
+
 ## [16.4.0] - 2026-07-10
 
 ### Breaking Changes

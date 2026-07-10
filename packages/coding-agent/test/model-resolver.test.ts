@@ -10,6 +10,7 @@ import {
 	parseModelString,
 	pickDefaultAvailableModel,
 	resolveAgentModelPatterns,
+	resolveAgentModelRequest,
 	resolveAllowedModels,
 	resolveCliModel,
 	resolveModelFromString,
@@ -839,6 +840,319 @@ describe("resolveAgentModelPatterns", () => {
 		const dashed = resolveModelOverride(patterns, dashedRegistry, settings);
 		expect(dashed.model?.provider).toBe("anthropic");
 		expect(dashed.model?.id).toBe("claude-opus-4-8");
+	});
+});
+
+describe("resolveAgentModelRequest and ordered candidates", () => {
+	test("returns all candidates and candidateRole with resolveAgentModelRequest", () => {
+		const settings = Settings.isolated({
+			modelRoles: {
+				task: {
+					strategy: "ordered",
+					candidates: [{ model: "anthropic/claude-sonnet-4-5" }, { model: "openai/gpt-4o" }],
+				},
+			},
+		});
+
+		const result = resolveAgentModelRequest({
+			agentModel: "pi/task",
+			settings,
+		});
+
+		expect(result.patterns).toEqual(["anthropic/claude-sonnet-4-5", "openai/gpt-4o"]);
+		expect(result.candidateRole).toBe("task");
+	});
+
+	test("legacy resolveAgentModelPatterns returns candidate 0 only for the same settings", () => {
+		const settings = Settings.isolated({
+			modelRoles: {
+				task: {
+					strategy: "ordered",
+					candidates: [{ model: "anthropic/claude-sonnet-4-5" }, { model: "openai/gpt-4o" }],
+				},
+			},
+		});
+
+		const result = resolveAgentModelPatterns({
+			agentModel: "pi/task",
+			settings,
+		});
+
+		expect(result).toEqual(["anthropic/claude-sonnet-4-5"]);
+	});
+
+	test("resolves candidate 0 only for default, pi/default, or undefined without returning candidateRole", () => {
+		const settings = Settings.isolated({
+			modelRoles: {
+				default: {
+					strategy: "ordered",
+					candidates: [{ model: "anthropic/claude-sonnet-4-5" }, { model: "openai/gpt-4o" }],
+				},
+			},
+		});
+
+		// Case 1: pi/default
+		const reqPiDefault = resolveAgentModelRequest({
+			agentModel: "pi/default",
+			settings,
+		});
+		expect(reqPiDefault.patterns).toEqual(["anthropic/claude-sonnet-4-5"]);
+		expect(reqPiDefault.candidateRole).toBeUndefined();
+
+		const patPiDefault = resolveAgentModelPatterns({
+			agentModel: "pi/default",
+			settings,
+		});
+		expect(patPiDefault).toEqual(["anthropic/claude-sonnet-4-5"]);
+
+		// Case 2: default
+		const reqDefault = resolveAgentModelRequest({
+			agentModel: "default",
+			settings,
+		});
+		expect(reqDefault.patterns).toEqual(["anthropic/claude-sonnet-4-5"]);
+		expect(reqDefault.candidateRole).toBeUndefined();
+
+		const patDefault = resolveAgentModelPatterns({
+			agentModel: "default",
+			settings,
+		});
+		expect(patDefault).toEqual(["anthropic/claude-sonnet-4-5"]);
+
+		// Case 3: undefined (falls back to default model role)
+		const reqUndefined = resolveAgentModelRequest({
+			settings,
+		});
+		expect(reqUndefined.patterns).toEqual(["anthropic/claude-sonnet-4-5"]);
+		expect(reqUndefined.candidateRole).toBeUndefined();
+
+		const patUndefined = resolveAgentModelPatterns({
+			settings,
+		});
+		expect(patUndefined).toEqual(["anthropic/claude-sonnet-4-5"]);
+	});
+
+	test("bypasses candidate list policy when settingsOverride is passed", () => {
+		const settings = Settings.isolated({
+			modelRoles: {
+				task: {
+					strategy: "ordered",
+					candidates: [{ model: "anthropic/claude-sonnet-4-5" }, { model: "openai/gpt-4o" }],
+				},
+			},
+		});
+
+		const result = resolveAgentModelRequest({
+			agentModel: "pi/task",
+			settingsOverride: "openai/gpt-4o:high",
+			settings,
+		});
+
+		expect(result.patterns).toEqual(["openai/gpt-4o:high"]);
+		expect(result.candidateRole).toBeUndefined();
+	});
+
+	test("settingsOverride with single role pattern resolves candidates and candidateRole", () => {
+		const settings = Settings.isolated({
+			modelRoles: {
+				slow: {
+					strategy: "ordered",
+					candidates: [{ model: "anthropic/claude-sonnet-4-5" }, { model: "openai/gpt-4o" }],
+				},
+				default: {
+					strategy: "ordered",
+					candidates: [{ model: "anthropic/claude-sonnet-4-5" }, { model: "openai/gpt-4o" }],
+				},
+			},
+		});
+
+		// settingsOverride='pi/slow:high' returns full candidates + candidateRole and applies :high
+		const result = resolveAgentModelRequest({
+			settingsOverride: "pi/slow:high",
+			settings,
+		});
+		expect(result.patterns).toEqual(["anthropic/claude-sonnet-4-5:high", "openai/gpt-4o:high"]);
+		expect(result.candidateRole).toBe("slow");
+
+		// legacy resolveAgentModelPatterns returns candidate0 with thinking suffix
+		const patternsResult = resolveAgentModelPatterns({
+			settingsOverride: "pi/slow:high",
+			settings,
+		});
+		expect(patternsResult).toEqual(["anthropic/claude-sonnet-4-5:high"]);
+
+		// pi/default remains no marker (candidateRole is undefined)
+		const resultDefault = resolveAgentModelRequest({
+			settingsOverride: "pi/default:high",
+			settings,
+		});
+		expect(resultDefault.patterns).toEqual(["anthropic/claude-sonnet-4-5:high"]);
+		expect(resultDefault.candidateRole).toBeUndefined();
+	});
+
+	test("regression: settingsOverride with empty role expansion falls through to agent model or fallback", () => {
+		const settings = Settings.isolated({
+			modelRoles: {
+				task: ",", // expands to empty because resolved.length is 0 and task has no roleDefaults
+				default: "local/fallback-model",
+			},
+		});
+
+		const result = resolveAgentModelRequest({
+			settingsOverride: "pi/task",
+			fallbackModelPattern: "openai/gpt-4o",
+			settings,
+		});
+
+		// Should fall through to fallbackModelPattern (openai/gpt-4o) since pi/task has empty expansion
+		expect(result.patterns).toEqual(["openai/gpt-4o"]);
+		expect(result.candidateRole).toBeUndefined();
+	});
+
+	test("appends and strips thinking level suffixes correctly", () => {
+		const settings = Settings.isolated({
+			modelRoles: {
+				task: {
+					strategy: "ordered",
+					candidates: [{ model: "anthropic/claude-sonnet-4-5:low" }, { model: "openai/gpt-4o" }],
+				},
+			},
+		});
+
+		// If outer pattern specifies :high, strip :low from candidate 0 and apply :high to all.
+		const resultHigh = resolveAgentModelRequest({
+			agentModel: "pi/task:high",
+			settings,
+		});
+		expect(resultHigh.patterns).toEqual(["anthropic/claude-sonnet-4-5:high", "openai/gpt-4o:high"]);
+		expect(resultHigh.candidateRole).toBe("task");
+
+		// If outer pattern has no suffix, preserve candidate's own suffix if present.
+		const resultNone = resolveAgentModelRequest({
+			agentModel: "pi/task",
+			settings,
+		});
+		expect(resultNone.patterns).toEqual(["anthropic/claude-sonnet-4-5:low", "openai/gpt-4o"]);
+		expect(resultNone.candidateRole).toBe("task");
+	});
+
+	test("falls back to default/built-in resolution if expansion of a candidate fails", () => {
+		const settings = Settings.isolated({
+			modelRoles: {
+				default: "local/fallback-model",
+				task: {
+					strategy: "ordered",
+					candidates: [
+						{ model: "" }, // empty is invalid -> candidate resolution fails
+						{ model: "openai/gpt-4o" },
+					],
+				},
+			},
+		});
+
+		const result = resolveAgentModelRequest({
+			agentModel: "pi/task",
+			settings,
+		});
+
+		// When candidates parsing fails, it falls back to the default or built-in priorities
+		expect(result.patterns).toEqual(["local/fallback-model"]);
+		expect(result.candidateRole).toBeUndefined();
+	});
+
+	test("retains legacy scalar, comma, and string-array formats behavior and returns candidateRole undefined", () => {
+		const settingsScalar = Settings.isolated({
+			modelRoles: { task: "anthropic/claude-sonnet-4-5" },
+		});
+		const resScalar = resolveAgentModelRequest({ agentModel: "pi/task", settings: settingsScalar });
+		expect(resScalar.patterns).toEqual(["anthropic/claude-sonnet-4-5"]);
+		expect(resScalar.candidateRole).toBeUndefined();
+
+		const settingsComma = Settings.isolated({
+			modelRoles: { task: "anthropic/claude-sonnet-4-5,openai/gpt-4o" },
+		});
+		const resComma = resolveAgentModelRequest({ agentModel: "pi/task", settings: settingsComma });
+		expect(resComma.patterns).toEqual(["anthropic/claude-sonnet-4-5", "openai/gpt-4o"]);
+		expect(resComma.candidateRole).toBeUndefined();
+
+		const settingsArray = Settings.isolated({
+			modelRoles: { task: ["anthropic/claude-sonnet-4-5", "openai/gpt-4o"] },
+		});
+		const resArray = resolveAgentModelRequest({ agentModel: "pi/task", settings: settingsArray });
+		expect(resArray.patterns).toEqual(["anthropic/claude-sonnet-4-5", "openai/gpt-4o"]);
+		expect(resArray.candidateRole).toBeUndefined();
+	});
+
+	test("ignores invalid candidates with comma lists or default/nested roles and treats policy as absent", () => {
+		// Candidate with comma list
+		const settingsCommaCand = Settings.isolated({
+			modelRoles: {
+				default: "local/fallback-model",
+				task: {
+					strategy: "ordered",
+					candidates: [{ model: "anthropic/claude-sonnet,openai/gpt-4o" }],
+				},
+			},
+		});
+		expect(resolveAgentModelRequest({ agentModel: "pi/task", settings: settingsCommaCand }).patterns).toEqual([
+			"local/fallback-model",
+		]);
+
+		// Candidate with "default" role
+		const settingsDefaultCand = Settings.isolated({
+			modelRoles: {
+				default: "local/fallback-model",
+				task: {
+					strategy: "ordered",
+					candidates: [{ model: "default" }],
+				},
+			},
+		});
+		expect(resolveAgentModelRequest({ agentModel: "pi/task", settings: settingsDefaultCand }).patterns).toEqual([
+			"local/fallback-model",
+		]);
+
+		// Candidate with nested "pi/slow" role
+		const settingsSlowCand = Settings.isolated({
+			modelRoles: {
+				default: "local/fallback-model",
+				task: {
+					strategy: "ordered",
+					candidates: [{ model: "pi/slow" }],
+				},
+			},
+		});
+		expect(resolveAgentModelRequest({ agentModel: "pi/task", settings: settingsSlowCand }).patterns).toEqual([
+			"local/fallback-model",
+		]);
+
+		// Candidate with nested "pi/slow:high" role (with thinking suffix)
+		const settingsSlowSuffixCand = Settings.isolated({
+			modelRoles: {
+				default: "local/fallback-model",
+				task: {
+					strategy: "ordered",
+					candidates: [{ model: "pi/slow:high" }],
+				},
+			},
+		});
+		expect(resolveAgentModelRequest({ agentModel: "pi/task", settings: settingsSlowSuffixCand }).patterns).toEqual([
+			"local/fallback-model",
+		]);
+
+		// Non-ordered strategy
+		const settingsUnordered = Settings.isolated({
+			modelRoles: {
+				default: "local/fallback-model",
+				task: {
+					strategy: "unordered",
+					candidates: [{ model: "openai/gpt-4o" }],
+				},
+			},
+		});
+		expect(resolveAgentModelRequest({ agentModel: "pi/task", settings: settingsUnordered }).patterns).toEqual([
+			"local/fallback-model",
+		]);
 	});
 });
 
