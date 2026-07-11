@@ -6895,12 +6895,13 @@ export class AgentSession {
 	 * (`buildDisplaySessionContext`) keep the keyed-only default.
 	 */
 	buildTranscriptSessionContext(
-		options?: Pick<BuildSessionContextOptions, "collapseCompactedHistory">,
+		options?: Pick<BuildSessionContextOptions, "collapseCompactedHistory" | "keepDanglingToolCalls">,
 	): SessionContext {
 		return deobfuscateSessionContext(
 			this.sessionManager.buildSessionContext({
 				transcript: true,
 				collapseCompactedHistory: options?.collapseCompactedHistory,
+				keepDanglingToolCalls: options?.keepDanglingToolCalls,
 			}),
 			this.#obfuscator,
 			true,
