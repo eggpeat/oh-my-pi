@@ -890,6 +890,56 @@ describe("advisor", () => {
 			// The loop re-checked maintenance for the expanded batch.
 			expect(maintainCalls).toBe(2);
 		});
+		it("re-scrubs coalesced pending updates when a later regex value collides with their friendly prefixes", async () => {
+			const obfuscator = new SecretObfuscator([
+				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
+				{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
+			]);
+			const promptInputs: string[] = [];
+			const { promise: firstMaintainStarted, resolve: startFirstMaintain } = Promise.withResolvers<void>();
+			const { promise: finishFirstMaintain, resolve: releaseFirstMaintain } = Promise.withResolvers<boolean>();
+			const { promise: promptStarted, resolve: startPrompt } = Promise.withResolvers<void>();
+			let maintainCalls = 0;
+			const agent: AdvisorAgent = {
+				prompt: async input => {
+					promptInputs.push(input);
+					startPrompt();
+				},
+				abort: () => {},
+				reset: () => {},
+				state: { messages: [] },
+			};
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "first OTHERSECRET", timestamp: 1 } as AgentMessage,
+			];
+			const host: AdvisorRuntimeHost = {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				obfuscator,
+				maintainContext: async () => {
+					maintainCalls++;
+					if (maintainCalls === 1) {
+						startFirstMaintain();
+						return await finishFirstMaintain;
+					}
+					return false;
+				},
+			};
+			const runtime = new AdvisorRuntime(agent, host);
+
+			runtime.onTurnEnd();
+			await firstMaintainStarted;
+
+			messages.push({ role: "user", content: "later tok_abc123", timestamp: 2 } as AgentMessage);
+			runtime.onTurnEnd();
+
+			releaseFirstMaintain(false);
+			await promptStarted;
+
+			expect(promptInputs).toHaveLength(1);
+			expect(promptInputs[0]).not.toContain("TOKABC123_");
+			expect(promptInputs[0]).not.toContain("tok_abc123");
+		});
 
 		it("caps maintainContext calls per drain cycle when arrivals never go stable", async () => {
 			// Regression guard for MAX_COALESCE_ROUNDS=3: during the first drain cycle,

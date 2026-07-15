@@ -362,10 +362,19 @@ export class AdvisorRuntime {
 		const obfuscator = this.host.obfuscator;
 		let formattedDelta = delta;
 		if (obfuscator?.hasSecrets()) {
+			let discoveredNewRegexSecretValue = false;
 			for (const secretValue of collectAdvisorRegexSecretValues(obfuscator, delta)) {
+				if (this.#advisorRegexSecretValues.has(secretValue)) continue;
 				this.#advisorRegexSecretValues.add(secretValue);
+				discoveredNewRegexSecretValue = true;
 			}
 			scrubAdvisorHistory(obfuscator, this.agent.state.messages, this.#advisorRegexSecretValues);
+			if (discoveredNewRegexSecretValue) {
+				this.#pending = this.#pending.map(delta => ({
+					...delta,
+					text: obfuscator.stripUnsafeFriendlyPlaceholderPrefixes(delta.text, this.#advisorRegexSecretValues),
+				}));
+			}
 			formattedDelta = obfuscateAdvisorMessages(obfuscator, delta, this.#advisorRegexSecretValues);
 		}
 		const md = formatSessionHistoryMarkdown(formattedDelta, {
@@ -506,6 +515,10 @@ export class AdvisorRuntime {
 			wip = late.at(-1)!.wip;
 		}
 
+		const obfuscator = this.host.obfuscator;
+		if (obfuscator?.hasSecrets()) {
+			batchText = obfuscator.stripUnsafeFriendlyPlaceholderPrefixes(batchText, this.#advisorRegexSecretValues);
+		}
 		return { batch: batchText || null, finalTurns: turns, wip };
 	}
 
