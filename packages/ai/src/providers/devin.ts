@@ -78,6 +78,13 @@ const CONNECT_END_STREAM_FLAG = 0x02;
  * fails fast instead of consuming memory.
  */
 const MAX_CONNECT_FRAME_PAYLOAD = 16 * 1024 * 1024;
+/**
+ * Recovery heuristic for opaque Devin `invalid_argument` trailers. This is not
+ * asserted to be the backend's hard limit: small requests can hit the same
+ * intermittent error, while compactable message history this large is likely
+ * to benefit from the existing context-overflow maintenance path.
+ */
+const LARGE_HISTORY_RECOVERY_BYTES = 512 * 1024;
 
 export const streamDevin: StreamFunction<"devin-agent"> = (
 	model: Model<"devin-agent">,
@@ -157,10 +164,14 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 			const auth = await fetchDevinAuthMetadata(apiKey, baseUrl, fetchImpl, options?.signal);
 			const chatBaseUrl = auth.baseUrl ?? baseUrl;
 			const request = buildDevinChatRequest(model, context, options, apiKey, auth.userJwt);
-			logger.debug("devin: sending chat request", { model: model.id, tools: context.tools?.length ?? 0 });
-
 			const reqBytes = toBinary(GetChatMessageRequestSchema, request);
 			const gz = gzipSync(reqBytes);
+			logger.debug("devin: sending chat request", {
+				model: model.id,
+				tools: context.tools?.length ?? 0,
+				requestBytes: reqBytes.byteLength,
+				compressedBytes: gz.byteLength,
+			});
 			const frame = Buffer.alloc(5 + gz.length);
 			frame[0] = CONNECT_COMPRESSED_FLAG;
 			frame.writeUInt32BE(gz.length, 1);
@@ -223,7 +234,34 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 					if (flag & CONNECT_END_STREAM_FLAG) {
 						const trailerBytes = flag & CONNECT_COMPRESSED_FLAG ? gunzipSync(payload) : payload;
 						const trailerError = readConnectTrailerError(trailerBytes.toString("utf8").trim());
-						if (trailerError) throw new AIError.ValidationError(trailerError);
+						if (trailerError) {
+							const error = new AIError.ValidationError(trailerError.formatted);
+							if (
+								firstTokenTime === undefined &&
+								trailerError.code.toLowerCase() === "invalid_argument" &&
+								/\binternal error\b/i.test(trailerError.message)
+							) {
+								// The full protobuf also contains the system prompt and tool
+								// schemas, which history maintenance cannot shrink. Re-encode
+								// only the repeated history field before choosing recovery.
+								const historyBytes = toBinary(
+									GetChatMessageRequestSchema,
+									create(GetChatMessageRequestSchema, {
+										chatMessagePrompts: request.chatMessagePrompts,
+									}),
+								).byteLength;
+								if (historyBytes >= LARGE_HISTORY_RECOVERY_BYTES) {
+									AIError.attach(error, AIError.create(AIError.Flag.ContextOverflow));
+									logger.warn("devin: treating large-history invalid_argument as context overflow", {
+										model: model.id,
+										historyBytes,
+										requestBytes: reqBytes.byteLength,
+										compressedBytes: gz.byteLength,
+									});
+								}
+							}
+							throw error;
+						}
 						continue;
 					}
 
@@ -569,12 +607,18 @@ function buildChatMessagePrompts(messages: Message[], cascadeId: string): ChatMe
 	return prompts;
 }
 
+interface ConnectTrailerError {
+	code: string;
+	message: string;
+	formatted: string;
+}
+
 /**
- * Parse a Connect end-of-stream JSON trailer and return a human-readable error
- * string when it carries `{ error: { code, message } }`, else `null`. The trailer
- * is untrusted server output, so the shape is checked with guards rather than asserted.
+ * Parse a Connect end-of-stream JSON trailer and return its structured error
+ * when it carries `{ error: { code, message } }`, else `null`. The trailer is
+ * untrusted server output, so the shape is checked with guards rather than asserted.
  */
-function readConnectTrailerError(text: string): string | null {
+function readConnectTrailerError(text: string): ConnectTrailerError | null {
 	if (text.length === 0) return null;
 	let parsed: unknown;
 	try {
@@ -588,5 +632,9 @@ function readConnectTrailerError(text: string): string | null {
 	const code = "code" in err && typeof err.code === "string" ? err.code : "";
 	const message = "message" in err && typeof err.message === "string" ? err.message : "";
 	if (!code && !message) return null;
-	return `Devin stream error${code ? ` ${code}` : ""}: ${message}`;
+	return {
+		code,
+		message,
+		formatted: `Devin stream error${code ? ` ${code}` : ""}: ${message}`,
+	};
 }
