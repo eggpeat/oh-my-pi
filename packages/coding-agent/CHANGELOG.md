@@ -6,6 +6,10 @@
 
 - Added `providers.webSearchOrder` to prioritize web-search fallbacks while preserving the built-in order for unlisted providers; a failing preferred provider now continues through that fallback chain.
 
+### Changed
+
+- Changed `providers.webSearch` preferred provider failure handling to fall back and cascade through other configured/default search providers rather than stopping immediately.
+
 ## [17.0.5] - 2026-07-18
 
 ### Added
