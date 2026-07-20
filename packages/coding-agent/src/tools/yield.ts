@@ -340,7 +340,7 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 				this.#emptyResultFailures = 0;
 				const error =
 					`yield result stayed empty after ${attemptCount} consecutive attempt(s); aborting child instead of retrying forever. ` +
-					YIELD_RESULT_FORMAT_HINT;
+					'Submit success as `{ "result": { "data": <your output> } }` or failure as `{ "result": { "error": "message" } }`.';
 				return {
 					content: [{ type: "text", text: `Task aborted: ${error}` }],
 					details: {
@@ -353,7 +353,7 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 			}
 			const remaining = MAX_EMPTY_RESULT_RETRIES - this.#emptyResultFailures;
 			throw new Error(
-				`result must contain either \`data\` or \`error\`. ${YIELD_RESULT_FORMAT_HINT} Empty untyped result retries remaining before abort: ${remaining}.`,
+				`result must contain either \`data\` or \`error\`. Use \`{result: {data: <your output>}}\` for success or \`{result: {error: "message"}}\` for failure. Empty untyped result retries remaining before abort: ${remaining}.`,
 			);
 		}
 
