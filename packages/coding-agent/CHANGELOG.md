@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `omp` crashing with `[Unhandled Rejection] Error: ENOENT ... uv_spawn 'git'` when `git` is not installed/on `PATH` (e.g. Windows relying on WSL git). The read-only git helpers in `utils/git.ts` spawned `git` directly and only inspected the exit code, so `Bun.spawn`/`Bun.spawnSync` throwing `ENOENT` at launch escaped as an unhandled rejection; missing-binary launches now degrade to a non-zero result (async) or `null` (sync ref readers) instead of crashing, while mutating/checked commands keep surfacing the clean "git is not installed." error ([#6169](https://github.com/can1357/oh-my-pi/issues/6169)).
+
 ## [17.0.6] - 2026-07-20
 
 - Fixed failed plan-mode exits leaving the session on the restored execution model while plan mode remained active and silently changing ambient `xd://` tool presentation; rollback now restores the plan model, thinking level, and exact top-level-versus-mounted tool partition so exit can be retried safely ([#6013](https://github.com/can1357/oh-my-pi/pull/6013)).
