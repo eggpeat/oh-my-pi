@@ -157,6 +157,7 @@
 ### Fixed
 
 - Fixed the single 30s Hindsight client timeout aborting healthy `reflect` calls, which are agentic retrieve+synthesize ops that routinely exceed 30s; each op now has its own deadline (reflect defaults to 120s) and the timeout error reports the effective seconds ([#6125](https://github.com/can1357/oh-my-pi/issues/6125)).
+- Fixed Mnemopi consolidation re-storing cumulative session transcripts after incremental auto-retain, including after resuming a session ([#6058](https://github.com/can1357/oh-my-pi/issues/6058)).
 
 ## [17.0.5] - 2026-07-18
 

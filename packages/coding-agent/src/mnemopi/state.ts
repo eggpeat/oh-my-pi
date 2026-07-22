@@ -158,6 +158,39 @@ export interface MnemopiScopedMemoryHit {
 
 type MnemopiRetentionMessage = { role: string; content: string };
 
+interface MnemopiRetentionCursorRow {
+	content: string;
+	sourceId: string | null;
+	retainedThroughUserTurn: number | null;
+}
+
+function countRetainedUserTurns(transcript: string): number {
+	let turns = 0;
+	for (const line of transcript.split(/\r?\n/)) {
+		if (line === "[role: user]") turns++;
+	}
+	return turns;
+}
+
+function deriveRetainedTurnCursor(rows: readonly MnemopiRetentionCursorRow[], sessionId: string): number {
+	let explicitCursor = 0;
+	let legacyIncrementalTurns = 0;
+	let legacySnapshotTurns = 0;
+	for (const row of rows) {
+		if (Number.isInteger(row.retainedThroughUserTurn) && row.retainedThroughUserTurn !== null) {
+			explicitCursor = Math.max(explicitCursor, row.retainedThroughUserTurn);
+			continue;
+		}
+		const turns = countRetainedUserTurns(row.content);
+		if (row.sourceId === sessionId) {
+			legacySnapshotTurns = Math.max(legacySnapshotTurns, turns);
+		} else if (row.sourceId?.startsWith(`${sessionId}-`)) {
+			legacyIncrementalTurns += turns;
+		}
+	}
+	return Math.max(explicitCursor, legacyIncrementalTurns, legacySnapshotTurns);
+}
+
 function sliceUnretainedMessages(
 	messages: MnemopiRetentionMessage[],
 	lastRetainedTurn: number,
@@ -208,6 +241,7 @@ export class MnemopiSessionState {
 	hasRecalledForFirstTurn: boolean;
 	lastRecallSnippet?: string;
 	unsubscribe?: () => void;
+	#retentionCursorLoaded = false;
 
 	constructor(options: MnemopiSessionStateOptions) {
 		this.sessionId = options.sessionId;
@@ -222,11 +256,15 @@ export class MnemopiSessionState {
 	}
 
 	setSessionId(sessionId: string): void {
+		if (this.sessionId === sessionId) return;
 		this.sessionId = sessionId;
+		this.lastRetainedTurn = 0;
+		this.#retentionCursorLoaded = false;
 	}
 
 	resetConversationTracking(): void {
 		this.lastRetainedTurn = 0;
+		this.#retentionCursorLoaded = false;
 		this.hasRecalledForFirstTurn = false;
 		this.lastRecallSnippet = undefined;
 	}
@@ -445,11 +483,13 @@ export class MnemopiSessionState {
 	async maybeRetainOnAgentEnd(_messages: AgentMessage[]): Promise<void> {
 		if (!this.config.autoRetain || this.aliasOf) return;
 		const flat = extractMessages(this.session.sessionManager);
+		this.#restoreRetainedTurnCursor();
 		const userTurns = flat.filter(message => message.role === "user").length;
 		if (userTurns - this.lastRetainedTurn < this.config.retainEveryNTurns) return;
 		await this.retainMessages(
 			sliceUnretainedMessages(flat, this.lastRetainedTurn),
 			`${this.sessionId}-${Date.now()}`,
+			{ retainedThroughUserTurn: userTurns },
 		);
 		this.lastRetainedTurn = userTurns;
 	}
@@ -457,14 +497,19 @@ export class MnemopiSessionState {
 	async forceRetainCurrentSession(options: { extract?: boolean } = {}): Promise<void> {
 		if (this.aliasOf) return;
 		const flat = extractMessages(this.session.sessionManager);
-		await this.retainMessages(flat, this.sessionId, options);
-		this.lastRetainedTurn = flat.filter(message => message.role === "user").length;
+		this.#restoreRetainedTurnCursor();
+		const userTurns = flat.filter(message => message.role === "user").length;
+		await this.retainMessages(sliceUnretainedMessages(flat, this.lastRetainedTurn), this.sessionId, {
+			...options,
+			retainedThroughUserTurn: userTurns,
+		});
+		this.lastRetainedTurn = Math.max(this.lastRetainedTurn, userTurns);
 	}
 
 	async retainMessages(
 		messages: Array<{ role: string; content: string }>,
 		sourceId: string,
-		options: { extract?: boolean } = {},
+		options: { extract?: boolean; retainedThroughUserTurn?: number } = {},
 	): Promise<void> {
 		const { transcript, messageCount } = prepareRetentionTranscript(messages, true);
 		if (!transcript) return;
@@ -478,6 +523,9 @@ export class MnemopiSessionState {
 				session_id: this.sessionId,
 				source_id: sourceId,
 				message_count: messageCount,
+				...(options.retainedThroughUserTurn === undefined
+					? {}
+					: { retained_through_user_turn: options.retainedThroughUserTurn }),
 				cwd: this.session.sessionManager.getCwd(),
 			},
 			scope: "bank",
@@ -488,6 +536,25 @@ export class MnemopiSessionState {
 			veracity: "unknown",
 			memoryType: "episode",
 		});
+	}
+
+	#restoreRetainedTurnCursor(): void {
+		if (this.#retentionCursorLoaded) return;
+		this.#retentionCursorLoaded = true;
+		const rows = this.memory.beam.db
+			.prepare<MnemopiRetentionCursorRow, [string]>(`
+				SELECT
+					content,
+					json_extract(metadata_json, '$.source_id') AS sourceId,
+					CAST(json_extract(metadata_json, '$.retained_through_user_turn') AS INTEGER)
+						AS retainedThroughUserTurn
+				FROM working_memory
+				WHERE source = 'coding-agent-transcript'
+				  AND json_extract(metadata_json, '$.session_id') = ?
+				ORDER BY rowid
+			`)
+			.all(this.sessionId);
+		this.lastRetainedTurn = Math.max(this.lastRetainedTurn, deriveRetainedTurnCursor(rows, this.sessionId));
 	}
 
 	attachSessionListeners(): void {
