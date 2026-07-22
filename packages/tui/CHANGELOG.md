@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [17.0.8] - 2026-07-22
+
 ### Fixed
 
 - Fixed an issue where OSC 8 hyperlinks with inline markup corrupted Markdown table column widths.

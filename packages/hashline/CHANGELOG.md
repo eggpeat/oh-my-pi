@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [17.0.8] - 2026-07-22
+
 ### Changed
 
 - Improved snapshot recovery line remapping by utilizing native line diffing.

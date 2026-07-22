@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [17.0.8] - 2026-07-22
+
 ### Fixed
 
 - Fixed Gemini Flash Cloud Code Assist empty-response retries when responses contain only intercepted planning-leak JSON.

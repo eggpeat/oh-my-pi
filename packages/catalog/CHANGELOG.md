@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [17.0.8] - 2026-07-22
+
 ### Added
 
 - Added support for several new models across multiple providers, including MiniMax M3, Gemini 3.5 Flash Lite, Gemini 3.6 Flash (with thinking support), Hy3, Doubao-Seed-Character, LongCat 2.0, Laguna S 2.1 (free and paid tiers), Qwen 3.6 35B A3B, SWE-1.6 Slow (devin agent catalog), and XiaomiMiMo/MiMo-V2.5.
