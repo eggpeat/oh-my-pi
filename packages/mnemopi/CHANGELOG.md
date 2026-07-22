@@ -4,7 +4,7 @@
 
 ### Changed
 
-- Recall hot loops (exact vector-index search, SHMR similarity clustering, and default-similarity MMR rerank) now run on native batch kernels with one N-API crossing per operation. Wrapper-inclusive speedups at dim=384 on Apple M1 (see `bench/native-vectors.bench.json`): 1.6-1.8x top-K search, 2.4x pairwise clustering scans at the measured 100- and 1000-candidate points (0.86x at the measured 10-candidate point, where the whole scan costs ~20µs either way), and 22-36x MMR rerank. Binary vector search stays on the TypeScript loops (per-call packing measured as a wash), as do custom `similarityFn` MMR reranks and incremental per-row scoring ([#6280](https://github.com/can1357/oh-my-pi/pull/6280) by [@wolfiesch](https://github.com/wolfiesch)).
+- Optimized vector operations (exact vector-index search, SHMR similarity clustering, and default-similarity MMR rerank) by migrating hot loops to native batch kernels, resulting in significant performance improvements (up to 1.8x faster top-K search, 2.4x faster pairwise clustering, and 22-36x faster MMR reranking).
 
 ## [17.0.4] - 2026-07-18
 

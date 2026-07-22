@@ -51,7 +51,6 @@ import {
 	parseChangelog,
 	parseItems,
 	type ReleaseSection,
-	recordSummarizedItemFingerprints,
 	renderChangelog,
 	resolveRepoRoot,
 } from "./fix-changelogs";
@@ -335,10 +334,8 @@ async function run(options: RunOptions): Promise<RunResult> {
 				.replace(/^## \[Unreleased\]\n?/, "")
 				.trim();
 
-			const sourceItems = section.subsections.flatMap(sub => parseItems(sub.lines));
 			const rewritten = await requestRewrite(model, changelogPath, unreleasedBody);
 			applyRewrite(section, rewritten);
-			recordSummarizedItemFingerprints(document, sourceItems, section);
 			const next = renderChangelog(document);
 			if (next === content) continue;
 

@@ -4,47 +4,26 @@
 
 ### Added
 
-- Added MiniMax M3 model with reasoning and multi-modal support
-- Added Gemini 3.5 Flash Lite model across multiple providers
-- Added Gemini 3.6 Flash model across multiple providers with thinking support
-- Added Hy3 model with reasoning and effort-based thinking
-- Added Doubao-Seed-Character model with image input support
-- Added LongCat 2.0 model across multiple providers
-- Added Laguna S 2.1 model (free and paid tiers) across multiple providers
-- Added Qwen 3.6 35B A3B model with thinking support
-- Added SWE-1.6 Slow model to devin agent catalog
-- Added XiaomiMiMo/MiMo-V2.5 model with reasoning support
+- Added support for several new models across multiple providers, including MiniMax M3, Gemini 3.5 Flash Lite, Gemini 3.6 Flash (with thinking support), Hy3, Doubao-Seed-Character, LongCat 2.0, Laguna S 2.1 (free and paid tiers), Qwen 3.6 35B A3B, SWE-1.6 Slow (devin agent catalog), and XiaomiMiMo/MiMo-V2.5.
 
 ### Changed
 
-- Changed Grok 4.5 API type from "openai-completions" to "openai-responses"
-- Changed thinking format for "o3-mini" from "zai" to "kimi"
-- Renamed "Auto Router (Beta)" to "OpenRouter Auto Router (Beta)"
-- Renamed "Body Builder (beta)" to "OpenRouter Body Builder (beta)"
-- Renamed "Pareto Code Router" to "OpenRouter Pareto Code Router"
-- Updated numerous model context window sizes, costs, and token limits
-- Updated "o3-mini" model to support thinking capabilities
+- Updated Grok 4.5 API type to "openai-responses" and updated "o3-mini" to support thinking capabilities with the "kimi" thinking format.
+- Renamed OpenRouter-specific models and routers to include "OpenRouter" in their names (e.g., "OpenRouter Auto Router (Beta)", "OpenRouter Body Builder (beta)", and "OpenRouter Pareto Code Router").
+- Updated context window sizes, costs, and token limits for numerous models.
 
 ### Fixed
 
-- Fixed GPT-5.6 Codex SKUs (`gpt-5.6-{sol,terra,luna}`) losing ~75K of usable context when the Codex discovery endpoint actively reports `context_window: 272000`: discovery now floors these SKUs at the 372K hard capacity instead of only substituting it when the field is absent, so the runtime dynamic value no longer overwrites the bundled pin ([#6259](https://github.com/can1357/oh-my-pi/issues/6259)).
-- Fixed authenticated OpenAI Codex discovery dropping account-listed ChatGPT-only models such as GPT-5.3 Codex Spark when they are unavailable through the public API ([#6108](https://github.com/can1357/oh-my-pi/issues/6108)).
-- Fixed Codex (`openai-codex`) catalog discovery hiding models available only through a second configured OAuth account: discovery fetched one account's `/models` catalog and, being authoritative, pruned every model the other accounts exposed. `openaiCodexModelManagerOptions` now takes a `resolveAccounts` callback, fetches each configured account's catalog independently, and unions them by id before the authoritative merge (bundled models are retained when every account fetch fails) ([#6265](https://github.com/can1357/oh-my-pi/issues/6265)).
-- Fixed cached models that reuse a bundled request model — including GitHub Copilot `-1m` long-context variants — being flagged unrestorable and dropped after a restart. Header restoration now matches the `requestModelId` base and bypasses a stale `unrestorable` marker written by the old id-only cache writer. ([#6037](https://github.com/can1357/oh-my-pi/issues/6037), [#6284](https://github.com/can1357/oh-my-pi/issues/6284))
-- Fixed LM Studio discovery reporting a model's architectural maximum (`max_context_length`) instead of the window the running instance actually serves. `getLmStudioNativeContextWindow` now prefers `loaded_context_length` when a model reports `state: "loaded"`, so context accounting and compaction schedule against the real window ([#6082](https://github.com/can1357/oh-my-pi/issues/6082)).
+- Fixed an issue where GPT-5.6 Codex SKUs lost usable context window capacity due to dynamic discovery values overwriting bundled limits.
+- Fixed OpenAI Codex discovery dropping account-listed ChatGPT-only models (such as GPT-5.3 Codex Spark) when they are unavailable through the public API.
+- Fixed Codex catalog discovery hiding models when multiple OAuth accounts are configured by independently fetching and merging catalogs from all accounts.
+- Fixed cached models reusing a bundled request model (such as GitHub Copilot long-context variants) being incorrectly flagged as unrestorable and dropped after a restart.
+- Fixed LM Studio discovery reporting a model's theoretical maximum context length instead of the actual loaded context window size of the running instance.
 
 ### Removed
 
-- Removed Claude Fable 5 family of models from devin catalog
-- Removed Claude Opus 4.6 and 4.7 model families from devin catalog
-- Removed Claude Sonnet 4.6 and 5 model families from devin catalog
-- Removed DeepSeek V4 Pro from devin catalog
-- Removed Gemini 3.1 Pro and Gemini 3.5 Flash families from devin catalog
-- Removed GLM-5.2 and GLM-5.2 1M from devin catalog
-- Removed GPT-5 through GPT-5.3 Codex variants from openai-codex catalog
-- Removed GPT-5.4 nano from openai-codex catalog
-- Removed SWE-1.6 family models from devin catalog
-- Removed Nemotron 3 Ultra from devin catalog
+- Removed several deprecated model families from the devin catalog, including Claude Fable 5, Claude Opus 4.6/4.7, Claude Sonnet 4.6/5, DeepSeek V4 Pro, Gemini 3.1 Pro, Gemini 3.5 Flash, GLM-5.2, SWE-1.6, and Nemotron 3 Ultra.
+- Removed GPT-5 through GPT-5.3 Codex variants and GPT-5.4 nano from the openai-codex catalog.
 
 ## [17.0.6] - 2026-07-20
 

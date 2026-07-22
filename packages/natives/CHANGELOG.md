@@ -4,12 +4,12 @@
 
 ### Added
 
-- Added jsdiff-compatible native diff exports: `diffLines`, `diffWords`, `diffLineRuns`, and `structuredPatchHunks` ([#6279](https://github.com/can1357/oh-my-pi/pull/6279) by [@wolfiesch](https://github.com/wolfiesch)).
-- Added batch vector kernels for mnemopi recall paths: `cosineSimilarityPairs`, `vectorIndexTopK`, and `mmrRerankIndices` ([#6280](https://github.com/can1357/oh-my-pi/pull/6280) by [@wolfiesch](https://github.com/wolfiesch)).
+- Added jsdiff-compatible native diff exports: `diffLines`, `diffWords`, `diffLineRuns`, and `structuredPatchHunks`.
+- Added batch vector kernels for mnemopi recall paths: `cosineSimilarityPairs`, `vectorIndexTopK`, and `mmrRerankIndices`.
 
 ### Fixed
 
-- Fixed the in-process `rm` builtin treating an empty path operand as the shell working directory, so `rm -rf ""` recursively deleted the current directory instead of rejecting the operand. An empty operand reached `pi_uutils_ctx::resolve`, which joins `""` onto the cwd and yields the cwd itself; the builtin now rejects empty operands before resolution, matching GNU `rm` (ENOENT, silent under `-f`) and leaving the cwd untouched ([#6287](https://github.com/can1357/oh-my-pi/issues/6287)).
+- Fixed a critical issue where the in-process `rm` builtin treated an empty path operand as the current working directory, causing `rm -rf ""` to recursively delete the current directory. Empty operands are now rejected, matching GNU `rm` behavior.
 
 ## [17.0.5] - 2026-07-18
 

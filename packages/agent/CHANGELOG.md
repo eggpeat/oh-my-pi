@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Recovered completed tool calls after transient stream JSON parse failures while keeping incomplete, unknown, refused, and sensitive calls non-executable.
+- Improved resilience against transient stream JSON parse failures by recovering completed tool calls while safely preventing incomplete, unknown, refused, or sensitive calls from executing.
 
 ## [17.0.5] - 2026-07-18
 
