@@ -639,7 +639,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const additionalRootsForTree = additionalWorkspaceRoots.filter(d => path.resolve(d) !== path.resolve(resolvedCwd));
 	const workspaceTreePromise = (async () => {
 		const primary = providedWorkspaceTree !== undefined
-			? providedWorkspaceTree
+			? await Promise.resolve(providedWorkspaceTree)
 			: includeWorkspaceTree
 				? await logger.time("buildWorkspaceTree", () =>
 						buildWorkspaceTree(resolvedCwd, { timeoutMs: SYSTEM_PROMPT_PREP_TIMEOUT_MS }),
