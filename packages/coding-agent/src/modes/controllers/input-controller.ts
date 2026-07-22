@@ -822,12 +822,25 @@ export class InputController {
 			// First, move any pending bash components to chat
 			this.ctx.flushPendingBashComponents();
 
+			// AgentSession.prompt() consumes registered extension commands locally.
+			// Classify them here because title generation starts before prompt dispatch.
+			const extensionCommandSpace = text.indexOf(" ");
+			const isLocalExtensionCommand =
+				text.startsWith("/") &&
+				runner?.getCommand(extensionCommandSpace === -1 ? text.slice(1) : text.slice(1, extensionCommandSpace)) !==
+					undefined;
+
 			// Auto-generate a session title while the session is still unnamed.
 			// Greetings / acknowledgements / empty input carry no task, so they are
 			// skipped deterministically (no model invoked, no download-progress UI)
 			// and the session stays unnamed — the next user message gets a fresh
 			// chance, so titling defers past "hi" instead of latching onto it.
-			if (!this.ctx.sessionManager.getSessionName() && !$env.PI_NO_TITLE && !isLowSignalTitleInput(text)) {
+			if (
+				!isLocalExtensionCommand &&
+				!this.ctx.sessionManager.getSessionName() &&
+				!$env.PI_NO_TITLE &&
+				!isLowSignalTitleInput(text)
+			) {
 				this.#showTinyTitleDownloadProgress(this.ctx.settings.get("providers.tinyModel"));
 				this.ctx.session
 					.generateTitle(text)
