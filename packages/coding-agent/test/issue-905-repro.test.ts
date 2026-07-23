@@ -125,10 +125,8 @@ test("omp models prints invalid models.yml schema errors before listing output",
 		`providers:
   myprovider:
     baseUrl: http://localhost:8000/v1
-    api: openai-completions
+    api: invalid-api
     auth: none
-    compat:
-      thinkingFormat: deepseek
     models:
       - id: my-model
         name: My Model
@@ -165,8 +163,8 @@ test("omp models prints invalid models.yml schema errors before listing output",
 
 		const output = captured.join("");
 		expect(output).toContain("Warning: models.yml validation failed — custom providers disabled");
-		expect(output).toContain("providers.myprovider.compat.thinkingFormat");
-		expect(output).toContain("deepseek");
+		expect(output).toContain("providers.myprovider.api");
+		expect(output).toContain("invalid-api");
 	} finally {
 		authStorage.close();
 	}
