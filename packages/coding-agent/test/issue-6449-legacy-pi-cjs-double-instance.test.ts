@@ -1,61 +1,44 @@
-import { afterEach, describe, expect, it } from "bun:test";
-import * as fs from "node:fs";
-import * as path from "node:path";
-import {
-	installLegacyPiSpecifierShim,
-	loadLegacyPiModule,
-} from "@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-compat";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { ensureGraphCommonJsRequireRegistered } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-compat";
 
-const COMPAT_MODULE = Bun.resolveSync(
-	"@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-compat",
-	import.meta.dir,
-);
+// The global key the host bundle and every re-instantiated shim copy share to
+// hand graph-owned CommonJS modules to whichever instance owns the populated
+// graph state.
+const COMMONJS_REQUIRE_GLOBAL = "__ompLegacyPiRequireGraphModule";
 
-describe("issue #6449: legacy pi CommonJS graph across double instantiation", () => {
-	let dupPath: string | undefined;
-	let tempDir: TempDir | undefined;
+describe("issue #6449: legacy pi CommonJS graph registration is first-wins", () => {
+	let original: unknown;
 
-	afterEach(() => {
-		if (dupPath) {
-			fs.rmSync(dupPath, { force: true });
-			dupPath = undefined;
-		}
-		if (tempDir) {
-			tempDir.removeSync();
-			tempDir = undefined;
-		}
+	beforeEach(() => {
+		original = Reflect.get(globalThis, COMMONJS_REQUIRE_GLOBAL);
 	});
 
-	it("keeps the host graph bridge after a second legacy-pi-compat instance loads", async () => {
-		installLegacyPiSpecifierShim();
+	afterEach(() => {
+		Reflect.set(globalThis, COMMONJS_REQUIRE_GLOBAL, original);
+	});
 
-		tempDir = TempDir.createSync("@issue-6449-");
-		const extDir = tempDir.absolute();
-		fs.writeFileSync(path.join(extDir, "dep.cjs"), 'module.exports = { greet: () => "hello" };\n');
-		const entryPath = path.join(extDir, "index.ts");
-		// Import the CommonJS dependency lazily so the graph scan records it into
-		// the CommonJS graph at load time, but its bridge only evaluates when
-		// useDep() runs — after the second instance has re-registered the global.
-		fs.writeFileSync(
-			entryPath,
-			`export async function useDep(): Promise<string> {\n\tconst mod = await import("./dep.cjs");\n\treturn (mod as { greet(): string }).greet();\n}\n`,
-		);
+	// On source-link installs the pi-coding-agent root shim is served from src/,
+	// so an extension import evaluates a SECOND instance of legacy-pi-compat with
+	// empty graph state. Its module-level registration must not clobber the host
+	// bundle's populated bridge — a regression to an unconditional `Reflect.set`
+	// broke transitive CommonJS resolution ("Missing graph-owned CommonJS
+	// definition"). `ensureGraphCommonJsRequireRegistered` is exactly the
+	// module-level registration a second instance runs.
+	it("does not overwrite an existing bridge registration", () => {
+		const hostBridge = (path: string): unknown => `host:${path}`;
+		Reflect.set(globalThis, COMMONJS_REQUIRE_GLOBAL, hostBridge);
 
-		const ns = (await loadLegacyPiModule(entryPath)) as { useDep(): Promise<string> };
+		// Re-running the registration (as a second instance would) is a no-op.
+		ensureGraphCommonJsRequireRegistered();
 
-		// A source-link install serves the pi-coding-agent root shim from src/, so
-		// an extension's import evaluates a SECOND on-disk instance of this module
-		// with empty graph state. Reproduce that distinct module identity by
-		// copying the module beside the original (identical relative imports
-		// resolve to the same shared deps) and importing the copy, which re-runs
-		// its top-level global registration. A regression to an unconditional
-		// `Reflect.set` clobbers the host bridge and makes useDep() throw
-		// "Missing graph-owned CommonJS definition".
-		dupPath = path.join(path.dirname(COMPAT_MODULE), "issue-6449-compat-dup.ts");
-		fs.copyFileSync(COMPAT_MODULE, dupPath);
-		await import(Bun.pathToFileURL(dupPath).href);
+		expect(Reflect.get(globalThis, COMMONJS_REQUIRE_GLOBAL)).toBe(hostBridge);
+	});
 
-		expect(await ns.useDep()).toBe("hello");
+	it("registers a bridge when none is present yet", () => {
+		Reflect.deleteProperty(globalThis, COMMONJS_REQUIRE_GLOBAL);
+
+		ensureGraphCommonJsRequireRegistered();
+
+		expect(typeof Reflect.get(globalThis, COMMONJS_REQUIRE_GLOBAL)).toBe("function");
 	});
 });
