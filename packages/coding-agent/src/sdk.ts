@@ -2177,7 +2177,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 				const usageReservePolicy = settings.get("retry.usageReservePolicy");
 				if (
-					(hasUsageFallbackCandidate || usageReservePolicy === "fail-closed") &&
+					(hasUsageFallbackCandidate || usageFallbackTriggered || usageReservePolicy === "fail-closed") &&
 					settings.get("retry.modelFallback") &&
 					settings.get("retry.usageAwareFallback")
 				) {
