@@ -6943,6 +6943,7 @@ export class AgentSession {
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 		}
+		this.#clearSessionScopedToolState();
 		this.#rehydrateCheckpointRewindState();
 		this.#todo.syncFromBranch();
 		this.#freshProviderSessionId = undefined;
@@ -7039,6 +7040,8 @@ export class AgentSession {
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 		}
+
+		this.#clearSessionScopedToolState();
 
 		this.#rehydrateCheckpointRewindState();
 		this.sessionManager.appendMessage({

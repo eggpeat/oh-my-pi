@@ -22,7 +22,7 @@ describe("AgentSession resolve reminder", () => {
 	let mock: MockModel;
 	let authStorage: AuthStorage | undefined;
 
-	const transitions: Array<"new" | "switch"> = ["new", "switch"];
+	const transitions: Array<"new" | "switch" | "branch"> = ["new", "switch", "branch"];
 	beforeEach(async () => {
 		tempDir = path.join(os.tmpdir(), `pi-resolve-reminder-test-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
@@ -70,9 +70,17 @@ describe("AgentSession resolve reminder", () => {
 		}
 	});
 
-	async function changeLogicalSession(transition: "new" | "switch"): Promise<void> {
+	async function changeLogicalSession(transition: "new" | "switch" | "branch"): Promise<void> {
 		if (transition === "new") {
 			expect(await session.newSession()).toBe(true);
+			return;
+		}
+		if (transition === "branch") {
+			session.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
+			const [target] = session.getUserMessagesForBranching();
+			if (!target) throw new Error("Expected a branchable user message");
+			const result = await session.branch(target.entryId);
+			expect(result.cancelled).toBe(false);
 			return;
 		}
 		const targetId = `target-${Snowflake.next()}`;
