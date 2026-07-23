@@ -1717,7 +1717,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return usage(`Failed to save pending settings: ${errorMessage(err)}`, runtime);
 			}
 			try {
-				await runtime.sessionManager.moveTo(resolvedPath);
+				await runtime.session.moveSession(resolvedPath);
 			} catch (err) {
 				return usage(`Move failed: ${errorMessage(err)}`, runtime);
 			}

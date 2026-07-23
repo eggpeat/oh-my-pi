@@ -4045,6 +4045,12 @@ export class AgentSession {
 		this.#planProposalHandler = handler ?? undefined;
 	}
 
+	#sessionBeforeSwitchReconciler: (() => Promise<void>) | undefined;
+
+	setSessionBeforeSwitchReconciler(reconciler: (() => Promise<void>) | null): void {
+		this.#sessionBeforeSwitchReconciler = reconciler ?? undefined;
+	}
+
 	#sessionSwitchReconciler: (() => Promise<void>) | undefined;
 
 	setSessionSwitchReconciler(reconciler: (() => Promise<void>) | null): void {
@@ -7406,12 +7412,30 @@ export class AgentSession {
 
 	/** Removes tools installed by {@link activateVibeTools} and activates `nextToolNames`. */
 	async deactivateVibeTools(nextToolNames: string[]): Promise<void> {
+		this.#uninstallVibeTools();
+		await this.#applyActiveToolsByName(nextToolNames);
+	}
+
+	/**
+	 * Removes the ephemeral vibe tools while keeping whatever active tool set the
+	 * session currently holds (minus those vibe tools). Unlike
+	 * {@link deactivateVibeTools}, this never restores a caller-held pre-vibe
+	 * snapshot — use it on the session-switch path, where that snapshot belongs to
+	 * the source session and would clobber the freshly loaded target's tools.
+	 */
+	async removeVibeToolsPreservingActive(): Promise<void> {
+		const removed = new Set(this.#installedVibeToolNames);
+		this.#uninstallVibeTools();
+		const nextActive = this.getActiveToolNames().filter(name => !removed.has(name));
+		await this.#applyActiveToolsByName(nextActive);
+	}
+
+	#uninstallVibeTools(): void {
 		for (const name of this.#installedVibeToolNames) {
 			this.#toolRegistry.delete(name);
 			this.#builtInToolNames.delete(name);
 		}
 		this.#installedVibeToolNames.clear();
-		await this.#applyActiveToolsByName(nextToolNames);
 	}
 
 	#getEditModeSession() {
@@ -8367,6 +8391,12 @@ export class AgentSession {
 
 	setVibeModeState(state: VibeModeState | undefined): void {
 		this.#vibeModeState = state;
+	}
+
+	#assertVibeSessionTransitionAllowed(action: string): void {
+		if (this.#vibeModeState?.enabled) {
+			throw new Error(`Cannot ${action} while vibe mode is active. Exit vibe mode first.`);
+		}
 	}
 
 	get goalRuntime(): GoalRuntime {
@@ -10155,6 +10185,7 @@ export class AgentSession {
 	 * @returns true if completed, false if cancelled by hook
 	 */
 	async newSession(options?: NewSessionOptions): Promise<boolean> {
+		this.#assertVibeSessionTransitionAllowed("start a new session");
 		const previousSessionFile = this.sessionFile;
 
 		// Emit session_before_switch event with reason "new" (can be cancelled)
@@ -10260,6 +10291,7 @@ export class AgentSession {
 	 * @returns true if completed, false if cancelled by hook or not persisting
 	 */
 	async fork(): Promise<boolean> {
+		this.#assertVibeSessionTransitionAllowed("fork the session");
 		const previousSessionFile = this.sessionFile;
 
 		// Emit session_before_switch event with reason "fork" (can be cancelled)
@@ -10331,6 +10363,12 @@ export class AgentSession {
 		}
 
 		return true;
+	}
+
+	/** Move the active session and artifacts after enforcing mode transition invariants. */
+	async moveSession(newCwd: string, targetSessionDir?: string): Promise<void> {
+		this.#assertVibeSessionTransitionAllowed("move the session");
+		await this.sessionManager.moveTo(newCwd, targetSessionDir);
 	}
 
 	// =========================================================================
@@ -11558,6 +11596,7 @@ export class AgentSession {
 	 * @returns The handoff document text, or undefined if cancelled/failed
 	 */
 	async handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
+		this.#assertVibeSessionTransitionAllowed("handoff to a new session");
 		const entries = this.sessionManager.getBranch();
 		const messageCount = entries.filter(e => e.type === "message").length;
 
@@ -17136,6 +17175,7 @@ export class AgentSession {
 
 		this.#disconnectFromAgent();
 		await this.abort({ goalReason: "internal" });
+		await this.#sessionBeforeSwitchReconciler?.();
 
 		await this.#flushPendingBashMessages();
 		// Flush pending writes before switching so restore snapshots reflect committed state.
@@ -17363,6 +17403,14 @@ export class AgentSession {
 			this.#syncTodoPhasesFromBranch();
 			this.#resetAllAdvisorRuntimes();
 			this.#reconnectToAgent();
+			try {
+				await this.#sessionSwitchReconciler?.();
+			} catch (reconcileError) {
+				logger.warn("Failed to reconcile session mode after switch rollback", {
+					targetSessionFile: sessionPath,
+					error: String(reconcileError),
+				});
+			}
 			this.#finishBashSessionTransition(bashTransition, false);
 			throw error;
 		}

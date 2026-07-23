@@ -26,6 +26,7 @@ import type { ArtifactManager } from "../session/artifacts";
 import type { ClientBridge } from "../session/client-bridge";
 import type { CustomMessage } from "../session/messages";
 import type { UsageStatistics } from "../session/session-entries";
+import type { SessionManager } from "../session/session-manager";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
@@ -217,6 +218,8 @@ export interface ToolSession {
 	getEvalSessionId?: () => string | null;
 	/** Get session file */
 	getSessionFile: () => string | null;
+	/** Parent session journal used by tools that persist runtime lifecycle state. */
+	sessionManager?: Pick<SessionManager, "appendCustomEntry" | "ensureOnDisk" | "flush" | "getBranch" | "getEntries">;
 	/** Get eval kernel owner ID for session-scoped retained-kernel cleanup. */
 	getEvalKernelOwnerId?: () => string | null;
 	/** Reject new eval work once session disposal has started. */

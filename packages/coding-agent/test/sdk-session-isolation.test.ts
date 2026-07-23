@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,10 +7,13 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as secrets from "@oh-my-pi/pi-coding-agent/secrets";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 import { getSessionsDir, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { getActiveProfile, getConfigRootDir, setProfile } from "@oh-my-pi/pi-utils/dirs";
 
@@ -105,6 +108,7 @@ describe("createAgentSession session storage isolation", () => {
 	});
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		for (const tempDir of tempDirs.splice(0)) {
 			removeSyncWithRetries(tempDir);
 		}
@@ -143,6 +147,131 @@ describe("createAgentSession session storage isolation", () => {
 			await session.dispose();
 		}
 	});
+	it("does not replace a newer registry generation when creation expected the id to be absent", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-generation-cas-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		fs.mkdirSync(cwd, { recursive: true });
+		const registry = new AgentRegistry();
+		const replacement = registry.register({
+			id: "shared-worker",
+			displayName: "replacement B",
+			kind: "sub",
+			parentId: "Main",
+			session: null,
+			status: "idle",
+		});
+
+		await expect(
+			createAgentSession({
+				cwd,
+				agentDir: path.join(tempDir, "agent"),
+				modelRegistry: sharedModelRegistry,
+				settings: Settings.isolated(),
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				agentRegistry: registry,
+				agentId: "shared-worker",
+				agentDisplayName: "late A",
+				parentTaskPrefix: "shared-worker",
+				parentAgentId: "Main",
+				taskDepth: 1,
+				expectedAgentRef: null,
+			}),
+		).rejects.toThrow("already owned by another session generation");
+		expect(registry.get("shared-worker")).toBe(replacement);
+		expect(replacement).toMatchObject({ status: "idle", session: null });
+	});
+
+	it("reuses the exact parked ref authorized for revival", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-generation-revive-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		fs.mkdirSync(cwd, { recursive: true });
+		const sessionManager = SessionManager.create(cwd, tempDir);
+		await sessionManager.ensureOnDisk();
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted worker session file");
+		const registry = new AgentRegistry();
+		const parked = registry.register({
+			id: "revived-worker",
+			displayName: "revived worker",
+			kind: "sub",
+			parentId: "Main",
+			session: null,
+			sessionFile,
+			status: "parked",
+		});
+
+		const { session } = await createAgentSession({
+			cwd,
+			modelRegistry: sharedModelRegistry,
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			sessionManager,
+			agentRegistry: registry,
+			agentId: "revived-worker",
+			agentDisplayName: "revived worker",
+			parentTaskPrefix: "revived-worker",
+			parentAgentId: "Main",
+			taskDepth: 1,
+			expectedAgentRef: parked,
+		});
+		try {
+			expect(registry.get("revived-worker")).toBe(parked);
+			expect(parked).toMatchObject({ status: "running", session, sessionFile });
+		} finally {
+			await session.dispose();
+		}
+		expect(registry.get("revived-worker")).toBeUndefined();
+	});
+
+	it("suspends the exact Vibe owner scope before global lifecycle teardown", async () => {
+		VibeSessionRegistry.resetGlobalForTests();
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-vibe-dispose-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		fs.mkdirSync(cwd, { recursive: true });
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir: path.join(tempDir, "agent"),
+			modelRegistry: sharedModelRegistry,
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+		const vibeRegistry = VibeSessionRegistry.global();
+		const suspend = vi.spyOn(vibeRegistry, "suspendScope");
+		const lifecycleDispose = vi.spyOn(AgentLifecycleManager.global(), "dispose");
+		const parentSessionId = session.sessionManager.getSessionId();
+		const parentSessionFile = session.sessionManager.getSessionFile();
+		if (!parentSessionFile) throw new Error("Expected persisted parent session file");
+
+		await session.dispose();
+
+		expect(suspend).toHaveBeenCalledWith(
+			{ ownerId: "Main", parentSessionId, parentSessionFile },
+			session.asyncJobManager,
+		);
+		expect(suspend.mock.invocationCallOrder[0]).toBeLessThan(lifecycleDispose.mock.invocationCallOrder[0]);
+	});
+
 	it("wires the discovered TTSR manager into the created session", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-ttsr-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);

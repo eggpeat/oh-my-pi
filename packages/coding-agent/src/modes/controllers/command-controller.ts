@@ -1067,7 +1067,7 @@ export class CommandController {
 		}
 
 		try {
-			await this.ctx.sessionManager.moveTo(resolvedPath);
+			await this.ctx.session.moveSession(resolvedPath);
 		} catch (err) {
 			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
 			return;

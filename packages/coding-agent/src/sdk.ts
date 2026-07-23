@@ -108,7 +108,7 @@ import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memor
 import type { MnemopiSessionState } from "./mnemopi/state";
 import lateDiagnosticTemplate from "./prompts/tools/lsp-late-diagnostic.md" with { type: "text" };
 import { AgentLifecycleManager } from "./registry/agent-lifecycle";
-import { AgentRegistry, MAIN_AGENT_ID } from "./registry/agent-registry";
+import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "./registry/agent-registry";
 import {
 	collectEnvSecrets,
 	deobfuscateSessionContext,
@@ -201,6 +201,7 @@ import { ttsTool } from "./tools/tts";
 import { resolveActiveRepoContext } from "./utils/active-repo-context";
 import { EventBus } from "./utils/event-bus";
 import { buildNamedToolChoice } from "./utils/tool-choice";
+import { VibeSessionRegistry } from "./vibe/runtime";
 import { buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 
 type McpNotificationEntry = {
@@ -480,6 +481,13 @@ export interface CreateAgentSessionOptions {
 	agentDisplayName?: string;
 	/** Optional shared agent registry for IRC routing. Default: AgentRegistry.global(). */
 	agentRegistry?: AgentRegistry;
+	/**
+	 * Registry generation authorized for this creation. `null` requires the id
+	 * to be absent; an AgentRef allows a parked revival to reuse only that ref.
+	 * Undefined preserves legacy unconditional registration for external SDK callers.
+	 * @internal
+	 */
+	expectedAgentRef?: AgentRef | null;
 	/** Parent task ID prefix for nested artifact naming (e.g., "Extensions") */
 	parentTaskPrefix?: string;
 	/**
@@ -1575,15 +1583,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const resolvedAgentDisplayName =
 		options.agentDisplayName ?? ((options.taskDepth ?? 0) > 0 || options.parentTaskPrefix ? "sub" : "main");
 	const agentKind = (options.taskDepth ?? 0) > 0 || options.parentTaskPrefix ? ("sub" as const) : ("main" as const);
+	let registeredAgentRef: AgentRef | undefined;
 	/**
 	 * Forget the agent ref on teardown — unless the agent is being parked (or is
 	 * already parked). Parking disposes the session but keeps the ref addressable
 	 * (history://, revive); only process teardown / explicit kill unregisters.
 	 */
 	const unregisterUnlessParked = (): void => {
-		if (agentRegistry.get(resolvedAgentId)?.status === "parked") return;
-		if (AgentLifecycleManager.global().isParking(resolvedAgentId)) return;
-		agentRegistry.unregister(resolvedAgentId);
+		const ref = registeredAgentRef;
+		if (!ref || agentRegistry.get(resolvedAgentId) !== ref) return;
+		if (ref.status === "parked") return;
+		if (AgentLifecycleManager.global().isParking(resolvedAgentId, ref)) return;
+		agentRegistry.unregister(resolvedAgentId, ref);
 	};
 	const evalKernelOwnerId = `agent-session:${Snowflake.next()}`;
 
@@ -1639,6 +1650,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			prewalkArmed: options.prewalk !== undefined,
 			taskDepth: options.taskDepth ?? 0,
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
+			sessionManager,
 			getEvalKernelOwnerId: () => evalKernelOwnerId,
 			getEvalSessionId: () =>
 				session?.getEvalSessionId() ?? options.parentEvalSessionId ?? defaultEvalSessionId(toolSession),
@@ -2706,16 +2718,25 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// so that subagents launched in the same parallel batch can see each other in
 		// their initial `# IRC Peers` block (rendered inside `rebuildSystemPrompt`).
 		// The session reference is attached after construction below.
-		agentRegistry.register({
+		const registrationInput = {
 			id: resolvedAgentId,
 			displayName: resolvedAgentDisplayName,
 			kind: agentKind,
 			parentId: options.parentAgentId,
 			session: null,
 			sessionFile: sessionManager.getSessionFile() ?? null,
-			status: "running",
-		});
-		hasRegistered = true;
+			status: "running" as const,
+		};
+		registeredAgentRef =
+			options.expectedAgentRef === undefined
+				? agentRegistry.register(registrationInput)
+				: agentRegistry.registerIfAvailable(registrationInput, options.expectedAgentRef);
+		if (!registeredAgentRef) {
+			throw new Error(`Agent "${resolvedAgentId}" is already owned by another session generation.`);
+		}
+		// A reused parked ref remains parked until the new AgentSession is fully
+		// constructed and attached. Startup failure therefore leaves it revivable.
+		hasRegistered = options.expectedAgentRef === undefined || options.expectedAgentRef === null;
 
 		// Partition the initial enabled set for the xd:// transport: ambient
 		// discoverable tools become mounted devices, while explicitly requested
@@ -3083,7 +3104,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Attach the live session to the pre-registered ref so peers can route IRC
 		// messages here. Refresh sessionFile in case it was unavailable at pre-register
 		// time. The dispose wrapper below unregisters on teardown (unless parked).
-		agentRegistry.attachSession(resolvedAgentId, session, sessionManager.getSessionFile() ?? null);
+		if (
+			!registeredAgentRef ||
+			!agentRegistry.attachSession(
+				resolvedAgentId,
+				session,
+				sessionManager.getSessionFile() ?? null,
+				registeredAgentRef,
+			) ||
+			!agentRegistry.setStatus(resolvedAgentId, "running", registeredAgentRef)
+		) {
+			throw new Error(`Agent "${resolvedAgentId}" was replaced during session initialization.`);
+		}
+		hasRegistered = true;
 		{
 			const originalDispose = session.dispose.bind(session);
 			session.dispose = async () => {
@@ -3097,6 +3130,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						// adopted subagent sessions, revivers. Tear it down while shared
 						// resources (kernels, MCP, LSP) are still live. Subagent disposal
 						// must NOT touch the global lifecycle.
+						const vibeRegistry = VibeSessionRegistry.global();
+						const vibeParentSession = {
+							getAgentId: () => resolvedAgentId,
+							getSessionId: () => sessionManager.getSessionId(),
+							getSessionFile: () => sessionManager.getSessionFile() ?? null,
+							sessionManager,
+							asyncJobManager: scopedAsyncJobManager,
+							settings,
+							getActiveModelString,
+						};
+						await vibeRegistry.suspendScope(vibeRegistry.ownerScope(vibeParentSession), scopedAsyncJobManager);
 						await AgentLifecycleManager.global().dispose();
 					}
 					await originalDispose();
@@ -3338,6 +3382,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		try {
 			if (hasSession) {
 				await session.dispose();
+				if (hasRegistered) unregisterUnlessParked();
 			} else {
 				if (hasRegistered) unregisterUnlessParked();
 				if (asyncJobManager) {

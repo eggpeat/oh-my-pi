@@ -36,7 +36,7 @@ import type { MnemopiSessionState } from "../mnemopi/state";
 import subagentAsyncPendingTemplate from "../prompts/system/subagent-async-pending.md" with { type: "text" };
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
-import { AgentLifecycleManager } from "../registry/agent-lifecycle";
+import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-lifecycle";
 import { AgentRegistry } from "../registry/agent-registry";
 import { type CreateAgentSessionOptions, createAgentSession, discoverAuthStorage } from "../sdk";
 import type { AgentSession, AgentSessionEvent, Prewalk } from "../session/agent-session";
@@ -2198,9 +2198,11 @@ export async function finalizeSubagentLifecycle(args: {
 	keepAlive: boolean;
 	isolated: boolean;
 	agentIdleTtlMs: number;
-	reviveSession: (() => Promise<AgentSession>) | null;
+	reviveSession: AgentReviver | null;
 }): Promise<void> {
 	const registry = AgentRegistry.global();
+	const ref = registry.get(args.id);
+	const ownsRef = Boolean(ref && ref.session === args.session);
 	const disposeSession = async (): Promise<void> => {
 		try {
 			await untilAborted(AbortSignal.timeout(5000), () => args.session.dispose());
@@ -2215,7 +2217,7 @@ export async function finalizeSubagentLifecycle(args: {
 	const resumableAbort =
 		args.abortKind === "budget" && args.keepAlive && !args.isolated && args.reviveSession !== null;
 	if (args.aborted && !resumableAbort) {
-		registry.setStatus(args.id, "aborted");
+		if (ref && ownsRef) registry.setStatus(args.id, "aborted", ref);
 		await disposeSession();
 		return;
 	}
@@ -2223,7 +2225,7 @@ export async function finalizeSubagentLifecycle(args: {
 	if (!args.keepAlive) {
 		// One-shot helper: dispose and unregister. No IRC, no revival.
 		await disposeSession();
-		registry.unregister(args.id);
+		if (ref && ownsRef) registry.unregister(args.id, ref);
 		return;
 	}
 
@@ -2233,19 +2235,26 @@ export async function finalizeSubagentLifecycle(args: {
 		// transcript stays reachable (history://), but ensureLive will throw.
 		// Status must flip to "parked" before dispose so the sdk dispose
 		// wrapper skips unregister.
-		registry.setStatus(args.id, "parked");
+		if (ref && ownsRef) registry.setStatus(args.id, "parked", ref);
 		await disposeSession();
-		registry.detachSession(args.id);
+		if (ref && ownsRef) registry.detachSession(args.id, ref);
 		return;
 	}
 
 	// Keep-alive: finished and failed subagents both stay interrogable.
 	// The lifecycle manager owns idle-TTL parking + revival from here on.
-	registry.setStatus(args.id, "idle");
-	AgentLifecycleManager.global().adopt(args.id, {
-		idleTtlMs: args.agentIdleTtlMs,
-		revive: args.reviveSession ?? undefined,
-	});
+	if (!ref || !ownsRef || !registry.setStatus(args.id, "idle", ref)) {
+		await disposeSession();
+		return;
+	}
+	AgentLifecycleManager.global().adopt(
+		args.id,
+		{
+			idleTtlMs: args.agentIdleTtlMs,
+			revive: args.reviveSession ?? undefined,
+		},
+		ref,
+	);
 }
 
 /** Options for {@link runSubagentFollowUpTurn}. */
@@ -2504,7 +2513,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	});
 	const progress = monitor.progress;
 	let unsubscribe: (() => void) | null = null;
-	let reviveSession: (() => Promise<AgentSession>) | null = null;
+	let reviveSession: AgentReviver | null = null;
 	// Adopted (kept-alive) subagents flip registry status from session events on
 	// later turns: revive/wake → running, turn drained → idle. The subscription
 	// intentionally survives this run; a disposed session emits nothing, so it
@@ -2512,9 +2521,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	const installRegistryStatusSync = (target: AgentSession): void => {
 		target.subscribe(event => {
 			if (event.type === "agent_start") {
-				AgentRegistry.global().setStatus(id, "running");
+				AgentRegistry.global().setStatus(id, "running", target);
 			} else if (event.type === "agent_end") {
-				AgentRegistry.global().setStatus(id, "idle");
+				AgentRegistry.global().setStatus(id, "idle", target);
 			}
 		});
 	};
@@ -2737,7 +2746,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// the same JSONL file re-invokes createAgentSession with the exact options
 			// of the original run (same agent id, tools, model, system prompt,
 			// artifacts dir) — only the SessionManager differs.
-			const buildSubagentSessionOptions = (sessionManagerForRun: SessionManager): CreateAgentSessionOptions => ({
+			const buildSubagentSessionOptions = (
+				sessionManagerForRun: SessionManager,
+				expectedAgentRef: CreateAgentSessionOptions["expectedAgentRef"],
+			): CreateAgentSessionOptions => ({
 				cwd: worktree ?? cwd,
 				additionalDirectories: worktree !== undefined ? undefined : options.additionalDirectories,
 				authStorage,
@@ -2791,6 +2803,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				parentAgentId: options.parentAgentId,
 				agentId: id,
 				agentDisplayName: agent.name,
+				expectedAgentRef,
 				enableLsp: lspEnabled,
 				enableIrc: options.enableIrc,
 				skipPythonPreflight,
@@ -2805,7 +2818,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				},
 			});
 
-			const sessionPromise = createAgentSession(buildSubagentSessionOptions(sessionManager));
+			const sessionPromise = createAgentSession(buildSubagentSessionOptions(sessionManager, null));
 			let session: AgentSession;
 			try {
 				({ session } = await awaitAbortable(sessionPromise));
@@ -2825,14 +2838,16 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				// the single-writer lock cleanly and restores the full message history
 				// (createAgentSession → agent.replaceMessages). Isolated runs are not
 				// resumable (worktree is merged + cleaned) and never get a reviver.
-				reviveSession = async () => {
+				reviveSession = async expectedAgentRef => {
 					const reopened = await SessionManager.open(sessionFile, undefined, undefined, {
 						suppressBreadcrumb: true,
 					});
 					if (options.parentArtifactManager) {
 						reopened.adoptArtifactManager(options.parentArtifactManager);
 					}
-					const { session: revived } = await createAgentSession(buildSubagentSessionOptions(reopened));
+					const { session: revived } = await createAgentSession(
+						buildSubagentSessionOptions(reopened, expectedAgentRef),
+					);
 					installRegistryStatusSync(revived);
 					return revived;
 				};

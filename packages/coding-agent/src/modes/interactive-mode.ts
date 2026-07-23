@@ -55,7 +55,7 @@ import { reset as resetCapabilities } from "../capability";
 import type { CollabGuestLink } from "../collab/guest";
 import type { CollabHost } from "../collab/host";
 import { KeybindingsManager } from "../config/keybindings";
-import type { ResolvedModelRoleValue } from "../config/model-resolver";
+import { formatModelString, type ResolvedModelRoleValue } from "../config/model-resolver";
 import { applyProviderGlobalsFromSettings } from "../config/provider-globals";
 import {
 	isSettingsInitialized,
@@ -137,7 +137,12 @@ import {
 	setSessionTerminalTitle,
 	setTerminalTitleStateEnabled,
 } from "../utils/title-generator";
-import { aggregateVibeWorkerTokensPerSecond, VibeSessionRegistry } from "../vibe/runtime";
+import {
+	aggregateVibeWorkerTokensPerSecond,
+	type VibeOwnerScope,
+	type VibeParentSession,
+	VibeSessionRegistry,
+} from "../vibe/runtime";
 import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
 import { ChatBlock, type ChatBlockHost } from "./components/chat-block";
@@ -549,6 +554,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#planModePreviousTools: string[] | undefined;
 	#goalModePreviousTools: string[] | undefined;
 	#vibeModePreviousTools: string[] | undefined;
+	#vibeModeOwnerScope: VibeOwnerScope | undefined;
+	#vibeScopeSuspendedForSwitch = false;
 	#goalContinuationTimer: NodeJS.Timeout | undefined;
 	#goalTurnHadToolCalls = false;
 	#goalContinuationTurnInFlight = false;
@@ -1004,6 +1011,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.initHooksAndCustomTools();
 
 		// Restore mode from session (e.g. plan mode on resume)
+		this.session.setSessionBeforeSwitchReconciler?.(() => this.#quiesceVibeForSessionSwitch());
 		this.session.setSessionSwitchReconciler?.(() => this.#reconcileModeFromSession({ preserveActiveGoal: true }));
 		await this.#reconcileModeFromSession();
 
@@ -2074,6 +2082,29 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.requestRender();
 	}
 
+	#vibeParentSession(): VibeParentSession {
+		return {
+			getAgentId: () => this.session.getAgentId() ?? null,
+			getSessionId: () => this.sessionManager.getSessionId(),
+			getSessionFile: () => this.sessionManager.getSessionFile() ?? null,
+			sessionManager: this.sessionManager,
+			asyncJobManager: this.session.asyncJobManager,
+			settings: this.session.settings,
+			// Resolve restored/switched-to workers against this session's active model
+			// (same as the spawn-path ToolSession), not the settings default. This is
+			// the primary fallback in resolveAgentModelPatterns, so the `good` worker's
+			// pi/task inheritance tracks the reopened session's model.
+			getActiveModelString: () => (this.session.model ? formatModelString(this.session.model) : undefined),
+		};
+	}
+
+	async #quiesceVibeForSessionSwitch(): Promise<void> {
+		const ownerScope = this.#vibeModeOwnerScope;
+		if (!this.vibeModeEnabled || !ownerScope) return;
+		await VibeSessionRegistry.global().suspendScope(ownerScope, this.session.asyncJobManager);
+		this.#vibeScopeSuspendedForSwitch = true;
+	}
+
 	#updateGoalModeStatus(): void {
 		const status =
 			this.goalModeEnabled || this.goalModePaused
@@ -2257,7 +2288,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	async #clearTransientModeState(): Promise<void> {
+	async #clearTransientModeState(options?: {
+		preserveVibe?: boolean;
+		vibeScopeAlreadySuspended?: boolean;
+	}): Promise<void> {
 		if (this.planModeEnabled || this.planModePaused) {
 			this.session.setPlanModeState(undefined);
 			try {
@@ -2293,23 +2327,40 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#updateGoalModeStatus();
 		}
 
-		if (this.vibeModeEnabled) {
-			await this.session.deactivateVibeTools(this.#vibeModePreviousTools ?? []);
+		if (this.vibeModeEnabled && !options?.preserveVibe) {
+			const ownerScope = this.#vibeModeOwnerScope;
+			// This runs only from #reconcileModeFromSession, i.e. after switchSession
+			// already loaded and restored the target session's active tools. The
+			// #vibeModePreviousTools snapshot belongs to the SOURCE session, so
+			// applying it here would clobber the target's tools — strip only the
+			// transient vibe tools and keep the target's active set intact.
+			await this.session.removeVibeToolsPreservingActive();
 			this.session.setVibeModeState(undefined);
 			this.vibeModeEnabled = false;
 			this.#vibeModePreviousTools = undefined;
-			await VibeSessionRegistry.global().killAll(
-				this.session.getAgentId() ?? MAIN_AGENT_ID,
-				this.session.asyncJobManager,
-			);
+			this.#vibeModeOwnerScope = undefined;
+			if (ownerScope && !options?.vibeScopeAlreadySuspended) {
+				await VibeSessionRegistry.global().suspendScope(ownerScope, this.session.asyncJobManager);
+			}
 			this.#updateVibeModeStatus();
 		}
 	}
 
 	/** Reconcile mode state from session entries on resume/switch. */
 	async #reconcileModeFromSession(options?: { preserveActiveGoal?: boolean }): Promise<void> {
-		await this.#clearTransientModeState();
+		const vibeScopeAlreadySuspended = this.#vibeScopeSuspendedForSwitch;
+		this.#vibeScopeSuspendedForSwitch = false;
 		const sessionContext = this.sessionManager.buildSessionContext();
+		const vibeSession = this.#vibeParentSession();
+		const targetVibeScope = VibeSessionRegistry.global().ownerScope(vibeSession);
+		const preserveVibe =
+			this.vibeModeEnabled &&
+			sessionContext.mode === "vibe" &&
+			this.#vibeModeOwnerScope?.ownerId === targetVibeScope.ownerId &&
+			this.#vibeModeOwnerScope.parentSessionId === targetVibeScope.parentSessionId &&
+			this.#vibeModeOwnerScope.parentSessionFile === targetVibeScope.parentSessionFile;
+		await this.#clearTransientModeState({ preserveVibe, vibeScopeAlreadySuspended });
+		await VibeSessionRegistry.global().rehydrate(vibeSession);
 		const goalEnabled = this.session.settings.get("goal.enabled");
 		if (!goalEnabled && (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused")) {
 			this.session.goalRuntime.clearAccounting();
@@ -2344,7 +2395,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		this.session.goalRuntime.clearAccounting();
 		if (sessionContext.mode === "vibe") {
-			await this.#enterVibeMode();
+			if (!preserveVibe) await this.#enterVibeMode({ persistModeChange: false });
 			return;
 		}
 		if (!this.session.settings.get("plan.enabled")) {
@@ -3151,7 +3202,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	async #enterVibeMode(): Promise<void> {
+	async #enterVibeMode(options?: { persistModeChange?: boolean }): Promise<void> {
 		if (this.vibeModeEnabled) {
 			return;
 		}
@@ -3164,9 +3215,13 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 
+		const vibeRegistry = VibeSessionRegistry.global();
+		const ownerScope = vibeRegistry.ownerScope(this.#vibeParentSession());
+		vibeRegistry.activateScope(ownerScope);
 		const previousTools = this.session.getEnabledToolNames();
 		await this.session.activateVibeTools(["read"]);
 		this.#vibeModePreviousTools = previousTools;
+		this.#vibeModeOwnerScope = ownerScope;
 		this.vibeModeEnabled = true;
 		// Suppress cache-miss marker on the next turn: vibe mode changes the
 		// injected context, which predictably invalidates the cache.
@@ -3176,7 +3231,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			await this.session.sendVibeModeContext({ deliverAs: "steer" });
 		}
 		this.#updateVibeModeStatus();
-		this.sessionManager.appendModeChange("vibe");
+		if (options?.persistModeChange !== false) this.sessionManager.appendModeChange("vibe");
 		this.showStatus("Vibe mode enabled. You direct fast/good worker sessions; toolset is read + vibe tools.");
 	}
 
@@ -3184,17 +3239,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (!this.vibeModeEnabled) {
 			return;
 		}
+		const ownerScope = this.#vibeModeOwnerScope;
+		const killed = await VibeSessionRegistry.global().killAll(this.#vibeParentSession(), ownerScope);
 		await this.session.deactivateVibeTools(this.#vibeModePreviousTools ?? []);
 		this.session.setVibeModeState(undefined);
 		this.vibeModeEnabled = false;
 		this.#vibeModePreviousTools = undefined;
+		this.#vibeModeOwnerScope = undefined;
 		this.lastAssistantUsage = undefined;
-		const killed = await VibeSessionRegistry.global().killAll(
-			this.session.getAgentId() ?? MAIN_AGENT_ID,
-			this.session.asyncJobManager,
-		);
 		this.#updateVibeModeStatus();
-		this.sessionManager.appendModeChange("none");
 		this.showStatus(
 			killed > 0
 				? `Vibe mode disabled. Killed ${killed} worker session${killed === 1 ? "" : "s"}.`
