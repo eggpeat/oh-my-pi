@@ -131,6 +131,7 @@ import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { GeminiHeaderRunDetector, isGeminiThinkingModel } from "@oh-my-pi/pi-ai/utils/thinking-loop";
 import { type RepeatedToolCallDetection, ToolCallLoopGuard } from "@oh-my-pi/pi-ai/utils/tool-call-loop-guard";
 import { isFireworksFastModelId, toFireworksBaseModelId } from "@oh-my-pi/pi-catalog/fireworks-model-id";
+import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { MacOSPowerAssertion } from "@oh-my-pi/pi-natives";
@@ -11414,6 +11415,11 @@ export class AgentSession {
 			let snapcompactReady = wantsSnapcompact;
 			const snapcompactShapeSetting = this.settings.get("snapcompact.shape");
 			let snapcompactShape: snapcompact.Shape | undefined;
+			// Claude refuses inputs that reproduce its own reasoning as text
+			// ("reasoning_extraction"), and the snapcompact archive is replayed as
+			// text into every later request; drop `¶think:` sections for
+			// Anthropic-dialect targets (issue #6093).
+			const snapcompactIncludeThinking = preferredDialect(this.model.id) !== "anthropic";
 			if (wantsSnapcompact && !this.model.input.includes("image")) {
 				if (explicitSnapcompact) {
 					this.emitNotice(
@@ -11432,6 +11438,7 @@ export class AgentSession {
 			} else if (snapcompactReady) {
 				const text = snapcompact.serializeConversation(
 					convertToLlm(preparation.messagesToSummarize.concat(preparation.turnPrefixMessages)),
+					{ includeThinking: snapcompactIncludeThinking },
 				);
 				const probeText = snapcompact.renderabilityProbeText(
 					text,
@@ -11487,6 +11494,7 @@ export class AgentSession {
 						model: this.model,
 						...(snapcompactShapeSetting === "auto" ? {} : { shape }),
 						maxFrames,
+						includeThinking: snapcompactIncludeThinking,
 					});
 					const framePayloadBytes = this.#snapcompactFramePayloadBytes(snapcompactResult);
 					if (framePayloadBytes > snapcompact.FRAME_DATA_BYTES_BUDGET) {
@@ -14698,8 +14706,13 @@ export class AgentSession {
 			let snapcompactResult: snapcompact.CompactionResult | undefined;
 			let snapcompactBlocker: string | undefined;
 			if (action === "snapcompact" && compactionPrep.kind !== "fromHook") {
+				// Drop `¶think:` sections for Anthropic-dialect targets: the archive
+				// is replayed as text and Claude refuses reproduced reasoning
+				// ("reasoning_extraction", issue #6093).
+				const snapcompactIncludeThinking = preferredDialect(this.model.id) !== "anthropic";
 				const text = snapcompact.serializeConversation(
 					convertToLlm(preparation.messagesToSummarize.concat(preparation.turnPrefixMessages)),
+					{ includeThinking: snapcompactIncludeThinking },
 				);
 				const probeText = snapcompact.renderabilityProbeText(
 					text,
@@ -14730,6 +14743,7 @@ export class AgentSession {
 							model: this.model,
 							...(shapeSetting === "auto" ? {} : { shape }),
 							maxFrames,
+							includeThinking: snapcompactIncludeThinking,
 						});
 						const framePayloadBytes = this.#snapcompactFramePayloadBytes(snapcompactResult);
 						if (framePayloadBytes > snapcompact.FRAME_DATA_BYTES_BUDGET) {

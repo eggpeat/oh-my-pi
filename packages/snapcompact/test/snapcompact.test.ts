@@ -717,6 +717,21 @@ describe("serializeConversation", () => {
 		expect(out).toBe("¶think:weigh options\n\n¶ai:the answer");
 	});
 
+	it("drops ¶think reasoning sections when includeThinking is false but keeps the reply", () => {
+		const out = snapcompact.serializeConversation(
+			[
+				createAssistantMessage([
+					{ type: "thinking", thinking: "private chain of thought" },
+					{ type: "text", text: "the answer" },
+				]),
+			],
+			{ includeThinking: false },
+		);
+		expect(out).not.toContain("¶think:");
+		expect(out).not.toContain("private chain of thought");
+		expect(out).toBe("¶ai:the answer");
+	});
+
 	it("gives a thinking-only turn its own heading before the tool calls", () => {
 		const out = snapcompact.serializeConversation([
 			createAssistantMessage([

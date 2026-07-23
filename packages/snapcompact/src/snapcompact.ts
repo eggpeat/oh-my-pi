@@ -735,6 +735,12 @@ export interface SerializeOptions {
 	/** Print tool-result text in dim gray ink so archived conversation reads
 	 *  louder than archived tool noise. Defaults to `true`. */
 	dimToolResults?: boolean;
+	/** Serialize assistant reasoning as `¶think:` sections. Defaults to `true`.
+	 *  Callers archiving for a Claude/Anthropic-dialect model set this `false`:
+	 *  the archive frames are replayed as text into every later request, and
+	 *  reasoning rendered back to Claude trips its `reasoning_extraction`
+	 *  classifier (issue #6093). */
+	includeThinking?: boolean;
 }
 
 /** Keep the head and tail of `text`, eliding the middle beyond `maxChars`. */
@@ -773,6 +779,7 @@ export function serializeConversation(messages: Message[], options?: SerializeOp
 	const toolCallMaxChars = options?.toolCallMaxChars ?? TOOL_CALL_MAX_CHARS;
 	const headRatio = options?.truncateHeadRatio ?? TRUNCATE_HEAD_RATIO;
 	const dimToolResults = options?.dimToolResults !== false;
+	const includeThinking = options?.includeThinking !== false;
 	const parts: string[] = [];
 	let lastPrefix: string | null = null;
 
@@ -845,6 +852,7 @@ export function serializeConversation(messages: Message[], options?: SerializeOp
 					const text = stripDimMarkers(block.text);
 					if (text.trim()) pendingText.push(text);
 				} else if (block.type === "thinking") {
+					if (!includeThinking) continue;
 					const thinking = stripDimMarkers(block.thinking);
 					if (thinking.trim()) pendingThinking.push(thinking);
 				} else if (block.type === "toolCall") {
