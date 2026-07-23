@@ -403,9 +403,14 @@ describe("task.batch spawning", () => {
 	it("accepts the flat single-spawn form at runtime under batch mode", async () => {
 		// Internal callers (e.g. the commit flow) and stale transcripts use the
 		// flat shape directly; the wire schema is batch-only but runtime is not.
-		mockDiscovery({ ...taskAgent, output: { type: "object", properties: { agent: { type: "string" } } } });
+		mockDiscovery({
+			...taskAgent,
+			model: ["anthropic/claude-sonnet-4"],
+			output: { type: "object", properties: { agent: { type: "string" } } },
+		});
 		let captured:
 			| {
+					modelOverride?: string | string[];
 					outputSchema?: unknown;
 					outputSchemaMode?: "permissive" | "strict";
 					outputSchemaSource?: "caller" | "agent" | "session" | "none";
@@ -414,6 +419,7 @@ describe("task.batch spawning", () => {
 			| undefined;
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			captured = {
+				modelOverride: options.modelOverride,
 				outputSchema: options.outputSchema,
 				outputSchemaMode: options.outputSchemaMode,
 				outputSchemaSource: options.outputSchemaSource,
@@ -424,7 +430,14 @@ describe("task.batch spawning", () => {
 
 		const manager = createManager();
 		const tool = await TaskTool.create(
-			createSession({ manager, settings: { "async.enabled": true, "task.batch": true } }),
+			createSession({
+				manager,
+				settings: {
+					"async.enabled": true,
+					"task.batch": true,
+					"task.agentModelOverrides": { task: "openai/gpt-4.1-mini" },
+				},
+			}),
 		);
 
 		const callerSchema = { type: "object", properties: { caller: { type: "number" } } };
@@ -432,6 +445,7 @@ describe("task.batch spawning", () => {
 			agent: "task",
 			name: "Flat",
 			task: "Do the thing.",
+			model: ["openai-codex/gpt-5.6-sol:high", "anthropic/claude-sonnet-4:low"],
 			outputSchema: callerSchema,
 			schemaMode: "strict",
 		} as TaskParams);
@@ -440,6 +454,7 @@ describe("task.batch spawning", () => {
 		const job = manager.getJob(result.details!.async!.jobId)!;
 		await job.promise;
 		expect(job.status).toBe("completed");
+		expect(captured?.modelOverride).toEqual(["openai-codex/gpt-5.6-sol:high", "anthropic/claude-sonnet-4:low"]);
 		expect(captured?.outputSchema).toEqual(callerSchema);
 		expect(captured?.outputSchemaMode).toBe("strict");
 		expect(captured?.outputSchemaSource).toBe("caller");
