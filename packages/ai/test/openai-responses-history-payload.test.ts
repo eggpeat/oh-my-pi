@@ -1360,6 +1360,13 @@ describe("OpenAI responses history payload", () => {
 
 		const model = getOpenAIReasoningModel("openai", "gpt-5-mini");
 		const payload = (await captureResponsesPayload(model, context)) as { input?: unknown[] };
+		const nonStrictDefaultModel: Model<"openai-responses"> = {
+			...model,
+			compat: { ...model.compat, strictResponsesPairing: false },
+		};
+		const overriddenPayload = (await captureResponsesPayload(nonStrictDefaultModel, context, undefined, {
+			strictResponsesPairing: true,
+		})) as { input?: unknown[] };
 
 		const orphanSurvivors = (payload.input ?? []).filter(item => {
 			if (!item || typeof item !== "object") return false;
@@ -1367,6 +1374,12 @@ describe("OpenAI responses history payload", () => {
 			return candidate.type === "function_call_output" && candidate.call_id === orphanCallId;
 		});
 		expect(orphanSurvivors).toEqual([]);
+		const overriddenOrphanSurvivors = (overriddenPayload.input ?? []).filter(item => {
+			if (!item || typeof item !== "object") return false;
+			const candidate = item as { type?: unknown; call_id?: unknown };
+			return candidate.type === "function_call_output" && candidate.call_id === orphanCallId;
+		});
+		expect(overriddenOrphanSurvivors).toEqual([]);
 
 		const pairedOutputs = (payload.input ?? []).filter(item => {
 			if (!item || typeof item !== "object") return false;

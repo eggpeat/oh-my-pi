@@ -960,6 +960,16 @@ function restoreResponsesCacheBreakpointsFromBaseline(
 	return restored;
 }
 
+function hasResponsesCacheBreakpoint(input: ResponseInput | undefined): boolean {
+	return (
+		input?.some(
+			message =>
+				isResponsesPromptCacheableMessage(message) &&
+				message.content.some(block => block.prompt_cache_breakpoint !== undefined),
+		) ?? false
+	);
+}
+
 function markLatestStableResponsesCacheBreakpoint(
 	input: ResponseInput | undefined,
 	statefulBaseline?: ResponseInput,
@@ -967,7 +977,13 @@ function markLatestStableResponsesCacheBreakpoint(
 	if (!input) return false;
 	// Stateful appends use a strict wire-prefix comparison. Retain the exact
 	// marker from that prefix rather than recomputing a newer boundary.
-	if (statefulBaseline) return restoreResponsesCacheBreakpointsFromBaseline(input, statefulBaseline);
+	if (statefulBaseline) {
+		if (restoreResponsesCacheBreakpointsFromBaseline(input, statefulBaseline)) return true;
+		// A prior marker whose content no longer matches means chaining will
+		// reset to a full replay. Recompute a fresh boundary for that replay.
+		// Markerless baselines stay markerless so appends do not mutate them.
+		if (!hasResponsesCacheBreakpoint(statefulBaseline)) return false;
+	}
 
 	let latestInputMessage = -1;
 	for (let i = input.length - 1; i >= 0; i--) {
@@ -1044,6 +1060,7 @@ export function buildParams(
 		reasoning: options?.reasoning,
 		disableReasoning: options?.disableReasoning,
 		toolChoice: options?.toolChoice,
+		strictResponsesPairing: options?.strictResponsesPairing,
 		includeEncryptedReasoning: options?.includeEncryptedReasoning,
 		filterReasoningHistory: options?.filterReasoningHistory,
 		omitReasoningEffort: options?.omitReasoningEffort,

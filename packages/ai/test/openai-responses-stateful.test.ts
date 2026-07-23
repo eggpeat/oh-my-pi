@@ -242,6 +242,53 @@ describe("openai-responses stateful chaining", () => {
 		]);
 	});
 
+	it("recomputes a cache breakpoint when an edited prefix resets the chain", async () => {
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = createCapturingFetch(sentRequests);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			apiKey: "test-key",
+			sessionId: "stateful-edited-cache-prefix-session",
+			providerSessionState,
+			statefulResponses: true,
+			promptCache: { mode: "explicit" as const },
+			fetch: fetchMock,
+		};
+		const firstUser = { role: "user" as const, content: "First question", timestamp: 1000 };
+		const firstResponse = await streamOpenAIResponses(
+			explicitPromptCacheModel,
+			{ systemPrompt: ["Original system prompt"], messages: [firstUser] },
+			options,
+		).result();
+		const secondUser = { role: "user" as const, content: "Second question", timestamp: 1001 };
+		const secondResponse = await streamOpenAIResponses(
+			explicitPromptCacheModel,
+			{
+				systemPrompt: ["Edited system prompt"],
+				messages: [firstUser, firstResponse, secondUser],
+			},
+			options,
+		).result();
+		const thirdUser = { role: "user" as const, content: "Third question", timestamp: 1002 };
+		await streamOpenAIResponses(
+			explicitPromptCacheModel,
+			{
+				systemPrompt: ["Edited system prompt"],
+				messages: [firstUser, firstResponse, secondUser, secondResponse, thirdUser],
+			},
+			options,
+		).result();
+
+		expect(sentRequests).toHaveLength(3);
+		expect(sentRequests[1]?.previous_response_id).toBeUndefined();
+		expect(JSON.stringify(sentRequests[1]?.input)).toContain("Edited system prompt");
+		expect(JSON.stringify(sentRequests[1]?.input)).toContain("prompt_cache_breakpoint");
+		expect(sentRequests[2]?.previous_response_id).toBe("resp_2");
+		expect(sentRequests[2]?.input).toEqual([
+			{ role: "user", content: [{ type: "input_text", text: "Third question" }] },
+		]);
+	});
+
 	it("chains turns without appending an extra no-reasoning developer item", async () => {
 		const sentRequests: Array<Record<string, unknown>> = [];
 		const fetchMock = createCapturingFetch(sentRequests);
