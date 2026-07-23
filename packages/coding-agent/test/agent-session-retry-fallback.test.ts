@@ -370,6 +370,79 @@ describe("AgentSession retry fallback", () => {
 		expect(requestedModels).toEqual([`${primaryModel.provider}/${primaryModel.id}`]);
 	});
 
+	it("reselects a healthy sibling before applying a same-provider model fallback", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallbackModel = getBundledModel("anthropic", "claude-haiku-4-5");
+		if (!primaryModel || !fallbackModel) throw new Error("Expected bundled same-provider fallback models");
+		const requestedModels: string[] = [];
+		const mock = createMockModel({ responses: [{ content: ["same-provider fallback continued"] }] });
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primaryModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.usageAwareFallback": true,
+			"retry.usageReservePolicy": "auto",
+			"retry.fallbackChains": {
+				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
+			},
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		vi.spyOn(modelRegistry.authStorage, "getModelUsageHealth").mockImplementation(async (_provider, options) =>
+			options.modelId === primaryModel.id
+				? {
+						state: "reserve",
+						accounts: [
+							{
+								credentialId: 1,
+								credentialType: "oauth",
+								selected: true,
+								state: "reserve",
+								remainingFraction: 0.05,
+							},
+						],
+					}
+				: {
+						state: "healthy",
+						accounts: [
+							{
+								credentialId: 1,
+								credentialType: "oauth",
+								selected: true,
+								state: "reserve",
+								remainingFraction: 0.05,
+							},
+							{
+								credentialId: 2,
+								credentialType: "oauth",
+								state: "healthy",
+								remainingFraction: 0.8,
+							},
+						],
+					},
+		);
+		const release = vi
+			.spyOn(modelRegistry.authStorage, "releaseSessionCredentialForReselection")
+			.mockReturnValue(true);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		await session.prompt("Use the healthy sibling for the fallback model");
+		await session.waitForIdle();
+
+		expect(release).toHaveBeenCalledWith(primaryModel.provider, session.sessionId);
+		expect(requestedModels).toEqual([`${fallbackModel.provider}/${fallbackModel.id}`]);
+	});
+
 	it("does not dispatch a prompt after its usage preflight is cancelled", async () => {
 		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!primaryModel) throw new Error("Expected bundled preflight model");
