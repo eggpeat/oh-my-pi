@@ -154,6 +154,48 @@ describe("AuthStorage model usage health", () => {
 		expect(health.state).toBe("reserve");
 	});
 
+	it.each([
+		["5-hour", 0.95, 0.2],
+		["7-day", 0.2, 0.95],
+	])("uses the most consumed active window when the %s limit reaches reserve", async (_window, short, long) => {
+		const storage = await createStorage([oauthRow(1)], {
+			"account-1": report("account-1", [limit("5-hour", short), limit("7-day", long)]),
+		});
+
+		const health = await storage.getModelUsageHealth("anthropic", {
+			modelId: "claude",
+			reserveFraction: 0.1,
+		});
+
+		expect(health.state).toBe("reserve");
+		expect(health.accounts[0]?.remainingFraction).toBeCloseTo(0.05);
+	});
+
+	it("expires short and long usage windows independently", async () => {
+		const now = Date.now();
+		const usageReport = report("account-1", [limit("5-hour", 1), limit("7-day", 0.95)]);
+		usageReport.fetchedAt = now - 120_000;
+		usageReport.limits[0].window = {
+			id: "5-hour",
+			label: "5-hour",
+			resetsAt: now - 60_000,
+		};
+		usageReport.limits[1].window = {
+			id: "7-day",
+			label: "7-day",
+			resetsAt: now + 60_000,
+		};
+		const storage = await createStorage([oauthRow(1)], { "account-1": usageReport });
+
+		const health = await storage.getModelUsageHealth("anthropic", {
+			modelId: "claude",
+			reserveFraction: 0.1,
+		});
+
+		expect(health.state).toBe("reserve");
+		expect(health.accounts[0]?.remainingFraction).toBeCloseTo(0.05);
+	});
+
 	it("ignores reserve samples after their usage window has reset", async () => {
 		const now = Date.now();
 		const staleReport = report("account-1", [limit("short", 0.95)]);
