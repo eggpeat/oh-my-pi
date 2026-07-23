@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { POLL_MAX_ATTEMPTS, pollOperation } from "@oh-my-pi/pi-ai/registry/oauth/google-gemini-cli";
 import { oauthFetch } from "@oh-my-pi/pi-ai/registry/oauth/google-oauth-shared";
@@ -10,14 +10,10 @@ import { oauthFetch } from "@oh-my-pi/pi-ai/registry/oauth/google-oauth-shared";
  * the caller's own signal/timeout.
  */
 function stallingServer() {
-	return Bun.serve({ port: 0, idleTimeout: 0, fetch: () => new Promise<Response>(() => {}) });
+	return Bun.serve({ port: 0, idleTimeout: 0, fetch: () => Promise.withResolvers<Response>().promise });
 }
 
 describe("issue #4085 — Google OAuth provisioning honors cancel/timeout", () => {
-	afterEach(() => {
-		// spyOn handles are restored per-test to stay full-suite safe.
-	});
-
 	it("oauthFetch surfaces an already-cancelled signal as LoginCancelledError", async () => {
 		const ctrl = new AbortController();
 		ctrl.abort(new Error("user pressed ESC"));
