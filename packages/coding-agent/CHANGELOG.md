@@ -30,6 +30,7 @@
 ### Fixed
 
 - Fixed `error.notify` raising a "Stopped with error" toast for provider failures while an auto-retry or async-delivery continuation was pending; the toast now waits for the true terminal settle.
+- Fixed concurrent MCP config mutations losing updates and racing on a shared temp path: every `mcp.json` read-modify-write (add/update/remove server, disabled/force-enabled lists) is now serialized under a per-file lock, and each atomic write uses a unique temp file so overlapping writers no longer rename each other's `.tmp` out from under them (ENOENT or clobbered config) — reachable in-process via the fire-and-forget extensions-dashboard toggle and across processes on a shared `~/.omp/mcp.json` ([#4104](https://github.com/can1357/oh-my-pi/issues/4104)).
 - Fixed terminal `yield` results racing post-turn maintenance, which could trigger an unnecessary automatic handoff or compaction.
 - Fixed credential-shaped tokens (GitHub/GitLab/OpenAI/Anthropic key patterns) being redacted from outbound provider requests even with `secrets.enabled` off; the pattern redaction now follows the `secrets.enabled` ("Hide Secrets") setting like the secret obfuscator.
 - Fixed Ctrl-clicking a wrapped OAuth authorization URL opening only the clicked row's truncated fragment by preserving the complete hyperlink target on every rendered row.
