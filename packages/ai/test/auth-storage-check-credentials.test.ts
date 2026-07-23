@@ -33,6 +33,7 @@ import {
 	type StoredAuthCredential,
 } from "@oh-my-pi/pi-ai/auth-storage";
 import type { UsageProvider } from "@oh-my-pi/pi-ai/usage";
+import { alibabaTokenPlanUsageProvider } from "@oh-my-pi/pi-ai/usage/alibaba-token-plan";
 import * as claudeUsage from "@oh-my-pi/pi-ai/usage/claude";
 import { opencodeGoUsageProvider } from "@oh-my-pi/pi-ai/usage/opencode-go";
 
@@ -409,6 +410,37 @@ describe("AuthStorage.checkCredentials", () => {
 		const store = makeStore([apiKeyRow]);
 		const storage = new AuthStorage(store, {
 			usageProviderResolver: provider => (provider === "opencode-go" ? opencodeGoUsageProvider : undefined),
+		});
+		await storage.reload();
+
+		const probe = vi.fn<CompletionProbe>().mockResolvedValue({ ok: false, reason: "401 invalid_api_key" });
+
+		try {
+			const [result] = await storage.checkCredentials({ completionProbe: probe });
+			expect(result.ok).toBeNull();
+			expect(result.reason).toMatch(/does not validate credentials/);
+			expect(result.report).toBeUndefined();
+			expect(probe).toHaveBeenCalledTimes(1);
+			expect(result.completion).toEqual({ ok: false, reason: "401 invalid_api_key" });
+		} finally {
+			storage.close();
+		}
+	});
+
+	it("does not treat Token Plan console quota as API-key validation", async () => {
+		const apiKeyRow: StoredAuthCredential = {
+			id: 13,
+			provider: "alibaba-token-plan",
+			credential: {
+				type: "api_key",
+				key: '{"token":"sk-sp-placeholder","cookie":"session_id=placeholder"}',
+			},
+			disabledCause: null,
+		};
+		const store = makeStore([apiKeyRow]);
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: provider =>
+				provider === "alibaba-token-plan" ? alibabaTokenPlanUsageProvider : undefined,
 		});
 		await storage.reload();
 

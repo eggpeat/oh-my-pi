@@ -11,6 +11,7 @@ import { Database, type Statement } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { parseAlibabaTokenPlanCredential } from "@oh-my-pi/pi-catalog/wire/alibaba-token-plan";
 import { $env, getAgentDbPath, logger } from "@oh-my-pi/pi-utils";
 import type { ApiKeyResolver } from "./auth-retry";
 import * as AIError from "./error";
@@ -42,6 +43,7 @@ import type {
 	UsageReport,
 } from "./usage";
 import { resolveUsedFraction } from "./usage";
+import { alibabaTokenPlanRankingStrategy, alibabaTokenPlanUsageProvider } from "./usage/alibaba-token-plan";
 import { claudeRankingStrategy, claudeUsageProvider } from "./usage/claude";
 import { cursorUsageProvider } from "./usage/cursor";
 import { googleGeminiCliUsageProvider } from "./usage/gemini";
@@ -587,6 +589,7 @@ async function defaultConfigValueResolver(config: string): Promise<string | unde
 // ─────────────────────────────────────────────────────────────────────────────
 
 const DEFAULT_USAGE_PROVIDERS: UsageProvider[] = [
+	alibabaTokenPlanUsageProvider,
 	openaiCodexUsageProvider,
 	kimiUsageProvider,
 	antigravityUsageProvider,
@@ -974,6 +977,7 @@ function resolveDefaultUsageProvider(provider: Provider): UsageProvider | undefi
 }
 
 const DEFAULT_RANKING_STRATEGIES = new Map<Provider, CredentialRankingStrategy>([
+	["alibaba-token-plan", alibabaTokenPlanRankingStrategy],
 	["openai-codex", codexRankingStrategy],
 	["anthropic", claudeRankingStrategy],
 	["google-antigravity", antigravityRankingStrategy],
@@ -3012,11 +3016,13 @@ export class AuthStorage {
 				return report;
 			}
 			// Failure: apply a short jittered cool-down so the credential doesn't
-			// re-hit the endpoint on every poll. Serve the last good value when we
-			// have one (keeps the credential in the report); otherwise cache null
-			// so a cold or throttled credential stops re-bursting until the window
-			// expires and the next poll retries.
-			const lastGood = this.#usageCache.getStale<UsageReport | null>(cacheKey)?.value ?? null;
+			// re-hit the endpoint on every poll. Most providers serve the last good
+			// value through transient failures. Session-cookie providers can opt out
+			// so an expired login does not display stale quota indefinitely.
+			const retainLastGood = this.#usageProviderResolver?.(request.provider)?.retainLastGoodOnFailure !== false;
+			const lastGood = retainLastGood
+				? (this.#usageCache.getStale<UsageReport | null>(cacheKey)?.value ?? null)
+				: null;
 			const backoffJitter = USAGE_FAILURE_BACKOFF_MS * (Math.random() * 0.5 - 0.25);
 			const coolDown = Date.now() + USAGE_FAILURE_BACKOFF_MS + backoffJitter;
 			this.#usageCache.set(cacheKey, { value: lastGood, expiresAt: coolDown });
@@ -5992,7 +5998,12 @@ function matchesReplacementCredential(
 ): boolean {
 	if (!existing || existing.type !== incoming.type) return false;
 	if (incoming.type === "api_key") {
-		return existing.type === "api_key" && existing.key === incoming.key;
+		if (existing.type !== "api_key") return false;
+		if (existing.key === incoming.key) return true;
+		if (provider !== "alibaba-token-plan") return false;
+		const existingToken = parseAlibabaTokenPlanCredential(existing.key)?.token;
+		const incomingToken = parseAlibabaTokenPlanCredential(incoming.key)?.token;
+		return existingToken !== undefined && existingToken === incomingToken;
 	}
 	const incomingIdentifiers = extractOAuthCredentialIdentifiers(incoming);
 	const incomingIdentityKey = resolveProviderCredentialIdentityKey(provider, incomingIdentifiers);

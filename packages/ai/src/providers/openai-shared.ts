@@ -13,6 +13,7 @@ import type {
 	ResolvedOpenAISharedCompat,
 	VercelGatewayRouting,
 } from "@oh-my-pi/pi-catalog/types";
+import { parseAlibabaTokenPlanCredential } from "@oh-my-pi/pi-catalog/wire/alibaba-token-plan";
 import {
 	COREWEAVE_PROJECT_HEADER,
 	coreWeaveProjectHeaders,
@@ -201,6 +202,12 @@ export function resolveOpenAIRequestSetup(
 	options: OpenAIRequestSetupOptions,
 ): OpenAIRequestSetup {
 	let apiKey = options.apiKey;
+	if (!apiKey && model.provider === "alibaba-token-plan") {
+		throw new AIError.MissingApiKeyError(
+			undefined,
+			"QwenCloud Token Plan API key is required. Use /login alibaba-token-plan or set ALIBABA_TOKEN_PLAN_API_KEY.",
+		);
+	}
 	if (!apiKey) {
 		if (!$env.OPENAI_API_KEY) {
 			throw new AIError.MissingApiKeyError(
@@ -253,6 +260,12 @@ export function resolveOpenAIRequestSetup(
 		Object.assign(headers, copilot.headers);
 		copilotPremiumRequests = copilot.premiumRequests;
 		baseUrl = resolveGitHubCopilotBaseUrl(model.baseUrl, rawApiKey) ?? model.baseUrl;
+	}
+
+	if (model.provider === "alibaba-token-plan") {
+		const credential = parseAlibabaTokenPlanCredential(rawApiKey);
+		if (!credential) throw new AIError.ConfigurationError("Invalid QwenCloud Token Plan credential");
+		apiKey = credential.token;
 	}
 
 	if (options.alibabaCodingPlanAuth && model.provider === "alibaba-coding-plan") {
