@@ -8,7 +8,7 @@ import type {
 	UsageStatus,
 	UsageWindow,
 } from "../usage";
-import { isRecord } from "../utils";
+import { isRecord } from "@oh-my-pi/pi-utils/type-guards";
 
 const QUOTAS_URL = "https://api.synthetic.new/v2/quotas";
 const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
@@ -70,7 +70,7 @@ function parseRollingFiveHourLimit(raw: unknown, provider: UsageFetchParams["pro
 	const regenPercent = tickPercent !== undefined ? Number((tickPercent * 100).toFixed(2)) : undefined;
 	const window: UsageWindow = {
 		id: "5h",
-		label: regenPercent !== undefined ? `5h Rolling · regen ${regenPercent}%/tick` : "5 Hour Rolling",
+		label: regenPercent !== undefined ? `5h · regen ${regenPercent}%/tick` : "5h",
 		durationMs: FIVE_HOUR_MS,
 		...(nextTickAt !== undefined ? { resetsAt: nextTickAt, resetLabel: "tick" } : {}),
 	};
@@ -84,7 +84,7 @@ function parseRollingFiveHourLimit(raw: unknown, provider: UsageFetchParams["pro
 	const status: UsageStatus = limited ? "exhausted" : (getUsageStatus(amount.usedFraction) ?? "ok");
 	return {
 		id: "synthetic:requests:5h",
-		label: "Synthetic 5h Rolling Limit",
+		label: "Synthetic Requests",
 		scope: { provider, windowId: "5h", shared: true },
 		window,
 		amount,
@@ -107,7 +107,7 @@ function parseWeeklyTokenLimit(raw: unknown, provider: UsageFetchParams["provide
 	const nextRegenCredits = parseDollarAmount(raw.nextRegenCredits);
 	const window: UsageWindow = {
 		id: "7d",
-		label: nextRegenCredits !== undefined ? `7d Rolling · regen $${nextRegenCredits.toFixed(2)}/tick` : "Weekly",
+		label: nextRegenCredits !== undefined ? `7d · regen $${nextRegenCredits.toFixed(2)}/tick` : "7d",
 		durationMs: WEEK_MS,
 		...(nextRegenAt !== undefined ? { resetsAt: nextRegenAt, resetLabel: "regen" } : {}),
 	};
@@ -120,7 +120,7 @@ function parseWeeklyTokenLimit(raw: unknown, provider: UsageFetchParams["provide
 	});
 	return {
 		id: "synthetic:usd:7d",
-		label: "Synthetic Weekly Credit Limit",
+		label: "Synthetic Credits",
 		scope: { provider, windowId: "7d", shared: true },
 		window,
 		amount,

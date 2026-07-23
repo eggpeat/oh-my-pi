@@ -1,13 +1,4 @@
-import { describe, expect, it, mock } from "bun:test";
-
-// pi-natives requires a built Rust nightly .node addon — mock it so the
-// @oh-my-pi/pi-utils barrel (which re-exports procmgr/ptree) doesn't crash.
-mock.module("@oh-my-pi/pi-natives", () => ({
-	Process: class {},
-	ProcessStatus: { Running: "running", Exited: "exited" },
-	Shell: class {},
-	PtySession: class {},
-}));
+import { describe, expect, it } from "bun:test";
 
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import type { UsageFetchContext, UsageFetchParams } from "@oh-my-pi/pi-ai/usage";
@@ -67,7 +58,7 @@ describe("synthetic usage provider", () => {
 		expect(report).not.toBeNull();
 		expect(report!.limits).toHaveLength(2);
 		expect(report!.limits.map(l => l.id)).toEqual(["synthetic:requests:5h", "synthetic:usd:7d"]);
-		expect(report!.limits.map(l => l.label)).toEqual(["Synthetic 5h Rolling Limit", "Synthetic Weekly Credit Limit"]);
+		expect(report!.limits.map(l => l.label)).toEqual(["Synthetic Requests", "Synthetic Credits"]);
 		expect(report!.limits.map(l => l.scope.windowId)).toEqual(["5h", "7d"]);
 		expect(report!.limits.map(l => l.window?.durationMs)).toEqual([5 * 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000]);
 	});
@@ -95,7 +86,7 @@ describe("synthetic usage provider", () => {
 		const fiveHour = report!.limits.find(l => l.id === "synthetic:requests:5h")!;
 		// Single-line rendering: no notes; tickPercent 0.05 → "5%" in the window label.
 		expect(fiveHour.notes).toBeUndefined();
-		expect(fiveHour.window?.label).toContain("regen 5%/tick");
+		expect(fiveHour.window?.label).toBe("5h · regen 5%/tick");
 		// nextTickAt drives the countdown, rendered as "tick in …" (not a window reset).
 		expect(fiveHour.window?.resetsAt).toBe(Date.parse("2026-07-10T06:46:05.000Z"));
 		expect(fiveHour.window?.resetLabel).toBe("tick");
@@ -117,7 +108,7 @@ describe("synthetic usage provider", () => {
 		expect(weekly.status).toBe("warning");
 		// Weekly credits regenerate incrementally too: "regen in …" + $/tick in the label.
 		expect(weekly.window?.resetLabel).toBe("regen");
-		expect(weekly.window?.label).toContain("regen $0.48/tick");
+		expect(weekly.window?.label).toBe("7d · regen $0.48/tick");
 		expect(weekly.window?.resetsAt).toBe(Date.parse("2026-07-10T08:17:04.000Z"));
 	});
 
