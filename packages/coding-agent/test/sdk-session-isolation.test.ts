@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -8,10 +8,11 @@ import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
-import { SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets";
+import * as secrets from "@oh-my-pi/pi-coding-agent/secrets";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getSessionsDir, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { getActiveProfile, getConfigRootDir, setProfile } from "@oh-my-pi/pi-utils/dirs";
 
 function createTtsrRule(name: string): Rule {
 	return {
@@ -45,6 +46,33 @@ async function withClearedSecretEnv<T>(run: () => Promise<T>): Promise<T> {
 		for (const [name, value] of removed) {
 			process.env[name] = value;
 		}
+	}
+}
+
+async function withTempConfigRoot<T>(run: () => Promise<T>): Promise<T> {
+	const originalProfile = getActiveProfile();
+	const originalConfigDir = process.env.PI_CONFIG_DIR;
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const configDirName = `.omp-sdk-session-${Snowflake.next()}`;
+	const configRoot = path.join(os.homedir(), configDirName);
+	try {
+		process.env.PI_CONFIG_DIR = configDirName;
+		setProfile(undefined);
+		return await run();
+	} finally {
+		setProfile(undefined);
+		if (originalConfigDir === undefined) {
+			delete process.env.PI_CONFIG_DIR;
+		} else {
+			process.env.PI_CONFIG_DIR = originalConfigDir;
+		}
+		if (originalAgentDir === undefined) {
+			delete process.env.PI_CODING_AGENT_DIR;
+		} else {
+			process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+		}
+		setProfile(originalProfile);
+		fs.rmSync(configRoot, { recursive: true, force: true });
 	}
 }
 
@@ -169,11 +197,18 @@ describe("createAgentSession session storage isolation", () => {
 				enableLsp: false,
 			};
 
-			const withoutSecrets = await createAgentSession(commonOptions);
+			const existingKeySpy = spyOn(secrets, "getExistingSecretPlaceholderKey").mockImplementation(
+				async () => undefined,
+			);
 			try {
-				expect(withoutSecrets.session.obfuscator?.hasSecrets()).toBeFalsy();
+				const withoutSecrets = await createAgentSession(commonOptions);
+				try {
+					expect(withoutSecrets.session.obfuscator?.hasSecrets()).toBeFalsy();
+				} finally {
+					await withoutSecrets.session.dispose();
+				}
 			} finally {
-				await withoutSecrets.session.dispose();
+				existingKeySpy.mockRestore();
 			}
 
 			fs.mkdirSync(path.join(cwd, ".omp"), { recursive: true });
@@ -188,49 +223,93 @@ describe("createAgentSession session storage isolation", () => {
 		});
 	});
 
-	it("keeps restored assistant messages deobfuscated across reloads", async () => {
+	it("restores keyed assistant placeholders across reloads", async () => {
 		await withClearedSecretEnv(async () => {
-			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-session-secrets-${Snowflake.next()}-`));
+			await withTempConfigRoot(async () => {
+				const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-session-secrets-${Snowflake.next()}-`));
+				tempDirs.push(tempDir);
+				const cwd = path.join(tempDir, "project");
+				const agentDir = path.join(tempDir, "agent");
+				fs.mkdirSync(path.join(cwd, ".omp"), { recursive: true });
+				fs.writeFileSync(
+					path.join(cwd, ".omp", "secrets.yml"),
+					"- type: plain\n  content: sdk-secret-token-123456\n",
+				);
+
+				const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+				if (!model) throw new Error("Expected anthropic model");
+
+				const obfuscator = new secrets.SecretObfuscator(
+					[{ type: "plain", content: "sdk-secret-token-123456" }],
+					await secrets.getSecretPlaceholderKey(agentDir),
+				);
+				const placeholder = obfuscator.obfuscate("token sdk-secret-token-123456");
+				const initialManager = SessionManager.create(cwd, path.join(agentDir, "sessions"));
+				initialManager.appendMessage({
+					role: "assistant",
+					content: [{ type: "text", text: placeholder }],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: Date.now(),
+				});
+				await initialManager.flush();
+				const sessionFile = initialManager.getSessionFile();
+				if (!sessionFile) throw new Error("Expected persisted session file");
+				await initialManager.close();
+
+				const resumedManager = await SessionManager.open(sessionFile, path.dirname(sessionFile));
+				const { session } = await createAgentSession({
+					cwd,
+					agentDir,
+					modelRegistry: sharedModelRegistry,
+					sessionManager: resumedManager,
+					model,
+					settings: Settings.isolated({ "secrets.enabled": true }),
+					disableExtensionDiscovery: true,
+					skills: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					enableMCP: false,
+					enableLsp: false,
+				});
+				try {
+					expect(getAssistantText(session.messages.at(-1) as AssistantMessage | undefined)).toBe(
+						"token sdk-secret-token-123456",
+					);
+					await session.reload();
+					expect(getAssistantText(session.messages.at(-1) as AssistantMessage | undefined)).toBe(
+						"token sdk-secret-token-123456",
+					);
+				} finally {
+					await session.dispose();
+				}
+			});
+		});
+	});
+
+	it("creates the placeholder key only when an obfuscate-mode secret is configured", async () => {
+		await withClearedSecretEnv(async () => {
+			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-secrets-key-${Snowflake.next()}-`));
 			tempDirs.push(tempDir);
 			const cwd = path.join(tempDir, "project");
 			const agentDir = path.join(tempDir, "agent");
 			fs.mkdirSync(path.join(cwd, ".omp"), { recursive: true });
-			fs.writeFileSync(path.join(cwd, ".omp", "secrets.yml"), "- type: plain\n  content: sdk-secret-token-123456\n");
 
-			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
-			if (!model) throw new Error("Expected anthropic model");
-
-			const obfuscator = new SecretObfuscator([{ type: "plain", content: "sdk-secret-token-123456" }]);
-			const initialManager = SessionManager.create(cwd, path.join(agentDir, "sessions"));
-			initialManager.appendMessage({
-				role: "assistant",
-				content: [{ type: "text", text: obfuscator.obfuscate("token sdk-secret-token-123456") }],
-				api: model.api,
-				provider: model.provider,
-				model: model.id,
-				usage: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-				stopReason: "stop",
-				timestamp: Date.now(),
-			});
-			await initialManager.flush();
-			const sessionFile = initialManager.getSessionFile();
-			if (!sessionFile) throw new Error("Expected persisted session file");
-			await initialManager.close();
-
-			const resumedManager = await SessionManager.open(sessionFile, path.dirname(sessionFile));
-			const { session } = await createAgentSession({
+			const commonOptions = {
 				cwd,
 				agentDir,
 				modelRegistry: sharedModelRegistry,
-				sessionManager: resumedManager,
-				model,
 				settings: Settings.isolated({ "secrets.enabled": true }),
 				disableExtensionDiscovery: true,
 				skills: [],
@@ -239,18 +318,148 @@ describe("createAgentSession session storage isolation", () => {
 				slashCommands: [],
 				enableMCP: false,
 				enableLsp: false,
-			});
+			};
+
+			const keySpy = spyOn(secrets, "getSecretPlaceholderKey").mockImplementation(
+				async () => "test-placeholder-key",
+			);
+			const existingKeySpy = spyOn(secrets, "getExistingSecretPlaceholderKey").mockImplementation(
+				async () => "existing-placeholder-key",
+			);
 			try {
-				expect(getAssistantText(session.messages.at(-1) as AssistantMessage | undefined)).toContain(
-					"sdk-secret-token-123456",
+				const keyOnly = await createAgentSession(commonOptions);
+				try {
+					expect(keySpy).not.toHaveBeenCalled();
+					expect(existingKeySpy).toHaveBeenCalled();
+					expect(keyOnly.session.obfuscator?.obfuscate("existing-placeholder-key")).not.toContain(
+						"existing-placeholder-key",
+					);
+				} finally {
+					await keyOnly.session.dispose();
+				}
+
+				existingKeySpy.mockClear();
+				// Replace-mode secrets never build a reversible keyed placeholder, so
+				// startup must not create the key file; an existing key is still redacted.
+				fs.writeFileSync(
+					path.join(cwd, ".omp", "secrets.yml"),
+					"- type: plain\n  mode: replace\n  content: replace-only-secret-123456\n",
 				);
-				await session.reload();
-				expect(getAssistantText(session.messages.at(-1) as AssistantMessage | undefined)).toContain(
-					"sdk-secret-token-123456",
+				const replaceOnly = await createAgentSession(commonOptions);
+				try {
+					expect(replaceOnly.session.obfuscator?.hasSecrets()).toBe(true);
+					expect(keySpy).not.toHaveBeenCalled();
+					expect(existingKeySpy).toHaveBeenCalled();
+					expect(replaceOnly.session.obfuscator?.obfuscate("existing-placeholder-key")).not.toContain(
+						"existing-placeholder-key",
+					);
+				} finally {
+					await replaceOnly.session.dispose();
+				}
+
+				// An obfuscate-mode secret needs the key for its reversible placeholder.
+				keySpy.mockClear();
+				existingKeySpy.mockClear();
+				fs.writeFileSync(
+					path.join(cwd, ".omp", "secrets.yml"),
+					"- type: plain\n  content: obfuscate-secret-123456\n",
 				);
+				const withObfuscate = await createAgentSession(commonOptions);
+				try {
+					expect(keySpy).toHaveBeenCalled();
+					expect(existingKeySpy).not.toHaveBeenCalled();
+				} finally {
+					await withObfuscate.session.dispose();
+				}
 			} finally {
-				await session.dispose();
+				keySpy.mockRestore();
+				existingKeySpy.mockRestore();
 			}
+		});
+	});
+
+	it("redacts a pre-existing placeholder key when only ignored short secrets remain", async () => {
+		await withClearedSecretEnv(async () => {
+			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-secrets-stale-key-${Snowflake.next()}-`));
+			tempDirs.push(tempDir);
+			const cwd = path.join(tempDir, "project");
+			const agentDir = path.join(tempDir, "agent");
+			fs.mkdirSync(path.join(cwd, ".omp"), { recursive: true });
+			// Only an ignored short (<8 char) plain obfuscate secret: it never becomes an
+			// active secret, but a previously-created key file must still be redacted and
+			// no new key must be created.
+			fs.writeFileSync(path.join(cwd, ".omp", "secrets.yml"), "- type: plain\n  content: abc\n");
+
+			const keySpy = spyOn(secrets, "getSecretPlaceholderKey").mockImplementation(
+				async () => "test-placeholder-key",
+			);
+			const existingKeySpy = spyOn(secrets, "getExistingSecretPlaceholderKey").mockImplementation(
+				async () => "existing-placeholder-key",
+			);
+			try {
+				const session = await createAgentSession({
+					cwd,
+					agentDir,
+					modelRegistry: sharedModelRegistry,
+					settings: Settings.isolated({ "secrets.enabled": true }),
+					disableExtensionDiscovery: true,
+					skills: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					enableMCP: false,
+					enableLsp: false,
+				});
+				try {
+					expect(keySpy).not.toHaveBeenCalled();
+					expect(existingKeySpy).toHaveBeenCalled();
+					expect(session.session.obfuscator?.hasSecrets()).toBe(true);
+					expect(session.session.obfuscator?.obfuscate("existing-placeholder-key")).not.toContain(
+						"existing-placeholder-key",
+					);
+				} finally {
+					await session.session.dispose();
+				}
+			} finally {
+				keySpy.mockRestore();
+				existingKeySpy.mockRestore();
+			}
+		});
+	});
+
+	it("stores placeholder keys under the configured agentDir", async () => {
+		await withClearedSecretEnv(async () => {
+			await withTempConfigRoot(async () => {
+				const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-secrets-agent-key-${Snowflake.next()}-`));
+				tempDirs.push(tempDir);
+				const cwd = path.join(tempDir, "project");
+				const agentDir = path.join(tempDir, "agent");
+				fs.mkdirSync(path.join(cwd, ".omp"), { recursive: true });
+				fs.writeFileSync(
+					path.join(cwd, ".omp", "secrets.yml"),
+					"- type: plain\n  content: agent-dir-secret-123456\n",
+				);
+
+				const { session } = await createAgentSession({
+					cwd,
+					agentDir,
+					modelRegistry: sharedModelRegistry,
+					settings: Settings.isolated({ "secrets.enabled": true }),
+					disableExtensionDiscovery: true,
+					skills: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					enableMCP: false,
+					enableLsp: false,
+				});
+				try {
+					expect(fs.existsSync(path.join(agentDir, "secret-placeholder.key"))).toBe(true);
+					expect(fs.existsSync(path.join(getConfigRootDir(), "secret-placeholder.key"))).toBe(false);
+				} finally {
+					await session.dispose();
+				}
+			});
 		});
 	});
 });

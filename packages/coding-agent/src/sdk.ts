@@ -113,10 +113,13 @@ import {
 	collectEnvSecrets,
 	deobfuscateSessionContext,
 	deobfuscateToolArguments,
+	getExistingSecretPlaceholderKey,
+	getSecretPlaceholderKey,
 	loadSecrets,
 	obfuscateMessages,
 	obfuscateProviderContext,
 	SecretObfuscator,
+	secretEntriesNeedPlaceholderKey,
 } from "./secrets";
 import { AgentSession, type InitialRetryFallbackState, type PlanYolo, type Prewalk } from "./session/agent-session";
 import { discoverAuthStorage as discoverAuthStorageFromConfig } from "./session/auth-broker-config";
@@ -1310,8 +1313,30 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const fileEntries = await logger.time("loadSecrets", loadSecrets, cwd, agentDir);
 		const envEntries = collectEnvSecrets();
 		const allEntries = [...envEntries, ...fileEntries];
+		const needsPlaceholderKey = secretEntriesNeedPlaceholderKey(allEntries);
+		const placeholderKey = needsPlaceholderKey
+			? await getSecretPlaceholderKey(agentDir)
+			: await getExistingSecretPlaceholderKey(agentDir);
 		if (allEntries.length > 0) {
-			obfuscator = new SecretObfuscator(allEntries);
+			// The persisted placeholder key — and creating its key file under the
+			// configured agentDir — is only needed for reversible obfuscate-mode
+			// placeholders, or for a default (no custom `replacement`) replace-mode
+			// regex whose key-derived idempotent fallback marker needs a stable key
+			// across restarts (see `secretEntryNeedsPlaceholderKey`). A replace-only
+			// secrets set with no such regex must not require the key; otherwise a
+			// headless run with an unwritable default config root fails startup for a
+			// feature it does not use.
+			obfuscator = new SecretObfuscator(allEntries, placeholderKey);
+		}
+		if (obfuscator?.hasSecrets() !== true && placeholderKey !== undefined) {
+			// No configured entry produced an active secret (e.g. only ignored short
+			// plain entries, or no entries at all), but a persisted key exists. Build a
+			// redaction-only obfuscator so a tool read of the key file does not ship the
+			// reusable HMAC key to the provider.
+			obfuscator = new SecretObfuscator(
+				[{ type: "plain", mode: "replace", content: placeholderKey }],
+				placeholderKey,
+			);
 		}
 	}
 	const secretsEnabled = obfuscator?.hasSecrets() === true;

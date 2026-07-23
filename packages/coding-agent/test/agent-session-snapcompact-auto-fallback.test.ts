@@ -24,6 +24,11 @@ interface Harness {
 interface HarnessOptions {
 	activeModel: { provider: GeneratedProvider; id: string };
 	seedMessages?: Message[];
+	// Prompt-token count billed on the triggering assistant turn. Stays at or
+	// below the active model's context window for a threshold-driven compaction;
+	// exceeding it routes through the overflow-recovery path, which drops the
+	// failed turn (and, in a minimal transcript, leaves nothing to summarize).
+	triggerInputTokens?: number;
 }
 
 async function createHarness(tempDir: TempDir, authStorage: AuthStorage, options: HarnessOptions): Promise<Harness> {
@@ -80,10 +85,12 @@ async function createHarness(tempDir: TempDir, authStorage: AuthStorage, options
 		// snapcompact's renderability preflight can scan it, leaving nothing to
 		// summarize). Derived from the live window so the fixture survives model
 		// metadata changes (claude-sonnet-4-5's 200k window is narrower than the
-		// vision-role qwen's, so a fixed count would overflow one of them).
+		// vision-role qwen's, so a fixed count would overflow one of them). Tests
+		// may override the billed input via triggerInputTokens.
 		const contextWindow = activeModel.contextWindow ?? 0;
 		const thresholdTokens = compactionModule.resolveThresholdTokens(contextWindow, settings.getGroup("compaction"));
-		const promptTokens = contextWindow > 0 ? Math.floor((thresholdTokens + contextWindow) / 2) : 246_000;
+		const derivedPromptTokens = contextWindow > 0 ? Math.floor((thresholdTokens + contextWindow) / 2) : 246_000;
+		const inputTokens = options.triggerInputTokens ?? derivedPromptTokens;
 		const assistantMsg = {
 			role: "assistant" as const,
 			content: [{ type: "text" as const, text: "Done." }],
@@ -92,11 +99,11 @@ async function createHarness(tempDir: TempDir, authStorage: AuthStorage, options
 			model: activeModel.id,
 			stopReason: "stop" as const,
 			usage: {
-				input: promptTokens,
+				input: inputTokens,
 				output: 0,
 				cacheRead: 0,
 				cacheWrite: 0,
-				totalTokens: promptTokens,
+				totalTokens: inputTokens,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
 			timestamp: Date.now(),
@@ -152,6 +159,10 @@ describe("AgentSession auto-snapcompact local-blocker fallback", () => {
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
 		const harness = await createHarness(tempDir, authStorage, {
 			activeModel: { provider: "aimlapi", id: "claude-sonnet-4-5-20250929" },
+			// claude-sonnet-4-5 has a 200K window; bill just under it so the turn
+			// trips the threshold compaction (which keeps the turn) instead of the
+			// overflow-recovery path (which drops it and empties the summarize set).
+			triggerInputTokens: 195_000,
 			seedMessages: [
 				{
 					role: "user",

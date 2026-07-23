@@ -276,7 +276,7 @@ describe("azure openai responses streaming", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain("server_error: backend exploded late");
 	});
-	it("preserves assistant message phase when rebuilding fallback replay history", async () => {
+	it("preserves assistant message id and phase when rebuilding fallback replay history", async () => {
 		const payload = await captureAzurePayload({
 			messages: [
 				{ role: "user", content: "first user", timestamp: Date.now() },

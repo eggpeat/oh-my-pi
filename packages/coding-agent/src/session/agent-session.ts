@@ -311,6 +311,7 @@ import {
 	obfuscateMessages,
 	obfuscateProviderContext,
 	type SecretObfuscator,
+	stripPendingSecretPlaceholderSuffix,
 } from "../secrets/obfuscator";
 import { usesCodexTaskPrompt } from "../task/prompt-policy";
 import {
@@ -2505,6 +2506,9 @@ export class AgentSession {
 		const action = todoGateOpen
 			? context.toolResults.find(result => PREWALK_ACTION_TOOLS[result.toolName])
 			: undefined;
+		if (context.toolResults.some(result => result.toolName === "todo" && !result.isError)) {
+			this.#prewalkTodoSeen = true;
+		}
 		if (!action) {
 			if (!this.#prewalkPlanInjected) {
 				this.#prewalkPlanInjected = true;
@@ -8118,7 +8122,10 @@ export class AgentSession {
 	 * Transcript for TUI display. Full history is kept for export/resume-style
 	 * callers; live chat can collapse compacted history to keep the hot render
 	 * surface bounded. Display-only — NEVER feed the result to
-	 * `agent.replaceMessages` or a provider.
+	 * `agent.replaceMessages` or a provider. Because it is never re-obfuscated,
+	 * it opts into legacy index-derived alias restoration so pre-keyed sessions
+	 * still render their secrets; the agent-feeding paths
+	 * (`buildDisplaySessionContext`) keep the keyed-only default.
 	 */
 	buildTranscriptSessionContext(
 		options?: Pick<BuildSessionContextOptions, "collapseCompactedHistory" | "keepDanglingToolCalls">,
@@ -8130,6 +8137,7 @@ export class AgentSession {
 				keepDanglingToolCalls: options?.keepDanglingToolCalls,
 			}),
 			this.#obfuscator,
+			true,
 		);
 	}
 
@@ -8191,9 +8199,7 @@ export class AgentSession {
 	#deobfuscatedProviderTextReadyForDelta(text: string): string {
 		const deobfuscated = this.#deobfuscateFromProvider(text);
 		if (!this.#obfuscator?.hasSecrets()) return deobfuscated;
-		const pendingPlaceholderStart = deobfuscated.match(/#[A-Z0-9]{0,4}$/);
-		if (pendingPlaceholderStart?.index === undefined) return deobfuscated;
-		return deobfuscated.slice(0, pendingPlaceholderStart.index);
+		return stripPendingSecretPlaceholderSuffix(deobfuscated);
 	}
 
 	#convertToLlmForSideRequest(messages: AgentMessage[]): Message[] {
