@@ -137,6 +137,7 @@ describe("AgentSession message pipeline", () => {
 			modelRegistry: {} as never,
 		});
 		sessions.push(session);
+		vi.spyOn(session.agent, "continue").mockResolvedValue(undefined);
 
 		await session.sendUserMessage("raw <steer> &", { deliverAs: "steer" });
 
