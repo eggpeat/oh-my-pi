@@ -56,6 +56,8 @@ import type {
 	ImageContent,
 	Message,
 	Model,
+	ModelUsageHealth,
+	ProviderResponseMetadata,
 	ProviderSessionState,
 	ResetCreditAccountStatus,
 	ResetCreditRedeemOutcome,
@@ -320,12 +322,14 @@ import { TtsrCoordinator, type TtsrCoordinatorHost } from "./ttsr-coordinator";
 
 const PLAN_MODE_REMINDER_MAX = 3;
 
+
 /** Internal marker for hook messages queued through the agent loop */
 // ============================================================================
 // Constants
 // ============================================================================
 
 /** Standard thinking levels */
+
 
 /**
  * Build the per-request `metadata` payload for the Anthropic provider, shaped
@@ -553,6 +557,9 @@ export class AgentSession {
 
 	// Model registry for API key resolution
 	#modelRegistry: ModelRegistry;
+	#usageFallbackConfirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined;
+	#usageReserveApprovedSelector: string | undefined;
+	#usagePreflightAbortControllers = new Set<AbortController>();
 
 	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
@@ -3572,6 +3579,13 @@ export class AgentSession {
 		return this.#recovery.retryFallbackModel;
 	}
 
+	/** Install the interactive decision surface for reserve-triggered model changes. */
+	setUsageFallbackConfirmer(
+		confirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined,
+	): void {
+		this.#usageFallbackConfirmer = confirmer;
+	}
+
 	/** Effective thinking level applied to the agent (the resolved level when `auto`). */
 	get thinkingLevel(): ThinkingLevel | undefined {
 		return this.#models.thinkingLevel;
@@ -4445,15 +4459,15 @@ export class AgentSession {
 
 		// If streaming, queue via steer() or followUp() based on option
 		if (this.isStreaming) {
-			if (!options?.streamingBehavior) {
-				throw new AgentBusyError();
-			}
+			const streamingBehavior = options?.streamingBehavior;
+			if (!streamingBehavior) throw new AgentBusyError();
+			if (!(await this.#runUsageAwarePreflight())) return false;
 			// Steer/follow-up the keyword notices BEFORE the queued user message so the
 			// model reads the steering notice ahead of the prompt it modifies.
 			for (const notice of keywordNotices) {
-				await this.sendCustomMessage(notice, { deliverAs: options.streamingBehavior });
+				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
-			if (options.streamingBehavior === "followUp") {
+			if (streamingBehavior === "followUp") {
 				await this.#queueUserMessage(expandedText, options?.images, "followUp");
 			} else {
 				await this.#queueUserMessage(expandedText, options?.images, "steer");
@@ -4540,26 +4554,23 @@ export class AgentSession {
 		}
 
 		if (options?.queueOnly) {
-			if (!options.streamingBehavior) {
-				throw new AgentBusyError();
-			}
+			const streamingBehavior = options?.streamingBehavior;
+			if (!streamingBehavior) throw new AgentBusyError();
+			if (!(await this.#runUsageAwarePreflight())) return;
 			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, options.streamingBehavior);
+				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
-			await this.#queueCustomMessage(message, options.streamingBehavior, options.queueChipText);
+			await this.#queueCustomMessage(message, streamingBehavior, options.queueChipText);
 			return;
 		}
 		if (this.isStreaming) {
-			if (!options?.streamingBehavior) {
-				throw new AgentBusyError();
-			}
+			const streamingBehavior = options?.streamingBehavior;
+			if (!streamingBehavior) throw new AgentBusyError();
+			if (!(await this.#runUsageAwarePreflight())) return;
 			for (const notice of keywordNotices) {
-				await this.sendCustomMessage(notice, { deliverAs: options.streamingBehavior });
+				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
-			await this.sendCustomMessage(message, {
-				deliverAs: options.streamingBehavior,
-				queueChipText: options.queueChipText,
-			});
+			await this.#queueCustomMessage(message, streamingBehavior, options?.queueChipText);
 			return;
 		}
 
@@ -4591,6 +4602,8 @@ export class AgentSession {
 		this.#beginInFlight();
 		const generation = this.#promptGeneration;
 		try {
+			await this.#maybeRestoreRetryFallbackPrimary();
+			if (!(await this.#runUsageAwarePreflight())) return;
 			// Flush any pending bash messages before the new prompt
 			await this.#bash.flushPending();
 			this.#eval.flushPending();
@@ -4601,7 +4614,6 @@ export class AgentSession {
 			this.#recovery.setAcceptTerminalEmptyStop(options?.acceptTerminalEmptyStop === true);
 
 			await this.#recovery.maybeRestoreRetryFallbackPrimary();
-
 			// Validate model
 			if (!this.model) {
 				throw new Error(
@@ -4949,6 +4961,7 @@ export class AgentSession {
 		}
 
 		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
+		if (!(await this.#runUsageAwarePreflight())) return;
 		await this.#queueUserMessage(expandedText, images, "steer");
 	}
 
@@ -4966,6 +4979,7 @@ export class AgentSession {
 
 		const expandedText =
 			options?.expandPromptTemplates === false ? text : expandPromptTemplate(text, [...this.#promptTemplates]);
+		if (!(await this.#runUsageAwarePreflight())) return;
 		if (!options?.synthetic) {
 			await this.#queueUserMessage(expandedText, images, "followUp");
 			return;
@@ -5177,6 +5191,7 @@ export class AgentSession {
 	): Promise<void> {
 		this.#beginInFlight();
 		try {
+			if (!(await this.#runUsageAwarePreflight())) return;
 			const acceptTerminalEmptyStop = options?.acceptTerminalEmptyStop === true;
 			if (acceptTerminalEmptyStop) {
 				this.#resetPromptMaintenanceState();
@@ -5272,6 +5287,7 @@ export class AgentSession {
 				this.#queueHiddenNextTurnMessage(normalizedAppMessage, options?.triggerTurn ?? false);
 				return false;
 			}
+			if (!(await this.#runUsageAwarePreflight())) return false;
 
 			if (options?.deliverAs === "followUp") {
 				this.agent.followUp(normalizedAppMessage);
@@ -5354,6 +5370,7 @@ export class AgentSession {
 			if (images.length === 0) images = undefined;
 		}
 
+		if (options?.deliverAs && !(await this.#runUsageAwarePreflight())) return;
 		if (options?.deliverAs === "followUp") {
 			await this.#queueUserMessage(text, images, "followUp");
 			return;
@@ -5578,6 +5595,7 @@ export class AgentSession {
 		this.#abortInProgress = true;
 		try {
 			this.#abortAutolearnCapture();
+			for (const controller of this.#usagePreflightAbortControllers) controller.abort();
 			this.abortRetry();
 			this.#promptGeneration++;
 			this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -7508,6 +7526,26 @@ export class AgentSession {
 			},
 			signal,
 		});
+	}
+
+	/** Models whose live `/usage` reports map to a quantitative provider scope. */
+	getUsageReportingModelSelectors(reports: readonly UsageReport[]): string[] {
+		const modelsByProvider = new Map<string, Model[]>();
+		for (const model of this.#modelRegistry.getAvailable()) {
+			const models = modelsByProvider.get(model.provider) ?? [];
+			models.push(model);
+			modelsByProvider.set(model.provider, models);
+		}
+		const selectors = new Set<string>();
+		for (const [provider, models] of modelsByProvider) {
+			const modelIds = this.#modelRegistry.authStorage.getUsageReportingModelIds(
+				provider,
+				models.map(model => model.id),
+				reports,
+			);
+			for (const modelId of modelIds) selectors.add(`${provider}/${modelId}`);
+		}
+		return [...selectors].sort((left, right) => left.localeCompare(right));
 	}
 
 	/**

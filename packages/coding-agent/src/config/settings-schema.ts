@@ -1493,6 +1493,65 @@ export const SETTINGS_SCHEMA = {
 			description: "Allow retry recovery to switch to configured fallback models",
 		},
 	},
+	"retry.usageAwareFallback": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Usage-Aware Fallback",
+			description:
+				"Use reliable coding-plan quota reports to prefer same-provider accounts, then configured fallback models, before a hard usage limit. Ordinary configured API keys are excluded.",
+		},
+	},
+	"retry.usageReservePct": {
+		type: "number",
+		default: 10,
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Reserve Margin",
+			description:
+				"Treat a coding-plan model as near its limit below this remaining percentage. Unknown or unmapped usage keeps the primary model.",
+			condition: "usageAwareFallbackEnabled",
+			options: [
+				{ value: "5", label: "5%", description: "Act only when nearly exhausted" },
+				{ value: "10", label: "10%", description: "Balanced safety margin" },
+				{ value: "15", label: "15%", description: "Conservative" },
+				{ value: "20", label: "20%", description: "Early protection" },
+				{ value: "25", label: "25%", description: "Very conservative" },
+			],
+		},
+	},
+	"retry.usageReservePolicy": {
+		type: "enum",
+		values: ["confirm", "auto", "fail-closed"] as const,
+		default: "confirm",
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Reserve Policy",
+			description: "What to do when every same-provider coding-plan account is inside the reserve margin.",
+			condition: "usageAwareFallbackEnabled",
+			options: [
+				{
+					value: "confirm",
+					label: "Confirm interactively",
+					description: "Keep interactive sessions on the primary until confirmed; background agents auto-fallback",
+				},
+				{
+					value: "auto",
+					label: "Auto-fallback",
+					description: "Always select the next eligible configured fallback",
+				},
+				{
+					value: "fail-closed",
+					label: "Fail closed",
+					description: "Do not spend reserve quota or select a fallback",
+				},
+			],
+		},
+	},
 	"retry.fallbackChains": {
 		type: "record",
 		default: {} as Record<string, string[]>,
@@ -5325,6 +5384,9 @@ export interface RetrySettings {
 	baseDelayMs: number;
 	maxDelayMs: number;
 	modelFallback: boolean;
+	usageAwareFallback: boolean;
+	usageReservePct: number;
+	usageReservePolicy: "confirm" | "auto" | "fail-closed";
 }
 
 export interface MemoriesSettings {

@@ -14,6 +14,7 @@ import type {
 	CredentialDisabledEvent,
 	Message,
 	Model,
+	ModelUsageHealth,
 	ProviderSessionState,
 	SimpleStreamOptions,
 } from "@oh-my-pi/pi-ai";
@@ -56,6 +57,12 @@ import {
 } from "./config/model-resolver";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
 import { applyProviderGlobalsFromSettings } from "./config/provider-globals";
+import {
+	expandDefaultRetryFallbackChains,
+	findRetryFallbackCandidates,
+	type RetryFallbackResolutionContext,
+	resolveRetryFallbackChainKey,
+} from "./config/retry-fallback";
 import { buildServiceTierByFamily } from "./config/service-tier";
 import { Settings, type SkillsSettings } from "./config/settings";
 import { CursorExecHandlers } from "./cursor";
@@ -2091,27 +2098,38 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						if (!resolved.configuredRole || !settings.get("retry.modelFallback")) {
 							return primaryPatterns;
 						}
-						const fallbackChains = settings.get("retry.fallbackChains");
-						const roleFallbacks =
-							fallbackChains[resolved.configuredRole] ??
-							(resolved.configuredRole === "default" ? undefined : fallbackChains.default);
-						if (!Array.isArray(roleFallbacks)) return primaryPatterns;
+						const fallbackContext: RetryFallbackResolutionContext = {
+							chains: expandDefaultRetryFallbackChains(settings.get("retry.fallbackChains"), [
+								...Object.keys(settings.getModelRoles()),
+								resolved.configuredRole,
+							]),
+							getModelRole: role => settings.getModelRole(role),
+							modelLookup: modelRegistry,
+						};
 						const originalSelector = resolved.configuredPatterns[0];
+						const originalModel = parseModelPattern(originalSelector, availableModels, matchPreferences).model;
+						const chainKey = resolveRetryFallbackChainKey(
+							fallbackContext,
+							originalSelector,
+							originalModel,
+							resolved.configuredRole,
+						);
+						if (!chainKey) return primaryPatterns;
 						const parsedOriginal = parseModelString(originalSelector, {
 							allowMaxSuffix: true,
 							allowAutoAlias: true,
 							isLiteralModelId: (provider, id) => modelRegistry.find(provider, id) !== undefined,
 						});
 						const retryFallback: InitialRetryFallbackState = {
-							role: resolved.configuredRole,
+							role: chainKey,
 							originalSelector,
 							originalThinkingLevel: parsedOriginal?.thinkingLevel,
 						};
 						return [
 							...primaryPatterns,
-							...roleFallbacks
-								.filter((pattern): pattern is string => typeof pattern === "string")
-								.map(pattern => ({ pattern, retryFallback })),
+							...findRetryFallbackCandidates(fallbackContext, chainKey, originalSelector, originalModel, {
+								allowMissingPrimary: true,
+							}).map(candidate => ({ pattern: candidate.raw, retryFallback })),
 						];
 					}
 					if (resolved.model) {
@@ -2131,10 +2149,68 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					}));
 				}),
 			);
+			let usageFallbackTriggered = false;
 			for (let patternIndex = 0; patternIndex < expandedModelPatterns.length; patternIndex += 1) {
 				const { pattern, retryFallback } = expandedModelPatterns[patternIndex];
 				const primary = parseModelPattern(pattern, availableModels, matchPreferences);
 				if (!primary.model || (retryFallback && !hasModelAuth(primary.model))) continue;
+				let hasUsageFallbackCandidate = false;
+				for (
+					let candidateIndex = patternIndex + 1;
+					candidateIndex < expandedModelPatterns.length;
+					candidateIndex += 1
+				) {
+					const candidate = parseModelPattern(
+						expandedModelPatterns[candidateIndex].pattern,
+						availableModels,
+						matchPreferences,
+					);
+					if (candidate.model && hasModelAuth(candidate.model)) {
+						hasUsageFallbackCandidate = true;
+						break;
+					}
+				}
+				const usageReservePolicy = settings.get("retry.usageReservePolicy");
+				if (
+					(hasUsageFallbackCandidate || usageReservePolicy === "fail-closed") &&
+					settings.get("retry.modelFallback") &&
+					settings.get("retry.usageAwareFallback")
+				) {
+					let usageHealth: ModelUsageHealth | undefined;
+					try {
+						usageHealth = await modelRegistry.authStorage.getModelUsageHealth(primary.model.provider, {
+							modelId: primary.model.id,
+							baseUrl: primary.model.baseUrl,
+							reserveFraction: settings.get("retry.usageReservePct") / 100,
+						});
+					} catch (error) {
+						logger.debug("Usage-aware model preflight failed open", {
+							provider: primary.model.provider,
+							model: primary.model.id,
+							error: String(error),
+						});
+					}
+					if (usageHealth?.state === "depleted") {
+						if (usageReservePolicy === "fail-closed") {
+							throw new Error(
+								`Usage depleted for ${primary.model.provider}/${primary.model.id}; reserve policy is fail-closed.`,
+							);
+						}
+						usageFallbackTriggered = true;
+						continue;
+					}
+					if (usageHealth?.state === "reserve") {
+						if (usageReservePolicy === "fail-closed") {
+							throw new Error(
+								`Usage reserve reached for ${primary.model.provider}/${primary.model.id}; reserve policy is fail-closed.`,
+							);
+						}
+						if (usageReservePolicy === "auto" || !options.hasUI) {
+							usageFallbackTriggered = true;
+							continue;
+						}
+					}
+				}
 				let selectedModel = primary.model;
 				let selectedThinkingLevel = primary.thinkingLevel;
 				let selectedExplicitThinkingLevel = primary.explicitThinkingLevel;
@@ -2214,7 +2290,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					}
 				}
 				model = selectedModel;
-				initialRetryFallback = retryFallback;
+				initialRetryFallback =
+					retryFallback && usageFallbackTriggered ? { ...retryFallback, pinned: true } : retryFallback;
 				modelFallbackMessage = undefined;
 				if (selectedExplicitThinkingLevel) {
 					restoredSessionThinkingLevel = selectedThinkingLevel;

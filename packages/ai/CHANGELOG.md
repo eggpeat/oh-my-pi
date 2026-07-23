@@ -14,6 +14,7 @@
 - Fixed SuperGrok (`xai-oauth`) `/usage` showing "no usage data" for unified-billing accounts: when `?format=credits` lacks `creditUsagePercent` (or marks `isUnifiedBillingUser`), fall back to / merge the default monthly `monthlyLimit`/`used` payload.
 - Fixed sessions wedging onto their fallback model with `400 Invalid \`signature\` in \`thinking\` block` after switching to an Anthropic signing endpoint while the latest assistant turn came from a different Anthropic-compatible provider (e.g. Kimi k3). The cross-model thinking-signature strip skipped the latest surviving assistant turn entirely, replaying the foreign signature verbatim on every attempt; the latest turn now strips signatures whose issuing provider differs from the target (same-provider switches keep their byte-for-byte latest turn), and foreign `redacted_thinking` siblings are dropped alongside instead of riding the wire unverifiable.
 - Fixed OAuth callback servers aborting login when an invalid callback arrives before the legitimate browser redirect, and restricted `localhost` callback listeners to the IPv4 loopback interface ([#4106](https://github.com/can1357/oh-my-pi/issues/4106)).
+- Added model-scoped usage health and same-provider reselection for native coding-plan credential pools, preserving OAuth/login-pool precedence, scoped broker blocks, sibling rotation state, and conservative unknown-account handling while excluding ordinary configured API keys ([#5018](https://github.com/can1357/oh-my-pi/issues/5018)).
 
 ## [17.0.9] - 2026-07-23
 

@@ -2275,6 +2275,24 @@ export class AcpAgent implements Agent {
 			return;
 		}
 
+		const uiContext = createAcpExtensionUiContext(
+			this.#connection,
+			() => record.session.sessionId,
+			this.#clientCapabilities,
+		);
+		if (this.#clientCapabilities?.elicitation?.form != null) {
+			record.session.setUsageFallbackConfirmer(confirmation => {
+				const reserve =
+					confirmation.remainingPercent === undefined
+						? "inside the configured reserve margin"
+						: `${confirmation.remainingPercent.toFixed(1)}% remaining`;
+				return uiContext.confirm(
+					"Coding-plan reserve reached",
+					`${confirmation.from} has ${reserve}. Switch to ${confirmation.to}? Choose No to keep using the current plan.`,
+				);
+			});
+		}
+
 		const extensionRunner = record.session.extensionRunner;
 		if (!extensionRunner) {
 			record.extensionsConfigured = true;
@@ -2355,15 +2373,7 @@ export class AcpAgent implements Agent {
 				},
 				compact: instructionsOrOptions => runExtensionCompact(record.session, instructionsOrOptions),
 			},
-			// Per-session getter: `record.session.sessionId` reads through to
-			// `sessionManager.getSessionId()` (it's a getter, not a field), so an
-			// extension command that calls `ctx.newSession` / `ctx.switchSession`
-			// — both exposed in the block just above — mutates the underlying id
-			// mid-flight. Reading lazily on each elicitation matches every other
-			// `sessionUpdate` call in this file. Hoisting the factory to an
-			// `AcpAgent` field would still be wrong because it would also lose
-			// the per-`record` binding.
-			createAcpExtensionUiContext(this.#connection, () => record.session.sessionId, this.#clientCapabilities),
+			uiContext,
 		);
 		await extensionRunner.emit({ type: "session_start" });
 		record.extensionsConfigured = true;

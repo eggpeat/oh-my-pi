@@ -98,6 +98,13 @@
 
 - Added dynamic multi-root workspace context (issue [#2569](https://github.com/can1357/oh-my-pi/issues/2569)): a session now carries an ordered list of workspace directories beyond `cwd`, managed live from the terminal. New `/add-dir <path>`, `/remove-dir <path>`, and `/dirs` slash commands let you add and remove folders mid-session; the repeatable `--add-dir <path>` CLI flag seeds them at launch, and the `workspace.additionalDirectories` setting persists defaults per project. Additional roots are persisted in the session header, survive reopen/fork/move, and are surfaced to the agent in the system prompt so it knows they exist and can `read`/`grep`/`glob` them by absolute path. Design aligns with the endorsed community implementation on `feature/session-workspace`.
 - Fixed the `browser` tool's `open` action ignoring the requested `timeout` during browser acquisition (CDP discovery/connect ran to its own fixed wait), and orphaning a freshly-created browser on abort/timeout before tab publication. The requested timeout now bounds the whole open lifecycle, and one explicit registry lease is held across tab acquisition so rollback disposes exactly the failed open — a concurrent open of a different tab name on the same browser can no longer dispose the browser out from under it. ([#6365](https://github.com/can1357/oh-my-pi/issues/6365))
+### Added
+
+- Added opt-in usage-aware model fallback for rationed coding plans: `/usage` lists every available model mapped to live quantitative usage data, same-provider account pools are reselected before model changes, interactive reserve crossings require confirmation, and noninteractive role/subagent selection walks existing fallback chains ([#5018](https://github.com/can1357/oh-my-pi/issues/5018)).
+
+### Changed
+
+- Unified startup and runtime retry-fallback selector resolution, so deferred model roles honor the same exact-model, longest-wildcard, role, and default-chain precedence before session creation ([#5018](https://github.com/can1357/oh-my-pi/issues/5018)).
 
 ## [17.0.9] - 2026-07-23
 
