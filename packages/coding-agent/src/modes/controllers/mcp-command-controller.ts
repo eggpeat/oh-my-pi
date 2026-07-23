@@ -1071,8 +1071,10 @@ export class MCPCommandController {
 			connectionError = error as Error;
 		}
 
-		// Server connected fine without auth — reauth is not needed
-		if (connectionSucceeded) {
+		// Server connected fine without auth — reauth is not needed. A tool-level
+		// challenge overrides this: servers may allow the anonymous handshake yet
+		// protect individual tool calls with `_meta["mcp/www_authenticate"]`.
+		if (connectionSucceeded && !authChallenge) {
 			throw new Error("Server connection succeeded without OAuth; reauthorization is not required.");
 		}
 
