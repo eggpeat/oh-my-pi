@@ -40,7 +40,7 @@ const makeConfig = (overrides: Partial<HindsightConfig> = {}): HindsightConfig =
 });
 
 class FakeHindsightApi extends HindsightApi {
-	public calls: { bankId: string; transcript: string; options?: RetainOptions }[] = [];
+	calls: { bankId: string; transcript: string; options?: RetainOptions }[] = [];
 
 	constructor() {
 		super({ baseUrl: "http://localhost" });
@@ -254,5 +254,51 @@ describe("Hindsight incremental full-session retention cache", () => {
 			"[role: user]\nA_rewritten\n[user:end]\n\n[role: assistant]\nB\n[assistant:end]\n\n" +
 				"[role: user]\nC\n[user:end]\n\n[role: assistant]\nD\n[assistant:end]",
 		);
+	});
+
+	it("forced retain resends the full transcript even when no new messages arrived", async () => {
+		const client = new FakeHindsightApi();
+		const config = makeConfig({ retainMode: "full-session" });
+		const messages: HindsightMessage[] = [
+			{ role: "user", content: "hello first turn" },
+			{ role: "assistant", content: "hi there first response" },
+		];
+		const session = {
+			sessionId: "test-session",
+			sessionManager: {
+				getEntries: () => [
+					{ type: "message", message: { role: "user", content: "hello first turn" } },
+					{
+						type: "message",
+						message: { role: "assistant", content: [{ type: "text", text: "hi there first response" }] },
+					},
+				],
+			},
+		} as object as AgentSession;
+		const banksSet = new Set<string>();
+
+		const state = new HindsightSessionState({
+			sessionId: "test-session",
+			client,
+			bankId: "test-bank",
+			config,
+			session,
+			banksSet,
+		});
+
+		const expected =
+			"[role: user]\nhello first turn\n[user:end]\n\n[role: assistant]\nhi there first response\n[assistant:end]";
+
+		await state.retainSession(messages);
+		expect(client.calls.length).toBe(1);
+		expect(client.calls[0].transcript).toBe(expected);
+
+		client.calls = [];
+
+		// No new messages since the successful auto-retain: a forced retain must
+		// still resend the full transcript (recovery path for lost upstream docs).
+		await state.forceRetainCurrentSession();
+		expect(client.calls.length).toBe(1);
+		expect(client.calls[0].transcript).toBe(expected);
 	});
 });

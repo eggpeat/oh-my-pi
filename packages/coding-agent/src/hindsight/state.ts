@@ -391,6 +391,14 @@ export class HindsightSessionState {
 	async forceRetainCurrentSession(): Promise<void> {
 		const messages = extractMessages(this.session.sessionManager);
 		if (messages.length === 0) return;
+		// Forced retains are user-initiated rebuilds (`/memory enqueue`): drop the
+		// incremental cache so the full transcript is reformatted and resent even
+		// when no new messages arrived since the last auto-retain — otherwise a
+		// rebuild could never recover an upstream document that was deleted or a
+		// previous async retain that never materialized.
+		this.#lastRetainedMessageIndex = 0;
+		this.#cachedTranscript = "";
+		this.#lastRetainedPrefixKey = "";
 		try {
 			await this.retainSession(messages);
 			this.lastRetainedTurn = messages.filter(m => m.role === "user").length;
