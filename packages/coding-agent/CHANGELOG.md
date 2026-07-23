@@ -17,6 +17,7 @@
 - Made the statusline `git` segment jj-aware: in a Jujutsu repo it shows the nearest bookmark (falling back to the short change-id) instead of git's `detached` label or nothing, and working-copy change counts come from jj where there is no `.git` to read ([#3582](https://github.com/can1357/oh-my-pi/issues/3582))
 - Added `block`/`unblock` todo operations and a `blocked` status for tasks waiting on external input; blocked tasks stay visible in the todo HUD and summary but are excluded from the incomplete-todo stop reminder, and an optional blocker note records what the task is waiting for.
 - Added a toggle-list editor in `/settings` for array-of-enum settings: `providers.webSearchOrder` and `providers.imageOrder` (ordered — Enter/Space toggles, ←/→ nudges, 1-9 splices the hovered provider into that position) and `providers.webSearchExclude` now appear under Providers → Services instead of being config-file only.
+- Added `models.yml` Bedrock Converse prompt-cache capability overrides for bundled and opaque inference profiles.
 
 ### Changed
 
@@ -26,13 +27,10 @@
 - Bound interactive bash live display write queue to prevent unbounded PTY chunk backlog ([#4240](https://github.com/can1357/oh-my-pi/issues/4240))
 - All Markdown flavors (`.markdown`, `.mdx`, `.mdc`, `.mkd`, `.mdown`) now follow the `read.summarize.prose` setting like `.md`, so they read verbatim instead of being code-block summarized when prose summaries are off.
 - xAI web search now uses `grok-4.5` (at low reasoning effort) instead of `grok-4.3`.
-### Added
-
-- Added `models.yml` Bedrock Converse prompt-cache capability overrides for bundled and opaque inference profiles.
 
 ### Fixed
-- Fixed a first-use race in `ArtifactManager` where two concurrent `allocatePath`/`save` callers on a fresh instance both re-seeded `#nextId` across the directory-scan yield and allocated the same artifact id, silently overwriting the first artifact (same tool type) or making `artifact://` resolution ambiguous (different tool types). The initial scan is now memoized as a single in-flight promise so all concurrent callers share one initialization and receive distinct ids ([#4091](https://github.com/can1357/oh-my-pi/issues/4091)).
 
+- Fixed a first-use race in `ArtifactManager` where two concurrent `allocatePath`/`save` callers on a fresh instance both re-seeded `#nextId` across the directory-scan yield and allocated the same artifact id, silently overwriting the first artifact (same tool type) or making `artifact://` resolution ambiguous (different tool types). The initial scan is now memoized as a single in-flight promise so all concurrent callers share one initialization and receive distinct ids ([#4091](https://github.com/can1357/oh-my-pi/issues/4091)).
 - Fixed blob reference resolution passing unvalidated `blob:sha256:` suffixes into `path.join`, allowing a crafted ref (e.g. `blob:sha256:../../../etc/passwd`) in a persisted/shared session to escape the blob directory and read arbitrary files into resolved image history; `parseBlobRef` now rejects any suffix that is not a canonical 64-char lowercase hex hash, gating every resolution path ([#4088](https://github.com/can1357/oh-my-pi/issues/4088)).
 - Fixed discarded `Settings` instances keeping debounced save timers and chained background saves armed; discarding an instance now cancels its pending writes so they cannot race a successor's file locks.
 - Fixed startup status messages (warnings, errors, extension/tool errors, status lines) keeping the dark-mode color after auto-theme detection later switched the active theme to light — e.g. `dark-catppuccin`/`light-catppuccin` warnings rendered in Mocha yellow on the Latte background. Transient status presenters now resolve their color lazily at render time so a theme swap re-shapes them ([#6337](https://github.com/can1357/oh-my-pi/issues/6337)).
@@ -217,6 +215,7 @@
 - Changed every bundled TTSR rule to warn without interrupting generation.
 - Renamed the system prompt's project-context section wrapper from `<context>` to `<repo-rules>` to stop it colliding with the `task` tool's `context` parameter under in-band XML tool dialects: models were closing `<parameter name="context">` with a stray `</context>` (primed by the ambient section tag) and emitting sibling params as bare `<tasks>` elements, so `tasks` arrived missing.
 - Rendered `read xd://` calls in the compact grouped read view instead of a full tool-execution card; other internal URLs (`skill://`, `agent://`, …) still render full so their resolved content stays visible.
+- Changed `providers.webSearch` preferred provider failure handling to fall back and cascade through other configured/default search providers rather than stopping immediately.
 
 ### Fixed
 
@@ -312,10 +311,6 @@
 - Fixed custom `anthropic-messages` OAuth providers being unable to opt into configured Claude Code fingerprint header overrides. ([#5888](https://github.com/can1357/oh-my-pi/issues/5888))
 - Fixed authoritative providers (e.g. `openai-codex`) keeping unsupported bundled models selectable when a fresh model cache and an expired OAuth token coincided: built-in discovery now forces the OAuth refresh so the provider's model manager is constructed and prunes stale bundled entries (e.g. `gpt-5.4-nano`) instead of waiting out the cache TTL. ([#5364](https://github.com/can1357/oh-my-pi/issues/5364))
 - Added `providers.webSearchOrder` to prioritize web-search fallbacks while preserving the built-in order for unlisted providers; a failing preferred provider now continues through that fallback chain.
-
-### Changed
-
-- Changed `providers.webSearch` preferred provider failure handling to fall back and cascade through other configured/default search providers rather than stopping immediately.
 
 ## [17.0.5] - 2026-07-18
 
