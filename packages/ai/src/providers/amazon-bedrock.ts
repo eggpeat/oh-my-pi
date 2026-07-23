@@ -700,9 +700,14 @@ function handleContentBlockStop(
 
 /**
  * Resolve Bedrock's explicit-cache request policy from the catalog's
- * materialized provider contract. `AWS_BEDROCK_FORCE_CACHE` remains an escape
- * hatch for opaque application inference profiles, but it cannot invent 1h
- * retention that the model compat did not explicitly grant.
+ * materialized provider contract. Bedrock enforces each model's minimum
+ * prefix-token requirement, so this boundary intentionally does not locally
+ * count tokens. The fixed emitter adds at most two checkpoints (system and
+ * final user), within every known explicit model's documented maximum of four.
+ *
+ * `AWS_BEDROCK_FORCE_CACHE` remains an escape hatch for opaque application
+ * inference profiles, but it cannot invent 1h retention that the model compat
+ * did not explicitly grant.
  */
 function resolvePromptCachePolicy(
 	model: Model<"bedrock-converse-stream">,

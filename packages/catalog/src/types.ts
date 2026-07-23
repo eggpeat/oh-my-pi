@@ -468,9 +468,16 @@ export interface BedrockCompat {
 	promptCacheMode?: "none" | "automatic" | "explicit";
 	/** Whether explicit cachePoint blocks accept `ttl: "1h"`; omitted TTL means Bedrock's 5-minute default. */
 	supportsLongPromptCacheRetention?: boolean;
-	/** Minimum prompt-prefix tokens required for an effective checkpoint. Zero means no explicit checkpoints. */
+	/**
+	 * Bedrock-enforced minimum prompt-prefix tokens for an effective checkpoint.
+	 * Capability metadata only: emitters must not estimate local token counts.
+	 * Zero means no explicit checkpoints.
+	 */
 	promptCacheMinimumTokens?: number;
-	/** Maximum explicit cache checkpoints accepted in one request. Zero means no explicit checkpoints. */
+	/**
+	 * Bedrock-enforced maximum explicit cache checkpoints per request.
+	 * Capability metadata only; zero means no explicit checkpoints.
+	 */
 	promptCacheMaximumCheckpoints?: number;
 }
 

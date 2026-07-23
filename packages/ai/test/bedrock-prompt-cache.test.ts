@@ -119,6 +119,37 @@ describe("Bedrock prompt cache checkpoints", () => {
 		}
 	});
 
+	test("emits default-5m system and message checkpoints for every exact Nova base ID", async () => {
+		for (const id of [
+			"amazon.nova-lite-v1:0",
+			"amazon.nova-micro-v1:0",
+			"amazon.nova-pro-v1:0",
+			"amazon.nova-premier-v1:0",
+		] as const) {
+			const payload = await capturePayload(model(id), "long");
+			expect(payload.system).toEqual([{ text: "Use concise answers." }, { cachePoint: { type: "default" } }]);
+			expect(payload.messages).toEqual([
+				{ role: "user", content: [{ text: "What is the answer?" }, { cachePoint: { type: "default" } }] },
+			]);
+			expect(checkpoints(payload)).toHaveLength(2);
+		}
+	});
+
+	test("does not emit checkpoints for unknown Nova IDs", async () => {
+		for (const id of [
+			"amazon.nova-lite-v1:1",
+			"amazon.nova-micro-v1:1",
+			"amazon.nova-pro-v1:1",
+			"amazon.nova-premier-v1:1",
+			"us.amazon.nova-unknown-v1:0",
+		] as const) {
+			const payload = await capturePayload(model(id), "long");
+			expect(payload.system).toEqual([{ text: "Use concise answers." }]);
+			expect(payload.messages).toEqual([{ role: "user", content: [{ text: "What is the answer?" }] }]);
+			expect(checkpoints(payload)).toHaveLength(0);
+		}
+	});
+
 	test("emits default-5m system and message checkpoints for Nova Premier's in-region ID", async () => {
 		const payload = await capturePayload(model("amazon.nova-premier-v1:0"), "long");
 		expect(payload.system).toEqual([{ text: "Use concise answers." }, { cachePoint: { type: "default" } }]);

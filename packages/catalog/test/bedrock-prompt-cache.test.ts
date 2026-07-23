@@ -94,7 +94,7 @@ describe("Bedrock prompt-cache compat", () => {
 		}
 	});
 
-	test("models exact cache-capable Nova IDs for explicit 5m checkpoints", () => {
+	test("models exact cache-capable Nova base and geo IDs for explicit 5m checkpoints", () => {
 		const expected = {
 			promptCacheMode: "explicit",
 			supportsLongPromptCacheRetention: false,
@@ -128,7 +128,13 @@ describe("Bedrock prompt-cache compat", () => {
 		const unknown = buildModel(bedrockSpec({ id: opaqueProfileId }));
 		expect(unknown.compat.promptCacheMode).toBe("none");
 
-		for (const id of ["amazon.nova-premier-v1:1", "us.amazon.nova-unknown-v1:0"]) {
+		for (const id of [
+			"amazon.nova-lite-v1:1",
+			"amazon.nova-micro-v1:1",
+			"amazon.nova-pro-v1:1",
+			"amazon.nova-premier-v1:1",
+			"us.amazon.nova-unknown-v1:0",
+		]) {
 			expect(buildModel(bedrockSpec({ id })).compat.promptCacheMode).toBe("none");
 		}
 		const sparse = {
