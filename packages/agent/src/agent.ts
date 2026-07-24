@@ -1064,7 +1064,7 @@ export class Agent {
 	/**
 	 * Continue from current context (used for retries and resuming queued messages).
 	 */
-	async continue() {
+	async continue(signal?: AbortSignal) {
 		if (this.#state.isStreaming) {
 			throw new AgentBusyError();
 		}
@@ -1077,12 +1077,12 @@ export class Agent {
 			// callers (AgentSession#scheduleQueuedMessageDrain) re-arm continue() on every
 			// microtask because hasQueuedMessages() never clears, spinning an unbounded
 			// allocation loop until OOM (issue #6344).
-			const queuedSteering = await this.#dequeueSteeringMessagesAfterHooks();
+			const queuedSteering = await this.#dequeueSteeringMessagesAfterHooks(signal);
 			if (queuedSteering.length > 0) {
 				await this.#runLoop(queuedSteering, { skipInitialSteeringPoll: true });
 				return;
 			}
-			const queuedFollowUp = await this.#dequeueFollowUpMessagesAfterHooks();
+			const queuedFollowUp = await this.#dequeueFollowUpMessagesAfterHooks(signal);
 			if (queuedFollowUp.length > 0) {
 				await this.#runLoop(queuedFollowUp);
 				return;
@@ -1090,13 +1090,13 @@ export class Agent {
 			throw new Error("No messages to continue from");
 		}
 		if (messages[messages.length - 1].role === "assistant") {
-			const queuedSteering = await this.#dequeueSteeringMessagesAfterHooks();
+			const queuedSteering = await this.#dequeueSteeringMessagesAfterHooks(signal);
 			if (queuedSteering.length > 0) {
 				await this.#runLoop(queuedSteering, { skipInitialSteeringPoll: true });
 				return;
 			}
 
-			const queuedFollowUp = await this.#dequeueFollowUpMessagesAfterHooks();
+			const queuedFollowUp = await this.#dequeueFollowUpMessagesAfterHooks(signal);
 			if (queuedFollowUp.length > 0) {
 				await this.#runLoop(queuedFollowUp);
 				return;

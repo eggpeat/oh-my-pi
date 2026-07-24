@@ -22,16 +22,20 @@ describe("Agent", () => {
 		const agent = new Agent({ streamFn: mock.stream });
 		agent.replaceMessages([createAssistantMessage([{ type: "text", text: "ready" }])]);
 		let calls = 0;
-		const hook = () => {
+		const signals: Array<AbortSignal | undefined> = [];
+		const hook = (signal?: AbortSignal) => {
 			calls++;
+			signals.push(signal);
 		};
 		const removeFirst = agent.addBeforeQueuedMessageDequeueHook(hook);
 		const removeSecond = agent.addBeforeQueuedMessageDequeueHook(hook);
 
+		const controller = new AbortController();
 		removeFirst();
 		agent.followUp({ role: "user", content: "first turn", timestamp: Date.now() });
-		await agent.continue();
+		await agent.continue(controller.signal);
 		expect(calls).toBe(1);
+		expect(signals).toEqual([controller.signal]);
 
 		removeSecond();
 		agent.followUp({ role: "user", content: "second turn", timestamp: Date.now() });

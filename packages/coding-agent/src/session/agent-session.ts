@@ -2844,7 +2844,7 @@ export class AgentSession {
 							return;
 						}
 					}
-					await this.agent.continue();
+					await this.agent.continue(signal);
 				} catch (error) {
 					logger.warn("agent.continue failed after scheduling", {
 						error: error instanceof Error ? error.message : String(error),
