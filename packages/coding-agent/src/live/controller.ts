@@ -4,7 +4,9 @@ import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionEvent } from "../session/agent-session-events";
-import { startStreamingRecording, type StreamingRecordingHandle } from "../stt/recorder";
+import { type StreamingRecordingHandle, startStreamingRecording } from "../stt/recorder";
+import agentFinalMessageTemplate from "./prompts/agent-final-message.md" with { type: "text" };
+import liveInstructionsTemplate from "./prompts/live-instructions.md" with { type: "text" };
 import {
 	buildDelegationContextAppend,
 	buildSessionClose,
@@ -12,8 +14,6 @@ import {
 	type LiveClientMessage,
 	type LiveServerEvent,
 } from "./protocol";
-import liveInstructionsTemplate from "./prompts/live-instructions.md" with { type: "text" };
-import agentFinalMessageTemplate from "./prompts/agent-final-message.md" with { type: "text" };
 import { CodexLiveTransport } from "./transport";
 import type { LivePhase, LiveTranscript } from "./visualizer";
 
@@ -124,7 +124,9 @@ export class LiveSessionController {
 	/** Connects the realtime surface and starts microphone streaming. */
 	async start(): Promise<void> {
 		if (this.#stopped) {
-			throw this.#failure ?? new Error("This live session has already stopped; create a new controller to reconnect.");
+			throw (
+				this.#failure ?? new Error("This live session has already stopped; create a new controller to reconnect.")
+			);
 		}
 		if (this.#started) return;
 		this.#started = true;
@@ -313,7 +315,7 @@ export class LiveSessionController {
 		if (!delegationId) return;
 		for (let index = messages.length - 1; index >= 0; index -= 1) {
 			const message = messages[index];
-			if (!message || message.role !== "assistant") continue;
+			if (message?.role !== "assistant") continue;
 			const text = this.#extractAssistantText(message).trim();
 			if (!text) continue;
 			const finalContext = prompt.render(agentFinalMessageTemplate, { message: text });

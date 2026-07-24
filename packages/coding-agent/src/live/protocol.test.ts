@@ -1,12 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
-	CONTEXT_CHUNK_BYTES,
-	LIVE_MODEL,
 	buildDelegationContextAppend,
 	buildLiveSessionPayload,
 	buildSessionClose,
 	buildSessionContextAppend,
+	CONTEXT_CHUNK_BYTES,
 	chunkLiveContext,
+	LIVE_MODEL,
 	parseLiveServerEvent,
 } from "./protocol";
 
@@ -43,12 +43,14 @@ describe("Frameless Bidi server events", () => {
 	});
 
 	test("parses input and output transcript deltas", () => {
-		expect(
-			parseLiveServerEvent({ type: "input_transcript.added", item: { text: "What changed?" } }),
-		).toEqual({ type: "input_transcript.added", item: { text: "What changed?" } });
-		expect(
-			parseLiveServerEvent({ type: "output_transcript.added", item: { text: "I will inspect it." } }),
-		).toEqual({ type: "output_transcript.added", item: { text: "I will inspect it." } });
+		expect(parseLiveServerEvent({ type: "input_transcript.added", item: { text: "What changed?" } })).toEqual({
+			type: "input_transcript.added",
+			item: { text: "What changed?" },
+		});
+		expect(parseLiveServerEvent({ type: "output_transcript.added", item: { text: "I will inspect it." } })).toEqual({
+			type: "output_transcript.added",
+			item: { text: "I will inspect it." },
+		});
 	});
 
 	test("parses completed user and assistant turns", () => {
@@ -75,12 +77,10 @@ describe("Frameless Bidi server events", () => {
 			type: "error",
 			message: "call expired",
 		});
-		expect(parseLiveServerEvent({ type: "error", error: { message: "media rejected", code: "bad_media" } })).toEqual(
-			{
-				type: "error",
-				message: "media rejected",
-			},
-		);
+		expect(parseLiveServerEvent({ type: "error", error: { message: "media rejected", code: "bad_media" } })).toEqual({
+			type: "error",
+			message: "media rejected",
+		});
 	});
 
 	test("classifies unsupported events and rejects malformed known events", () => {

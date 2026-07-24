@@ -1,9 +1,4 @@
-import {
-	type AuthStorage,
-	isAuthRetryableError,
-	type OAuthAccess,
-	withOAuthAccess,
-} from "@oh-my-pi/pi-ai";
+import { type AuthStorage, isAuthRetryableError, type OAuthAccess, withOAuthAccess } from "@oh-my-pi/pi-ai";
 import { getProxyForProvider, wrapFetchForProxy } from "@oh-my-pi/pi-ai/utils/proxy";
 import {
 	CODEX_BASE_URL,
@@ -19,8 +14,8 @@ import browserRuntimeSource from "./browser-runtime.txt" with { type: "text" };
 import {
 	buildLiveSessionPayload,
 	type LiveClientMessage,
-	parseLiveServerEvent,
 	type LiveServerEvent,
+	parseLiveServerEvent,
 } from "./protocol";
 
 const SIGNALING_URL = `${CODEX_BASE_URL}/codex/realtime/calls?intent=quicksilver&architecture=avas`;
@@ -117,7 +112,6 @@ function liveSessionHeaders(access: OAuthAccess, sessionId: string): Record<stri
 	return headers;
 }
 
-
 function boundedErrorBody(body: string, statusText: string): string {
 	const normalized = body.trim().replaceAll(/\s+/g, " ");
 	if (!normalized) return statusText || "empty response body";
@@ -167,7 +161,8 @@ export class CodexLiveTransport {
 	connect(): Promise<void> {
 		if (this.#state === "connected") return Promise.resolve();
 		if (this.#connectPromise) return this.#connectPromise;
-		if (this.#state === "closing" || this.#state === "closed") return Promise.reject(new Error("Live transport is closed"));
+		if (this.#state === "closing" || this.#state === "closed")
+			return Promise.reject(new Error("Live transport is closed"));
 		if (this.#options.signal?.aborted) return Promise.reject(abortReason(this.#options.signal));
 		this.#state = "connecting";
 		const operation = this.#connect().catch(async error => {
@@ -387,10 +382,7 @@ export class CodexLiveTransport {
 	}
 
 	#reportFailure(message: string): void {
-		if (
-			(this.#state !== "connecting" && this.#state !== "connected") ||
-			this.#unexpectedFailureReported
-		) {
+		if ((this.#state !== "connecting" && this.#state !== "connected") || this.#unexpectedFailureReported) {
 			return;
 		}
 		this.#unexpectedFailureReported = true;
@@ -416,7 +408,8 @@ export class CodexLiveTransport {
 	/** Queue 16 kHz mono Float32 PCM for continuous browser-side resampling and playback. */
 	pushAudio(samples: Float32Array): void {
 		if (this.#state !== "connected" || this.#muted || samples.length === 0) return;
-		const retained = samples.length > MAX_HOST_AUDIO_SAMPLES ? samples.subarray(samples.length - MAX_HOST_AUDIO_SAMPLES) : samples;
+		const retained =
+			samples.length > MAX_HOST_AUDIO_SAMPLES ? samples.subarray(samples.length - MAX_HOST_AUDIO_SAMPLES) : samples;
 		const queued = { payload: encodePcm(retained), sampleCount: retained.length };
 		this.#audioQueue.push(queued);
 		this.#queuedAudioSamples += queued.sampleCount;

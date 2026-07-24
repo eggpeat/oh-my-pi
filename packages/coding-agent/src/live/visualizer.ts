@@ -1,6 +1,6 @@
-import { type Component, truncateToWidth, visibleWidth, matchesKey } from "@oh-my-pi/pi-tui";
-import { theme, type ThemeColor } from "../modes/theme/theme";
+import { type Component, matchesKey, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
+import { type ThemeColor, theme } from "../modes/theme/theme";
 
 /** Distinct states of a realtime call connection. */
 export type LivePhase = "connecting" | "listening" | "working" | "speaking" | "muted" | "error";
@@ -128,7 +128,7 @@ export class LiveVisualizer implements Component {
 		const w = Math.max(2, Math.min(maxWidth, 120));
 		const innerW = w - 2;
 
-		const topBorder = theme.fg("border", "┌" + "─".repeat(innerW) + (w > 1 ? "┐" : ""));
+		const topBorder = theme.fg("border", `┌${"─".repeat(innerW)}${w > 1 ? "┐" : ""}`);
 
 		const maxWaveW = Math.min(40, Math.max(0, w - 4));
 		const sideW = Math.max(0, Math.floor((maxWaveW - 3) / 2));
@@ -139,12 +139,20 @@ export class LiveVisualizer implements Component {
 		const inColor: ThemeColor = this.#phase === "muted" ? "dim" : "success";
 		const outColor: ThemeColor = this.#phase === "error" ? "error" : "accent";
 
-		const waveContent = truncateToWidth(theme.fg(inColor, inWave) + theme.fg("dim", " │ ") + theme.fg(outColor, outWave), innerW);
+		const waveContent = truncateToWidth(
+			theme.fg(inColor, inWave) + theme.fg("dim", " │ ") + theme.fg(outColor, outWave),
+			innerW,
+		);
 		const waveLen = visibleWidth(waveContent);
 
 		const wavePadL = Math.floor((innerW - waveLen) / 2);
 		const wavePadR = innerW - waveLen - wavePadL;
-		const row1 = theme.fg("border", "│") + " ".repeat(Math.max(0, wavePadL)) + waveContent + " ".repeat(Math.max(0, wavePadR)) + (w > 1 ? theme.fg("border", "│") : "");
+		const row1 =
+			theme.fg("border", "│") +
+			" ".repeat(Math.max(0, wavePadL)) +
+			waveContent +
+			" ".repeat(Math.max(0, wavePadR)) +
+			(w > 1 ? theme.fg("border", "│") : "");
 
 		const phaseColors: Record<LivePhase, ThemeColor> = {
 			connecting: "dim",
@@ -177,7 +185,12 @@ export class LiveVisualizer implements Component {
 		const pLen = visibleWidth(coloredPhase);
 		const pPadL = Math.floor((innerW - pLen) / 2);
 		const pPadR = innerW - pLen - pPadL;
-		const row2 = theme.fg("border", "│") + " ".repeat(Math.max(0, pPadL)) + coloredPhase + " ".repeat(Math.max(0, pPadR)) + (w > 1 ? theme.fg("border", "│") : "");
+		const row2 =
+			theme.fg("border", "│") +
+			" ".repeat(Math.max(0, pPadL)) +
+			coloredPhase +
+			" ".repeat(Math.max(0, pPadR)) +
+			(w > 1 ? theme.fg("border", "│") : "");
 
 		const row3 = theme.fg("border", "│") + " ".repeat(Math.max(0, innerW)) + (w > 1 ? theme.fg("border", "│") : "");
 
@@ -187,7 +200,7 @@ export class LiveVisualizer implements Component {
 			const roleStr = this.#transcript.role === "user" ? "User: " : "Assistant: ";
 			transcriptText = theme.fg("dim", roleStr + cleanText);
 		}
-		const row4Content = truncateToWidth("  " + transcriptText, Math.max(0, innerW - 2)) || "";
+		const row4Content = truncateToWidth(`  ${transcriptText}`, Math.max(0, innerW - 2)) || "";
 		const r4Pad = Math.max(0, innerW - visibleWidth(row4Content));
 		const row4 = theme.fg("border", "│") + row4Content + " ".repeat(r4Pad) + (w > 1 ? theme.fg("border", "│") : "");
 
@@ -195,9 +208,12 @@ export class LiveVisualizer implements Component {
 		const dashCount = Math.max(0, innerW - visibleWidth(footerContent));
 		let bottomBorder: string;
 		if (innerW >= visibleWidth(footerContent) + 2) {
-			bottomBorder = theme.fg("border", "└─") + theme.fg("dim", footerContent) + theme.fg("border", "─".repeat(dashCount - 2) + (w > 1 ? "┘" : ""));
+			bottomBorder =
+				theme.fg("border", "└─") +
+				theme.fg("dim", footerContent) +
+				theme.fg("border", "─".repeat(dashCount - 2) + (w > 1 ? "┘" : ""));
 		} else {
-			bottomBorder = theme.fg("border", "└" + "─".repeat(Math.max(0, innerW)) + (w > 1 ? "┘" : ""));
+			bottomBorder = theme.fg("border", `└${"─".repeat(Math.max(0, innerW))}${w > 1 ? "┘" : ""}`);
 		}
 
 		return [topBorder, row1, row2, row3, row4, bottomBorder];
