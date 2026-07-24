@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed stateful OpenAI Responses explicit cache breakpoints being restored onto edited historical messages, ensuring full replays recompute the latest stable cache boundary.
+
 ## [17.1.0] - 2026-07-24
 
 ### Added
