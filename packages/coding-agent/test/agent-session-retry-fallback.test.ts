@@ -315,11 +315,14 @@ describe("AgentSession retry fallback", () => {
 		session.setUsageFallbackConfirmer(confirmFallback);
 		await session.prompt("Keep working on the same task");
 		await session.waitForIdle();
-		expect(confirmFallback).toHaveBeenCalledWith({
-			from: `${primaryModel.provider}/${primaryModel.id}`,
-			to: `${fallbackModel.provider}/${fallbackModel.id}`,
-			remainingPercent: 2,
-		});
+		expect(confirmFallback).toHaveBeenCalledWith(
+			{
+				from: `${primaryModel.provider}/${primaryModel.id}`,
+				to: `${fallbackModel.provider}/${fallbackModel.id}`,
+				remainingPercent: 2,
+			},
+			expect.any(AbortSignal),
+		);
 		expect(requestedModels).toEqual([`${fallbackModel.provider}/${fallbackModel.id}`]);
 		expect(session.messages.some(message => message.role === "user")).toBe(true);
 	});
