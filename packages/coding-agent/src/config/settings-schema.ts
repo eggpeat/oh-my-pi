@@ -4095,6 +4095,40 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"tools.xdevDocs": {
+		type: "enum",
+		values: ["inline", "builtins", "catalog"] as const,
+		default: "builtins",
+		ui: {
+			tab: "tools",
+			group: "Discovery & MCP",
+			label: "xd:// Prompt Docs",
+			description:
+				"Choose which mounted-device docs and schemas are inlined in the system prompt. Built-ins keeps core tools inline while MCP and extension tools stay on-demand.",
+			options: [
+				{ value: "inline", label: "All Devices", description: "Inline docs and schemas for every mounted device." },
+				{
+					value: "builtins",
+					label: "Built-ins Only",
+					description: "Inline built-in docs; fetch MCP and extension docs on demand.",
+				},
+				{ value: "catalog", label: "Catalog Only", description: "List every device; fetch all docs on demand." },
+			],
+		},
+	},
+
+	"tools.xdevInlineDevices": {
+		type: "array",
+		default: EMPTY_STRING_ARRAY,
+		ui: {
+			tab: "tools",
+			group: "Discovery & MCP",
+			label: "xd:// Inline Devices",
+			description:
+				"When xd:// Prompt Docs is Built-ins Only, inline dynamic devices whose names match these glob patterns (for example mcp__context_mode_*). Catalog Only ignores this setting.",
+		},
+	},
+
 	// MCP
 	"mcp.enableProjectConfig": {
 		type: "boolean",
@@ -4343,7 +4377,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Subagents",
 			label: "Batch Task Calls",
 			description:
-				"Switch the task tool to its batch shape: one call carries { agent, context, tasks[] } — one subagent per item (with per-item isolation) and a required shared context prepended to every assignment. With async.enabled=true, each spawn runs as an independent background agent with the normal idle/parked lifecycle; otherwise the call blocks for merged results. Disable to restore the flat single-spawn schema.",
+				"Switch the task tool to its batch shape: one call carries { context, tasks[] } — one subagent per item, with an optional per-item agent (defaulting to the session spawn-policy agent), per-item isolation, and a required shared context prepended to every assignment. With async.enabled=true, each spawn runs as an independent background agent with the normal idle/parked lifecycle; otherwise the call blocks for merged results. Disable to restore the flat single-spawn schema.",
 		},
 	},
 

@@ -74,7 +74,7 @@ export interface PlanYolo {
 	thinkingLevel?: ConfiguredThinkingLevel;
 }
 
-/** Interactive decision requested before crossing a usage-reserve model boundary. */
+/** Details shown when confirming a usage-reserve-triggered model fallback. */
 export interface UsageFallbackConfirmation {
 	from: string;
 	to: string;

@@ -23,11 +23,7 @@ import { isFireworksFastModelId, toFireworksBaseModelId } from "@oh-my-pi/pi-cat
 import { extractRetryHint, logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelStringWithRouting, resolveModelOverride } from "../config/model-resolver";
-import {
-	findRetryFallbackCandidates as findConfiguredRetryFallbackCandidates,
-	type RetryFallbackResolutionContext,
-	resolveRetryFallbackChainKey,
-} from "../config/retry-fallback";
+
 import type { Settings } from "../config/settings";
 import type { RecoveredRetryError } from "../extensibility/shared-events";
 import emptyStopRetryTemplate from "../prompts/system/empty-stop-retry.md" with { type: "text" };
@@ -40,13 +36,16 @@ import { isEmptyErrorTurn } from "./messages";
 import {
 	type ActiveRetryFallbackState,
 	calculateRetryBackoffDelayMs,
+	findRetryFallbackCandidates,
 	formatRetryFallbackSelector,
 	getRetryFallbackChains,
 	getRetryFallbackRevertPolicy,
 	parseRetryFallbackSelector,
 	type RetryFallbackChains,
+	type RetryFallbackResolutionContext,
 	type RetryFallbackRevertPolicy,
 	type RetryFallbackSelector,
+	resolveRetryFallbackChainKey,
 	validateRetryFallbackChains,
 } from "./retry-fallback-chains";
 import { getLatestCompactionEntry } from "./session-context";
@@ -921,6 +920,13 @@ export class TurnRecovery {
 		return stopType === "refusal" || stopType === "sensitive";
 	}
 
+	#getRetryFallbackResolutionContext(): RetryFallbackResolutionContext {
+		return {
+			chains: this.#getRetryFallbackChains(),
+			getModelRole: role => this.#host.settings.getModelRole(role),
+			modelLookup: this.#host.modelRegistry,
+		};
+	}
 	#getRetryFallbackChains(): RetryFallbackChains {
 		return getRetryFallbackChains(this.#host.settings);
 	}
@@ -966,15 +972,7 @@ export class TurnRecovery {
 		currentSelector: string,
 		currentModel: Model | null | undefined = this.#host.model(),
 	): string | undefined {
-		return resolveRetryFallbackChainKey(this.#retryFallbackResolutionContext(), currentSelector, currentModel);
-	}
-
-	#retryFallbackResolutionContext(): RetryFallbackResolutionContext {
-		return {
-			chains: this.#getRetryFallbackChains(),
-			getModelRole: role => this.#host.settings.getModelRole(role),
-			modelLookup: this.#host.modelRegistry,
-		};
+		return resolveRetryFallbackChainKey(this.#getRetryFallbackResolutionContext(), currentSelector, currentModel);
 	}
 
 	/** Finds fallback candidates that follow the active selector. */
@@ -983,8 +981,8 @@ export class TurnRecovery {
 		currentSelector: string,
 		currentModel: Model | null | undefined = this.#host.model(),
 	): RetryFallbackSelector[] {
-		return findConfiguredRetryFallbackCandidates(
-			this.#retryFallbackResolutionContext(),
+		return findRetryFallbackCandidates(
+			this.#getRetryFallbackResolutionContext(),
 			role,
 			currentSelector,
 			currentModel,
@@ -1132,7 +1130,7 @@ export class TurnRecovery {
 			return;
 		}
 		this.#usageReserveApprovedSelector = undefined;
-		await this.#applyRetryFallbackCandidate(role, fallback.selector, currentSelector, {
+		await this.applyRetryFallbackCandidate(role, fallback.selector, currentSelector, {
 			pinFallback: true,
 			apiKey: fallback.apiKey,
 			signal,
@@ -1155,7 +1153,7 @@ export class TurnRecovery {
 		}
 	}
 
-	async #applyRetryFallbackCandidate(
+	async applyRetryFallbackCandidate(
 		role: string,
 		selector: RetryFallbackSelector,
 		currentSelector: string,
@@ -1214,7 +1212,7 @@ export class TurnRecovery {
 			if (!candidate) continue;
 			const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
 			if (!apiKey) continue;
-			await this.#applyRetryFallbackCandidate(role, selector, currentSelector, options);
+			await this.applyRetryFallbackCandidate(role, selector, currentSelector, options);
 			return true;
 		}
 

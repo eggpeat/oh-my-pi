@@ -297,6 +297,7 @@ describe("AgentSession retry fallback", () => {
 							{
 								credentialId: 2,
 								credentialType: "oauth",
+								selected: true,
 								state: "reserve",
 								remainingFraction: 0.02,
 							},
@@ -377,7 +378,6 @@ describe("AgentSession retry fallback", () => {
 		expect(confirmFallback).toHaveBeenCalledTimes(1);
 		expect(usageHealth).toHaveBeenCalledTimes(3);
 	});
-
 	it("reselects a healthy same-provider account before considering a model fallback", async () => {
 		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
@@ -860,6 +860,73 @@ describe("AgentSession retry fallback", () => {
 		expect(usageHealth).toHaveBeenCalledTimes(2);
 		expect(requestedModels).toEqual([`${primaryModel.provider}/${primaryModel.id}`]);
 		expect(session.model?.id).toBe(primaryModel.id);
+	});
+
+	it("rechecks fail-closed usage health before an internally scheduled continuation", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primaryModel) throw new Error("Expected bundled scheduled continuation model");
+		const requestedModels: string[] = [];
+		let useReserve = false;
+		const mock = createMockModel({
+			responses: [
+				async () => {
+					useReserve = true;
+					return { content: [], stopReason: "stop" };
+				},
+				{ content: ["must not run"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primaryModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.usageAwareFallback": true,
+			"retry.usageReservePolicy": "fail-closed",
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		const usageHealth = vi.spyOn(modelRegistry.authStorage, "getModelUsageHealth").mockImplementation(async () =>
+			useReserve
+				? {
+						state: "reserve",
+						accounts: [
+							{
+								credentialId: 1,
+								credentialType: "oauth",
+								state: "reserve",
+								remainingFraction: 0.05,
+							},
+						],
+					}
+				: {
+						state: "healthy",
+						accounts: [
+							{
+								credentialId: 1,
+								credentialType: "oauth",
+								state: "healthy",
+								remainingFraction: 0.8,
+							},
+						],
+					},
+		);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		await session.prompt("Retry this empty response");
+		await session.waitForIdle();
+
+		expect(usageHealth).toHaveBeenCalledTimes(2);
+		expect(requestedModels).toEqual([`${primaryModel.provider}/${primaryModel.id}`]);
 	});
 
 	it("continues a startup-owned role fallback chain from the active fallback", async () => {

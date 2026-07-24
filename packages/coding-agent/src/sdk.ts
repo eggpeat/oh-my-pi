@@ -57,12 +57,6 @@ import {
 } from "./config/model-resolver";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
 import { applyProviderGlobalsFromSettings } from "./config/provider-globals";
-import {
-	expandDefaultRetryFallbackChains,
-	findRetryFallbackCandidates,
-	type RetryFallbackResolutionContext,
-	resolveRetryFallbackChainKey,
-} from "./config/retry-fallback";
 import { buildServiceTierByFamily } from "./config/service-tier";
 import { Settings, type SkillsSettings } from "./config/settings";
 import { CursorExecHandlers } from "./cursor";
@@ -143,6 +137,12 @@ import {
 	wrapSteeringForModel,
 } from "./session/messages";
 import { clampProviderContextImages } from "./session/provider-image-budget";
+import {
+	expandDefaultRetryFallbackChains,
+	findRetryFallbackCandidates,
+	type RetryFallbackResolutionContext,
+	resolveRetryFallbackChainKey,
+} from "./session/retry-fallback-chains";
 import { getRestorableSessionModels } from "./session/session-context";
 import { SessionManager } from "./session/session-manager";
 import { createSettingsAwareStreamFn } from "./session/settings-stream-fn";
@@ -2684,7 +2684,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				cwd,
 				additionalWorkspaceRoots: sessionManager.getAdditionalDirectories(),
 				xdevTools: toolSession.xdevRegistry?.entries() ?? [],
-				xdevDocs: toolSession.xdevRegistry?.docsAll() ?? "",
+				xdevDocs:
+					toolSession.xdevRegistry?.docsAll(
+						settings.get("tools.xdevDocs"),
+						settings.get("tools.xdevInlineDevices"),
+					) ?? "",
 				autoQaEnabled: !restrictToolNames && isAutoQaEnabled(settings),
 				resolvedCustomPrompt: options.customSystemPrompt,
 				skills: session?.skills ?? skills,

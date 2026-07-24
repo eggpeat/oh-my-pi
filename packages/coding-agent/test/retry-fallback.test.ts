@@ -5,7 +5,7 @@ import {
 	findRetryFallbackCandidates,
 	type RetryFallbackResolutionContext,
 	resolveRetryFallbackChainKey,
-} from "@oh-my-pi/pi-coding-agent/config/retry-fallback";
+} from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
 
 function createContext(
 	chains: RetryFallbackResolutionContext["chains"],

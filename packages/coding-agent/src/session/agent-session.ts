@@ -1416,6 +1416,7 @@ export class AgentSession {
 			finishBashSessionTransition: (transition, success) => this.#bash.finishSessionTransition(transition, success),
 			cancelOwnAsyncJobs: () => this.#cancelOwnAsyncJobs(),
 			clearCheckpointRuntimeState: () => this.#clearCheckpointRuntimeState(),
+			clearSessionScopedToolState: () => this.#clearSessionScopedToolState(),
 			clearFreshProviderSessionId: () => {
 				this.#freshProviderSessionId = undefined;
 			},
@@ -2834,17 +2835,11 @@ export class AgentSession {
 				this.#beginInFlight();
 				try {
 					await this.#recovery.maybeRestoreRetryFallbackPrimary();
-					if (this.settings.get("retry.usageAwareFallback")) {
-						this.#usagePreflightPendingForQueuedTurn = false;
-						if (!(await this.#runUsageAwarePreflight(signal))) {
-							this.#skipAgentContinue("session-unavailable", options);
-							return;
-						}
-					}
 					if (signal.aborted || this.#isDisposed) {
 						this.#skipAgentContinue("post-restore-unavailable", options);
 						return;
 					}
+					this.#markUsagePreflightForQueuedTurn();
 					await this.agent.continue();
 				} catch (error) {
 					logger.warn("agent.continue failed after scheduling", {
@@ -3607,7 +3602,7 @@ export class AgentSession {
 	}
 
 	#markUsagePreflightForQueuedTurn(): void {
-		if (this.isStreaming && this.settings.get("retry.usageAwareFallback")) {
+		if (this.settings.get("retry.usageAwareFallback")) {
 			this.#usagePreflightPendingForQueuedTurn = true;
 		}
 	}
@@ -4089,6 +4084,12 @@ export class AgentSession {
 		this.#rewoundToolResultIds.clear();
 	}
 
+	/** Drop mutable tool decisions and directives owned by the previous logical session. */
+	#clearSessionScopedToolState(): void {
+		this.#toolChoiceQueue.clear();
+		this.#tools.clearAcpPermissionDecisions();
+	}
+
 	/**
 	 * Rebuild checkpoint/rewind runtime state from the current branch. Handles two
 	 * cases surfaced by session resume, `switchSession()` reloading the same file,
@@ -4272,8 +4273,6 @@ export class AgentSession {
 		const content = prompt.render(planModeReferencePrompt, {
 			planFilePath,
 		});
-
-		this.#planReferenceSent = true;
 
 		return {
 			role: "custom",
@@ -4513,6 +4512,7 @@ export class AgentSession {
 		if (this.isStreaming) {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) throw new AgentBusyError();
+
 			// Steer/follow-up the keyword notices BEFORE the queued user message so the
 			// model reads the steering notice ahead of the prompt it modifies.
 			for (const notice of keywordNotices) {
@@ -4607,6 +4607,7 @@ export class AgentSession {
 		if (options?.queueOnly) {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) throw new AgentBusyError();
+
 			for (const notice of keywordNotices) {
 				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
@@ -4616,6 +4617,7 @@ export class AgentSession {
 		if (this.isStreaming) {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) throw new AgentBusyError();
+
 			for (const notice of keywordNotices) {
 				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
@@ -4837,6 +4839,17 @@ export class AgentSession {
 				nonMessageTokens,
 				cutoffCount: this.messages.length + messages.length,
 			});
+			// Commit the plan-reference delivery flag only now that the message is
+			// actually handed to agent.prompt. Every pre-send setup step above can
+			// return (generation-bail) or throw (@-mention reads, before_agent_start
+			// hooks, pre-prompt compaction) before this point; setting the flag at
+			// construction time (#buildPlanReferenceMessage) stranded it `true` with
+			// nothing delivered, so the retry skipped re-injection and the executor
+			// lost the approved plan (issue #4094). The compaction-success resets
+			// (issue #1246) still clear it for re-injection on the next turn.
+			if (planReferenceMessage) {
+				this.#planReferenceSent = true;
+			}
 			try {
 				await this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions);
 			} finally {
@@ -5760,6 +5773,7 @@ export class AgentSession {
 			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 		}
 
+		this.#clearSessionScopedToolState();
 		this.#clearCheckpointRuntimeState();
 		this.setTodoPhases([]);
 		this.#freshProviderSessionId = undefined;
@@ -6883,6 +6897,9 @@ export class AgentSession {
 			if (switchingToDifferentSession) {
 				await this.#memory.resetContextForNewTranscript();
 			}
+			if (switchingToDifferentSession) {
+				this.#clearSessionScopedToolState();
+			}
 			this.#reconnectToAgent();
 			try {
 				await this.#sessionSwitchReconciler?.();
@@ -7007,6 +7024,7 @@ export class AgentSession {
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 		}
+		this.#clearSessionScopedToolState();
 		this.#rehydrateCheckpointRewindState();
 		this.#todo.syncFromBranch();
 		this.#freshProviderSessionId = undefined;
@@ -7104,6 +7122,8 @@ export class AgentSession {
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 		}
+
+		this.#clearSessionScopedToolState();
 
 		this.#rehydrateCheckpointRewindState();
 		this.sessionManager.appendMessage({
