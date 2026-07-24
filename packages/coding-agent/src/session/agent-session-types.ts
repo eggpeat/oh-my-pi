@@ -81,6 +81,8 @@ export interface UsageFallbackConfirmation {
 	remainingPercent: number | undefined;
 }
 
+export type UsageFallbackConfirmer = (confirmation: UsageFallbackConfirmation, signal: AbortSignal) => Promise<boolean>;
+
 /** Identifies a retry fallback chain already entered during startup model resolution. */
 export interface InitialRetryFallbackState {
 	/** Role whose configured primary was unavailable. */

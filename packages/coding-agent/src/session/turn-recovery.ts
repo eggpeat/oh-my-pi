@@ -31,7 +31,11 @@ import thinkingLoopRedirectTemplate from "../prompts/system/thinking-loop-redire
 import unexpectedStopRetryTemplate from "../prompts/system/unexpected-stop-retry.md" with { type: "text" };
 import type { ConfiguredThinkingLevel } from "../thinking";
 import type { AgentSessionEvent } from "./agent-session-events";
-import type { InitialRetryFallbackState, UsageFallbackConfirmation } from "./agent-session-types";
+import type {
+	InitialRetryFallbackState,
+	UsageFallbackConfirmation,
+	UsageFallbackConfirmer,
+} from "./agent-session-types";
 import { isEmptyErrorTurn } from "./messages";
 import {
 	type ActiveRetryFallbackState,
@@ -281,10 +285,7 @@ export class TurnRecovery {
 	}
 
 	/** Applies model fallback policy from live usage health before a turn starts. */
-	maybeApplyUsageAwareFallback(
-		signal: AbortSignal,
-		confirmer?: (confirmation: UsageFallbackConfirmation) => Promise<boolean>,
-	): Promise<void> {
+	maybeApplyUsageAwareFallback(signal: AbortSignal, confirmer?: UsageFallbackConfirmer): Promise<void> {
 		return this.#maybeApplyUsageAwareFallback(signal, confirmer);
 	}
 
@@ -989,10 +990,7 @@ export class TurnRecovery {
 		);
 	}
 
-	async #maybeApplyUsageAwareFallback(
-		signal: AbortSignal,
-		confirmer?: (confirmation: UsageFallbackConfirmation) => Promise<boolean>,
-	): Promise<void> {
+	async #maybeApplyUsageAwareFallback(signal: AbortSignal, confirmer?: UsageFallbackConfirmer): Promise<void> {
 		if (!this.#host.settings.get("retry.usageAwareFallback")) return;
 		const currentModel = this.#host.model();
 		if (!currentModel) return;
@@ -1138,7 +1136,7 @@ export class TurnRecovery {
 	}
 
 	async #confirmUsageFallback(
-		confirmer: (confirmation: UsageFallbackConfirmation) => Promise<boolean>,
+		confirmer: UsageFallbackConfirmer,
 		confirmation: UsageFallbackConfirmation,
 		signal: AbortSignal,
 	): Promise<boolean> {
@@ -1147,7 +1145,7 @@ export class TurnRecovery {
 		const onAbort = () => aborted.resolve(false);
 		signal.addEventListener("abort", onAbort, { once: true });
 		try {
-			return await Promise.race([confirmer(confirmation), aborted.promise]);
+			return await Promise.race([confirmer(confirmation, signal), aborted.promise]);
 		} finally {
 			signal.removeEventListener("abort", onAbort);
 		}

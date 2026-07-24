@@ -584,20 +584,23 @@ describe("AgentSession retry fallback", () => {
 		);
 		const confirmationStarted = Promise.withResolvers<void>();
 		const pendingConfirmation = Promise.withResolvers<boolean>();
+		const confirmationAborted = Promise.withResolvers<void>();
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
 		});
-		session.setUsageFallbackConfirmer(async () => {
+		session.setUsageFallbackConfirmer(async (_confirmation, signal) => {
 			confirmationStarted.resolve();
+			signal.addEventListener("abort", () => confirmationAborted.resolve(), { once: true });
 			return pendingConfirmation.promise;
 		});
 
 		const prompt = session.prompt("Do not send after confirmation cancellation");
 		await confirmationStarted.promise;
 		await session.abort();
+		await confirmationAborted.promise;
 		await prompt;
 
 		expect(requestedModels).toEqual([]);

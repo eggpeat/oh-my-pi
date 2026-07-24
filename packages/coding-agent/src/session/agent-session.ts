@@ -217,7 +217,7 @@ import type {
 	RoleModelCycleResult,
 	SessionHandoffOptions,
 	SessionStats,
-	UsageFallbackConfirmation,
+	UsageFallbackConfirmer,
 } from "./agent-session-types";
 import {
 	ASYNC_INLINE_RESULT_MAX_CHARS,
@@ -554,7 +554,7 @@ export class AgentSession {
 
 	// Model registry for API key resolution
 	#modelRegistry: ModelRegistry;
-	#usageFallbackConfirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined;
+	#usageFallbackConfirmer: UsageFallbackConfirmer | undefined;
 	#usagePreflightAbortControllers = new Set<AbortController>();
 	#queuedMessageDrainBlocked = false;
 	#detachUsageBeforeModelCall: (() => void) | undefined;
@@ -3599,9 +3599,7 @@ export class AgentSession {
 	}
 
 	/** Install the interactive decision surface for reserve-triggered model changes. */
-	setUsageFallbackConfirmer(
-		confirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined,
-	): void {
+	setUsageFallbackConfirmer(confirmer: UsageFallbackConfirmer | undefined): void {
 		this.#usageFallbackConfirmer = confirmer;
 	}
 
