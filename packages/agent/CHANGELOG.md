@@ -4,7 +4,8 @@
 
 ### Added
 
-- Added signal-aware, independently removable `Agent.addBeforeModelCallHook()` registrations for session policies that must run after queued messages are injected but before the next model is resolved.
+- Added signal-aware, independently removable `Agent.addBeforeQueuedMessageDequeueHook()` registrations for session policies that must run before queued messages are consumed.
+
 ## [17.1.0] - 2026-07-24
 
 ### Added

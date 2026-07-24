@@ -556,7 +556,7 @@ export class AgentSession {
 	#modelRegistry: ModelRegistry;
 	#usageFallbackConfirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined;
 	#usagePreflightAbortControllers = new Set<AbortController>();
-	#usagePreflightPendingForQueuedTurn = false;
+	#queuedMessageDrainBlocked = false;
 	#detachUsageBeforeModelCall: (() => void) | undefined;
 
 	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
@@ -747,10 +747,10 @@ export class AgentSession {
 			!this.#canAutoContinueForFollowUp()
 				? [...this.agent.peekFollowUpQueue()]
 				: [];
-		const parkedUsagePreflight = parkedFollowUps.length > 0 && this.#usagePreflightPendingForQueuedTurn;
+		const parkedQueueDrainBlocked = parkedFollowUps.length > 0 && this.#queuedMessageDrainBlocked;
 		if (parkedFollowUps.length > 0) {
 			this.agent.replaceQueues([...this.agent.peekSteeringQueue()], []);
-			if (parkedUsagePreflight) this.#usagePreflightPendingForQueuedTurn = false;
+			if (parkedQueueDrainBlocked) this.#queuedMessageDrainBlocked = false;
 		}
 		this.#resetPromptMaintenanceState();
 		this.#beginInFlight();
@@ -765,7 +765,7 @@ export class AgentSession {
 						[...this.agent.peekSteeringQueue()],
 						[...parkedFollowUps, ...this.agent.peekFollowUpQueue()],
 					);
-					this.#usagePreflightPendingForQueuedTurn ||= parkedUsagePreflight;
+					this.#queuedMessageDrainBlocked ||= parkedQueueDrainBlocked;
 				}
 				this.#endInFlight();
 			});
@@ -785,7 +785,7 @@ export class AgentSession {
 			steering.filter(m => !isAdvisorCard(m)),
 			followUp.filter(m => !isAdvisorCard(m)),
 		);
-		this.#reconcileUsagePreflightQueuedTurn();
+		this.#reconcileQueuedMessageDrain();
 		return cards;
 	}
 
@@ -996,10 +996,9 @@ export class AgentSession {
 			withBashBranchTransition: operation => this.#bash.withBranchTransition(operation),
 		};
 		this.#recovery = new TurnRecovery(recoveryHost, { initialRetryFallback: config.initialRetryFallback });
-		this.#detachUsageBeforeModelCall = this.agent.addBeforeModelCallHook(async (_context, signal) => {
-			if (!this.#usagePreflightPendingForQueuedTurn) return;
-			this.#usagePreflightPendingForQueuedTurn = false;
-			if (!(await this.#runUsageAwarePreflight(signal))) {
+		this.#detachUsageBeforeModelCall = this.agent.addBeforeQueuedMessageDequeueHook(async signal => {
+			if (!this.settings.get("retry.usageAwareFallback")) return;
+			if (!(await this.#runQueuedUsageAwarePreflight(signal))) {
 				signal?.throwIfAborted();
 				throw new DOMException("Usage preflight cancelled", "AbortError");
 			}
@@ -2839,7 +2838,12 @@ export class AgentSession {
 						this.#skipAgentContinue("post-restore-unavailable", options);
 						return;
 					}
-					this.#markUsagePreflightForQueuedTurn();
+					if (this.settings.get("retry.usageAwareFallback")) {
+						if (!(await this.#runQueuedUsageAwarePreflight(signal))) {
+							this.#skipAgentContinue("session-unavailable", options);
+							return;
+						}
+					}
 					await this.agent.continue();
 				} catch (error) {
 					logger.warn("agent.continue failed after scheduling", {
@@ -3384,7 +3388,7 @@ export class AgentSession {
 	 */
 	beginDispose(): void {
 		this.#isDisposed = true;
-		this.#usagePreflightPendingForQueuedTurn = false;
+		this.#queuedMessageDrainBlocked = false;
 		this.#detachUsageBeforeModelCall?.();
 		this.#detachUsageBeforeModelCall = undefined;
 		this.#memory.cancelLocalMemoryStartup();
@@ -3601,15 +3605,24 @@ export class AgentSession {
 		this.#usageFallbackConfirmer = confirmer;
 	}
 
-	#markUsagePreflightForQueuedTurn(): void {
-		if (this.settings.get("retry.usageAwareFallback")) {
-			this.#usagePreflightPendingForQueuedTurn = true;
+	#allowQueuedMessageDrainRetry(): void {
+		this.#queuedMessageDrainBlocked = false;
+	}
+
+	#reconcileQueuedMessageDrain(): void {
+		if (!this.agent.hasQueuedMessages()) {
+			this.#queuedMessageDrainBlocked = false;
 		}
 	}
 
-	#reconcileUsagePreflightQueuedTurn(): void {
-		if (!this.agent.hasQueuedMessages()) {
-			this.#usagePreflightPendingForQueuedTurn = false;
+	async #runQueuedUsageAwarePreflight(signal?: AbortSignal): Promise<boolean> {
+		try {
+			const allowed = await this.#runUsageAwarePreflight(signal);
+			this.#queuedMessageDrainBlocked = !allowed && this.agent.hasQueuedMessages();
+			return allowed;
+		} catch (error) {
+			this.#queuedMessageDrainBlocked = this.agent.hasQueuedMessages();
+			throw error;
 		}
 	}
 
@@ -5056,7 +5069,7 @@ export class AgentSession {
 		const imageDescriptionNotice = normalizedImages?.length
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
-		this.#markUsagePreflightForQueuedTurn();
+		this.#allowQueuedMessageDrainRetry();
 		if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
 		this.agent.followUp({
 			role: "developer",
@@ -5086,7 +5099,7 @@ export class AgentSession {
 		const imageDescriptionNotice = normalizedImages?.length
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
-		this.#markUsagePreflightForQueuedTurn();
+		this.#allowQueuedMessageDrainRetry();
 		if (mode === "followUp") {
 			if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
 			this.agent.followUp({
@@ -5113,7 +5126,12 @@ export class AgentSession {
 	}
 
 	#scheduleQueuedMessageDrain(): void {
-		if (this.#queuedMessageDrainScheduled || !this.#canAutoContinueForFollowUp() || !this.agent.hasQueuedMessages()) {
+		if (
+			this.#queuedMessageDrainScheduled ||
+			this.#queuedMessageDrainBlocked ||
+			!this.#canAutoContinueForFollowUp() ||
+			!this.agent.hasQueuedMessages()
+		) {
 			return;
 		}
 		this.#queuedMessageDrainScheduled = true;
@@ -5127,6 +5145,7 @@ export class AgentSession {
 			},
 			onError: () => {
 				this.#queuedMessageDrainScheduled = false;
+				this.#queuedMessageDrainBlocked = this.agent.hasQueuedMessages();
 			},
 		});
 	}
@@ -5293,7 +5312,7 @@ export class AgentSession {
 			timestamp: Date.now(),
 		};
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
-		this.#markUsagePreflightForQueuedTurn();
+		this.#allowQueuedMessageDrainRetry();
 		if (deliverAs === "followUp") {
 			this.agent.followUp(normalizedAppMessage);
 		} else {
@@ -5350,7 +5369,7 @@ export class AgentSession {
 				this.#queueHiddenNextTurnMessage(normalizedAppMessage, options?.triggerTurn ?? false);
 				return false;
 			}
-			this.#markUsagePreflightForQueuedTurn();
+			this.#allowQueuedMessageDrainRetry();
 
 			if (options?.deliverAs === "followUp") {
 				this.agent.followUp(normalizedAppMessage);
@@ -5472,7 +5491,7 @@ export class AgentSession {
 			? isAdvisorCard
 			: m => !isUserQueuedMessage(m) && !isHiddenUserCompanion(m);
 		this.agent.replaceQueues(steeringAll.filter(keep), followUpAll.filter(keep));
-		this.#reconcileUsagePreflightQueuedTurn();
+		this.#reconcileQueuedMessageDrain();
 		return { steering, followUp };
 	}
 
@@ -5522,14 +5541,14 @@ export class AgentSession {
 		if (fromSteer >= 0) {
 			const removed = steering[fromSteer];
 			this.agent.replaceQueues(removeWithCompanions(steering, fromSteer), followUp.slice());
-			this.#reconcileUsagePreflightQueuedTurn();
+			this.#reconcileQueuedMessageDrain();
 			return toRestoredQueuedMessage(removed);
 		}
 		const fromFollowUp = lastUserIndex(followUp);
 		if (fromFollowUp >= 0) {
 			const removed = followUp[fromFollowUp];
 			this.agent.replaceQueues(steering.slice(), removeWithCompanions(followUp, fromFollowUp));
-			this.#reconcileUsagePreflightQueuedTurn();
+			this.#reconcileQueuedMessageDrain();
 			return toRestoredQueuedMessage(removed);
 		}
 		return undefined;
@@ -5783,7 +5802,7 @@ export class AgentSession {
 		await this.#memory.resetContextForNewTranscript();
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
-		this.#usagePreflightPendingForQueuedTurn = false;
+		this.#queuedMessageDrainBlocked = false;
 
 		this.sessionManager.appendThinkingLevelChange(this.thinkingLevel, this.configuredThinkingLevel());
 		this.sessionManager.appendServiceTierChange(this.#models.serviceTierEntry());
@@ -6757,7 +6776,7 @@ export class AgentSession {
 		const previousFollowUpMessages = [...this.agent.peekFollowUpQueue()];
 		const previousPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
 		const previousScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
-		const previousUsagePreflightPendingForQueuedTurn = this.#usagePreflightPendingForQueuedTurn;
+		const previousQueuedMessageDrainBlocked = this.#queuedMessageDrainBlocked;
 		const previousModel = this.model;
 		const previousThinkingLevel = this.thinkingLevel;
 		const previousAutoThinking = this.isAutoThinking;
@@ -6782,7 +6801,7 @@ export class AgentSession {
 		this.agent.clearAllQueues();
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
-		this.#usagePreflightPendingForQueuedTurn = false;
+		this.#queuedMessageDrainBlocked = false;
 
 		try {
 			await this.sessionManager.setSessionFile(sessionPath);
@@ -6935,7 +6954,7 @@ export class AgentSession {
 			this.agent.replaceQueues(previousSteeringMessages, previousFollowUpMessages);
 			this.#pendingNextTurnMessages = previousPendingNextTurnMessages;
 			this.#scheduledHiddenNextTurnGeneration = previousScheduledHiddenNextTurnGeneration;
-			this.#usagePreflightPendingForQueuedTurn = previousUsagePreflightPendingForQueuedTurn;
+			this.#queuedMessageDrainBlocked = previousQueuedMessageDrainBlocked;
 			this.#inheritedProviderPromptCacheKey = previousInheritedProviderPromptCacheKey;
 			this.#checkpointState = previousCheckpointState;
 			this.#pendingRewindReport = previousPendingRewindReport;
@@ -7002,7 +7021,7 @@ export class AgentSession {
 		// Clear pending messages (bound to old session state)
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
-		this.#usagePreflightPendingForQueuedTurn = false;
+		this.#queuedMessageDrainBlocked = false;
 
 		await this.#bash.flushPending();
 		// Flush pending writes before branching
@@ -7102,7 +7121,7 @@ export class AgentSession {
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 		this.agent.replaceQueues([], []);
-		this.#usagePreflightPendingForQueuedTurn = false;
+		this.#queuedMessageDrainBlocked = false;
 		if (this.isStreaming) {
 			await this.abort({ goalReason: "internal", reason: "branching /btw" });
 			this.agent.replaceQueues([], []);

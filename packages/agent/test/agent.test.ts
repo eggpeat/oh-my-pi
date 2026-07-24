@@ -17,24 +17,26 @@ describe("Agent", () => {
 		expect(agent.state.messages).not.toContainEqual(message);
 	});
 
-	it("removes before-model hooks independently", async () => {
+	it("removes duplicate queued-message hooks independently", async () => {
 		const mock = createMockModel({ responses: [{ content: ["first"] }, { content: ["second"] }] });
 		const agent = new Agent({ streamFn: mock.stream });
-		const calls: string[] = [];
-		const removeFirst = agent.addBeforeModelCallHook(() => {
-			calls.push("first");
-		});
-		const removeSecond = agent.addBeforeModelCallHook(() => {
-			calls.push("second");
-		});
+		agent.replaceMessages([createAssistantMessage([{ type: "text", text: "ready" }])]);
+		let calls = 0;
+		const hook = () => {
+			calls++;
+		};
+		const removeFirst = agent.addBeforeQueuedMessageDequeueHook(hook);
+		const removeSecond = agent.addBeforeQueuedMessageDequeueHook(hook);
 
 		removeFirst();
-		await agent.prompt("first turn");
-		expect(calls).toEqual(["second"]);
+		agent.followUp({ role: "user", content: "first turn", timestamp: Date.now() });
+		await agent.continue();
+		expect(calls).toBe(1);
 
 		removeSecond();
-		await agent.prompt("second turn");
-		expect(calls).toEqual(["second"]);
+		agent.followUp({ role: "user", content: "second turn", timestamp: Date.now() });
+		await agent.continue();
+		expect(calls).toBe(1);
 	});
 
 	it("continue() should process queued follow-up messages after an assistant turn", async () => {
@@ -73,6 +75,10 @@ describe("Agent", () => {
 			responses: [{ content: ["Processed 1"] }, { content: ["Processed 2"] }],
 		});
 		const agent = new Agent({ streamFn: mock.stream });
+		let dequeueHooks = 0;
+		agent.addBeforeQueuedMessageDequeueHook(() => {
+			dequeueHooks++;
+		});
 
 		agent.replaceMessages([
 			{
@@ -99,6 +105,7 @@ describe("Agent", () => {
 		const recentMessages = agent.state.messages.slice(-4);
 		expect(recentMessages.map(m => m.role)).toEqual(["user", "assistant", "user", "assistant"]);
 		expect(mock.calls.length).toBe(2);
+		expect(dequeueHooks).toBe(2);
 	});
 
 	it("delivers a steer that lands at the yield boundary instead of stranding it", async () => {

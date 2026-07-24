@@ -390,7 +390,7 @@ export class Agent {
 	#asideMessageProvider?: () => AsideMessage[] | Promise<AsideMessage[]>;
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
-	#beforeModelCallHooks = new Set<NonNullable<AgentLoopConfig["syncContextBeforeModelCall"]>>();
+	#beforeQueuedMessageDequeueHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
 
 	/** Buffered Cursor tool results with text length at time of call (for correct ordering) */
 	#cursorToolResultBuffer: CursorToolResultEntry[] = [];
@@ -749,10 +749,27 @@ export class Agent {
 		return () => this.#listeners.delete(fn);
 	}
 
-	/** Register a composable hook after queued-message injection and before each model call. */
-	addBeforeModelCallHook(hook: NonNullable<AgentLoopConfig["syncContextBeforeModelCall"]>): () => void {
-		this.#beforeModelCallHooks.add(hook);
-		return () => this.#beforeModelCallHooks.delete(hook);
+	/** Register an independently removable hook that runs before queued messages are consumed. */
+	addBeforeQueuedMessageDequeueHook(hook: (signal?: AbortSignal) => Promise<void> | void): () => void {
+		const registration = (signal?: AbortSignal) => hook(signal);
+		this.#beforeQueuedMessageDequeueHooks.add(registration);
+		return () => this.#beforeQueuedMessageDequeueHooks.delete(registration);
+	}
+
+	async #runBeforeQueuedMessageDequeueHooks(signal?: AbortSignal): Promise<void> {
+		for (const hook of this.#beforeQueuedMessageDequeueHooks) await hook(signal);
+	}
+
+	async #dequeueSteeringMessagesAfterHooks(signal?: AbortSignal): Promise<AgentMessage[]> {
+		if (this.#steeringQueue.length === 0) return [];
+		await this.#runBeforeQueuedMessageDequeueHooks(signal);
+		return this.#dequeueSteeringMessages();
+	}
+
+	async #dequeueFollowUpMessagesAfterHooks(signal?: AbortSignal): Promise<AgentMessage[]> {
+		if (this.#followUpQueue.length === 0) return [];
+		await this.#runBeforeQueuedMessageDequeueHooks(signal);
+		return this.#dequeueFollowUpMessages();
 	}
 
 	setProviderResponseInterceptor(fn: SimpleStreamOptions["onResponse"] | undefined): void {
@@ -1060,12 +1077,12 @@ export class Agent {
 			// callers (AgentSession#scheduleQueuedMessageDrain) re-arm continue() on every
 			// microtask because hasQueuedMessages() never clears, spinning an unbounded
 			// allocation loop until OOM (issue #6344).
-			const queuedSteering = this.#dequeueSteeringMessages();
+			const queuedSteering = await this.#dequeueSteeringMessagesAfterHooks();
 			if (queuedSteering.length > 0) {
 				await this.#runLoop(queuedSteering, { skipInitialSteeringPoll: true });
 				return;
 			}
-			const queuedFollowUp = this.#dequeueFollowUpMessages();
+			const queuedFollowUp = await this.#dequeueFollowUpMessagesAfterHooks();
 			if (queuedFollowUp.length > 0) {
 				await this.#runLoop(queuedFollowUp);
 				return;
@@ -1073,13 +1090,13 @@ export class Agent {
 			throw new Error("No messages to continue from");
 		}
 		if (messages[messages.length - 1].role === "assistant") {
-			const queuedSteering = this.#dequeueSteeringMessages();
+			const queuedSteering = await this.#dequeueSteeringMessagesAfterHooks();
 			if (queuedSteering.length > 0) {
 				await this.#runLoop(queuedSteering, { skipInitialSteeringPoll: true });
 				return;
 			}
 
-			const queuedFollowUp = this.#dequeueFollowUpMessages();
+			const queuedFollowUp = await this.#dequeueFollowUpMessagesAfterHooks();
 			if (queuedFollowUp.length > 0) {
 				await this.#runLoop(queuedFollowUp);
 				return;
@@ -1185,8 +1202,7 @@ export class Agent {
 			onSseEvent: this.#onSseEvent,
 			getApiKey: this.getApiKey,
 			getToolContext: this.#getToolContext,
-			syncContextBeforeModelCall: async (context, signal) => {
-				for (const hook of this.#beforeModelCallHooks) await hook(context, signal);
+			syncContextBeforeModelCall: async context => {
 				if (this.#listeners.size > 0) {
 					await Bun.sleep(0);
 				}
@@ -1221,7 +1237,7 @@ export class Agent {
 					skipInitialSteeringPoll = false;
 					return [];
 				}
-				return this.#dequeueSteeringMessages();
+				return this.#dequeueSteeringMessagesAfterHooks(this.#abortController?.signal);
 			},
 			hasSteeringMessages: () => {
 				if (this.#steeringQueue.length === 0) {
@@ -1237,7 +1253,7 @@ export class Agent {
 				return { queued: true, source: "system" };
 			},
 			hasIrcInterrupts: this.hasIrcInterrupts,
-			getFollowUpMessages: async () => this.#dequeueFollowUpMessages(),
+			getFollowUpMessages: async () => this.#dequeueFollowUpMessagesAfterHooks(this.#abortController?.signal),
 			getAsideMessages: async () => (await this.#asideMessageProvider?.()) ?? [],
 			onBeforeYield: () => this.#onBeforeYield?.(),
 			telemetry: this.#telemetry,
