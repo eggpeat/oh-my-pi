@@ -290,9 +290,14 @@ describe("AgentSession retry fallback", () => {
 							{
 								credentialId: 1,
 								credentialType: "oauth",
-								selected: true,
 								state: "reserve",
-								remainingFraction: 0.05,
+								remainingFraction: 0.08,
+							},
+							{
+								credentialId: 2,
+								credentialType: "oauth",
+								state: "reserve",
+								remainingFraction: 0.02,
 							},
 						],
 					}
@@ -311,10 +316,65 @@ describe("AgentSession retry fallback", () => {
 		expect(confirmFallback).toHaveBeenCalledWith({
 			from: `${primaryModel.provider}/${primaryModel.id}`,
 			to: `${fallbackModel.provider}/${fallbackModel.id}`,
-			remainingPercent: 5,
+			remainingPercent: 2,
 		});
 		expect(requestedModels).toEqual([`${fallbackModel.provider}/${fallbackModel.id}`]);
 		expect(session.messages.some(message => message.role === "user")).toBe(true);
+	});
+
+	it("honors a live fail-closed policy after reserve spending was approved", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+		if (!primaryModel || !fallbackModel) throw new Error("Expected bundled reserve policy models");
+		const mock = createMockModel({ responses: [{ content: ["stayed on primary"] }] });
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primaryModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.usageAwareFallback": true,
+			"retry.usageReservePolicy": "confirm",
+			"retry.fallbackChains": {
+				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
+			},
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		const usageHealth = vi
+			.spyOn(modelRegistry.authStorage, "getModelUsageHealth")
+			.mockImplementation(async provider =>
+				provider === primaryModel.provider
+					? {
+							state: "reserve",
+							accounts: [
+								{
+									credentialId: 1,
+									credentialType: "oauth",
+									state: "reserve",
+									remainingFraction: 0.05,
+								},
+							],
+						}
+					: { state: "healthy", accounts: [] },
+			);
+		const confirmFallback = vi.fn(async () => false);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		session.setUsageFallbackConfirmer(confirmFallback);
+
+		await session.prompt("Stay on the primary");
+		await session.waitForIdle();
+		settings.override("retry.usageReservePolicy", "fail-closed");
+		expect(settings.get("retry.usageReservePolicy")).toBe("fail-closed");
+
+		await expect(session.prompt("Do not spend reserve")).rejects.toThrow("reserve policy is fail-closed");
+		expect(confirmFallback).toHaveBeenCalledTimes(1);
+		expect(usageHealth).toHaveBeenCalledTimes(3);
 	});
 
 	it("reselects a healthy same-provider account before considering a model fallback", async () => {
@@ -479,6 +539,63 @@ describe("AgentSession retry fallback", () => {
 
 		const prompt = session.prompt("Do not send this after cancellation");
 		await probeStarted.promise;
+		await session.abort();
+		await prompt;
+
+		expect(requestedModels).toEqual([]);
+	});
+
+	it("cancels a pending reserve confirmation without dispatching the prompt", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+		if (!primaryModel || !fallbackModel) throw new Error("Expected bundled confirmation cancellation models");
+		const requestedModels: string[] = [];
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primaryModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				return createMockModel().stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.usageAwareFallback": true,
+			"retry.fallbackChains": {
+				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
+			},
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		vi.spyOn(modelRegistry.authStorage, "getModelUsageHealth").mockImplementation(async provider =>
+			provider === primaryModel.provider
+				? {
+						state: "reserve",
+						accounts: [
+							{
+								credentialId: 1,
+								credentialType: "oauth",
+								state: "reserve",
+								remainingFraction: 0.05,
+							},
+						],
+					}
+				: { state: "healthy", accounts: [] },
+		);
+		const confirmationStarted = Promise.withResolvers<void>();
+		const pendingConfirmation = Promise.withResolvers<boolean>();
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		session.setUsageFallbackConfirmer(async () => {
+			confirmationStarted.resolve();
+			return pendingConfirmation.promise;
+		});
+
+		const prompt = session.prompt("Do not send after confirmation cancellation");
+		await confirmationStarted.promise;
 		await session.abort();
 		await prompt;
 

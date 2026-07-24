@@ -56,8 +56,6 @@ import type {
 	ImageContent,
 	Message,
 	Model,
-	ModelUsageHealth,
-	ProviderResponseMetadata,
 	ProviderSessionState,
 	ResetCreditAccountStatus,
 	ResetCreditRedeemOutcome,
@@ -219,6 +217,7 @@ import type {
 	RoleModelCycleResult,
 	SessionHandoffOptions,
 	SessionStats,
+	UsageFallbackConfirmation,
 } from "./agent-session-types";
 import {
 	ASYNC_INLINE_RESULT_MAX_CHARS,
@@ -322,14 +321,12 @@ import { TtsrCoordinator, type TtsrCoordinatorHost } from "./ttsr-coordinator";
 
 const PLAN_MODE_REMINDER_MAX = 3;
 
-
 /** Internal marker for hook messages queued through the agent loop */
 // ============================================================================
 // Constants
 // ============================================================================
 
 /** Standard thinking levels */
-
 
 /**
  * Build the per-request `metadata` payload for the Anthropic provider, shaped
@@ -558,7 +555,6 @@ export class AgentSession {
 	// Model registry for API key resolution
 	#modelRegistry: ModelRegistry;
 	#usageFallbackConfirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined;
-	#usageReserveApprovedSelector: string | undefined;
 	#usagePreflightAbortControllers = new Set<AbortController>();
 
 	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
@@ -2824,6 +2820,14 @@ export class AgentSession {
 				this.#beginInFlight();
 				try {
 					await this.#recovery.maybeRestoreRetryFallbackPrimary();
+					if (
+						this.settings.get("retry.modelFallback") &&
+						this.settings.get("retry.usageAwareFallback") &&
+						!(await this.#runUsageAwarePreflight())
+					) {
+						this.#skipAgentContinue("session-unavailable", options);
+						return;
+					}
 					if (signal.aborted || this.#isDisposed) {
 						this.#skipAgentContinue("post-restore-unavailable", options);
 						return;
@@ -3584,6 +3588,21 @@ export class AgentSession {
 		confirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined,
 	): void {
 		this.#usageFallbackConfirmer = confirmer;
+	}
+
+	async #runUsageAwarePreflight(): Promise<boolean> {
+		const generation = this.#promptGeneration;
+		const controller = new AbortController();
+		this.#usagePreflightAbortControllers.add(controller);
+		try {
+			await this.#recovery.maybeApplyUsageAwareFallback(controller.signal, this.#usageFallbackConfirmer);
+			return !controller.signal.aborted && this.#promptGeneration === generation;
+		} catch (error) {
+			if (controller.signal.aborted || this.#promptGeneration !== generation) return false;
+			throw error;
+		} finally {
+			this.#usagePreflightAbortControllers.delete(controller);
+		}
 	}
 
 	/** Effective thinking level applied to the agent (the resolved level when `auto`). */
@@ -4602,7 +4621,7 @@ export class AgentSession {
 		this.#beginInFlight();
 		const generation = this.#promptGeneration;
 		try {
-			await this.#maybeRestoreRetryFallbackPrimary();
+			await this.#recovery.maybeRestoreRetryFallbackPrimary();
 			if (!(await this.#runUsageAwarePreflight())) return;
 			// Flush any pending bash messages before the new prompt
 			await this.#bash.flushPending();

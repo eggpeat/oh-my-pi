@@ -12,6 +12,7 @@ import type {
 	AssistantRetryRecoveryKind,
 	CodexCompactionContext,
 	Model,
+	ModelUsageHealth,
 	TextContent,
 	ToolChoice,
 } from "@oh-my-pi/pi-ai";
@@ -21,12 +22,12 @@ import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { isFireworksFastModelId, toFireworksBaseModelId } from "@oh-my-pi/pi-catalog/fireworks-model-id";
 import { extractRetryHint, logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
+import { formatModelStringWithRouting, resolveModelOverride } from "../config/model-resolver";
 import {
-	formatModelSelectorValue,
-	formatModelString,
-	formatModelStringWithRouting,
-	resolveModelOverride,
-} from "../config/model-resolver";
+	findRetryFallbackCandidates as findConfiguredRetryFallbackCandidates,
+	type RetryFallbackResolutionContext,
+	resolveRetryFallbackChainKey,
+} from "../config/retry-fallback";
 import type { Settings } from "../config/settings";
 import type { RecoveredRetryError } from "../extensibility/shared-events";
 import emptyStopRetryTemplate from "../prompts/system/empty-stop-retry.md" with { type: "text" };
@@ -34,23 +35,15 @@ import thinkingLoopRedirectTemplate from "../prompts/system/thinking-loop-redire
 import unexpectedStopRetryTemplate from "../prompts/system/unexpected-stop-retry.md" with { type: "text" };
 import type { ConfiguredThinkingLevel } from "../thinking";
 import type { AgentSessionEvent } from "./agent-session-events";
-import type { InitialRetryFallbackState } from "./agent-session-types";
+import type { InitialRetryFallbackState, UsageFallbackConfirmation } from "./agent-session-types";
 import { isEmptyErrorTurn } from "./messages";
 import {
 	type ActiveRetryFallbackState,
 	calculateRetryBackoffDelayMs,
-	formatRetryFallbackBaseSelector,
 	formatRetryFallbackSelector,
 	getRetryFallbackChains,
-	getRetryFallbackEffectiveChain,
-	getRetryFallbackPrimarySelector,
 	getRetryFallbackRevertPolicy,
-	isKnownProvider,
-	isRetryFallbackModelKey,
-	isRetryFallbackWildcardKey,
-	parseRetryFallbackChainEntry,
 	parseRetryFallbackSelector,
-	parseRetryFallbackWildcard,
 	type RetryFallbackChains,
 	type RetryFallbackRevertPolicy,
 	type RetryFallbackSelector,
@@ -161,6 +154,7 @@ export class TurnRecovery {
 	#retryPromise: Promise<void> | undefined;
 	#retryResolve: (() => void) | undefined;
 	#activeRetryFallback: ActiveRetryFallbackState | undefined;
+	#usageReserveApprovedSelector: string | undefined;
 	#pendingRecoveredRetryErrors: PendingRecoveredRetryError[] = [];
 	#emptyStopRetryCount = 0;
 	#unexpectedStopRetryCount = 0;
@@ -172,7 +166,7 @@ export class TurnRecovery {
 			this.#activeRetryFallback = {
 				...options.initialRetryFallback,
 				lastAppliedFallbackThinkingLevel: host.configuredThinkingLevel(),
-				pinned: false,
+				pinned: options.initialRetryFallback.pinned ?? false,
 			};
 		}
 		this.#validateRetryFallbackChains();
@@ -284,6 +278,14 @@ export class TurnRecovery {
 	/** Restores the configured primary after fallback cooldown expiry. */
 	maybeRestoreRetryFallbackPrimary(): Promise<void> {
 		return this.#maybeRestoreRetryFallbackPrimary();
+	}
+
+	/** Applies model fallback policy from live usage health before a turn starts. */
+	maybeApplyUsageAwareFallback(
+		signal: AbortSignal,
+		confirmer?: (confirmation: UsageFallbackConfirmation) => Promise<boolean>,
+	): Promise<void> {
+		return this.#maybeApplyUsageAwareFallback(signal, confirmer);
 	}
 
 	/** Applies automatic retry, credential rotation, and model fallback policy. */
@@ -913,17 +915,6 @@ export class TurnRecovery {
 		return stopType === "refusal" || stopType === "sensitive";
 	}
 
-	/**
-	 * True when `provider` has registered models or is configured for dynamic
-	 * discovery. Discovery-only providers (e.g. a models.yml provider with
-	 * `discovery:` and no static models) can hold zero models until the online
-	 * refresh completes, so a models-only check would misreport them as
-	 * unknown during session construction.
-	 */
-	#isKnownProvider(provider: string): boolean {
-		return isKnownProvider(this.#host.modelRegistry, provider);
-	}
-
 	#getRetryFallbackChains(): RetryFallbackChains {
 		return getRetryFallbackChains(this.#host.settings);
 	}
@@ -936,10 +927,6 @@ export class TurnRecovery {
 
 	#getRetryFallbackRevertPolicy(): RetryFallbackRevertPolicy {
 		return getRetryFallbackRevertPolicy(this.#host.settings);
-	}
-
-	#getRetryFallbackPrimarySelector(role: string): RetryFallbackSelector | undefined {
-		return getRetryFallbackPrimarySelector(this.#host.settings, this.#host.modelRegistry, role);
 	}
 
 	/** Clears fallback ownership after an explicit model change. */
@@ -973,86 +960,15 @@ export class TurnRecovery {
 		currentSelector: string,
 		currentModel: Model | null | undefined = this.#host.model(),
 	): string | undefined {
-		const parsedCurrent = parseRetryFallbackSelector(currentSelector, this.#host.modelRegistry);
-		if (!parsedCurrent) return undefined;
-		const chains = this.#getRetryFallbackChains();
-		const currentBaseSelector = formatRetryFallbackBaseSelector(parsedCurrent);
-		const currentPlainSelector = currentModel
-			? formatModelSelectorValue(formatModelString(currentModel), parsedCurrent.thinkingLevel)
-			: undefined;
-		const currentPlainBaseSelector =
-			currentPlainSelector && currentPlainSelector !== currentSelector
-				? formatRetryFallbackBaseSelector(parseRetryFallbackSelector(currentPlainSelector) ?? parsedCurrent)
-				: undefined;
+		return resolveRetryFallbackChainKey(this.#retryFallbackResolutionContext(), currentSelector, currentModel);
+	}
 
-		const exactModelKeys: string[] = [];
-		const roleKeys: string[] = [];
-		for (const key in chains) {
-			if (!isRetryFallbackModelKey(key)) roleKeys.push(key);
-			else if (!isRetryFallbackWildcardKey(key)) exactModelKeys.push(key);
-		}
-		const matchesCurrent = (primary: RetryFallbackSelector | undefined): boolean => {
-			if (!primary) return false;
-			if (primary.raw === currentSelector || (currentPlainSelector && primary.raw === currentPlainSelector)) {
-				return true;
-			}
-			const base = formatRetryFallbackBaseSelector(primary);
-			return base === currentBaseSelector || (!!currentPlainBaseSelector && base === currentPlainBaseSelector);
+	#retryFallbackResolutionContext(): RetryFallbackResolutionContext {
+		return {
+			chains: this.#getRetryFallbackChains(),
+			getModelRole: role => this.#host.settings.getModelRole(role),
+			modelLookup: this.#host.modelRegistry,
 		};
-
-		// 1. Exact model-selector keys — most specific.
-		for (const key of exactModelKeys) {
-			if (matchesCurrent(this.#getRetryFallbackPrimarySelector(key))) return key;
-		}
-		// 2. Provider wildcards — an id-prefixed key (`openrouter/google/*`)
-		//    beats the plain `provider/*` key for ids under its prefix.
-		let wildcardMatch: string | undefined;
-		let wildcardPrefixLength = -1;
-		for (const key in chains) {
-			if (!isRetryFallbackWildcardKey(key) || !Array.isArray(chains[key])) continue;
-			const { provider, idPrefix } = parseRetryFallbackWildcard(key, p => this.#isKnownProvider(p));
-			if (provider !== parsedCurrent.provider) continue;
-			if (idPrefix !== undefined && !parsedCurrent.id.startsWith(`${idPrefix}/`)) continue;
-			const prefixLength = idPrefix === undefined ? 0 : idPrefix.length;
-			if (prefixLength > wildcardPrefixLength) {
-				wildcardMatch = key;
-				wildcardPrefixLength = prefixLength;
-			}
-		}
-		if (wildcardMatch) return wildcardMatch;
-		// 3. Role keys — matched by the role's currently-assigned model.
-		for (const key of roleKeys) {
-			if (matchesCurrent(this.#getRetryFallbackPrimarySelector(key))) return key;
-		}
-		// 4. The default chain, when default has no explicit role primary.
-		const defaultChain = chains.default;
-		if (
-			Array.isArray(defaultChain) &&
-			defaultChain.length > 0 &&
-			this.#getRetryFallbackPrimarySelector("default") === undefined
-		) {
-			return "default";
-		}
-		return undefined;
-	}
-
-	/**
-	 * Parse one configured chain entry. A `provider/*` entry keeps the failing
-	 * model's id and swaps the provider (google-antigravity/x → google/x); an
-	 * id-prefixed `provider/prefix/*` entry re-prefixes the failing model's
-	 * bare id instead (openrouter/google/* : google-antigravity/x →
-	 * openrouter/google/x). Ids the target provider lacks are skipped by the
-	 * candidate loop's registry lookup.
-	 */
-	#parseRetryFallbackChainEntry(
-		entry: string,
-		current: RetryFallbackSelector | undefined,
-	): RetryFallbackSelector | undefined {
-		return parseRetryFallbackChainEntry(entry, current, this.#host.modelRegistry);
-	}
-
-	#getRetryFallbackEffectiveChain(role: string, currentSelector?: string): RetryFallbackSelector[] {
-		return getRetryFallbackEffectiveChain(this.#host.settings, this.#host.modelRegistry, role, currentSelector);
 	}
 
 	/** Finds fallback candidates that follow the active selector. */
@@ -1061,65 +977,195 @@ export class TurnRecovery {
 		currentSelector: string,
 		currentModel: Model | null | undefined = this.#host.model(),
 	): RetryFallbackSelector[] {
-		let chain = this.#getRetryFallbackEffectiveChain(role, currentSelector);
-		const parsedCurrent = parseRetryFallbackSelector(currentSelector, this.#host.modelRegistry);
-		if (chain.length === 0 && role === "default" && parsedCurrent) {
-			const chains = this.#getRetryFallbackChains();
-			const defaultChain = chains.default;
-			if (
-				Array.isArray(defaultChain) &&
-				defaultChain.length > 0 &&
-				this.#getRetryFallbackPrimarySelector("default") === undefined
-			) {
-				const seen = new Set<string>([parsedCurrent.raw]);
-				chain = [parsedCurrent];
-				for (const selector of defaultChain) {
-					const parsed = this.#parseRetryFallbackChainEntry(selector, parsedCurrent);
-					if (!parsed || seen.has(parsed.raw)) continue;
-					seen.add(parsed.raw);
-					chain.push(parsed);
-				}
-			}
-		}
-		if (chain.length <= 1) return [];
-		const currentBaseSelector = parsedCurrent ? formatRetryFallbackBaseSelector(parsedCurrent) : undefined;
-		const currentPlainSelector =
-			currentModel && parsedCurrent
-				? formatModelSelectorValue(formatModelString(currentModel), parsedCurrent.thinkingLevel)
-				: undefined;
-		const currentPlainBaseSelector =
-			parsedCurrent && currentPlainSelector && currentPlainSelector !== currentSelector
-				? formatRetryFallbackBaseSelector(parseRetryFallbackSelector(currentPlainSelector) ?? parsedCurrent)
-				: undefined;
-		const exactIndex = chain.findIndex(
-			selector => selector.raw === currentSelector || selector.raw === currentPlainSelector,
+		return findConfiguredRetryFallbackCandidates(
+			this.#retryFallbackResolutionContext(),
+			role,
+			currentSelector,
+			currentModel,
 		);
-		if (exactIndex >= 0) return chain.slice(exactIndex + 1);
-		const baseIndex = currentBaseSelector
-			? chain.findIndex(selector => {
-					const selectorBase = formatRetryFallbackBaseSelector(selector);
-					return selectorBase === currentBaseSelector || selectorBase === currentPlainBaseSelector;
-				})
-			: -1;
-		if (baseIndex >= 0) return chain.slice(baseIndex + 1);
-		return chain.slice(1);
+	}
+
+	async #maybeApplyUsageAwareFallback(
+		signal: AbortSignal,
+		confirmer?: (confirmation: UsageFallbackConfirmation) => Promise<boolean>,
+	): Promise<void> {
+		if (!this.#host.settings.get("retry.modelFallback") || !this.#host.settings.get("retry.usageAwareFallback")) {
+			return;
+		}
+		const currentModel = this.#host.model();
+		if (!currentModel) return;
+		const currentSelector = formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel());
+		let health: ModelUsageHealth;
+		try {
+			health = await this.#host.modelRegistry.authStorage.getModelUsageHealth(currentModel.provider, {
+				modelId: currentModel.id,
+				sessionId: this.#host.sessionId(),
+				baseUrl: currentModel.baseUrl,
+				reserveFraction: this.#host.settings.get("retry.usageReservePct") / 100,
+				signal,
+			});
+		} catch (error) {
+			if (signal.aborted) return;
+			logger.debug("Usage-aware runtime preflight failed open", {
+				provider: currentModel.provider,
+				model: currentModel.id,
+				error: String(error),
+			});
+			return;
+		}
+		if (signal.aborted) return;
+		const selectedAccount = health.accounts.find(account => account.selected);
+		if (health.state === "healthy") {
+			this.#usageReserveApprovedSelector = undefined;
+			if (
+				selectedAccount &&
+				selectedAccount.state !== "healthy" &&
+				health.accounts.some(account => account.state === "healthy")
+			) {
+				this.#host.modelRegistry.authStorage.releaseSessionCredentialForReselection(
+					currentModel.provider,
+					this.#host.sessionId(),
+				);
+			}
+			return;
+		}
+		if (health.state === "unknown") {
+			this.#usageReserveApprovedSelector = undefined;
+			return;
+		}
+		if (health.state !== "reserve") this.#usageReserveApprovedSelector = undefined;
+
+		const reservePolicy = this.#host.settings.get("retry.usageReservePolicy");
+		if (reservePolicy === "fail-closed") {
+			const condition = health.state === "reserve" ? "reserve reached" : "usage depleted";
+			throw new Error(`${condition} for ${currentSelector}; reserve policy is fail-closed.`);
+		}
+		if (
+			reservePolicy === "confirm" &&
+			health.state === "reserve" &&
+			this.#usageReserveApprovedSelector === currentSelector
+		) {
+			return;
+		}
+
+		const role = this.#activeRetryFallback?.role ?? this.resolveRetryFallbackRole(currentSelector, currentModel);
+		if (!role) return;
+		let fallback: { selector: RetryFallbackSelector; apiKey: string } | undefined;
+		for (const candidate of this.findRetryFallbackCandidates(role, currentSelector, currentModel)) {
+			if (this.isRetryFallbackSelectorSuppressed(candidate)) continue;
+			const resolved = resolveModelOverride([candidate.raw], this.#host.modelRegistry, this.#host.settings);
+			const candidateModel = resolved.model ?? this.#host.modelRegistry.find(candidate.provider, candidate.id);
+			if (!candidateModel || !this.#host.modelRegistry.hasConfiguredAuth(candidateModel)) continue;
+			try {
+				const candidateHealth = await this.#host.modelRegistry.authStorage.getModelUsageHealth(
+					candidateModel.provider,
+					{
+						modelId: candidateModel.id,
+						sessionId: this.#host.sessionId(),
+						baseUrl: candidateModel.baseUrl,
+						reserveFraction: this.#host.settings.get("retry.usageReservePct") / 100,
+						signal,
+					},
+				);
+				if (signal.aborted) return;
+				if (candidateHealth.state === "depleted" || candidateHealth.state === "reserve") continue;
+				if (candidateHealth.state === "healthy") {
+					const selected = candidateHealth.accounts.find(account => account.selected);
+					if (
+						selected &&
+						selected.state !== "healthy" &&
+						candidateHealth.accounts.some(account => account.state === "healthy")
+					) {
+						this.#host.modelRegistry.authStorage.releaseSessionCredentialForReselection(
+							candidateModel.provider,
+							this.#host.sessionId(),
+						);
+					}
+				}
+			} catch {
+				if (signal.aborted) return;
+				// Unknown usage fails open for an otherwise valid fallback.
+			}
+			if (signal.aborted) return;
+			let apiKey: string | undefined;
+			try {
+				apiKey = await this.#host.modelRegistry.getApiKey(candidateModel, this.#host.sessionId(), { signal });
+			} catch {
+				if (signal.aborted) return;
+				continue;
+			}
+			if (signal.aborted) return;
+			if (!apiKey) continue;
+			fallback = { selector: candidate, apiKey };
+			break;
+		}
+		if (!fallback) return;
+
+		let shouldFallback = health.state === "depleted" || reservePolicy === "auto" || !confirmer;
+		if (!shouldFallback && health.state === "reserve" && confirmer) {
+			const remainingFraction =
+				selectedAccount?.remainingFraction ??
+				health.accounts.reduce<number | undefined>((minimum, account) => {
+					if (account.remainingFraction === undefined) return minimum;
+					return minimum === undefined ? account.remainingFraction : Math.min(minimum, account.remainingFraction);
+				}, undefined);
+			shouldFallback = await this.#confirmUsageFallback(
+				confirmer,
+				{
+					from: currentSelector,
+					to: fallback.selector.raw,
+					remainingPercent: remainingFraction === undefined ? undefined : Math.max(0, remainingFraction * 100),
+				},
+				signal,
+			);
+			if (signal.aborted) return;
+		}
+		if (!shouldFallback) {
+			this.#usageReserveApprovedSelector = currentSelector;
+			return;
+		}
+		this.#usageReserveApprovedSelector = undefined;
+		await this.#applyRetryFallbackCandidate(role, fallback.selector, currentSelector, {
+			pinFallback: true,
+			apiKey: fallback.apiKey,
+			signal,
+		});
+	}
+
+	async #confirmUsageFallback(
+		confirmer: (confirmation: UsageFallbackConfirmation) => Promise<boolean>,
+		confirmation: UsageFallbackConfirmation,
+		signal: AbortSignal,
+	): Promise<boolean> {
+		if (signal.aborted) return false;
+		const aborted = Promise.withResolvers<boolean>();
+		const onAbort = () => aborted.resolve(false);
+		signal.addEventListener("abort", onAbort, { once: true });
+		try {
+			return await Promise.race([confirmer(confirmation), aborted.promise]);
+		} finally {
+			signal.removeEventListener("abort", onAbort);
+		}
 	}
 
 	async #applyRetryFallbackCandidate(
 		role: string,
 		selector: RetryFallbackSelector,
 		currentSelector: string,
-		options?: { pinFallback?: boolean },
+		options?: { pinFallback?: boolean; apiKey?: string; signal?: AbortSignal },
 	): Promise<void> {
 		const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
 		const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
 		if (!candidate) {
 			throw new Error(`Retry fallback model not found: ${selector.raw}`);
 		}
-		const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
+		const apiKey =
+			options?.apiKey ??
+			(await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId(), { signal: options?.signal }));
 		if (!apiKey) {
 			throw new Error(`No API key for retry fallback ${selector.raw}`);
 		}
+		if (options?.signal?.aborted) return;
 
 		// Capture the configured selector (auto-aware) so a fallback chain preserves
 		// `auto` instead of collapsing it to the level it resolved to this turn.
