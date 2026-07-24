@@ -1,13 +1,14 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
-import { Agent } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import {
 	type AssistantMessage,
 	Effort,
 	type Model,
 	type ModelUsageHealth,
 	type ProviderSessionState,
+	z,
 } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -966,6 +967,81 @@ describe("AgentSession retry fallback", () => {
 		});
 
 		await session.prompt("Retry this empty response");
+		await session.waitForIdle();
+
+		expect(usageHealth).toHaveBeenCalledTimes(2);
+		expect(requestedModels).toEqual([`${primaryModel.provider}/${primaryModel.id}`]);
+	});
+
+	it("rechecks fail-closed usage health before a same-turn tool continuation", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primaryModel) throw new Error("Expected bundled tool-continuation model");
+		const requestedModels: string[] = [];
+		let useReserve = false;
+		const toolSchema = z.object({ value: z.string() });
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "consume",
+			label: "Consume",
+			description: "Consume plan quota",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				useReserve = true;
+				return { content: [{ type: "text", text: params.value }], details: params };
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "consume", arguments: { value: "done" } }] },
+				{ content: ["must not run"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primaryModel, systemPrompt: ["Test"], tools: [tool], messages: [] },
+			streamFn: (model, context, options) => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.usageAwareFallback": true,
+			"retry.usageReservePolicy": "fail-closed",
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		const usageHealth = vi.spyOn(modelRegistry.authStorage, "getModelUsageHealth").mockImplementation(async () =>
+			useReserve
+				? {
+						state: "reserve",
+						accounts: [
+							{
+								credentialId: 1,
+								credentialType: "oauth",
+								state: "reserve",
+								remainingFraction: 0.05,
+							},
+						],
+					}
+				: {
+						state: "healthy",
+						accounts: [
+							{
+								credentialId: 1,
+								credentialType: "oauth",
+								state: "healthy",
+								remainingFraction: 0.8,
+							},
+						],
+					},
+		);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		await session.prompt("Use the tool");
 		await session.waitForIdle();
 
 		expect(usageHealth).toHaveBeenCalledTimes(2);

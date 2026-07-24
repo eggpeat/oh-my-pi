@@ -557,6 +557,8 @@ export class AgentSession {
 	#usageFallbackConfirmer: UsageFallbackConfirmer | undefined;
 	#usagePreflightAbortControllers = new Set<AbortController>();
 	#queuedMessageDrainBlocked = false;
+	#usagePreflightReadyForNextModelCall = false;
+	#detachUsageBeforeQueueDequeue: (() => void) | undefined;
 	#detachUsageBeforeModelCall: (() => void) | undefined;
 
 	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
@@ -996,9 +998,20 @@ export class AgentSession {
 			withBashBranchTransition: operation => this.#bash.withBranchTransition(operation),
 		};
 		this.#recovery = new TurnRecovery(recoveryHost, { initialRetryFallback: config.initialRetryFallback });
-		this.#detachUsageBeforeModelCall = this.agent.addBeforeQueuedMessageDequeueHook(async signal => {
-			if (!this.settings.get("retry.usageAwareFallback")) return;
+		this.#detachUsageBeforeQueueDequeue = this.agent.addBeforeQueuedMessageDequeueHook(async signal => {
+			if (!this.settings.get("retry.usageAwareFallback") || this.#usagePreflightReadyForNextModelCall) return;
 			if (!(await this.#runQueuedUsageAwarePreflight(signal))) {
+				signal?.throwIfAborted();
+				throw new DOMException("Usage preflight cancelled", "AbortError");
+			}
+		});
+		this.#detachUsageBeforeModelCall = this.agent.addBeforeModelCallHook(async signal => {
+			if (!this.settings.get("retry.usageAwareFallback")) return;
+			if (this.#usagePreflightReadyForNextModelCall) {
+				this.#usagePreflightReadyForNextModelCall = false;
+				return;
+			}
+			if (!(await this.#runUsageAwarePreflight(signal))) {
 				signal?.throwIfAborted();
 				throw new DOMException("Usage preflight cancelled", "AbortError");
 			}
@@ -2852,6 +2865,7 @@ export class AgentSession {
 					});
 					options?.onError?.();
 				} finally {
+					this.#usagePreflightReadyForNextModelCall = false;
 					this.#endInFlight();
 				}
 			},
@@ -3389,6 +3403,9 @@ export class AgentSession {
 	beginDispose(): void {
 		this.#isDisposed = true;
 		this.#queuedMessageDrainBlocked = false;
+		this.#usagePreflightReadyForNextModelCall = false;
+		this.#detachUsageBeforeQueueDequeue?.();
+		this.#detachUsageBeforeQueueDequeue = undefined;
 		this.#detachUsageBeforeModelCall?.();
 		this.#detachUsageBeforeModelCall = undefined;
 		this.#memory.cancelLocalMemoryStartup();
@@ -3616,12 +3633,19 @@ export class AgentSession {
 	async #runQueuedUsageAwarePreflight(signal?: AbortSignal): Promise<boolean> {
 		try {
 			const allowed = await this.#runUsageAwarePreflight(signal);
+			this.#usagePreflightReadyForNextModelCall = allowed;
 			this.#queuedMessageDrainBlocked = !allowed && this.agent.hasQueuedMessages();
 			return allowed;
 		} catch (error) {
 			this.#queuedMessageDrainBlocked = this.agent.hasQueuedMessages();
 			throw error;
 		}
+	}
+
+	async #runUsageAwarePreflightForNextModelCall(signal?: AbortSignal): Promise<boolean> {
+		const allowed = await this.#runUsageAwarePreflight(signal);
+		this.#usagePreflightReadyForNextModelCall = allowed;
+		return allowed;
 	}
 
 	async #runUsageAwarePreflight(signal?: AbortSignal): Promise<boolean> {
@@ -4665,7 +4689,7 @@ export class AgentSession {
 		const generation = this.#promptGeneration;
 		try {
 			await this.#recovery.maybeRestoreRetryFallbackPrimary();
-			if (!(await this.#runUsageAwarePreflight())) return;
+			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return;
 			// Flush any pending bash messages before the new prompt
 			await this.#bash.flushPending();
 			this.#eval.flushPending();
@@ -4870,6 +4894,7 @@ export class AgentSession {
 				await this.#waitForPostPromptRecovery(generation);
 			}
 		} finally {
+			this.#usagePreflightReadyForNextModelCall = false;
 			this.#endInFlight();
 		}
 	}
@@ -5270,7 +5295,7 @@ export class AgentSession {
 	): Promise<void> {
 		this.#beginInFlight();
 		try {
-			if (!(await this.#runUsageAwarePreflight())) return;
+			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return;
 			const acceptTerminalEmptyStop = options?.acceptTerminalEmptyStop === true;
 			if (acceptTerminalEmptyStop) {
 				this.#resetPromptMaintenanceState();
@@ -5279,6 +5304,7 @@ export class AgentSession {
 			await this.agent.prompt(message);
 			await this.#waitForPostPromptRecovery();
 		} finally {
+			this.#usagePreflightReadyForNextModelCall = false;
 			this.#recovery.setAcceptTerminalEmptyStop(false);
 			this.#endInFlight();
 		}
@@ -5801,6 +5827,7 @@ export class AgentSession {
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 		this.#queuedMessageDrainBlocked = false;
+		this.#usagePreflightReadyForNextModelCall = false;
 
 		this.sessionManager.appendThinkingLevelChange(this.thinkingLevel, this.configuredThinkingLevel());
 		this.sessionManager.appendServiceTierChange(this.#models.serviceTierEntry());
@@ -6775,6 +6802,7 @@ export class AgentSession {
 		const previousPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
 		const previousScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
 		const previousQueuedMessageDrainBlocked = this.#queuedMessageDrainBlocked;
+		const previousUsagePreflightReadyForNextModelCall = this.#usagePreflightReadyForNextModelCall;
 		const previousModel = this.model;
 		const previousThinkingLevel = this.thinkingLevel;
 		const previousAutoThinking = this.isAutoThinking;
@@ -6800,6 +6828,7 @@ export class AgentSession {
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 		this.#queuedMessageDrainBlocked = false;
+		this.#usagePreflightReadyForNextModelCall = false;
 
 		try {
 			await this.sessionManager.setSessionFile(sessionPath);
@@ -6953,6 +6982,7 @@ export class AgentSession {
 			this.#pendingNextTurnMessages = previousPendingNextTurnMessages;
 			this.#scheduledHiddenNextTurnGeneration = previousScheduledHiddenNextTurnGeneration;
 			this.#queuedMessageDrainBlocked = previousQueuedMessageDrainBlocked;
+			this.#usagePreflightReadyForNextModelCall = previousUsagePreflightReadyForNextModelCall;
 			this.#inheritedProviderPromptCacheKey = previousInheritedProviderPromptCacheKey;
 			this.#checkpointState = previousCheckpointState;
 			this.#pendingRewindReport = previousPendingRewindReport;
@@ -7020,6 +7050,7 @@ export class AgentSession {
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 		this.#queuedMessageDrainBlocked = false;
+		this.#usagePreflightReadyForNextModelCall = false;
 
 		await this.#bash.flushPending();
 		// Flush pending writes before branching
@@ -7120,6 +7151,7 @@ export class AgentSession {
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 		this.agent.replaceQueues([], []);
 		this.#queuedMessageDrainBlocked = false;
+		this.#usagePreflightReadyForNextModelCall = false;
 		if (this.isStreaming) {
 			await this.abort({ goalReason: "internal", reason: "branching /btw" });
 			this.agent.replaceQueues([], []);

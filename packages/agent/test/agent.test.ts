@@ -442,6 +442,10 @@ describe("Agent", () => {
 			},
 			streamFn: mock.stream,
 		});
+		let beforeModelCalls = 0;
+		agent.addBeforeModelCallHook(() => {
+			beforeModelCalls++;
+		});
 
 		const unsubscribe = agent.subscribe(event => {
 			if (event.type === "message_end" && event.message.role === "toolResult") {
@@ -461,6 +465,7 @@ describe("Agent", () => {
 			{ systemPrompt: "prompt-one", toolNames: ["alpha"] },
 			{ systemPrompt: "prompt-two", toolNames: ["alpha", "beta"] },
 		]);
+		expect(beforeModelCalls).toBe(2);
 	});
 
 	it("prompt() drops stale forced toolChoice after same-turn tool refresh", async () => {
