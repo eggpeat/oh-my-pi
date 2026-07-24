@@ -390,6 +390,7 @@ export class Agent {
 	#asideMessageProvider?: () => AsideMessage[] | Promise<AsideMessage[]>;
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
+	#beforeModelCallHooks = new Set<NonNullable<AgentLoopConfig["syncContextBeforeModelCall"]>>();
 
 	/** Buffered Cursor tool results with text length at time of call (for correct ordering) */
 	#cursorToolResultBuffer: CursorToolResultEntry[] = [];
@@ -746,6 +747,12 @@ export class Agent {
 	subscribe(fn: (e: AgentEvent) => void): () => void {
 		this.#listeners.add(fn);
 		return () => this.#listeners.delete(fn);
+	}
+
+	/** Register a composable hook after queued-message injection and before each model call. */
+	addBeforeModelCallHook(hook: NonNullable<AgentLoopConfig["syncContextBeforeModelCall"]>): () => void {
+		this.#beforeModelCallHooks.add(hook);
+		return () => this.#beforeModelCallHooks.delete(hook);
 	}
 
 	setProviderResponseInterceptor(fn: SimpleStreamOptions["onResponse"] | undefined): void {
@@ -1178,7 +1185,8 @@ export class Agent {
 			onSseEvent: this.#onSseEvent,
 			getApiKey: this.getApiKey,
 			getToolContext: this.#getToolContext,
-			syncContextBeforeModelCall: async context => {
+			syncContextBeforeModelCall: async (context, signal) => {
+				for (const hook of this.#beforeModelCallHooks) await hook(context, signal);
 				if (this.#listeners.size > 0) {
 					await Bun.sleep(0);
 				}

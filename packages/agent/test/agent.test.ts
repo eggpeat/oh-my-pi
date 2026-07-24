@@ -17,6 +17,26 @@ describe("Agent", () => {
 		expect(agent.state.messages).not.toContainEqual(message);
 	});
 
+	it("removes before-model hooks independently", async () => {
+		const mock = createMockModel({ responses: [{ content: ["first"] }, { content: ["second"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+		const calls: string[] = [];
+		const removeFirst = agent.addBeforeModelCallHook(() => {
+			calls.push("first");
+		});
+		const removeSecond = agent.addBeforeModelCallHook(() => {
+			calls.push("second");
+		});
+
+		removeFirst();
+		await agent.prompt("first turn");
+		expect(calls).toEqual(["second"]);
+
+		removeSecond();
+		await agent.prompt("second turn");
+		expect(calls).toEqual(["second"]);
+	});
+
 	it("continue() should process queued follow-up messages after an assistant turn", async () => {
 		const mock = createMockModel({ responses: [{ content: ["Processed"] }] });
 		const agent = new Agent({ streamFn: mock.stream });

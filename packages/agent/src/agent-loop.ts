@@ -845,7 +845,7 @@ async function runLoopBody(
 
 				// Refresh prompt/tool context from live state before each model call
 				if (config.syncContextBeforeModelCall) {
-					await config.syncContextBeforeModelCall(currentContext);
+					await config.syncContextBeforeModelCall(currentContext, signal);
 				}
 
 				// Resolve the per-turn tool-choice directive ONCE per logical turn. The

@@ -556,6 +556,8 @@ export class AgentSession {
 	#modelRegistry: ModelRegistry;
 	#usageFallbackConfirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined;
 	#usagePreflightAbortControllers = new Set<AbortController>();
+	#usagePreflightPendingForQueuedTurn = false;
+	#detachUsageBeforeModelCall: (() => void) | undefined;
 
 	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
@@ -745,8 +747,10 @@ export class AgentSession {
 			!this.#canAutoContinueForFollowUp()
 				? [...this.agent.peekFollowUpQueue()]
 				: [];
+		const parkedUsagePreflight = parkedFollowUps.length > 0 && this.#usagePreflightPendingForQueuedTurn;
 		if (parkedFollowUps.length > 0) {
 			this.agent.replaceQueues([...this.agent.peekSteeringQueue()], []);
+			if (parkedUsagePreflight) this.#usagePreflightPendingForQueuedTurn = false;
 		}
 		this.#resetPromptMaintenanceState();
 		this.#beginInFlight();
@@ -761,6 +765,7 @@ export class AgentSession {
 						[...this.agent.peekSteeringQueue()],
 						[...parkedFollowUps, ...this.agent.peekFollowUpQueue()],
 					);
+					this.#usagePreflightPendingForQueuedTurn ||= parkedUsagePreflight;
 				}
 				this.#endInFlight();
 			});
@@ -780,6 +785,7 @@ export class AgentSession {
 			steering.filter(m => !isAdvisorCard(m)),
 			followUp.filter(m => !isAdvisorCard(m)),
 		);
+		this.#reconcileUsagePreflightQueuedTurn();
 		return cards;
 	}
 
@@ -990,6 +996,14 @@ export class AgentSession {
 			withBashBranchTransition: operation => this.#bash.withBranchTransition(operation),
 		};
 		this.#recovery = new TurnRecovery(recoveryHost, { initialRetryFallback: config.initialRetryFallback });
+		this.#detachUsageBeforeModelCall = this.agent.addBeforeModelCallHook(async (_context, signal) => {
+			if (!this.#usagePreflightPendingForQueuedTurn) return;
+			this.#usagePreflightPendingForQueuedTurn = false;
+			if (!(await this.#runUsageAwarePreflight(signal))) {
+				signal?.throwIfAborted();
+				throw new DOMException("Usage preflight cancelled", "AbortError");
+			}
+		});
 		const statsHost: SessionStatsTrackerHost = {
 			session: this,
 			agent: this.agent,
@@ -2820,13 +2834,12 @@ export class AgentSession {
 				this.#beginInFlight();
 				try {
 					await this.#recovery.maybeRestoreRetryFallbackPrimary();
-					if (
-						this.settings.get("retry.modelFallback") &&
-						this.settings.get("retry.usageAwareFallback") &&
-						!(await this.#runUsageAwarePreflight())
-					) {
-						this.#skipAgentContinue("session-unavailable", options);
-						return;
+					if (this.settings.get("retry.usageAwareFallback")) {
+						this.#usagePreflightPendingForQueuedTurn = false;
+						if (!(await this.#runUsageAwarePreflight(signal))) {
+							this.#skipAgentContinue("session-unavailable", options);
+							return;
+						}
 					}
 					if (signal.aborted || this.#isDisposed) {
 						this.#skipAgentContinue("post-restore-unavailable", options);
@@ -3376,6 +3389,9 @@ export class AgentSession {
 	 */
 	beginDispose(): void {
 		this.#isDisposed = true;
+		this.#usagePreflightPendingForQueuedTurn = false;
+		this.#detachUsageBeforeModelCall?.();
+		this.#detachUsageBeforeModelCall = undefined;
 		this.#memory.cancelLocalMemoryStartup();
 		this.#titleGenerationAbortController.abort();
 		this.#abortAutolearnCapture();
@@ -3590,9 +3606,25 @@ export class AgentSession {
 		this.#usageFallbackConfirmer = confirmer;
 	}
 
-	async #runUsageAwarePreflight(): Promise<boolean> {
+	#markUsagePreflightForQueuedTurn(): void {
+		if (this.isStreaming && this.settings.get("retry.usageAwareFallback")) {
+			this.#usagePreflightPendingForQueuedTurn = true;
+		}
+	}
+
+	#reconcileUsagePreflightQueuedTurn(): void {
+		if (!this.agent.hasQueuedMessages()) {
+			this.#usagePreflightPendingForQueuedTurn = false;
+		}
+	}
+
+	async #runUsageAwarePreflight(signal?: AbortSignal): Promise<boolean> {
+		if (signal?.aborted) return false;
 		const generation = this.#promptGeneration;
+
 		const controller = new AbortController();
+		const onAbort = () => controller.abort(signal?.reason);
+		signal?.addEventListener("abort", onAbort, { once: true });
 		this.#usagePreflightAbortControllers.add(controller);
 		try {
 			await this.#recovery.maybeApplyUsageAwareFallback(controller.signal, this.#usageFallbackConfirmer);
@@ -3601,6 +3633,7 @@ export class AgentSession {
 			if (controller.signal.aborted || this.#promptGeneration !== generation) return false;
 			throw error;
 		} finally {
+			signal?.removeEventListener("abort", onAbort);
 			this.#usagePreflightAbortControllers.delete(controller);
 		}
 	}
@@ -4480,7 +4513,6 @@ export class AgentSession {
 		if (this.isStreaming) {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) throw new AgentBusyError();
-			if (!(await this.#runUsageAwarePreflight())) return false;
 			// Steer/follow-up the keyword notices BEFORE the queued user message so the
 			// model reads the steering notice ahead of the prompt it modifies.
 			for (const notice of keywordNotices) {
@@ -4575,7 +4607,6 @@ export class AgentSession {
 		if (options?.queueOnly) {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) throw new AgentBusyError();
-			if (!(await this.#runUsageAwarePreflight())) return;
 			for (const notice of keywordNotices) {
 				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
@@ -4585,7 +4616,6 @@ export class AgentSession {
 		if (this.isStreaming) {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) throw new AgentBusyError();
-			if (!(await this.#runUsageAwarePreflight())) return;
 			for (const notice of keywordNotices) {
 				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
@@ -4980,7 +5010,6 @@ export class AgentSession {
 		}
 
 		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
-		if (!(await this.#runUsageAwarePreflight())) return;
 		await this.#queueUserMessage(expandedText, images, "steer");
 	}
 
@@ -4998,7 +5027,6 @@ export class AgentSession {
 
 		const expandedText =
 			options?.expandPromptTemplates === false ? text : expandPromptTemplate(text, [...this.#promptTemplates]);
-		if (!(await this.#runUsageAwarePreflight())) return;
 		if (!options?.synthetic) {
 			await this.#queueUserMessage(expandedText, images, "followUp");
 			return;
@@ -5015,6 +5043,7 @@ export class AgentSession {
 		const imageDescriptionNotice = normalizedImages?.length
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
+		this.#markUsagePreflightForQueuedTurn();
 		if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
 		this.agent.followUp({
 			role: "developer",
@@ -5044,6 +5073,7 @@ export class AgentSession {
 		const imageDescriptionNotice = normalizedImages?.length
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
+		this.#markUsagePreflightForQueuedTurn();
 		if (mode === "followUp") {
 			if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
 			this.agent.followUp({
@@ -5250,6 +5280,7 @@ export class AgentSession {
 			timestamp: Date.now(),
 		};
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
+		this.#markUsagePreflightForQueuedTurn();
 		if (deliverAs === "followUp") {
 			this.agent.followUp(normalizedAppMessage);
 		} else {
@@ -5306,7 +5337,7 @@ export class AgentSession {
 				this.#queueHiddenNextTurnMessage(normalizedAppMessage, options?.triggerTurn ?? false);
 				return false;
 			}
-			if (!(await this.#runUsageAwarePreflight())) return false;
+			this.#markUsagePreflightForQueuedTurn();
 
 			if (options?.deliverAs === "followUp") {
 				this.agent.followUp(normalizedAppMessage);
@@ -5389,7 +5420,6 @@ export class AgentSession {
 			if (images.length === 0) images = undefined;
 		}
 
-		if (options?.deliverAs && !(await this.#runUsageAwarePreflight())) return;
 		if (options?.deliverAs === "followUp") {
 			await this.#queueUserMessage(text, images, "followUp");
 			return;
@@ -5429,6 +5459,7 @@ export class AgentSession {
 			? isAdvisorCard
 			: m => !isUserQueuedMessage(m) && !isHiddenUserCompanion(m);
 		this.agent.replaceQueues(steeringAll.filter(keep), followUpAll.filter(keep));
+		this.#reconcileUsagePreflightQueuedTurn();
 		return { steering, followUp };
 	}
 
@@ -5478,12 +5509,14 @@ export class AgentSession {
 		if (fromSteer >= 0) {
 			const removed = steering[fromSteer];
 			this.agent.replaceQueues(removeWithCompanions(steering, fromSteer), followUp.slice());
+			this.#reconcileUsagePreflightQueuedTurn();
 			return toRestoredQueuedMessage(removed);
 		}
 		const fromFollowUp = lastUserIndex(followUp);
 		if (fromFollowUp >= 0) {
 			const removed = followUp[fromFollowUp];
 			this.agent.replaceQueues(steering.slice(), removeWithCompanions(followUp, fromFollowUp));
+			this.#reconcileUsagePreflightQueuedTurn();
 			return toRestoredQueuedMessage(removed);
 		}
 		return undefined;
@@ -5736,6 +5769,7 @@ export class AgentSession {
 		await this.#memory.resetContextForNewTranscript();
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
+		this.#usagePreflightPendingForQueuedTurn = false;
 
 		this.sessionManager.appendThinkingLevelChange(this.thinkingLevel, this.configuredThinkingLevel());
 		this.sessionManager.appendServiceTierChange(this.#models.serviceTierEntry());
@@ -6709,6 +6743,7 @@ export class AgentSession {
 		const previousFollowUpMessages = [...this.agent.peekFollowUpQueue()];
 		const previousPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
 		const previousScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
+		const previousUsagePreflightPendingForQueuedTurn = this.#usagePreflightPendingForQueuedTurn;
 		const previousModel = this.model;
 		const previousThinkingLevel = this.thinkingLevel;
 		const previousAutoThinking = this.isAutoThinking;
@@ -6733,6 +6768,7 @@ export class AgentSession {
 		this.agent.clearAllQueues();
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
+		this.#usagePreflightPendingForQueuedTurn = false;
 
 		try {
 			await this.sessionManager.setSessionFile(sessionPath);
@@ -6882,6 +6918,7 @@ export class AgentSession {
 			this.agent.replaceQueues(previousSteeringMessages, previousFollowUpMessages);
 			this.#pendingNextTurnMessages = previousPendingNextTurnMessages;
 			this.#scheduledHiddenNextTurnGeneration = previousScheduledHiddenNextTurnGeneration;
+			this.#usagePreflightPendingForQueuedTurn = previousUsagePreflightPendingForQueuedTurn;
 			this.#inheritedProviderPromptCacheKey = previousInheritedProviderPromptCacheKey;
 			this.#checkpointState = previousCheckpointState;
 			this.#pendingRewindReport = previousPendingRewindReport;
@@ -6948,6 +6985,7 @@ export class AgentSession {
 		// Clear pending messages (bound to old session state)
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
+		this.#usagePreflightPendingForQueuedTurn = false;
 
 		await this.#bash.flushPending();
 		// Flush pending writes before branching
@@ -7046,6 +7084,7 @@ export class AgentSession {
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 		this.agent.replaceQueues([], []);
+		this.#usagePreflightPendingForQueuedTurn = false;
 		if (this.isStreaming) {
 			await this.abort({ goalReason: "internal", reason: "branching /btw" });
 			this.agent.replaceQueues([], []);

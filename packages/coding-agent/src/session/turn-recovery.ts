@@ -61,6 +61,7 @@ const UNEXPECTED_STOP_TIMEOUT_MS = 4000;
 const EMPTY_STOP_MAX_RETRIES = 3;
 const SIBLING_UNBLOCK_BUFFER_MS = 1_000;
 const NON_WHITESPACE_RE = /\S/;
+const USAGE_PREFLIGHT_BLOCKED_PREFIX = "Usage preflight blocked:";
 
 function hasNonWhitespace(value: string): boolean {
 	return NON_WHITESPACE_RE.test(value);
@@ -790,6 +791,10 @@ export class TurnRecovery {
 		return message.errorMessage === "Request was aborted" || message.errorMessage === "Request was aborted.";
 	}
 
+	#isUsagePreflightBlocked(message: AssistantMessage): boolean {
+		return message.errorMessage?.startsWith(USAGE_PREFLIGHT_BLOCKED_PREFIX) === true;
+	}
+
 	/**
 	 * Retry an empty, reason-less provider abort: a turn with no content that
 	 * carries the generic sentinel (bare `abort()`), whether the provider
@@ -831,6 +836,7 @@ export class TurnRecovery {
 	 */
 	isRetryableError(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error") return false;
+		if (this.#isUsagePreflightBlocked(message)) return false;
 
 		const id = this.#classifyRetryMessage(message);
 		// Context overflow is handled by compaction, not retry
@@ -989,9 +995,7 @@ export class TurnRecovery {
 		signal: AbortSignal,
 		confirmer?: (confirmation: UsageFallbackConfirmation) => Promise<boolean>,
 	): Promise<void> {
-		if (!this.#host.settings.get("retry.modelFallback") || !this.#host.settings.get("retry.usageAwareFallback")) {
-			return;
-		}
+		if (!this.#host.settings.get("retry.usageAwareFallback")) return;
 		const currentModel = this.#host.model();
 		if (!currentModel) return;
 		const currentSelector = formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel());
@@ -1038,7 +1042,9 @@ export class TurnRecovery {
 		const reservePolicy = this.#host.settings.get("retry.usageReservePolicy");
 		if (reservePolicy === "fail-closed") {
 			const condition = health.state === "reserve" ? "reserve reached" : "usage depleted";
-			throw new Error(`${condition} for ${currentSelector}; reserve policy is fail-closed.`);
+			throw new Error(
+				`${USAGE_PREFLIGHT_BLOCKED_PREFIX} ${condition} for ${currentSelector}; reserve policy is fail-closed.`,
+			);
 		}
 		if (
 			reservePolicy === "confirm" &&
@@ -1047,6 +1053,7 @@ export class TurnRecovery {
 		) {
 			return;
 		}
+		if (!this.#host.settings.get("retry.modelFallback")) return;
 
 		const role = this.#activeRetryFallback?.role ?? this.resolveRetryFallbackRole(currentSelector, currentModel);
 		if (!role) return;
@@ -1234,6 +1241,7 @@ export class TurnRecovery {
 		const model = this.#activeFireworksFastModel();
 		if (!model) return false;
 		if (message.stopReason !== "error") return false;
+		if (this.#isUsagePreflightBlocked(message)) return false;
 		if (message.content.some(block => block.type === "toolCall")) return false;
 		// A content refusal/sensitivity stop is the model's decision, not a route
 		// failure — switching to the base model would just re-trigger it.
@@ -1258,6 +1266,7 @@ export class TurnRecovery {
 	 */
 	isHardErrorFallbackEligible(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error") return false;
+		if (this.#isUsagePreflightBlocked(message)) return false;
 		const model = this.#host.model();
 		if (!model) return false;
 		const retrySettings = this.#host.settings.getGroup("retry");

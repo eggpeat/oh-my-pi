@@ -96,6 +96,7 @@ describe("AgentSession retry fallback", () => {
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		authStorage.setRuntimeApiKey("anthropic", "anthropic-test-key");
 		authStorage.setRuntimeApiKey("openai", "openai-test-key");
+		authStorage.setRuntimeApiKey("fireworks", "fireworks-test-key");
 		authStorage.setRuntimeApiKey("google", "google-test-key");
 		authStorage.setRuntimeApiKey("google-vertex", "google-vertex-test-key");
 		authStorage.setRuntimeApiKey("openrouter", "openrouter-test-key");
@@ -600,6 +601,265 @@ describe("AgentSession retry fallback", () => {
 		await prompt;
 
 		expect(requestedModels).toEqual([]);
+	});
+
+	it("defers usage fallback for a queued steer until the active stream finishes", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+		if (!primaryModel || !fallbackModel) throw new Error("Expected bundled queued fallback models");
+		const requestedModels: string[] = [];
+		const streamStarted = Promise.withResolvers<void>();
+		const firstResponse = Promise.withResolvers<{ content: string[] }>();
+		const mock = createMockModel({
+			responses: [
+				async () => {
+					streamStarted.resolve();
+					return firstResponse.promise;
+				},
+				{ content: ["queued steer completed"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primaryModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.usageAwareFallback": true,
+			"retry.usageReservePolicy": "auto",
+			"retry.fallbackChains": {
+				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
+			},
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		let useReserve = false;
+		const usageHealth = vi
+			.spyOn(modelRegistry.authStorage, "getModelUsageHealth")
+			.mockImplementation(async provider =>
+				provider === primaryModel.provider
+					? useReserve
+						? {
+								state: "reserve",
+								accounts: [
+									{
+										credentialId: 1,
+										credentialType: "oauth",
+										state: "reserve",
+										remainingFraction: 0.05,
+									},
+								],
+							}
+						: {
+								state: "healthy",
+								accounts: [
+									{
+										credentialId: 1,
+										credentialType: "oauth",
+										state: "healthy",
+										remainingFraction: 0.8,
+									},
+								],
+							}
+					: { state: "healthy", accounts: [] },
+			);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		const firstPrompt = session.prompt("Keep the primary stream active");
+		await streamStarted.promise;
+		useReserve = true;
+		await session.sendUserMessage("Queue this steer", { deliverAs: "steer" });
+
+		expect(usageHealth).toHaveBeenCalledTimes(1);
+		expect(session.model?.id).toBe(primaryModel.id);
+
+		firstResponse.resolve({ content: ["primary stream completed"] });
+		await firstPrompt;
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${fallbackModel.provider}/${fallbackModel.id}`,
+		]);
+	});
+
+	it("cancels queued-turn usage confirmation when post-prompt work is disposed", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+		if (!primaryModel || !fallbackModel) throw new Error("Expected bundled queued cancellation models");
+		const requestedModels: string[] = [];
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primaryModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				return createMockModel().stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.usageAwareFallback": true,
+			"retry.fallbackChains": {
+				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
+			},
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		vi.spyOn(modelRegistry.authStorage, "getModelUsageHealth").mockImplementation(async provider =>
+			provider === primaryModel.provider
+				? {
+						state: "reserve",
+						accounts: [
+							{
+								credentialId: 1,
+								credentialType: "oauth",
+								state: "reserve",
+								remainingFraction: 0.05,
+							},
+						],
+					}
+				: { state: "healthy", accounts: [] },
+		);
+		const confirmationStarted = Promise.withResolvers<void>();
+		const pendingConfirmation = Promise.withResolvers<boolean>();
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		session.setUsageFallbackConfirmer(async () => {
+			confirmationStarted.resolve();
+			return pendingConfirmation.promise;
+		});
+
+		await session.sendUserMessage("Queue this turn", { deliverAs: "steer" });
+		await confirmationStarted.promise;
+		await session.dispose();
+		session = undefined;
+
+		expect(requestedModels).toEqual([]);
+	});
+
+	it("enforces fail-closed usage health when model fallback is disabled", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primaryModel) throw new Error("Expected bundled fail-closed model");
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primaryModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: createMockModel().stream,
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.modelFallback": false,
+			"retry.usageAwareFallback": true,
+			"retry.usageReservePolicy": "fail-closed",
+		});
+		vi.spyOn(modelRegistry.authStorage, "getModelUsageHealth").mockResolvedValue({
+			state: "reserve",
+			accounts: [
+				{
+					credentialId: 1,
+					credentialType: "oauth",
+					state: "reserve",
+					remainingFraction: 0.05,
+				},
+			],
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		await expect(session.prompt("Do not spend reserve")).rejects.toThrow("reserve policy is fail-closed");
+	});
+
+	it("does not degrade Fireworks Fast or retry a chain after queued fail-closed preflight", async () => {
+		const primaryModel = getBundledModel("fireworks", "kimi-k2.6-fast");
+		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+		if (!primaryModel || !fallbackModel) throw new Error("Expected bundled queued fail-closed models");
+		const requestedModels: string[] = [];
+		const streamStarted = Promise.withResolvers<void>();
+		const firstResponse = Promise.withResolvers<{ content: string[] }>();
+		const mock = createMockModel({
+			responses: [
+				async () => {
+					streamStarted.resolve();
+					return firstResponse.promise;
+				},
+				{ content: ["must not run"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primaryModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.usageAwareFallback": true,
+			"retry.usageReservePolicy": "fail-closed",
+			"retry.fallbackChains": {
+				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
+			},
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		let useReserve = false;
+		const usageHealth = vi.spyOn(modelRegistry.authStorage, "getModelUsageHealth").mockImplementation(async () =>
+			useReserve
+				? {
+						state: "reserve",
+						accounts: [
+							{
+								credentialId: 1,
+								credentialType: "oauth",
+								state: "reserve",
+								remainingFraction: 0.05,
+							},
+						],
+					}
+				: {
+						state: "healthy",
+						accounts: [
+							{
+								credentialId: 1,
+								credentialType: "oauth",
+								state: "healthy",
+								remainingFraction: 0.8,
+							},
+						],
+					},
+		);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		const firstPrompt = session.prompt("Keep the primary stream active");
+		await streamStarted.promise;
+		useReserve = true;
+		await session.sendUserMessage("Queue blocked work", { deliverAs: "steer" });
+		firstResponse.resolve({ content: ["primary stream completed"] });
+		await firstPrompt;
+		await session.waitForIdle();
+
+		expect(usageHealth).toHaveBeenCalledTimes(2);
+		expect(requestedModels).toEqual([`${primaryModel.provider}/${primaryModel.id}`]);
+		expect(session.model?.id).toBe(primaryModel.id);
 	});
 
 	it("continues a startup-owned role fallback chain from the active fallback", async () => {
