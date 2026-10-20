@@ -14,6 +14,7 @@ import {
 	GetUserStatusRequestSchema,
 	type GetUserStatusResponse,
 	GetUserStatusResponseSchema,
+	type Metadata,
 	MetadataSchema,
 	type PlanInfo,
 	type PlanStatus,
@@ -48,7 +49,7 @@ function timestampMs(timestamp: Timestamp): number {
 	return Number(timestamp.seconds) * 1_000 + timestamp.nanos / 1_000_000;
 }
 
-/** Credential bytes exactly as their storage kind requires on the Cascade wire. */
+/** Trim credential bytes before applying the CLI-first authentication handshake. */
 function devinCredential(credential: UsageCredential): string | undefined {
 	const raw = credential.type === "oauth" ? credential.accessToken : credential.apiKey;
 	const token = raw?.trim();
@@ -265,21 +266,28 @@ async function fetchDevinUsage(params: UsageFetchParams, ctx: UsageFetchContext)
 	if (!token) return null;
 	const baseUrl = (params.baseUrl ?? DEVIN_DEFAULT_BASE_URL).replace(/\/+$/, "");
 
-	const metadata = params.credential.type === "oauth" ? devinCliMetadata(token) : devinWireMetadata(token);
+	const sessionMetadata = create(MetadataSchema, devinCliMetadata(token));
 	try {
-		const request = create(GetUserStatusRequestSchema, {
-			metadata: create(MetadataSchema, metadata),
-		});
-		const response = await ctx.fetch(`${baseUrl}${GET_USER_STATUS_PATH}`, {
-			method: "POST",
-			headers: {
-				"content-type": "application/proto",
-				"connect-protocol-version": "1",
-				accept: "*/*",
-			},
-			body: toBinary(GetUserStatusRequestSchema, request),
-			signal: params.signal,
-		});
+		const requestUserStatus = (metadata: Metadata): Promise<Response> => {
+			const request = create(GetUserStatusRequestSchema, { metadata });
+			return ctx.fetch(`${baseUrl}${GET_USER_STATUS_PATH}`, {
+				method: "POST",
+				headers: {
+					"content-type": "application/proto",
+					"connect-protocol-version": "1",
+					accept: "*/*",
+				},
+				body: toBinary(GetUserStatusRequestSchema, request),
+				signal: params.signal,
+			});
+		};
+		let response = await requestUserStatus(sessionMetadata);
+		if (response.status === 401) {
+			const wireMetadata = create(MetadataSchema, devinWireMetadata(token));
+			if (wireMetadata.apiKey !== sessionMetadata.apiKey) {
+				response = await requestUserStatus(wireMetadata);
+			}
+		}
 		if (!response.ok) {
 			ctx.logger?.warn("Devin user status fetch failed", { provider: PROVIDER, status: response.status });
 			return null;

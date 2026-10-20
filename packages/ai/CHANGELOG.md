@@ -6,6 +6,10 @@
 
 - Added Inception API-key login (`/login inception`) and `INCEPTION_API_KEY` environment authentication ([#16439](https://github.com/can1357/oh-my-pi/pull/16439) by [@eggpeat](https://github.com/eggpeat))
 
+### Fixed
+
+- Fixed Devin usage showing unknown quota for session tokens stored as API keys while retaining legacy API-key authentication
+
 ## [18.12.3] - 2026-10-19
 
 ### Added

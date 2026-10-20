@@ -114,13 +114,17 @@ interface Capture {
 	metadata?: Metadata;
 }
 
-function mockFetch(payload: Uint8Array, capture: Capture, init?: { gzip?: boolean; status?: number }): FetchImpl {
+function mockFetch(
+	payload: Uint8Array,
+	capture: Capture,
+	init?: { gzip?: boolean; status?: number | ((metadata: Metadata | undefined) => number) },
+): FetchImpl {
 	return (input, requestInit) => {
 		capture.url = String(input);
 		capture.headers = new Headers(requestInit?.headers);
 		const body = requestInit?.body as Uint8Array;
 		capture.metadata = fromBinary(GetUserStatusRequestSchema, new Uint8Array(body)).metadata;
-		const status = init?.status ?? 200;
+		const status = typeof init?.status === "function" ? init.status(capture.metadata) : (init?.status ?? 200);
 		const bytes = init?.gzip ? new Uint8Array(gzipSync(payload)) : payload;
 		return Promise.resolve(
 			new Response(status === 200 ? bytes : "denied", {
@@ -250,19 +254,78 @@ describe("Devin account usage", () => {
 		expect(report.notes).toEqual(["Overage balance: $2.50"]);
 	});
 
-	test("sends API key credentials without the Devin session-token prefix", async () => {
+	test("reports API-key usage when only the CLI session-token form is accepted", async () => {
+		const payload = userStatusPayload(
+			{ planName: "Devin Pro", monthlyPromptCredits: 500 },
+			{ userId: "session-user", usedPromptCredits: 125, availablePromptCredits: 375 },
+		);
+		const apiKeys: (string | undefined)[] = [];
+		const report = await devinUsageProvider.fetchUsage(params("stored-session", "api_key"), {
+			fetch: mockFetch(
+				payload,
+				{},
+				{
+					status: metadata => {
+						apiKeys.push(metadata?.apiKey);
+						return metadata?.apiKey === "devin-session-token$stored-session" ? 200 : 401;
+					},
+				},
+			),
+		});
+
+		if (!report) throw new Error("expected a usage report");
+		expect(report.metadata?.accountId).toBe("session-user");
+		expect(limitById(report, "devin:credits:prompt").amount.usedFraction).toBe(0.25);
+		expect(apiKeys).toEqual(["devin-session-token$stored-session"]);
+	});
+
+	test("falls back to the raw key once only after HTTP 401 with a different encoding", async () => {
 		const payload = userStatusPayload(
 			{ planName: "Windsurf Enterprise", monthlyPromptCredits: 500 },
 			{ userId: "legacy-user", usedPromptCredits: 125, availablePromptCredits: 375 },
 		);
-		const capture: Capture = {};
+		for (const type of ["api_key", "oauth"] as const) {
+			const apiKeys: (string | undefined)[] = [];
+			const report = await devinUsageProvider.fetchUsage(params("legacy-windsurf-key", type), {
+				fetch: mockFetch(
+					payload,
+					{},
+					{
+						status: metadata => {
+							apiKeys.push(metadata?.apiKey);
+							return metadata?.apiKey === "legacy-windsurf-key" ? 200 : 401;
+						},
+					},
+				),
+			});
 
-		const report = await devinUsageProvider.fetchUsage(params("legacy-windsurf-key", "api_key"), {
-			fetch: mockFetch(payload, capture),
-		});
+			if (!report) throw new Error("expected a usage report");
+			expect(limitById(report, "devin:credits:prompt").amount.usedFraction).toBe(0.25);
+			expect(apiKeys).toEqual(["devin-session-token$legacy-windsurf-key", "legacy-windsurf-key"]);
+		}
 
-		expect(capture.metadata?.apiKey).toBe("legacy-windsurf-key");
-		expect(report?.metadata?.accountId).toBe("legacy-user");
+		for (const [token, status, expectedKeys] of [
+			["raw-token", 403, ["devin-session-token$raw-token"]],
+			["raw-token", 401, ["devin-session-token$raw-token", "raw-token"]],
+			["devin-session-token$already", 401, ["devin-session-token$already"]],
+		] as const) {
+			const apiKeys: (string | undefined)[] = [];
+			const report = await devinUsageProvider.fetchUsage(params(token, "api_key"), {
+				fetch: mockFetch(
+					payload,
+					{},
+					{
+						status: metadata => {
+							apiKeys.push(metadata?.apiKey);
+							return status;
+						},
+					},
+				),
+			});
+
+			expect(report).toBeNull();
+			expect<readonly (string | undefined)[]>(apiKeys).toEqual(expectedKeys);
+		}
 	});
 
 	test("decodes a gzip-encoded response body and keeps an already-prefixed session token", async () => {
