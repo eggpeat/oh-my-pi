@@ -8,7 +8,7 @@
 
 ### Fixed
 
-- Fixed Devin usage showing unknown quota for session tokens stored as API keys while retaining legacy API-key authentication
+- Fixed Devin usage showing unknown quota for session tokens stored as API keys while retaining legacy API-key authentication ([#2](https://github.com/eggpeat/oh-my-pi/pull/2) by [@eggpeat](https://github.com/eggpeat))
 
 ## [18.12.3] - 2026-10-19
 
