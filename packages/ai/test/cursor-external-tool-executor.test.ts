@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "bun:test";
 import * as http2 from "node:http2";
 import { AuthGatewaySessionStateStore } from "@oh-my-pi/pi-ai/auth-gateway";
+import { encodeStream as encodeAnthropicMessagesStream } from "@oh-my-pi/pi-ai/providers/anthropic-messages-server";
 import { buildGrpcRequest, type CursorOptions, streamCursor } from "@oh-my-pi/pi-ai/providers/cursor";
+import { encodeStream as encodeChatCompletionsStream } from "@oh-my-pi/pi-ai/providers/openai-chat-server";
 import type {
 	AssistantMessage,
 	Message,
@@ -27,6 +29,7 @@ import {
 	McpArgsSchema,
 	type McpResult,
 	McpToolCallSchema,
+	PartialToolCallUpdateSchema,
 	RequestContextArgsSchema,
 	SetBlobArgsSchema,
 	TextDeltaUpdateSchema,
@@ -530,6 +533,14 @@ function readStarted(n: number, args = readArgs(n)): Buffer {
 	});
 }
 
+/** Cursor streaming `call-read-n`'s argument text so far. */
+function readArgsText(n: number, argsTextDelta: string): Buffer {
+	return interactionFrame({
+		case: "partialToolCall",
+		value: create(PartialToolCallUpdateSchema, { callId: `call-read-${n}`, argsTextDelta }),
+	});
+}
+
 /** `call-read-n`'s MCP exec frame: Cursor waits on its answer. */
 function readExec(n: number): Buffer {
 	return execFrame(n + 1, { case: "mcpArgs", value: readArgs(n) });
@@ -722,6 +733,66 @@ function drivenCursor(): { serve: FixtureStream; runs: DrivenRun[]; run(index: n
 	return { serve, runs, run: index => opening(index).promise };
 }
 
+/** The data payloads of a gateway SSE response, in order. */
+function ssePayloads<T>(body: string): T[] {
+	return body
+		.split("\n")
+		.flatMap(line => (line.startsWith("data: ") && line !== "data: [DONE]" ? [JSON.parse(line.slice(6)) as T] : []));
+}
+
+/** A call as its client assembled it from the stream; argument text that does not parse stays as it came. */
+function clientCall({ id, name, json }: { id: string; name: string; json: string }): unknown {
+	let args: unknown;
+	try {
+		args = JSON.parse(json || "{}");
+	} catch {
+		args = json;
+	}
+	return { type: "toolCall", id, name, arguments: args };
+}
+
+interface AnthropicStreamEvent {
+	type: string;
+	index: number;
+	content_block?: { type: string; id?: string; name?: string };
+	delta?: { type: string; partial_json?: string };
+}
+
+/** The calls an Anthropic Messages client assembles: a `tool_use` block's input is its `input_json_delta` text. */
+function anthropicClientCalls(body: string): unknown[] {
+	const calls = new Map<number, { id: string; name: string; json: string }>();
+	for (const event of ssePayloads<AnthropicStreamEvent>(body)) {
+		if (event.type === "content_block_start" && event.content_block?.type === "tool_use") {
+			calls.set(event.index, { id: event.content_block.id ?? "", name: event.content_block.name ?? "", json: "" });
+		} else if (event.type === "content_block_delta" && event.delta?.type === "input_json_delta") {
+			const call = calls.get(event.index);
+			if (call) call.json += event.delta.partial_json ?? "";
+		}
+	}
+	return [...calls.values()].map(clientCall);
+}
+
+interface ChatCompletionChunk {
+	choices?: {
+		delta: { tool_calls?: { index: number; id?: string; function?: { name?: string; arguments?: string } }[] };
+	}[];
+}
+
+/** The calls a Chat Completions client assembles: each `tool_calls` field concatenated by index. */
+function chatClientCalls(body: string): unknown[] {
+	const calls = new Map<number, { id: string; name: string; json: string }>();
+	for (const chunk of ssePayloads<ChatCompletionChunk>(body)) {
+		for (const delta of chunk.choices?.[0]?.delta.tool_calls ?? []) {
+			const call = calls.get(delta.index) ?? { id: "", name: "", json: "" };
+			call.id += delta.id ?? "";
+			call.name += delta.function?.name ?? "";
+			call.json += delta.function?.arguments ?? "";
+			calls.set(delta.index, call);
+		}
+	}
+	return [...calls.values()].map(clientCall);
+}
+
 describe("Cursor runs relayed across an external executor's requests", () => {
 	it("answers the parked call in-band with the next request's result and streams on in the same run", async () => {
 		const runs: ServedRun[] = [];
@@ -900,6 +971,40 @@ describe("Cursor runs relayed across an external executor's requests", () => {
 			expect(cursor.runs[0].answers.map(mcpText)).toEqual(["file 1", "file 2"]);
 		});
 	});
+
+	it.each([
+		{ route: "Anthropic Messages", encode: encodeAnthropicMessagesStream, clientCalls: anthropicClientCalls },
+		{ route: "Chat Completions", encode: encodeChatCompletionsStream, clientCalls: chatClientCalls },
+	])(
+		"streams the $route client only the calls it holds, each with its arguments complete",
+		async ({ encode, clientCalls }) => {
+			const cursor = drivenCursor();
+			const states = new Map<string, ProviderSessionState>();
+			await withCursorServer(cursor.serve, async baseUrl => {
+				// One gateway request on the route: the calls its client assembles from
+				// the stream, and the reply its history keeps.
+				const request = async (messages: Message[]) => {
+					const response = streamCursor(model(baseUrl), { messages, tools }, relayOptions(states));
+					const body = await new Response(encode(response, "composer-2.5")).text();
+					return { calls: clientCalls(body), message: await response.result() };
+				};
+				const firstReply = request([user]);
+				const run = await cursor.run(0);
+				// Cursor starts on the second call's arguments, then waits on the first
+				// before sending the second's exec frame.
+				await run.send(
+					Buffer.concat([readCall(1), readStarted(2, readArgs(2, {})), readArgsText(2, '{"path":"fi')]),
+				);
+				const first = await firstReply;
+				expect(first.calls).toEqual([readToolCall(1)]);
+
+				const secondReply = request([user, first.message, fileResult(1)]);
+				await run.answered(1);
+				await run.send(Buffer.concat([readExec(2), listed(2)]));
+				expect((await secondReply).calls).toEqual([readToolCall(2)]);
+			});
+		},
+	);
 
 	it("does not hand a call off again when Cursor announces it after the handoff", async () => {
 		const cursor = drivenCursor();

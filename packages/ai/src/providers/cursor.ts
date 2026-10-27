@@ -1525,6 +1525,7 @@ function streamCursorWithWireMode(
 				openToolCalls: previousState?.openToolCalls ?? new Map<string, ToolCallState>(),
 				resolvedMcpToolCallIds,
 				handedOffToolCallIds,
+				unheldExternalCalls: previousState?.unheldExternalCalls ?? (relay ? new Map() : undefined),
 				get firstTokenTime() {
 					return firstTokenTime;
 				},
@@ -1778,34 +1779,17 @@ function streamCursorWithWireMode(
 				// response is complete and `finally` closes the transport.
 				const parkUntilResumed = async (): Promise<boolean> => {
 					await drainInFlightDispatches();
-					// A streamed call's arguments are settled by its completion frame,
-					// which follows the result; the exec frame carries them complete.
-					for (const { mcpCall } of relay.held.values()) {
-						const block = output.content.find(
-							(item): item is ToolCallState => item.type === "toolCall" && item.id === mcpCall.toolCallId,
-						);
-						if (!block) continue;
-						const partial = block[kStreamingPartialJson];
-						const streamed = partial === undefined ? block.arguments : parseToolCallArguments(partial);
-						block.arguments =
-							"__parseError" in streamed ? mcpCall.args : mergeCursorMcpToolCallArgs(streamed, mcpCall.args);
-						clearStreamingPartialJson(block);
-					}
 					endCurrentTextBlock(output, stream, state);
 					endCurrentThinkingBlock(output, stream, state);
-					// Only the held calls are handed off, and only once: a late
+					// The held calls went out whole as their exec frames were held
+					// (`streamUnheldExternalCall`), and go out only once: a late
 					// announcement must not reopen one in a later response. A call
-					// Cursor has announced without its exec frame stays open, and
-					// moves to the response that resumes the run.
-					for (const call of new Set([...state.openToolCalls.values(), state.currentToolCall])) {
-						if (!call || !relay.held.has(call.id)) continue;
-						const contentIndex = streamedBlockIndex(output, call);
-						stream.push({ type: "toolcall_end", contentIndex, toolCall: call, partial: output });
-						releaseStreamedCall(state, call);
-					}
+					// announced without its exec frame never reached this response, and
+					// stays open into the one that resumes the run, as does a call
+					// Cursor serves itself that is still running.
 					for (const callId of relay.held.keys()) handedOffToolCallIds.add(callId);
 					const carried = [...new Set([...state.openToolCalls.values(), state.currentToolCall])].filter(
-						(call): call is ToolCallState => call !== null,
+						(call): call is ToolCallState => call !== null && output.content.includes(call),
 					);
 					output.content = output.content.filter(block => !carried.some(call => call === block));
 					turnRecords.relayed = true;
@@ -1873,7 +1857,7 @@ function streamCursorWithWireMode(
 					startTime = performance.now();
 					firstTokenTime = undefined;
 					stream.push({ type: "start", partial: output });
-					// The calls left open at the handoff carry on in this response.
+					// The streamed calls left open at the handoff carry on in this response.
 					for (const call of carried) {
 						call[kStreamingBlockIndex] = output.content.length;
 						output.content.push(call);
@@ -2366,6 +2350,15 @@ export interface BlockState {
 	 * Optional so existing test harnesses stay valid.
 	 */
 	handedOffToolCallIds?: Set<string>;
+	/**
+	 * MCP calls a relayed run (`CursorParkedRun`) has seen announced but holds
+	 * no exec frame for, by call id. A streaming client runs every call it is
+	 * sent and a streamed event cannot be taken back, while a response may hand
+	 * the client only held calls; so a call stays off the stream and out of the
+	 * message until its exec frame is held (`streamUnheldExternalCall`).
+	 * Set only for a relayed run.
+	 */
+	unheldExternalCalls?: Map<string, ToolCallState>;
 	/**
 	 * Native `editToolCall` (StrReplace) ids whose materialization `readArgs` /
 	 * `writeArgs` must stay raw and must not synthesize extra transcript blocks.
@@ -3246,6 +3239,8 @@ async function handleExecServerMessage(
 			// `stop`, so the client never saw the call it was meant to execute.
 			const externalHandoff = externalToolExecutor && !execHandlers?.mcp;
 			if (execHandlers?.mcp || externalHandoff) {
+				const unheld = state.unheldExternalCalls?.get(mcpCall.toolCallId);
+				if (unheld) streamHeldExternalCall(output, stream, state, unheld, mcpCall.args);
 				const existingBlock = output.content.find(
 					block => block.type === "toolCall" && block.id === mcpCall.toolCallId,
 				);
@@ -5075,6 +5070,8 @@ export function flushOpenToolCalls(
 	const openBlocks = new Set<ToolCallState>(state.openToolCalls.values());
 	if (state.currentToolCall) openBlocks.add(state.currentToolCall);
 	for (const block of openBlocks) {
+		// A call a relayed run kept back goes out first, as it streamed.
+		if (state.unheldExternalCalls?.has(block.id)) streamUnheldExternalCall(output, stream, state, block);
 		const idx = streamedBlockIndex(output, block);
 		const partialJson = block[kStreamingPartialJson];
 		if (partialJson !== undefined) {
@@ -5568,6 +5565,50 @@ export function synthesizeCursorExecToolCall(
 }
 
 /**
+ * Put an MCP call a relayed run kept back (`BlockState.unheldExternalCalls`)
+ * on the stream as it would have streamed: its announcement, then the
+ * argument text it has so far as one delta.
+ */
+function streamUnheldExternalCall(
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	state: BlockState,
+	block: ToolCallState,
+): void {
+	state.unheldExternalCalls?.delete(block.id);
+	endCurrentTextBlock(output, stream, state);
+	endCurrentThinkingBlock(output, stream, state);
+	block[kStreamingBlockIndex] = output.content.length;
+	output.content.push(block);
+	const contentIndex = block[kStreamingBlockIndex];
+	stream.push({ type: "toolcall_start", contentIndex, partial: output });
+	const delta = block[kStreamingPartialJson] ?? JSON.stringify(block.arguments);
+	stream.push({ type: "toolcall_delta", contentIndex, delta, partial: output });
+}
+
+/**
+ * Stream a kept-back MCP call once its exec frame, which the run holds, has
+ * arrived: whole, on the arguments that frame carries complete. What streamed
+ * can stop short of them, since the call's completion frame only follows its
+ * result.
+ */
+function streamHeldExternalCall(
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	state: BlockState,
+	block: ToolCallState,
+	execArgs: Record<string, unknown>,
+): void {
+	const partial = block[kStreamingPartialJson];
+	const streamed = partial === undefined ? block.arguments : parseToolCallArguments(partial);
+	block.arguments = "__parseError" in streamed ? execArgs : mergeCursorMcpToolCallArgs(streamed, execArgs);
+	clearStreamingPartialJson(block);
+	streamUnheldExternalCall(output, stream, state, block);
+	stream.push({ type: "toolcall_end", contentIndex: block[kStreamingBlockIndex], toolCall: block, partial: output });
+	releaseStreamedCall(state, block);
+}
+
+/**
  * Pair a `toolResult` for a synthesized block the client answered itself,
  * without ever consulting a handler.
  *
@@ -5698,10 +5739,12 @@ export function processInteractionUpdate(
 				state.resolvedMcpToolCallIds.delete(id);
 				// The exec channel may have emitted this block first — executed
 				// (marked resolved) or handed to an external executor (deliberately
-				// unmarked). Either way the call is already in the transcript, so a
-				// second block for the same id would duplicate it.
+				// unmarked) — or a relayed run may be keeping it back. Either way the
+				// call already has its block, and a second one for the same id would
+				// duplicate it.
 				if (
 					state.handedOffToolCallIds?.has(id) ||
+					state.unheldExternalCalls?.has(id) ||
 					output.content.some(block => block.type === "toolCall" && block.id === id)
 				) {
 					return;
@@ -5718,8 +5761,13 @@ export function processInteractionUpdate(
 					[kStreamingBlockKind]: "mcp",
 					[kStreamingEnvelopeId]: update.message.value.callId || undefined,
 				};
-				output.content.push(block);
 				retainStreamedCall(state, block, update.message.value.callId);
+				// A relayed run streams the call once its exec frame is held.
+				if (state.unheldExternalCalls) {
+					state.unheldExternalCalls.set(id, block);
+					return;
+				}
+				output.content.push(block);
 				stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
 				return;
 			}
@@ -5816,6 +5864,8 @@ export function processInteractionUpdate(
 				target.arguments = throttled.value;
 				target[kStreamingLastParseLen] = throttled.parsedLen;
 			}
+			// Kept back with its announcement (`BlockState.unheldExternalCalls`).
+			if (state.unheldExternalCalls?.has(target.id)) return;
 			const idx = streamedBlockIndex(output, target);
 			stream.push({ type: "toolcall_delta", contentIndex: idx, delta: chunk, partial: output });
 		}
@@ -5831,6 +5881,9 @@ export function processInteractionUpdate(
 		if (settled) {
 			const toolCall = update.message.value.toolCall;
 			if (settled[kStreamingBlockKind] === "mcp") {
+				// Cursor settled a kept-back call without asking for its result: it
+				// goes out as it streamed, and closes like any streamed call.
+				if (state.unheldExternalCalls?.has(settled.id)) streamUnheldExternalCall(output, stream, state, settled);
 				// Authoritative full parse of the accumulated argument buffer; the delta
 				// path throttles mid-stream parses, so `arguments` may lag the buffer.
 				const partial = settled[kStreamingPartialJson];
