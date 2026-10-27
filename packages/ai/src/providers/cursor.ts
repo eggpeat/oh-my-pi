@@ -215,6 +215,7 @@ import { normalizeSystemPrompts, normalizeToolCallId } from "../utils";
 import {
 	type CursorExecResolvedCarrier,
 	clearStreamingPartialJson,
+	isCursorExecResolved,
 	kCursorExecResolved,
 	kStreamingBlockIndex,
 	kStreamingBlockKind,
@@ -329,6 +330,25 @@ function sanitizeCursorCallerHeaders(headers: Record<string, string> | undefined
 	return sanitized;
 }
 
+/**
+ * Header the Cursor backend reads to limit a run's built-in toolset to the
+ * listed agent proto tool names: `ToolCall` oneof field names, comma-joined, as
+ * Cursor's own SDK sends them for its `tools` option.
+ */
+const CURSOR_ALLOWED_TOOLS_HEADER = "x-cursor-agent-allowed-tools";
+
+/**
+ * The toolset of a run whose tools an external executor owns: MCP calls, and
+ * the MCP catalog lookup Cursor serves itself. A native tool's exec frame can
+ * only be answered by running the tool where the files are, which the gateway
+ * cannot do; answered "Tool not available", its call still reached the client,
+ * in Cursor's argument shape (StrReplace as `edit { path, stream_content }`).
+ * An MCP call reaches the client under the client's own tool name and schema,
+ * is handed off, and its result comes back with the next request. The MCP
+ * resource and auth tools stay out: no MCP server stands behind the gateway.
+ */
+const CURSOR_EXTERNAL_EXECUTOR_ALLOWED_TOOLS = "mcp_tool_call,get_mcp_tools_tool_call";
+
 const CURSOR_PROXY_TUNNEL_TIMEOUT_MS = 30_000;
 
 /**
@@ -395,7 +415,11 @@ export interface CursorOptions extends StreamOptions {
 	conversationId?: string;
 	execHandlers?: CursorExecHandlers;
 	onToolResult?: CursorToolResultHandler;
-	/** Treat unhandled MCP calls as accepted handoffs to an external executor. */
+	/**
+	 * The caller's client runs every tool (auth-gateway). Cursor is limited to
+	 * MCP calls, every context tool is advertised as one, unhandled calls are
+	 * handed off, and a turn that handed one off stops with `toolUse`.
+	 */
 	externalToolExecutor?: boolean;
 	/** Wire model id selected after thinking-effort routing (`resolveWireModelId`). */
 	wireModelId?: string;
@@ -1271,6 +1295,7 @@ function streamCursorWithWireMode(
 			const requestContextTools = buildMcpToolDefinitions(
 				context.tools,
 				model.requiresCursorToolSchemaProjection === true,
+				options?.externalToolExecutor === true,
 			);
 			const requestContextRules = buildCursorRequestContextRules(context.systemPrompt);
 
@@ -1289,6 +1314,9 @@ function streamCursorWithWireMode(
 				"connect-protocol-version": "1",
 				"x-request-id": requestId,
 				...(retryContext ? { "x-original-request-id": originalRequestId } : undefined),
+				...(options?.externalToolExecutor
+					? { [CURSOR_ALLOWED_TOOLS_HEADER]: CURSOR_EXTERNAL_EXECUTOR_ALLOWED_TOOLS }
+					: undefined),
 			};
 			const requestHeaders =
 				transportMode === "http2"
@@ -1591,6 +1619,16 @@ function streamCursorWithWireMode(
 			// Results that flush and server-owned tools reported are still settling
 			// through the host; the digest must see them as the host stored them.
 			await drainInFlightDispatches();
+			// A call handed to an external executor is still owed its result, which
+			// comes with the next request. The turn stops for the client to run it,
+			// however Cursor's model wound up its side after the handoff.
+			if (
+				options?.externalToolExecutor &&
+				output.stopReason === "stop" &&
+				output.content.some(block => block.type === "toolCall" && !isCursorExecResolved(block))
+			) {
+				output.stopReason = "toolUse";
+			}
 			// The records hold the user message and results as the server saw them,
 			// written on one route; a host edit to either, in place or not, must not
 			// be undone by sending them back, nor may a retry's route change relabel them.
@@ -5810,12 +5848,17 @@ function isJsonValue(value: unknown): value is JsonValue {
 export function buildMcpToolDefinitions(
 	tools: Tool[] | undefined,
 	requiresCursorToolSchemaProjection = false,
+	externalToolExecutor = false,
 ): McpToolDefinition[] {
 	if (!tools || tools.length === 0) {
 		return [];
 	}
 
-	const advertisedTools = tools.filter(tool => !CURSOR_NATIVE_TOOL_NAMES.has(tool.name));
+	// An external executor's run drives no tool natively
+	// (`CURSOR_EXTERNAL_EXECUTOR_ALLOWED_TOOLS`), so every tool goes out as MCP.
+	const advertisedTools = externalToolExecutor
+		? tools
+		: tools.filter(tool => !CURSOR_NATIVE_TOOL_NAMES.has(tool.name));
 	if (advertisedTools.length === 0) {
 		return [];
 	}
@@ -5827,7 +5870,8 @@ export function buildMcpToolDefinitions(
 	// devices are advertised — otherwise a staged preview can never be resolved
 	// and the SoftToolRequirement('write') escalation aborts the turn.
 	const writeTool = tools.find(tool => tool.name === "write");
-	const forwarded = writeTool ? [...advertisedTools, writeTool] : advertisedTools;
+	const forwarded =
+		writeTool && !advertisedTools.includes(writeTool) ? [...advertisedTools, writeTool] : advertisedTools;
 
 	return forwarded.map(tool => {
 		const wireSchema = toolWireSchema(tool);

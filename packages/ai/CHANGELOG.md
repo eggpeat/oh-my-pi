@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Cursor models served through `omp auth-gateway` being told their file and shell tools were unavailable while the client ran the calls anyway, in Cursor's own argument shape (edits failed validation); gateway runs now offer Cursor only the client's tools, so each call reaches the client as one of its own and the turn stops with `toolUse` until the result comes back
+
 ## [18.13.2] - 2026-10-27
 
 ### Fixed
