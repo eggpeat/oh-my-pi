@@ -466,6 +466,8 @@ interface CursorRetryContext {
 	blobStore: Map<string, Uint8Array>;
 	turnRecords: CursorTurnRecordState;
 	firstTokenTime?: number;
+	/** Output tokens a relayed run's earlier responses reported (`CursorRelayState.reportedOutput`). */
+	relayReportedOutput?: number;
 }
 
 /** What one turn's server records stand for, as the turn sent it, across its retries. */
@@ -1356,7 +1358,7 @@ function streamCursorWithWireMode(
 						quietTimer: undefined,
 						handedOff: Promise.withResolvers(),
 						backlog: undefined,
-						reportedOutput: 0,
+						reportedOutput: retryContext?.relayReportedOutput ?? 0,
 						turnOutputReported: false,
 					}
 				: undefined;
@@ -1507,6 +1509,7 @@ function streamCursorWithWireMode(
 			let currentThinkingBlock = previousState?.currentThinkingBlock ?? null;
 			let currentToolCall = previousState?.currentToolCall ?? null;
 			const resolvedMcpToolCallIds = previousState?.resolvedMcpToolCallIds ?? new Set<string>();
+			const handedOffToolCallIds = previousState?.handedOffToolCallIds ?? new Set<string>();
 			usageState = retryContext?.usageState ?? { sawTokenDelta: false };
 
 			const state: BlockState = {
@@ -1521,6 +1524,7 @@ function streamCursorWithWireMode(
 				},
 				openToolCalls: previousState?.openToolCalls ?? new Map<string, ToolCallState>(),
 				resolvedMcpToolCallIds,
+				handedOffToolCallIds,
 				get firstTokenTime() {
 					return firstTokenTime;
 				},
@@ -1582,6 +1586,29 @@ function streamCursorWithWireMode(
 			// entry and the call is left unpaired. Awaited after
 			// `h2Completion` below.
 			const dispatchServerMessage = (serverMessage: AgentServerMessage): void => {
+				// A relayed run keeps count of the step it is handing off as each
+				// frame reaches the response: on arrival, or when the run resumes
+				// for a frame that arrived while it was parked.
+				const interaction =
+					serverMessage.message.case === "interactionUpdate" ? serverMessage.message.value : undefined;
+				if (relay && interaction) {
+					if (interaction.message.case === "toolRequestsListed") {
+						relay.listed = interaction.message.value.callCount;
+						handOffWhenListed();
+					} else if (
+						interaction.message.case === "toolCallStarted" &&
+						interaction.message.value.toolCall !== undefined &&
+						!selectMcpCall(interaction.message.value.toolCall)
+					) {
+						relay.served++;
+						handOffWhenListed();
+					} else if (interaction.message.case === "turnEnded") {
+						relay.turnOutputReported = (interaction.message.value.outputTokens ?? 0n) > 0n;
+					} else if (interaction.message.case !== "heartbeat" && relay.quietTimer !== undefined) {
+						// Cursor is still streaming the step: not waiting on the held calls yet.
+						handOffWhenListed();
+					}
+				}
 				const dispatch = handleServerMessage(
 					serverMessage,
 					output,
@@ -1664,28 +1691,9 @@ function streamCursorWithWireMode(
 							checkpointCoversTurn = false;
 						}
 						const isTurnEnded = interactionCase === "turnEnded";
-						// Frames that arrive while parked are counted when the resumed run replays them.
-						if (relay && interaction && !relay.backlog) {
-							if (interaction.message.case === "toolRequestsListed") {
-								relay.listed = interaction.message.value.callCount;
-								handOffWhenListed();
-							} else if (
-								interaction.message.case === "toolCallStarted" &&
-								interaction.message.value.toolCall !== undefined &&
-								!selectMcpCall(interaction.message.value.toolCall)
-							) {
-								relay.served++;
-								handOffWhenListed();
-							} else if (interaction.message.case === "turnEnded") {
-								relay.turnOutputReported = (interaction.message.value.outputTokens ?? 0n) > 0n;
-							} else if (interactionCase !== "heartbeat" && relay.quietTimer !== undefined) {
-								// Cursor is still streaming the step: not waiting on the held calls yet.
-								handOffWhenListed();
-							}
-						}
 						// A parked run's response has ended: what Cursor sends meanwhile
-						// belongs to the response that resumes it. Blob requests and
-						// keepalives are answered on the spot.
+						// belongs to the response that resumes it, which replays it. Blob
+						// requests and keepalives are answered on the spot.
 						if (
 							relay?.backlog &&
 							serverMessage.message.case !== "kvServerMessage" &&
@@ -1785,7 +1793,21 @@ function streamCursorWithWireMode(
 					}
 					endCurrentTextBlock(output, stream, state);
 					endCurrentThinkingBlock(output, stream, state);
-					flushOpenToolCalls(output, stream, state);
+					// Only the held calls are handed off, and only once: a late
+					// announcement must not reopen one in a later response. A call
+					// Cursor has announced without its exec frame stays open, and
+					// moves to the response that resumes the run.
+					for (const call of new Set([...state.openToolCalls.values(), state.currentToolCall])) {
+						if (!call || !relay.held.has(call.id)) continue;
+						const contentIndex = streamedBlockIndex(output, call);
+						stream.push({ type: "toolcall_end", contentIndex, toolCall: call, partial: output });
+						releaseStreamedCall(state, call);
+					}
+					for (const callId of relay.held.keys()) handedOffToolCallIds.add(callId);
+					const carried = [...new Set([...state.openToolCalls.values(), state.currentToolCall])].filter(
+						(call): call is ToolCallState => call !== null,
+					);
+					output.content = output.content.filter(block => !carried.some(call => call === block));
 					turnRecords.relayed = true;
 					relay.reportedOutput += output.usage.output;
 					output.stopReason = "toolUse";
@@ -1851,6 +1873,12 @@ function streamCursorWithWireMode(
 					startTime = performance.now();
 					firstTokenTime = undefined;
 					stream.push({ type: "start", partial: output });
+					// The calls left open at the handoff carry on in this response.
+					for (const call of carried) {
+						call[kStreamingBlockIndex] = output.content.length;
+						output.content.push(call);
+						stream.push({ type: "toolcall_start", contentIndex: call[kStreamingBlockIndex], partial: output });
+					}
 					if (options.signal?.aborted) abortTransport();
 					else options.signal?.addEventListener("abort", abortTransport, { once: true });
 					for (const [callId, { execMsg, mcpCall }] of relay.held) {
@@ -1875,9 +1903,6 @@ function streamCursorWithWireMode(
 					const backlog = relay.backlog;
 					relay.backlog = undefined;
 					for (const message of backlog) dispatchServerMessage(message);
-					// Calls whose exec frames came in while parked are handed over once
-					// listed, or once Cursor goes quiet on them.
-					if (relay.held.size > 0) handOffWhenListed();
 					return true;
 				};
 				while ((await Promise.race([transportSettled, relay.handedOff.promise])) === "handedOff") {
@@ -2146,6 +2171,7 @@ function streamCursorWithWireMode(
 							blobStore: retryBlobStore,
 							turnRecords,
 							firstTokenTime,
+							relayReportedOutput: relay?.reportedOutput,
 						},
 					});
 					stream.forwardLocalWorkFrom(retryStream);
@@ -2333,6 +2359,13 @@ export interface BlockState {
 	openToolCalls: Map<string, ToolCallState>;
 	/** MCP call IDs synthesized from exec frames before their redundant streamed block arrives. */
 	resolvedMcpToolCallIds: Set<string>;
+	/**
+	 * Calls a relayed run handed its client in an earlier response
+	 * (`CursorParkedRun`). Each response fills its own message, so a streamed
+	 * announcement that trails the handoff must not open the call again there.
+	 * Optional so existing test harnesses stay valid.
+	 */
+	handedOffToolCallIds?: Set<string>;
 	/**
 	 * Native `editToolCall` (StrReplace) ids whose materialization `readArgs` /
 	 * `writeArgs` must stay raw and must not synthesize extra transcript blocks.
@@ -5667,7 +5700,10 @@ export function processInteractionUpdate(
 				// (marked resolved) or handed to an external executor (deliberately
 				// unmarked). Either way the call is already in the transcript, so a
 				// second block for the same id would duplicate it.
-				if (output.content.some(block => block.type === "toolCall" && block.id === id)) {
+				if (
+					state.handedOffToolCallIds?.has(id) ||
+					output.content.some(block => block.type === "toolCall" && block.id === id)
+				) {
 					return;
 				}
 				const block: ToolCallState = {

@@ -23,6 +23,7 @@ import {
 	type InteractionUpdate,
 	InteractionUpdateSchema,
 	KvServerMessageSchema,
+	type McpArgs,
 	McpArgsSchema,
 	type McpResult,
 	McpToolCallSchema,
@@ -30,6 +31,7 @@ import {
 	SetBlobArgsSchema,
 	TextDeltaUpdateSchema,
 	TokenDeltaUpdateSchema,
+	ToolCallCompletedUpdateSchema,
 	ToolCallSchema,
 	ToolCallStartedUpdateSchema,
 	ToolRequestsListedUpdateSchema,
@@ -372,6 +374,14 @@ interface ServedRun {
 	closed: Promise<void>;
 }
 
+/** The model's closing text and the turn's end, whose output count covers the whole turn. */
+function finished(text: string): Buffer {
+	return Buffer.concat([
+		interactionFrame({ case: "textDelta", value: create(TextDeltaUpdateSchema, { text }) }),
+		interactionFrame({ case: "turnEnded", value: create(TurnEndedUpdateSchema, { outputTokens: 12n }) }),
+	]);
+}
+
 /**
  * Cursor handing the client one `read` call the way it does on the wire: the
  * call's start, its MCP exec frame, then the step's listing. Once the call is
@@ -380,11 +390,6 @@ interface ServedRun {
  */
 function relayingCursor(runs: ServedRun[], finish = true): FixtureStream {
 	const served = new WeakMap<http2.ServerHttp2Stream, { run: ServedRun; step: number; end(data: Buffer): void }>();
-	const finished = (text: string): Buffer =>
-		Buffer.concat([
-			interactionFrame({ case: "textDelta", value: create(TextDeltaUpdateSchema, { text }) }),
-			interactionFrame({ case: "turnEnded", value: create(TurnEndedUpdateSchema, { outputTokens: 12n }) }),
-		]);
 	return (stream, _headers, received) => {
 		const entry = served.get(stream);
 		if (!entry) {
@@ -501,26 +506,59 @@ function text(message: AssistantMessage): string {
 	return message.content.map(block => (block.type === "text" ? block.text : "")).join("");
 }
 
-function readCall(n: number): Buffer {
-	const args = create(McpArgsSchema, {
+/** `call-read-n`'s MCP arguments; `args` replaces the `{ path }` its exec frame carries. */
+function readArgs(n: number, args: McpArgs["args"] = { path: encodeJsonValue(`file${n}.py`) }): McpArgs {
+	return create(McpArgsSchema, {
 		name: "read",
 		toolName: "read",
 		toolCallId: `call-read-${n}`,
 		providerIdentifier: "pi-agent",
-		args: { path: encodeJsonValue(`file${n}.py`) },
+		args,
 	});
-	return Buffer.concat([
-		interactionFrame({
-			case: "toolCallStarted",
-			value: create(ToolCallStartedUpdateSchema, {
-				callId: `call-read-${n}`,
-				toolCall: create(ToolCallSchema, {
-					tool: { case: "mcpToolCall", value: create(McpToolCallSchema, { args }) },
-				}),
+}
+
+/** Cursor announcing `call-read-n` as the model streams it. */
+function readStarted(n: number, args = readArgs(n)): Buffer {
+	return interactionFrame({
+		case: "toolCallStarted",
+		value: create(ToolCallStartedUpdateSchema, {
+			callId: `call-read-${n}`,
+			toolCall: create(ToolCallSchema, {
+				tool: { case: "mcpToolCall", value: create(McpToolCallSchema, { args }) },
 			}),
 		}),
-		execFrame(n + 1, { case: "mcpArgs", value: args }),
-	]);
+	});
+}
+
+/** `call-read-n`'s MCP exec frame: Cursor waits on its answer. */
+function readExec(n: number): Buffer {
+	return execFrame(n + 1, { case: "mcpArgs", value: readArgs(n) });
+}
+
+/** Cursor completing `call-read-n` once its answer is in. */
+function readCompleted(n: number): Buffer {
+	return interactionFrame({
+		case: "toolCallCompleted",
+		value: create(ToolCallCompletedUpdateSchema, {
+			callId: `call-read-${n}`,
+			toolCall: create(ToolCallSchema, {
+				tool: { case: "mcpToolCall", value: create(McpToolCallSchema, { args: readArgs(n) }) },
+			}),
+		}),
+	});
+}
+
+function readCall(n: number): Buffer {
+	return Buffer.concat([readStarted(n), readExec(n)]);
+}
+
+/** `call-read-n` as the client receives it, arguments complete. */
+function readToolCall(n: number): ToolCall {
+	return { type: "toolCall", id: `call-read-${n}`, name: "read", arguments: { path: `file${n}.py` } };
+}
+
+function toolCalls(message: AssistantMessage): ToolCall[] {
+	return message.content.filter((block): block is ToolCall => block.type === "toolCall");
 }
 
 function listed(callCount: number): Buffer {
@@ -600,6 +638,89 @@ const fileResult = (n: number): ToolResultMessage => ({
 	isError: false,
 	timestamp: 3 + n,
 });
+
+/** A Run stream whose Cursor side the test writes. */
+interface DrivenRun extends ServedRun {
+	/** Writes `frames`, resolving once the client has read them. */
+	send(frames: Buffer): Promise<void>;
+	/** Resolves once the client has answered `n` MCP calls on the stream. */
+	answered(n: number): Promise<void>;
+	/** Writes `frames` and ends the stream. */
+	end(frames: Buffer): void;
+}
+
+/**
+ * A Cursor whose side of each Run stream the test writes. It opens a stream by
+ * asking for the request context; `run(n)` resolves with the `n`th stream once
+ * the client has answered. `send` trails its frames with a blob write, which
+ * the client acknowledges on the spot, parked or not, after reading them.
+ */
+function drivenCursor(): { serve: FixtureStream; runs: DrivenRun[]; run(index: number): Promise<DrivenRun> } {
+	const runs: DrivenRun[] = [];
+	const opened: PromiseWithResolvers<DrivenRun>[] = [];
+	const opening = (index: number) => (opened[index] ??= Promise.withResolvers<DrivenRun>());
+	const receivers = new WeakMap<http2.ServerHttp2Stream, (received: AgentClientMessage[]) => void>();
+	const serve: FixtureStream = (stream, _headers, received) => {
+		const receive = receivers.get(stream);
+		if (receive) {
+			receive(received);
+			return;
+		}
+		const request = received.find(message => message.message.case === "runRequest");
+		if (request?.message.case !== "runRequest") return;
+		const index = runs.length;
+		const closed = Promise.withResolvers<void>();
+		let acknowledged = new Set<number>();
+		let waits: { ready(): boolean; resolve(): void }[] = [];
+		const until = (ready: () => boolean): Promise<void> => {
+			if (ready()) return Promise.resolve();
+			const { promise, resolve } = Promise.withResolvers<void>();
+			waits.push({ ready, resolve });
+			return promise;
+		};
+		let writes = 0;
+		let ended = false;
+		const run: DrivenRun = {
+			action: request.message.value.action?.action.case,
+			answers: [],
+			cancelled: false,
+			closed: closed.promise,
+			send: frames => {
+				const id = ++writes;
+				stream.write(Buffer.concat([frames, setBlobFrame(id, `write ${id}`)]));
+				return until(() => acknowledged.has(id));
+			},
+			answered: n => until(() => run.answers.length >= n),
+			end: frames => {
+				ended = true;
+				stream.end(frames);
+			},
+		};
+		stream.on("close", () => {
+			run.cancelled = !ended;
+			closed.resolve();
+		});
+		receivers.set(stream, received => {
+			const replies = received.flatMap(message =>
+				message.message.case === "execClientMessage" ? [message.message.value.message] : [],
+			);
+			run.answers = replies.flatMap(reply => (reply.case === "mcpResult" ? [reply.value] : []));
+			acknowledged = new Set(
+				received.flatMap(message => (message.message.case === "kvClientMessage" ? [message.message.value.id] : [])),
+			);
+			if (replies.some(reply => reply.case === "requestContextResult")) opening(index).resolve(run);
+			waits = waits.filter(wait => {
+				if (!wait.ready()) return true;
+				wait.resolve();
+				return false;
+			});
+		});
+		runs.push(run);
+		stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+		stream.write(execFrame(1, { case: "requestContextArgs", value: create(RequestContextArgsSchema, {}) }));
+	};
+	return { serve, runs, run: index => opening(index).promise };
+}
 
 describe("Cursor runs relayed across an external executor's requests", () => {
 	it("answers the parked call in-band with the next request's result and streams on in the same run", async () => {
@@ -749,6 +870,119 @@ describe("Cursor runs relayed across an external executor's requests", () => {
 			expect(aborted.stopReason).toBe("aborted");
 			expect(runs.map(run => [run.answers.length, run.cancelled])).toEqual([[1, true]]);
 			expect(states.size).toBe(0);
+		});
+	});
+
+	it("hands off only the calls whose exec frames it holds when Cursor goes quiet, and keeps the others open", async () => {
+		const cursor = drivenCursor();
+		const states = new Map<string, ProviderSessionState>();
+		await withCursorServer(cursor.serve, async baseUrl => {
+			const firstReply = respond(baseUrl, [user], relayOptions(states));
+			const run = await cursor.run(0);
+			// Cursor announces the second call, its arguments still to come, and
+			// waits on the first before sending the second's exec frame.
+			await run.send(Buffer.concat([readCall(1), readStarted(2, readArgs(2, {}))]));
+			const first = await firstReply;
+			expect(toolCalls(first)).toEqual([readToolCall(1)]);
+
+			const secondReply = respond(baseUrl, [user, first, fileResult(1)], relayOptions(states));
+			await run.answered(1);
+			await run.send(Buffer.concat([readExec(2), listed(2)]));
+			const second = await secondReply;
+			expect(toolCalls(second)).toEqual([readToolCall(2)]);
+
+			const thirdReply = respond(baseUrl, [user, first, fileResult(1), second, fileResult(2)], relayOptions(states));
+			await run.answered(2);
+			run.end(finished("Fixed."));
+			const third = await thirdReply;
+			expect(text(third)).toBe("Fixed.");
+			expect(cursor.runs).toHaveLength(1);
+			expect(cursor.runs[0].answers.map(mcpText)).toEqual(["file 1", "file 2"]);
+		});
+	});
+
+	it("does not hand a call off again when Cursor announces it after the handoff", async () => {
+		const cursor = drivenCursor();
+		const states = new Map<string, ProviderSessionState>();
+		await withCursorServer(cursor.serve, async baseUrl => {
+			const firstReply = respond(baseUrl, [user], relayOptions(states));
+			const run = await cursor.run(0);
+			// The exec frame can come before the call's announcement.
+			await run.send(Buffer.concat([readExec(1), listed(1)]));
+			const first = await firstReply;
+			expect(toolCalls(first)).toEqual([readToolCall(1)]);
+
+			const secondReply = respond(baseUrl, [user, first, fileResult(1)], relayOptions(states));
+			await run.answered(1);
+			run.end(Buffer.concat([readStarted(1), readCompleted(1), finished("Fixed.")]));
+			const second = await secondReply;
+			expect(toolCalls(second)).toEqual([]);
+			expect(second.stopReason).toBe("stop");
+			expect(text(second)).toBe("Fixed.");
+		});
+	});
+
+	it("counts a listing that arrives while the run is parked toward the step it lists", async () => {
+		const cursor = drivenCursor();
+		const states = new Map<string, ProviderSessionState>();
+		await withCursorServer(cursor.serve, async baseUrl => {
+			const firstReply = respond(baseUrl, [user], relayOptions(states));
+			const run = await cursor.run(0);
+			await run.send(readCall(1));
+			const first = await firstReply;
+			expect(toolCalls(first)).toEqual([readToolCall(1)]);
+			// Cursor lists the step only once the run has parked on it.
+			await run.send(listed(1));
+
+			const secondReply = respond(baseUrl, [user, first, fileResult(1)], relayOptions(states));
+			await run.answered(1);
+			// The next step lists its two calls before the second one's exec frame.
+			await run.send(Buffer.concat([readStarted(2), readStarted(3, readArgs(3, {})), readExec(2), listed(2)]));
+			await run.send(readExec(3));
+			const second = await secondReply;
+			expect(toolCalls(second)).toEqual([readToolCall(2), readToolCall(3)]);
+
+			const thirdReply = respond(
+				baseUrl,
+				[user, first, fileResult(1), second, fileResult(2), fileResult(3)],
+				relayOptions(states),
+			);
+			await run.answered(3);
+			run.end(finished("Fixed."));
+			const third = await thirdReply;
+			expect(text(third)).toBe("Fixed.");
+			expect(cursor.runs).toHaveLength(1);
+		});
+	});
+
+	it("reports a relayed turn's output once across a checkpoint retry", async () => {
+		const cursor = drivenCursor();
+		const states = new Map<string, ProviderSessionState>();
+		const options = relayOptions(states, { providerRetryWait: async () => {} });
+		await withCursorServer(cursor.serve, async baseUrl => {
+			const firstReply = respond(baseUrl, [user], options);
+			const run = await cursor.run(0);
+			await run.send(
+				Buffer.concat([
+					interactionFrame({ case: "tokenDelta", value: create(TokenDeltaUpdateSchema, { tokens: 5 }) }),
+					readCall(1),
+					listed(1),
+				]),
+			);
+			const first = await firstReply;
+			expect(first.usage.output).toBe(5);
+
+			const secondReply = respond(baseUrl, [user, first, fileResult(1)], options);
+			await run.answered(1);
+			// Cursor checkpoints the turn and the transport drops.
+			run.end(checkpointFrame([]));
+			const retry = await cursor.run(1);
+			retry.end(finished("Fixed."));
+			const second = await secondReply;
+
+			expect(cursor.runs.map(served => served.action)).toEqual(["userMessageAction", "resumeAction"]);
+			expect(text(second)).toBe("Fixed.");
+			expect(first.usage.output + second.usage.output).toBe(12);
 		});
 	});
 });
