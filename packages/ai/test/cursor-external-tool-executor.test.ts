@@ -1,7 +1,16 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import * as http2 from "node:http2";
+import { AuthGatewaySessionStateStore } from "@oh-my-pi/pi-ai/auth-gateway";
 import { buildGrpcRequest, type CursorOptions, streamCursor } from "@oh-my-pi/pi-ai/providers/cursor";
-import type { AssistantMessage, Message, Model, Tool, ToolCall, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
+import type {
+	AssistantMessage,
+	Message,
+	Model,
+	ProviderSessionState,
+	Tool,
+	ToolCall,
+	ToolResultMessage,
+} from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import {
 	type AgentClientMessage,
@@ -11,13 +20,19 @@ import {
 	ConversationStateStructureSchema,
 	type ExecServerMessage,
 	ExecServerMessageSchema,
+	type InteractionUpdate,
 	InteractionUpdateSchema,
 	KvServerMessageSchema,
 	McpArgsSchema,
 	type McpResult,
+	McpToolCallSchema,
 	RequestContextArgsSchema,
 	SetBlobArgsSchema,
 	TextDeltaUpdateSchema,
+	TokenDeltaUpdateSchema,
+	ToolCallSchema,
+	ToolCallStartedUpdateSchema,
+	ToolRequestsListedUpdateSchema,
 	TurnEndedUpdateSchema,
 } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
 import { create, encodeJsonValue, fromBinary, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
@@ -329,6 +344,411 @@ describe("Cursor runs whose tools an external executor owns", () => {
 		expect(JSON.parse(toolRecords[0])).toMatchObject({
 			role: "tool",
 			content: [{ type: "tool-result", toolCallId: "call-read-1", result: "1|def add(a, b):\n2|    return a - b" }],
+		});
+	});
+});
+
+// With a session to park in (the gateway's `providerSessionState`), a run keeps
+// the client's calls open across its requests instead of handing them off.
+
+function interactionFrame(message: InteractionUpdate["message"]): Buffer {
+	return frame({ case: "interactionUpdate", value: create(InteractionUpdateSchema, { message }) });
+}
+
+function mcpText(answer: McpResult): string {
+	return answer.result.case === "success"
+		? answer.result.value.content.map(item => (item.content.case === "text" ? item.content.value.text : "")).join("")
+		: `<${answer.result.case}>`;
+}
+
+/** One Run stream the relaying fixture Cursor served. */
+interface ServedRun {
+	/** The run request's action: a turn opens on `userMessageAction`, a rebuilt one resumes. */
+	action: string | undefined;
+	/** MCP answers the client wrote on the stream. */
+	answers: McpResult[];
+	/** The client closed the stream before Cursor ended it. */
+	cancelled: boolean;
+	closed: Promise<void>;
+}
+
+/**
+ * Cursor handing the client one `read` call the way it does on the wire: the
+ * call's start, its MCP exec frame, then the step's listing. Once the call is
+ * answered the model finishes (or, with `finish: false`, keeps talking). A turn
+ * rebuilt from history (`resumeAction`) finishes at once.
+ */
+function relayingCursor(runs: ServedRun[], finish = true): FixtureStream {
+	const served = new WeakMap<http2.ServerHttp2Stream, { run: ServedRun; step: number; end(data: Buffer): void }>();
+	const finished = (text: string): Buffer =>
+		Buffer.concat([
+			interactionFrame({ case: "textDelta", value: create(TextDeltaUpdateSchema, { text }) }),
+			interactionFrame({ case: "turnEnded", value: create(TurnEndedUpdateSchema, { outputTokens: 12n }) }),
+		]);
+	return (stream, _headers, received) => {
+		const entry = served.get(stream);
+		if (!entry) {
+			const request = received.find(message => message.message.case === "runRequest");
+			if (request?.message.case !== "runRequest") return;
+			const closed = Promise.withResolvers<void>();
+			const run: ServedRun = {
+				action: request.message.value.action?.action.case,
+				answers: [],
+				cancelled: false,
+				closed: closed.promise,
+			};
+			let ended = false;
+			stream.on("close", () => {
+				run.cancelled = !ended;
+				closed.resolve();
+			});
+			served.set(stream, {
+				run,
+				step: 0,
+				end: data => {
+					ended = true;
+					stream.end(data);
+				},
+			});
+			runs.push(run);
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			stream.write(execFrame(1, { case: "requestContextArgs", value: create(RequestContextArgsSchema, {}) }));
+			return;
+		}
+		const replies = received.flatMap(message =>
+			message.message.case === "execClientMessage" ? [message.message.value.message] : [],
+		);
+		entry.run.answers = replies.flatMap(reply => (reply.case === "mcpResult" ? [reply.value] : []));
+		if (entry.step === 0 && replies.some(reply => reply.case === "requestContextResult")) {
+			entry.step = 1;
+			if (entry.run.action === "resumeAction") {
+				entry.end(finished("Rebuilt."));
+				return;
+			}
+			const args = create(McpArgsSchema, {
+				name: "read",
+				toolName: "read",
+				toolCallId: "call-read-1",
+				providerIdentifier: "pi-agent",
+				args: { path: encodeJsonValue("calc.py") },
+			});
+			stream.write(
+				Buffer.concat([
+					interactionFrame({ case: "tokenDelta", value: create(TokenDeltaUpdateSchema, { tokens: 5 }) }),
+					interactionFrame({
+						case: "toolCallStarted",
+						value: create(ToolCallStartedUpdateSchema, {
+							callId: "call-read-1",
+							toolCall: create(ToolCallSchema, {
+								tool: { case: "mcpToolCall", value: create(McpToolCallSchema, { args }) },
+							}),
+						}),
+					}),
+					execFrame(2, { case: "mcpArgs", value: args }),
+					interactionFrame({
+						case: "toolRequestsListed",
+						value: create(ToolRequestsListedUpdateSchema, { callCount: 1 }),
+					}),
+				]),
+			);
+			return;
+		}
+		if (entry.step === 1 && entry.run.answers.length > 0) {
+			entry.step = 2;
+			if (finish) {
+				entry.end(finished("Fixed."));
+			} else {
+				stream.write(
+					interactionFrame({ case: "textDelta", value: create(TextDeltaUpdateSchema, { text: "Fix" }) }),
+				);
+			}
+		}
+	};
+}
+
+const readResult: ToolResultMessage = {
+	role: "toolResult",
+	toolCallId: "call-read-1",
+	toolName: "read",
+	content: [{ type: "text", text: "1|def add(a, b):\n2|    return a - b" }],
+	isError: false,
+	timestamp: 3,
+};
+
+function relayOptions(
+	states: Map<string, ProviderSessionState>,
+	extra?: Omit<CursorOptions, "providerSessionState">,
+): CursorOptions {
+	return {
+		externalToolExecutor: true,
+		sessionId: "relay-session",
+		providerSessionState: states,
+		apiKey: "test-token",
+		...extra,
+	};
+}
+
+/** One gateway request, as its client receives the reply over pi-native: plain JSON. */
+async function respond(baseUrl: string, messages: Message[], options: CursorOptions): Promise<AssistantMessage> {
+	const response = streamCursor(model(baseUrl), { messages, tools }, options);
+	for await (const _event of response) {
+		// drain
+	}
+	return JSON.parse(JSON.stringify(await response.result())) as AssistantMessage;
+}
+
+function text(message: AssistantMessage): string {
+	return message.content.map(block => (block.type === "text" ? block.text : "")).join("");
+}
+
+function readCall(n: number): Buffer {
+	const args = create(McpArgsSchema, {
+		name: "read",
+		toolName: "read",
+		toolCallId: `call-read-${n}`,
+		providerIdentifier: "pi-agent",
+		args: { path: encodeJsonValue(`file${n}.py`) },
+	});
+	return Buffer.concat([
+		interactionFrame({
+			case: "toolCallStarted",
+			value: create(ToolCallStartedUpdateSchema, {
+				callId: `call-read-${n}`,
+				toolCall: create(ToolCallSchema, {
+					tool: { case: "mcpToolCall", value: create(McpToolCallSchema, { args }) },
+				}),
+			}),
+		}),
+		execFrame(n + 1, { case: "mcpArgs", value: args }),
+	]);
+}
+
+function listed(callCount: number): Buffer {
+	return interactionFrame({
+		case: "toolRequestsListed",
+		value: create(ToolRequestsListedUpdateSchema, { callCount }),
+	});
+}
+
+/**
+ * Cursor running a step's two `read` calls one at a time, as it does for Grok:
+ * a call it serves itself (listed on its own) comes first, then `call-read-1`
+ * with no listing; only once that is answered does it stream `call-read-2`
+ * and list the step's two calls.
+ */
+function serializingCursor(runs: ServedRun[]): FixtureStream {
+	const served = new WeakMap<http2.ServerHttp2Stream, { run: ServedRun; answered: number }>();
+	return (stream, _headers, received) => {
+		const entry = served.get(stream);
+		if (!entry) {
+			const request = received.find(message => message.message.case === "runRequest");
+			if (request?.message.case !== "runRequest") return;
+			const run: ServedRun = {
+				action: request.message.value.action?.action.case,
+				answers: [],
+				cancelled: false,
+				closed: Promise.resolve(),
+			};
+			served.set(stream, { run, answered: -1 });
+			runs.push(run);
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			stream.write(execFrame(1, { case: "requestContextArgs", value: create(RequestContextArgsSchema, {}) }));
+			return;
+		}
+		const replies = received.flatMap(message =>
+			message.message.case === "execClientMessage" ? [message.message.value.message] : [],
+		);
+		entry.run.answers = replies.flatMap(reply => (reply.case === "mcpResult" ? [reply.value] : []));
+		if (entry.answered === -1 && replies.some(reply => reply.case === "requestContextResult")) {
+			entry.answered = 0;
+			stream.write(
+				Buffer.concat([
+					interactionFrame({
+						case: "toolCallStarted",
+						value: create(ToolCallStartedUpdateSchema, {
+							callId: "server-call",
+							toolCall: create(ToolCallSchema, {}),
+						}),
+					}),
+					listed(1),
+					readCall(1),
+				]),
+			);
+		} else if (entry.answered >= 0 && entry.run.answers.length > entry.answered) {
+			entry.answered = entry.run.answers.length;
+			stream.write(
+				entry.answered === 1
+					? Buffer.concat([readCall(2), listed(2)])
+					: Buffer.concat([
+							interactionFrame({ case: "textDelta", value: create(TextDeltaUpdateSchema, { text: "Fixed." }) }),
+							interactionFrame({
+								case: "turnEnded",
+								value: create(TurnEndedUpdateSchema, { outputTokens: 12n }),
+							}),
+						]),
+			);
+			if (entry.answered === 2) stream.end();
+		}
+	};
+}
+
+const fileResult = (n: number): ToolResultMessage => ({
+	role: "toolResult",
+	toolCallId: `call-read-${n}`,
+	toolName: "read",
+	content: [{ type: "text", text: `file ${n}` }],
+	isError: false,
+	timestamp: 3 + n,
+});
+
+describe("Cursor runs relayed across an external executor's requests", () => {
+	it("answers the parked call in-band with the next request's result and streams on in the same run", async () => {
+		const runs: ServedRun[] = [];
+		const states = new Map<string, ProviderSessionState>();
+		await withCursorServer(relayingCursor(runs), async baseUrl => {
+			const handedOff = await respond(baseUrl, [user], relayOptions(states));
+
+			expect(handedOff.stopReason).toBe("toolUse");
+			expect(handedOff.content.filter(block => block.type === "toolCall")).toEqual([
+				{ type: "toolCall", id: "call-read-1", name: "read", arguments: { path: "calc.py" } },
+			]);
+			// Cursor still waits on the call: nothing, no handoff text, answered it.
+			expect(runs.map(run => run.answers)).toEqual([[]]);
+
+			const resumed = await respond(baseUrl, [user, handedOff, readResult], relayOptions(states));
+
+			expect(runs).toHaveLength(1);
+			expect(runs[0].answers.map(mcpText)).toEqual(["1|def add(a, b):\n2|    return a - b"]);
+			expect(resumed.stopReason).toBe("stop");
+			expect(text(resumed)).toBe("Fixed.");
+			// The turn-end count spans both responses; each reports only its share.
+			expect(handedOff.usage.output + resumed.usage.output).toBe(12);
+			expect(states.size).toBe(0);
+		});
+	});
+
+	it("hands off a call Cursor waits on before listing its step, and counts it toward the listing", async () => {
+		const runs: ServedRun[] = [];
+		const states = new Map<string, ProviderSessionState>();
+		await withCursorServer(serializingCursor(runs), async baseUrl => {
+			const first = await respond(baseUrl, [user], relayOptions(states));
+			expect(first.stopReason).toBe("toolUse");
+			expect(first.content.flatMap(block => (block.type === "toolCall" ? [block.id] : []))).toEqual(["call-read-1"]);
+
+			const second = await respond(baseUrl, [user, first, fileResult(1)], relayOptions(states));
+			expect(second.stopReason).toBe("toolUse");
+			expect(second.content.flatMap(block => (block.type === "toolCall" ? [block.id] : []))).toEqual([
+				"call-read-2",
+			]);
+
+			const third = await respond(
+				baseUrl,
+				[user, first, fileResult(1), second, fileResult(2)],
+				relayOptions(states),
+			);
+			expect(third.stopReason).toBe("stop");
+			expect(text(third)).toBe("Fixed.");
+			expect(runs).toHaveLength(1);
+			expect(runs[0].answers.map(mcpText)).toEqual(["file 1", "file 2"]);
+			expect(states.size).toBe(0);
+		});
+	});
+
+	it("cancels the parked run and rebuilds the turn when the next request does not continue it", async () => {
+		const runs: ServedRun[] = [];
+		const states = new Map<string, ProviderSessionState>();
+		await withCursorServer(relayingCursor(runs), async baseUrl => {
+			const handedOff = await respond(baseUrl, [user], relayOptions(states));
+			const stray: ToolResultMessage = { ...readResult, toolCallId: "call-read-2" };
+
+			const rebuilt = await respond(baseUrl, [user, handedOff, stray], relayOptions(states));
+			await runs[0].closed;
+
+			expect(runs.map(run => [run.action, run.answers.length, run.cancelled])).toEqual([
+				["userMessageAction", 0, true],
+				["resumeAction", 0, false],
+			]);
+			expect(text(rebuilt)).toBe("Rebuilt.");
+			expect(states.size).toBe(0);
+		});
+	});
+
+	it.each<{ cause: string; session: () => { states: Map<string, ProviderSessionState>; giveUp(): void } }>([
+		{
+			cause: "its idle timeout",
+			session: () => {
+				vi.useFakeTimers();
+				const states = new Map<string, ProviderSessionState>();
+				return {
+					states,
+					giveUp: () => {
+						vi.advanceTimersByTime(119_999);
+						expect(states.size).toBe(1);
+						vi.advanceTimersByTime(1);
+					},
+				};
+			},
+		},
+		{
+			cause: "the gateway evicting its session",
+			session: () => {
+				const store = new AuthGatewaySessionStateStore(1);
+				const session = (clientKey: string) =>
+					store.acquire({ clientKey, model: model(), context: { messages: [user], tools }, account: "key:test" });
+				const lease = session("relay-a");
+				return {
+					states: lease.states,
+					giveUp: () => {
+						lease.release();
+						session("relay-b").release();
+					},
+				};
+			},
+		},
+	])("cancels a parked run on $cause, and the late request rebuilds the turn", async ({ session }) => {
+		const runs: ServedRun[] = [];
+		try {
+			await withCursorServer(relayingCursor(runs), async baseUrl => {
+				const { states, giveUp } = session();
+				const handedOff = await respond(baseUrl, [user], relayOptions(states));
+				expect(runs.map(run => [run.answers.length, run.cancelled])).toEqual([[0, false]]);
+
+				giveUp();
+				await runs[0].closed;
+				vi.useRealTimers();
+				const rebuilt = await respond(baseUrl, [user, handedOff, readResult], relayOptions(states));
+
+				expect(runs.map(run => [run.action, run.answers.length, run.cancelled])).toEqual([
+					["userMessageAction", 0, true],
+					["resumeAction", 0, false],
+				]);
+				expect(text(rebuilt)).toBe("Rebuilt.");
+			});
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("cancels the run when the request it was resumed into is aborted", async () => {
+		const runs: ServedRun[] = [];
+		const states = new Map<string, ProviderSessionState>();
+		await withCursorServer(relayingCursor(runs, false), async baseUrl => {
+			const handedOff = await respond(baseUrl, [user], relayOptions(states));
+			const controller = new AbortController();
+			const response = streamCursor(
+				model(baseUrl),
+				{ messages: [user, handedOff, readResult], tools },
+				relayOptions(states, { signal: controller.signal }),
+			);
+			for await (const event of response) {
+				if (event.type === "text_delta") controller.abort();
+			}
+			const aborted = await response.result();
+			await runs[0].closed;
+
+			expect(aborted.stopReason).toBe("aborted");
+			expect(runs.map(run => [run.answers.length, run.cancelled])).toEqual([[1, true]]);
+			expect(states.size).toBe(0);
 		});
 	});
 });

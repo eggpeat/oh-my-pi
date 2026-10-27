@@ -202,6 +202,7 @@ import type {
 	ImageContent,
 	Message,
 	Model,
+	ProviderSessionState,
 	StreamFunction,
 	StreamOptions,
 	TextContent,
@@ -349,6 +350,24 @@ const CURSOR_ALLOWED_TOOLS_HEADER = "x-cursor-agent-allowed-tools";
  */
 const CURSOR_EXTERNAL_EXECUTOR_ALLOWED_TOOLS = "mcp_tool_call,get_mcp_tools_tool_call";
 
+/**
+ * How long a run that handed an external executor its calls stays parked,
+ * stream open and exec frames unanswered, for the client's next request to
+ * bring the results (`CursorParkedRun`). Past it the run is cancelled; a late
+ * request rebuilds the turn from its history like any other.
+ */
+const CURSOR_RELAY_IDLE_TIMEOUT_MS = 120_000;
+
+/** `providerSessionState` entry holding the session's parked run. */
+const CURSOR_RELAY_SESSION_STATE_KEY = "cursor-agent-relay";
+
+/**
+ * How long Cursor may stay quiet on held calls, without listing their step,
+ * before they are handed to the client anyway: it can wait on one call's
+ * result before streaming the step's next call and its listing.
+ */
+const CURSOR_RELAY_QUIET_MS = 1_000;
+
 const CURSOR_PROXY_TUNNEL_TIMEOUT_MS = 30_000;
 
 /**
@@ -417,8 +436,11 @@ export interface CursorOptions extends StreamOptions {
 	onToolResult?: CursorToolResultHandler;
 	/**
 	 * The caller's client runs every tool (auth-gateway). Cursor is limited to
-	 * MCP calls, every context tool is advertised as one, unhandled calls are
-	 * handed off, and a turn that handed one off stops with `toolUse`.
+	 * MCP calls, every context tool is advertised as one, and a turn that hands
+	 * the client a call stops with `toolUse`. With a `providerSessionState` to
+	 * park in, the run stays open for the next request to answer its calls
+	 * in-band (`CursorParkedRun`); without one, each call is handed off and
+	 * Cursor told its result comes with the next request.
 	 */
 	externalToolExecutor?: boolean;
 	/** Wire model id selected after thinking-effort routing (`resolveWireModelId`). */
@@ -458,6 +480,68 @@ interface CursorTurnRecordState {
 	stored: Map<string, ToolResultMessage>;
 	/** Hash of each result as the server saw it, taken before the host ran. */
 	given: Map<string, number | bigint>;
+	/**
+	 * The turn parked for an external executor's results (`CursorParkedRun`),
+	 * so it reached the client as several assistant messages and its records
+	 * stand for all of them: none may be replayed from them.
+	 */
+	relayed: boolean;
+}
+
+/** An external executor's MCP call whose exec frame waits for the client's result. */
+interface CursorHeldCall {
+	execMsg: ExecServerMessage;
+	mcpCall: CursorMcpCall;
+}
+
+/** What a parked run takes over from the request that resumes it. */
+interface CursorRelayResumption {
+	context: Context;
+	options: CursorOptions;
+	stream: AssistantMessageEventStream;
+	results: ReadonlyMap<string, ToolResultMessage>;
+}
+
+/**
+ * A run of an external executor (auth-gateway) parked between two requests of
+ * its client. It handed the client one step's calls and kept their exec frames
+ * open; the client's next request resumes it when that request ends on exactly
+ * those calls' results, which are answered in-band, and the run streams on into
+ * the new response as a run with a local bridge would. Anything else closes it:
+ * the request then rebuilds the turn from its history. Kept in the session's
+ * `providerSessionState`, so the host's eviction and shutdown close it too.
+ */
+interface CursorParkedRun extends ProviderSessionState {
+	/** The run's continuation as this request's response, or `undefined` when the request does not continue it. */
+	resume(
+		model: Model<"cursor-agent">,
+		context: Context,
+		options: CursorOptions | undefined,
+	): AssistantMessageEventStream | undefined;
+}
+
+/** A relayed run's bookkeeping for the step whose calls it is handing the client. */
+interface CursorRelayState {
+	/** The session's provider state, where the run parks. */
+	readonly states: Map<string, ProviderSessionState>;
+	/** MCP exec frames held unanswered, by call id. */
+	readonly held: Map<string, CursorHeldCall>;
+	/** `ToolRequestsListedUpdate.call_count`: every call the model made in the step. */
+	listed: number | undefined;
+	/** Calls of the step Cursor serves itself, which send no exec frame. */
+	served: number;
+	/** Calls of the step already answered in-band, before the step was listed. */
+	answered: number;
+	/** Hands the held calls off when Cursor goes quiet on them before listing the step. */
+	quietTimer: NodeJS.Timeout | undefined;
+	/** Settles once Cursor waits on the held calls. */
+	handedOff: PromiseWithResolvers<"handedOff">;
+	/** Frames that arrived while parked, for the response that resumes the run. */
+	backlog: AgentServerMessage[] | undefined;
+	/** Output tokens the run's earlier responses already reported. */
+	reportedOutput: number;
+	/** The run's `TurnEndedUpdate` counted its output tokens, which span every response. */
+	turnOutputReported: boolean;
 }
 
 interface CursorStreamTiming {
@@ -1065,6 +1149,27 @@ function omitTypeName(record: Record<string, unknown>): Record<string, unknown> 
 	return rest;
 }
 
+/** The assistant message one response of a Cursor run fills. */
+function createCursorOutput(model: Model<"cursor-agent">, timestamp: number): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [],
+		api: "cursor-agent" as Api,
+		provider: model.provider,
+		model: model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp,
+	};
+}
+
 function streamCursorWithWireMode(
 	model: Model<"cursor-agent">,
 	context: Context,
@@ -1072,33 +1177,18 @@ function streamCursorWithWireMode(
 	wireMode: CursorWireMode,
 	timing?: CursorStreamTiming,
 ): AssistantMessageEventStream {
-	const stream = new AssistantMessageEventStream();
+	// A relayed run outlives its first response: `context`, `options`, `stream`
+	// and `output` (and the response timings) belong to the request currently
+	// receiving it, and move to the request that resumes it (`CursorParkedRun`).
+	let stream = new AssistantMessageEventStream();
 
 	(async () => {
 		const retryContext = timing?.retry;
 		const transportMode = timing?.transport ?? (options?.transport === "http1" ? "http1" : "http2");
-		const startTime = timing?.startTime ?? performance.now();
+		let startTime = timing?.startTime ?? performance.now();
 		let firstTokenTime = retryContext?.firstTokenTime;
 
-		const output: AssistantMessage =
-			retryContext?.output ??
-			({
-				role: "assistant",
-				content: [],
-				api: "cursor-agent" as Api,
-				provider: model.provider,
-				model: model.id,
-				usage: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-				stopReason: "stop",
-				timestamp: timing?.timestamp ?? Date.now(),
-			} satisfies AssistantMessage);
+		let output = retryContext?.output ?? createCursorOutput(model, timing?.timestamp ?? Date.now());
 
 		// Declared outside the `try` because BOTH exits must drain it: an exec
 		// handler decoded from the last chunk can still be running when the
@@ -1232,6 +1322,7 @@ function streamCursorWithWireMode(
 			mixedRoutes: false,
 			stored: new Map(),
 			given: new Map(),
+			relayed: false,
 		};
 		const hostOnToolResult = options?.onToolResult;
 		const onToolResult: CursorToolResultHandler | undefined = hostOnToolResult
@@ -1251,6 +1342,48 @@ function streamCursorWithWireMode(
 					return persisted;
 				}
 			: undefined;
+		// An external executor's run parks between its client's requests when the
+		// session can hold it (`CursorParkedRun`). Not on RunSSE, whose transport
+		// is bound to the first request's signal.
+		const relay: CursorRelayState | undefined =
+			options?.externalToolExecutor && options.providerSessionState && transportMode === "http2"
+				? {
+						states: options.providerSessionState,
+						held: new Map(),
+						listed: undefined,
+						served: 0,
+						answered: 0,
+						quietTimer: undefined,
+						handedOff: Promise.withResolvers(),
+						backlog: undefined,
+						reportedOutput: 0,
+						turnOutputReported: false,
+					}
+				: undefined;
+		// A step is listed once its calls have streamed. Cursor can also run a
+		// step's calls one at a time, sending the next exec frame (and the
+		// listing) only after the previous call is answered, so held calls are
+		// handed off when Cursor goes quiet on them too; calls answered that way
+		// count toward the step's listing.
+		const handOffWhenListed = (): void => {
+			if (!relay) return;
+			clearTimeout(relay.quietTimer);
+			relay.quietTimer = undefined;
+			if (relay.listed !== undefined && relay.held.size + relay.served + relay.answered >= relay.listed) {
+				if (relay.held.size > 0) {
+					relay.handedOff.resolve("handedOff");
+					return;
+				}
+				// Cursor served the whole step itself.
+				relay.listed = undefined;
+				relay.served = 0;
+				relay.answered = 0;
+			}
+			if (relay.held.size > 0) {
+				const { handedOff } = relay;
+				relay.quietTimer = setTimeout(() => handedOff.resolve("handedOff"), CURSOR_RELAY_QUIET_MS);
+			}
+		};
 		try {
 			const apiKey = options?.apiKey;
 			if (!apiKey) {
@@ -1405,6 +1538,12 @@ function streamCursorWithWireMode(
 				},
 				onTodoSnapshot: options?.execHandlers?.todoSync?.bind(options.execHandlers),
 				onToolResult,
+				holdExternalCall: relay
+					? (execMsg, mcpCall) => {
+							relay.held.set(mcpCall.toolCallId, { execMsg, mcpCall });
+							handOffWhenListed();
+						}
+					: undefined,
 			};
 			openBlockState = state;
 
@@ -1435,6 +1574,34 @@ function streamCursorWithWireMode(
 					headers,
 				);
 			});
+
+			// Dispatch is fire-and-forget so the socket keeps draining while a
+			// handler runs, but the promise is tracked: `done` must not be
+			// pushed while an exec handler is still resolving, or the Agent
+			// drains its Cursor result buffer before the handler reserved its
+			// entry and the call is left unpaired. Awaited after
+			// `h2Completion` below.
+			const dispatchServerMessage = (serverMessage: AgentServerMessage): void => {
+				const dispatch = handleServerMessage(
+					serverMessage,
+					output,
+					stream,
+					state,
+					blobStore,
+					serverMessage.message.case === "kvServerMessage" ? runTransport! : resultWriter,
+					options?.execHandlers,
+					onToolResult,
+					usageState!,
+					requestContextTools,
+					requestContextRules,
+					onConversationCheckpoint,
+					options?.externalToolExecutor,
+				).catch(error => {
+					log("error", "handleServerMessage", { error: String(error) });
+				});
+				inFlightDispatches.add(dispatch);
+				void dispatch.finally(() => inFlightDispatches.delete(dispatch));
+			};
 
 			runTransport.onData((chunk: Buffer) => {
 				if (debugResponseLogPromise) {
@@ -1497,31 +1664,37 @@ function streamCursorWithWireMode(
 							checkpointCoversTurn = false;
 						}
 						const isTurnEnded = interactionCase === "turnEnded";
-						// Dispatch is fire-and-forget so the socket keeps draining while a
-						// handler runs, but the promise is tracked: `done` must not be
-						// pushed while an exec handler is still resolving, or the Agent
-						// drains its Cursor result buffer before the handler reserved its
-						// entry and the call is left unpaired. Awaited after
-						// `h2Completion` below.
-						const dispatch = handleServerMessage(
-							serverMessage,
-							output,
-							stream,
-							state,
-							blobStore,
-							serverMessage.message.case === "kvServerMessage" ? runTransport! : resultWriter,
-							options?.execHandlers,
-							onToolResult,
-							usageState!,
-							requestContextTools,
-							requestContextRules,
-							onConversationCheckpoint,
-							options?.externalToolExecutor,
-						).catch(error => {
-							log("error", "handleServerMessage", { error: String(error) });
-						});
-						inFlightDispatches.add(dispatch);
-						void dispatch.finally(() => inFlightDispatches.delete(dispatch));
+						// Frames that arrive while parked are counted when the resumed run replays them.
+						if (relay && interaction && !relay.backlog) {
+							if (interaction.message.case === "toolRequestsListed") {
+								relay.listed = interaction.message.value.callCount;
+								handOffWhenListed();
+							} else if (
+								interaction.message.case === "toolCallStarted" &&
+								interaction.message.value.toolCall !== undefined &&
+								!selectMcpCall(interaction.message.value.toolCall)
+							) {
+								relay.served++;
+								handOffWhenListed();
+							} else if (interaction.message.case === "turnEnded") {
+								relay.turnOutputReported = (interaction.message.value.outputTokens ?? 0n) > 0n;
+							} else if (interactionCase !== "heartbeat" && relay.quietTimer !== undefined) {
+								// Cursor is still streaming the step: not waiting on the held calls yet.
+								handOffWhenListed();
+							}
+						}
+						// A parked run's response has ended: what Cursor sends meanwhile
+						// belongs to the response that resumes it. Blob requests and
+						// keepalives are answered on the spot.
+						if (
+							relay?.backlog &&
+							serverMessage.message.case !== "kvServerMessage" &&
+							interactionCase !== "heartbeat"
+						) {
+							relay.backlog.push(serverMessage);
+						} else {
+							dispatchServerMessage(serverMessage);
+						}
 
 						// Application completion is not protocol success; wait for a clean transport end.
 						if (isTurnEnded) {
@@ -1575,18 +1748,145 @@ function streamCursorWithWireMode(
 				void closeDebugLog().finally(() => settleH2(mapped));
 			});
 
-			if (options?.signal) {
-				onTransportAbort = () => {
-					runTransport?.close();
-					void closeDebugLog().finally(() => {
-						settleH2(new AIError.AbortError());
-					});
-				};
-				options.signal.addEventListener("abort", onTransportAbort, { once: true });
-			}
+			const abortTransport = () => {
+				runTransport?.close();
+				void closeDebugLog().finally(() => {
+					settleH2(new AIError.AbortError());
+				});
+			};
+			onTransportAbort = abortTransport;
+			options?.signal?.addEventListener("abort", abortTransport, { once: true });
 
 			runTransport.write(frameConnectMessage(requestBytes));
 			heartbeatTimer = setInterval(sendHeartbeat, 5000);
+			if (relay) {
+				const transportSettled = h2Completion.promise.then(
+					() => "settled" as const,
+					() => "settled" as const,
+				);
+				// End this response on the step's calls and park the run, stream open
+				// and exec frames unanswered, until the request bringing the results
+				// resumes it. `false` once the run is given up while parked: its last
+				// response is complete and `finally` closes the transport.
+				const parkUntilResumed = async (): Promise<boolean> => {
+					await drainInFlightDispatches();
+					// A streamed call's arguments are settled by its completion frame,
+					// which follows the result; the exec frame carries them complete.
+					for (const { mcpCall } of relay.held.values()) {
+						const block = output.content.find(
+							(item): item is ToolCallState => item.type === "toolCall" && item.id === mcpCall.toolCallId,
+						);
+						if (!block) continue;
+						const partial = block[kStreamingPartialJson];
+						const streamed = partial === undefined ? block.arguments : parseToolCallArguments(partial);
+						block.arguments =
+							"__parseError" in streamed ? mcpCall.args : mergeCursorMcpToolCallArgs(streamed, mcpCall.args);
+						clearStreamingPartialJson(block);
+					}
+					endCurrentTextBlock(output, stream, state);
+					endCurrentThinkingBlock(output, stream, state);
+					flushOpenToolCalls(output, stream, state);
+					turnRecords.relayed = true;
+					relay.reportedOutput += output.usage.output;
+					output.stopReason = "toolUse";
+					calculateCost(model, output.usage, output.timestamp);
+					output.duration = performance.now() - startTime;
+					if (firstTokenTime) output.ttft = firstTokenTime - startTime;
+					// The run outlives this request: its end, the client dropping the
+					// finished response included, must not cancel the run.
+					options?.signal?.removeEventListener("abort", abortTransport);
+					relay.backlog = [];
+
+					const wireModelId = options?.wireModelId;
+					const conversationKey = options?.conversationId ?? options?.sessionId;
+					const resumed = Promise.withResolvers<CursorRelayResumption | undefined>();
+					let unparked = false;
+					const unpark = (resumption: CursorRelayResumption | undefined): void => {
+						unparked = true;
+						resumed.resolve(resumption);
+					};
+					const parked: CursorParkedRun = {
+						close: () => unpark(undefined),
+						resume: (nextModel, nextContext, nextOptions) => {
+							const results = collectRelayedResults(nextContext.messages, relay.held);
+							const mismatch =
+								unparked || h2Settled || nextOptions?.signal?.aborted
+									? "ended"
+									: !nextOptions?.externalToolExecutor ||
+										  nextModel.id !== model.id ||
+										  nextOptions.wireModelId !== wireModelId ||
+										  (nextOptions.conversationId ?? nextOptions.sessionId) !== conversationKey
+										? "route"
+										: results === undefined
+											? "results"
+											: undefined;
+							if (mismatch !== undefined || !nextOptions || !results) {
+								log("relay", "mismatch", { mismatch, last: nextContext.messages.at(-1)?.role });
+								return undefined;
+							}
+							const nextStream = new AssistantMessageEventStream();
+							unpark({ context: nextContext, options: nextOptions, stream: nextStream, results });
+							return nextStream;
+						},
+					};
+					relay.states.get(CURSOR_RELAY_SESSION_STATE_KEY)?.close();
+					relay.states.set(CURSOR_RELAY_SESSION_STATE_KEY, parked);
+					const idleTimer = setTimeout(parked.close, CURSOR_RELAY_IDLE_TIMEOUT_MS);
+					log("relay", "parked", { calls: [...relay.held.keys()] });
+					// Parked before the response ends, so the request it prompts finds the run.
+					stream.push({ type: "done", reason: "toolUse", message: output });
+					stream.end();
+
+					const resumption = await Promise.race([resumed.promise, transportSettled.then(() => undefined)]);
+					clearTimeout(idleTimer);
+					if (relay.states.get(CURSOR_RELAY_SESSION_STATE_KEY) === parked) {
+						relay.states.delete(CURSOR_RELAY_SESSION_STATE_KEY);
+					}
+					if (!resumption) {
+						log("relay", "closed", { transportSettled: h2Settled });
+						return false;
+					}
+					({ context, options, stream } = resumption);
+					output = createCursorOutput(model, Date.now());
+					startTime = performance.now();
+					firstTokenTime = undefined;
+					stream.push({ type: "start", partial: output });
+					if (options.signal?.aborted) abortTransport();
+					else options.signal?.addEventListener("abort", abortTransport, { once: true });
+					for (const [callId, { execMsg, mcpCall }] of relay.held) {
+						const result = resumption.results.get(callId)!;
+						sendExecClientMessage(
+							resultWriter,
+							execMsg,
+							"mcpResult",
+							buildMcpResultFromToolResult(mcpCall, result),
+						);
+					}
+					log("relay", "resumed", { calls: [...relay.held.keys()], backlog: relay.backlog.length });
+					const stepListed =
+						relay.listed !== undefined && relay.held.size + relay.served + relay.answered >= relay.listed;
+					relay.answered = stepListed ? 0 : relay.answered + relay.held.size;
+					if (stepListed) {
+						relay.listed = undefined;
+						relay.served = 0;
+					}
+					relay.held.clear();
+					relay.handedOff = Promise.withResolvers();
+					const backlog = relay.backlog;
+					relay.backlog = undefined;
+					for (const message of backlog) dispatchServerMessage(message);
+					// Calls whose exec frames came in while parked are handed over once
+					// listed, or once Cursor goes quiet on them.
+					if (relay.held.size > 0) handOffWhenListed();
+					return true;
+				};
+				while ((await Promise.race([transportSettled, relay.handedOff.promise])) === "handedOff") {
+					clearTimeout(relay.quietTimer);
+					relay.quietTimer = undefined;
+					if (!(await parkUntilResumed())) return;
+				}
+				clearTimeout(relay.quietTimer);
+			}
 			await h2Completion.promise;
 			if (conversationId && baseConversationId && conversationId !== baseConversationId) {
 				successfulRotatedConversationIds.add(conversationId);
@@ -1631,9 +1931,13 @@ function streamCursorWithWireMode(
 			}
 			// The records hold the user message and results as the server saw them,
 			// written on one route; a host edit to either, in place or not, must not
-			// be undone by sending them back, nor may a retry's route change relabel them.
+			// be undone by sending them back, nor may a retry's route change relabel
+			// them. A relayed turn's records stand for more than this message.
 			const userMessage = context.messages[findLastUserMessageIndex(context.messages)];
-			let keptAsSent = hashCursorUserMessage(userMessage) === turnRecords.userHash && !turnRecords.mixedRoutes;
+			let keptAsSent =
+				hashCursorUserMessage(userMessage) === turnRecords.userHash &&
+				!turnRecords.mixedRoutes &&
+				!turnRecords.relayed;
 			for (const [callId, stored] of turnRecords.stored) {
 				if (hashCursorToolResult(stored) !== turnRecords.given.get(callId)) keptAsSent = false;
 			}
@@ -1647,6 +1951,13 @@ function streamCursorWithWireMode(
 						})
 					: undefined;
 
+			// The turn-end counters cover every response a relayed run streamed
+			// into, and the earlier ones already reported their output.
+			if (relay?.turnOutputReported && relay.reportedOutput > 0) {
+				const usage = output.usage;
+				usage.output = Math.max(usage.output - relay.reportedOutput, 0);
+				usage.totalTokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+			}
 			calculateCost(model, output.usage, output.timestamp);
 
 			output.duration = performance.now() - startTime;
@@ -1658,6 +1969,7 @@ function streamCursorWithWireMode(
 			});
 			stream.end();
 		} catch (caughtError) {
+			if (relay) clearTimeout(relay.quietTimer);
 			let error = caughtError;
 			const h2Unavailable = transportMode === "http2" && isHttp2Unavailable(error);
 			if (
@@ -1934,9 +2246,53 @@ function streamCursorWithWireMode(
 	return stream;
 }
 
+/**
+ * The results a request brings for a parked run's held calls, by call id, or
+ * `undefined` when the request does not continue the run: its history must end
+ * on an assistant message followed by exactly one result for each held call.
+ */
+function collectRelayedResults(
+	messages: readonly Message[],
+	held: ReadonlyMap<string, CursorHeldCall>,
+): Map<string, ToolResultMessage> | undefined {
+	const results = new Map<string, ToolResultMessage>();
+	let index = messages.length - 1;
+	for (; index >= 0; index--) {
+		const message = messages[index];
+		if (message.role !== "toolResult") break;
+		if (!held.has(message.toolCallId) || results.has(message.toolCallId)) return undefined;
+		results.set(message.toolCallId, message);
+	}
+	if (results.size !== held.size || messages[index]?.role !== "assistant") return undefined;
+	return results;
+}
+
+/**
+ * Continue the session's parked run (`CursorParkedRun`) when this request
+ * brings the results of the calls it handed the client. A parked run the
+ * request does not continue is cancelled, and the request goes out as a new
+ * run that rebuilds the turn from its history.
+ */
+function resumeParkedCursorRun(
+	model: Model<"cursor-agent">,
+	context: Context,
+	options: CursorOptions | undefined,
+): AssistantMessageEventStream | undefined {
+	const states = options?.providerSessionState;
+	const parked = states?.get(CURSOR_RELAY_SESSION_STATE_KEY) as CursorParkedRun | undefined;
+	if (!states || !parked) return undefined;
+	states.delete(CURSOR_RELAY_SESSION_STATE_KEY);
+	const resumed = parked.resume(model, context, options);
+	if (!resumed) {
+		log("relay", "superseded");
+		parked.close();
+	}
+	return resumed;
+}
+
 /** Streams a Cursor Agent turn, retrying a discovered effort id when its normalized wire id is unavailable. */
 export const streamCursor: StreamFunction<"cursor-agent"> = (model, context, options) =>
-	streamCursorWithWireMode(model, context, options, "normalized");
+	resumeParkedCursorRun(model, context, options) ?? streamCursorWithWireMode(model, context, options, "normalized");
 
 export type ToolCallState = ToolCall & {
 	[kStreamingBlockIndex]: number;
@@ -2001,6 +2357,12 @@ export interface BlockState {
 	 * matching result and every transcript rebuild strips it as dangling.
 	 */
 	onToolResult?: CursorToolResultHandler;
+	/**
+	 * Keep an external executor's MCP exec frame open instead of handing the
+	 * call off: a relayed run answers it in-band once the client's next request
+	 * brings the result (`CursorParkedRun`).
+	 */
+	holdExternalCall?: (execMsg: ExecServerMessage, call: CursorMcpCall) => void;
 }
 
 function markCursorExecResolved(block: CursorExecResolvedCarrier): void {
@@ -2868,6 +3230,12 @@ async function handleExecServerMessage(
 					);
 					if (!externalHandoff) state.resolvedMcpToolCallIds.add(mcpCall.toolCallId);
 				}
+			}
+			// A relayed run leaves the frame open and answers it with the client's
+			// own result, which its next request brings (`CursorParkedRun`).
+			if (externalHandoff && state.holdExternalCall) {
+				state.holdExternalCall(execMsg, mcpCall);
+				return;
 			}
 			const { execResult } = await resolveExecHandler(
 				mcpCall,
