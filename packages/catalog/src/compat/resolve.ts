@@ -754,6 +754,7 @@ function resolveOpenAIResponsesPolicy(
 			hostMatchesUrl(baseUrl, "azureOpenAI") ||
 			(isAzure && !baseUrl) ||
 			hostMatchesUrl(baseUrl, "openaiCodex"),
+		escapeBuiltinToolNames: false,
 		supportsReasoningSummary: !isXaiHost,
 		statefulResponses: undefined,
 		supportsAllTurnsReasoningContext: false,
@@ -868,6 +869,7 @@ function pickResponsesOnly(compat: ResolvedOpenAIResponsesCompat): ResponsesOnly
 		supportsLongPromptCacheRetention: compat.supportsLongPromptCacheRetention,
 		strictResponsesPairing: compat.strictResponsesPairing,
 		supportsImageDetailOriginal: compat.supportsImageDetailOriginal,
+		escapeBuiltinToolNames: compat.escapeBuiltinToolNames,
 		supportsObfuscationOptOut: compat.supportsObfuscationOptOut,
 		storeResponses: compat.storeResponses,
 		connectionBoundNativeHistory: compat.connectionBoundNativeHistory,

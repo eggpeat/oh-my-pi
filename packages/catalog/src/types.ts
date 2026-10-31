@@ -552,6 +552,12 @@ export interface OpenAICompat {
 	/** Whether the Responses API accepts the `detail: "original"` image hint. Default: true for OpenAI, Azure OpenAI, and Codex; false for other hosts. Explicit overrides win. */
 	supportsImageDetailOriginal?: boolean;
 	/**
+	 * Prefix every function tool name with `_` to avoid reserved-name interception.
+	 * Applies to `openai-responses` and OpenRouter's Responses transport.
+	 * Azure and Codex ignore it. Default: false.
+	 */
+	escapeBuiltinToolNames?: boolean;
+	/**
 	 * Whether the Responses endpoint accepts `configuration_update` input items
 	 * that change `reasoning.effort` mid-conversation while the request-level
 	 * effort stays pinned for prompt caching (GPT-6 family). Default:
@@ -1090,6 +1096,7 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 			| "thinkingKeep"
 			| "strictResponsesPairing"
 			| "supportsImageDetailOriginal"
+			| "escapeBuiltinToolNames"
 			| "supportsConfigurationUpdate"
 			| "supportsSteering"
 			| "stripImageInput"
@@ -1119,6 +1126,8 @@ export interface ResolvedOpenAIResponsesCompat extends ResolvedOpenAISharedCompa
 	supportsLongPromptCacheRetention: boolean;
 	strictResponsesPairing: boolean;
 	supportsImageDetailOriginal: boolean;
+	/** Applies to `openai-responses` and OpenRouter's Responses transport, not Azure or Codex. */
+	escapeBuiltinToolNames: boolean;
 	supportsObfuscationOptOut: boolean;
 	/**
 	 * Whether `reasoning.context: "all_turns"` (full cross-turn reasoning

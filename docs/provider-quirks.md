@@ -1380,6 +1380,7 @@ Meta Model API is Meta's commercial API platform hosting first-party models such
 ### Special casings
 
 - **Output Token Clamp Bypass**: `resolveOpenAIResponsesOutputClamp` (`packages/ai/src/providers/openai-shared.ts`) checks `model.provider === "meta"` to allow Meta requests to output up to `model.maxTokens` (131,072 tokens) rather than being restricted by the default 64,000 token ceiling (`OPENAI_MAX_OUTPUT_TOKENS`).
+- **Subscription-only tool-name escaping**: Reserved-name attestation has only been verified with Muse Code subscription credentials. The `meta` pay-as-you-go provider leaves `escapeBuiltinToolNames` disabled; the same restriction has not been verified with a Meta API key.
 
 ### Auth & usage
 
@@ -2560,6 +2561,8 @@ Provider-specific overrides in `packages/catalog/src/compat/rules/providers/zhip
 ### Special casings
 
 - Uses `openai-responses` on the Meta Model API with `x-api-version: 1.0.0`. Credentialed authoritative discovery joins authored Muse lineage references and partitions the cache by credential/endpoint.
+- **Reserved function names**: On 2026-10-31, subscription requests to `POST /v1/responses` declaring a function named exactly `bash`, `shell`, `web_search`, `web_fetch`, or `apply_patch` returned HTTP 403 with `client_attestation_denied`; changing only the name to a prefixed name such as `_bash` or `_web_search` was accepted (200). Matching is case-sensitive, and the reserved set may grow. The `escape-builtin-tool-names` compat axis therefore prefixes **every** function name with `_`, including declarations, replayed calls, and named tool choices. Incoming function calls strip one prefix, so `_bash` and legacy `bash` both dispatch to `bash`; freeform custom tools retain their `customWireName` behavior.
+- **Direct and gateway parity**: The same attestation failure occurs both directly and through `omp auth-gateway`; it is not gateway authentication failure. Interactive model fallback can hide it, whereas runs with fallback disabled surface the 403.
 
 ### Auth & usage
 

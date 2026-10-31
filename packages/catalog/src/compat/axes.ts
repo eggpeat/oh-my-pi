@@ -247,7 +247,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 		"between-tools",
 	]),
 	"effort-beta": wire("effortBeta", ["anthropic"]),
-	"escape-builtin-tool-names": wire("escapeBuiltinToolNames", ["anthropic"]),
+	"escape-builtin-tool-names": wire("escapeBuiltinToolNames", ["anthropic", "openai-responses"]),
 	"extended-cache-ttl-beta": wire("extendedCacheTtlBeta", ["anthropic"]),
 	"fast-mode": wire("fastMode", ["anthropic"]),
 	"first-party-provider": wire("firstPartyProvider", ["anthropic"]),

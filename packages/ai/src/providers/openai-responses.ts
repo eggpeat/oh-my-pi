@@ -95,6 +95,8 @@ import {
 	createInitialResponsesAssistantMessage,
 	createOpenAIStrictToolsState,
 	disableStrictToolsForScope,
+	encodeResponsesToolName,
+	escapesResponsesToolNames,
 	getJuiceValue,
 	getOpenAIPromptCacheKey,
 	getOpenAIResponsesRoutingSessionId,
@@ -1561,6 +1563,7 @@ export function buildParams(
 		omitReasoningEffort: options?.omitReasoningEffort,
 	});
 	const strictResponsesPairing = policy.tools.strictResponsesPairing;
+	const escapeBuiltinToolNames = escapesResponsesToolNames(model);
 	const shouldReplayNativeHistory = providerSessionState?.nativeHistoryReplayWarmed ?? true;
 	// Filtering native reasoning must not be undone by reconstruction when the
 	// target also rejects synthetic items (Muse on OpenRouter). Unfiltered targets
@@ -1676,7 +1679,11 @@ export function buildParams(
 					? context.tools
 					: context.tools.filter(
 							t =>
-								emittedNames.has(t.customWireName ?? t.name) ||
+								emittedNames.has(
+									escapeBuiltinToolNames && !(supportsFreeformApplyPatch(model) && t.customFormat)
+										? encodeResponsesToolName(t.name, escapeBuiltinToolNames)
+										: (t.customWireName ?? t.name),
+								) ||
 								(t.native?.type === "computer" && emittedComputer),
 						);
 			const toolChoice = mapOpenAIResponsesToolChoiceForTools(options.toolChoice, survivingTools, model);
@@ -1812,13 +1819,16 @@ export function mapOpenAIResponsesToolChoiceForTools(
 	model: Model<"openai-responses">,
 ): OpenAIResponsesToolChoice {
 	if (!model.compat.supportsToolChoice) return undefined;
+	const escapeBuiltinToolNames = escapesResponsesToolNames(model);
 	if (isForcedToolChoice(choice) && !model.compat.supportsForcedToolChoice) {
 		return "auto";
 	}
 	if (typeof choice !== "string" && choice?.type === "computer") {
 		const computer = tools.find(tool => tool.native?.type === "computer");
 		if (!computer) return undefined;
-		return model.supportsComputerUse === true ? { type: "computer" } : { type: "function", name: computer.name };
+		return model.supportsComputerUse === true
+			? { type: "computer" }
+			: { type: "function", name: encodeResponsesToolName(computer.name, escapeBuiltinToolNames) };
 	}
 	const mapped = mapToOpenAIResponsesToolChoice(choice);
 	if (!mapped || typeof mapped === "string" || mapped.type !== "function") {
@@ -1831,12 +1841,17 @@ export function mapOpenAIResponsesToolChoiceForTools(
 		: undefined;
 	const offeredTool = customTool ?? directTool;
 	if (offeredTool?.native?.type === "computer") {
-		return model.supportsComputerUse === true ? { type: "computer" } : { type: "function", name: offeredTool.name };
+		return model.supportsComputerUse === true
+			? { type: "computer" }
+			: { type: "function", name: encodeResponsesToolName(offeredTool.name, escapeBuiltinToolNames) };
 	}
 	if (!offeredTool) {
 		return undefined;
 	}
-	return customTool ? { type: "custom", name: customTool.customWireName ?? customTool.name } : mapped;
+	if (customTool) return { type: "custom", name: customTool.customWireName ?? customTool.name };
+	return escapeBuiltinToolNames
+		? { ...mapped, name: encodeResponsesToolName(mapped.name, escapeBuiltinToolNames) }
+		: mapped;
 }
 
 /** @internal Exported for tests. */
@@ -1850,6 +1865,7 @@ export function convertTools(
 		),
 ): OpenAITool[] {
 	const allowFreeform = supportsFreeformApplyPatch(model);
+	const escapeBuiltinToolNames = escapesResponsesToolNames(model);
 	const rejectRootObjectUnion = model.compat.rejectRootObjectUnion;
 	const out: OpenAITool[] = [];
 	for (const tool of tools) {
@@ -1901,7 +1917,7 @@ export function convertTools(
 		}
 		out.push({
 			type: "function",
-			name: tool.name,
+			name: encodeResponsesToolName(tool.name, escapeBuiltinToolNames),
 			description: tool.description || "",
 			parameters,
 			// `strict: false` and an omitted `strict` are NOT equivalent for every

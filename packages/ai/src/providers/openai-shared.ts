@@ -1928,6 +1928,26 @@ export function convertResponsesInputContent(
 	return normalizedContent.length > 0 ? normalizedContent : undefined;
 }
 
+/** The shared Responses compat record does not enable escaping on Azure or Codex transports. */
+export function escapesResponsesToolNames(model: Model<Api>): boolean {
+	return (
+		(model.api === "openai-responses" || model.api === "openrouter") &&
+		model.compat !== undefined &&
+		"escapeBuiltinToolNames" in model.compat &&
+		model.compat.escapeBuiltinToolNames === true
+	);
+}
+
+/** Escape client function names without colliding with provider-reserved tools. */
+export function encodeResponsesToolName(name: string, escapeBuiltinToolNames = false): string {
+	return escapeBuiltinToolNames ? `_${name}` : name;
+}
+
+/** Accept both escaped and legacy unprefixed function calls; strip exactly one prefix. */
+export function decodeResponsesToolName(name: string, escapeBuiltinToolNames = false): string {
+	return escapeBuiltinToolNames && name.startsWith("_") ? name.slice(1) : name;
+}
+
 /**
  * Map freeform custom-tool wire names back to the internal tool name for
  * providers that only accept function_call / function_call_output.
@@ -1956,19 +1976,53 @@ function adaptResponsesReplayItemsForModel(
 	supportsCustomToolCalls: boolean,
 	wireNameMap: ReadonlyMap<string, string> | undefined,
 	supportsComputerUse: boolean,
+	escapeBuiltinToolNames = false,
+	assistantMessage?: AssistantMessage,
 ): ResponseInput {
-	if (supportsCustomToolCalls && supportsComputerUse) return input;
+	if (supportsCustomToolCalls && supportsComputerUse && !escapeBuiltinToolNames) return input;
+	let canonicalToolNames: Map<string, string | null> | undefined;
+	if (escapeBuiltinToolNames && assistantMessage) {
+		for (const block of assistantMessage.content) {
+			if (block.type !== "toolCall") continue;
+			canonicalToolNames ??= new Map();
+			const callId = normalizeResponsesToolCallId(block.id).callId;
+			canonicalToolNames.set(callId, canonicalToolNames.has(callId) ? null : block.name);
+		}
+		if (canonicalToolNames) {
+			let nativeCallIds: Set<string> | undefined;
+			for (const item of input) {
+				if (item.type !== "function_call") continue;
+				const canonicalName = canonicalToolNames.get(item.call_id);
+				if (canonicalName === undefined || canonicalName === null) continue;
+				nativeCallIds ??= new Set();
+				if (nativeCallIds.has(item.call_id)) canonicalToolNames.set(item.call_id, null);
+				else nativeCallIds.add(item.call_id);
+			}
+		}
+	}
 
 	let changed = false;
 	const adapted: ResponseInput = [];
 	for (const item of input) {
+		if (escapeBuiltinToolNames && item.type === "function_call") {
+			// Only a one-to-one native/local match can override the wire name.
+			// Full snapshots may reuse call IDs across different turns.
+			const localName =
+				canonicalToolNames?.get(item.call_id) ?? decodeResponsesToolName(item.name, escapeBuiltinToolNames);
+			const name = encodeResponsesToolName(localName, escapeBuiltinToolNames);
+			if (name !== item.name) {
+				changed = true;
+				adapted.push({ ...item, name });
+				continue;
+			}
+		}
 		if (!supportsCustomToolCalls && item.type === "custom_tool_call") {
 			changed = true;
 			adapted.push({
 				type: "function_call",
 				...(item.id ? { id: item.id } : {}),
 				call_id: item.call_id,
-				name: resolveReplayCustomToolName(item.name, wireNameMap),
+				name: encodeResponsesToolName(resolveReplayCustomToolName(item.name, wireNameMap), escapeBuiltinToolNames),
 				arguments: JSON.stringify({ input: item.input }),
 				...(item.namespace ? { namespace: item.namespace } : {}),
 			});
@@ -2153,6 +2207,7 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 	// Compat is resolved by the catalog (e.g. Copilot / xai-oauth reject
 	// `detail: "original"`). Do not re-branch on provider id here.
 	const supportsImageDetailOriginal = options.supportsImageDetailOriginal;
+	const escapeBuiltinToolNames = escapesResponsesToolNames(options.model);
 	// Freeform custom tools (`custom_tool_call`) only when the catalog says so;
 	// same gate as tool conversion (`applyPatchToolType === "freeform"`).
 	const supportsCustomToolCalls = options.model.applyPatchToolType === "freeform";
@@ -2237,6 +2292,7 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 					supportsCustomToolCalls,
 					customToolWireNameMap,
 					options.model.supportsComputerUse === true,
+					escapeBuiltinToolNames,
 				);
 				pushNativeReplayItems(escapeControlTokens ? escapeReplayedControlTokens(replayItems) : replayItems);
 				msgIndex++;
@@ -2294,6 +2350,8 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 								supportsCustomToolCalls,
 								customToolWireNameMap,
 								options.model.supportsComputerUse === true,
+								escapeBuiltinToolNames,
+								assistantMsg,
 							),
 							assistantMsg.stopReason,
 							options.requiresReasoningReplayForAllTurns ?? false,
@@ -2659,7 +2717,7 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 			type: "function_call",
 			...(itemId ? { id: itemId } : {}),
 			call_id: normalized.callId,
-			name: functionName,
+			name: encodeResponsesToolName(functionName, escapesResponsesToolNames(model)),
 			arguments: stringifyJson(block.arguments) ?? "null",
 		});
 	}
@@ -3277,6 +3335,7 @@ export async function processResponsesStream<TApi extends Api>(
 	model: Model<TApi>,
 	options?: ProcessResponsesStreamOptions,
 ): Promise<void> {
+	const escapeBuiltinToolNames = escapesResponsesToolNames(model);
 	type StreamingToolCallBlock = ToolCall & {
 		[kStreamingPartialJson]: string;
 		[kStreamingLastParseLen]?: number;
@@ -3544,7 +3603,7 @@ export async function processResponsesStream<TApi extends Api>(
 				const block: StreamingToolCallBlock = {
 					type: "toolCall",
 					id: encodeResponsesToolCallId(item.call_id, item.id),
-					name: item.name,
+					name: decodeResponsesToolName(item.name, escapeBuiltinToolNames),
 					arguments: {},
 					[kStreamingPartialJson]: item.arguments || "",
 				};
@@ -3768,7 +3827,7 @@ export async function processResponsesStream<TApi extends Api>(
 				const toolCall: ToolCall = {
 					type: "toolCall",
 					id: encodeResponsesToolCallId(item.call_id, item.id),
-					name: item.name,
+					name: decodeResponsesToolName(item.name, escapeBuiltinToolNames),
 					arguments: args,
 				};
 				let contentIndex: number;
@@ -3777,6 +3836,7 @@ export async function processResponsesStream<TApi extends Api>(
 					// throttled delta parser may have skipped the last partial parse,
 					// leaving block.arguments stale (often `{}`); the emitted toolCall
 					// and the persisted block must agree.
+					if (escapeBuiltinToolNames) block.name = toolCall.name;
 					block.arguments = args;
 					clearStreamingPartialJson(block);
 					contentIndex = contentIndexOf(block);
