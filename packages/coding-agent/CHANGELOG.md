@@ -25,7 +25,7 @@
 - In the bash tool, `xargs` reports a command killed by a signal as GNU xargs does: `xargs: CMD: terminated by signal N`, no further commands, status 125
 - On macOS, starting a bash tool session no longer briefly sets pi's umask to 022, which could give files created at that moment the wrong permissions
 - In the bash tool, an executable script without a `#!` line started in the background with its input from a FIFO (`./script < fifo &`) runs as a bash script instead of failing with `Exec format error`
-- Fixed JSON query reads (`?q=…`) stopped by the 50KB byte budget reporting the bytes shown as the limit instead of `50.0KB limit` ([#3](https://github.com/can1357/oh-my-pi/issues/3))
+- Fixed JSON query reads (`?q=…`) stopped by the 50KB byte budget reporting the bytes shown as the limit instead of `50.0KB limit` ([#3](https://github.com/eggpeat/oh-my-pi/issues/3))
 
 ## [18.16.0] - 2026-11-02
 
