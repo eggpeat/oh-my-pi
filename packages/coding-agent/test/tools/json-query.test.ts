@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "../../src/config/settings";
 import { resolveLocalUrlToPath } from "../../src/internal-urls";
+import { wrapToolWithMetaNotice } from "../../src/tools/output-meta";
 import { ReadTool } from "../../src/tools/read";
 
 type ToolTextResult = {
@@ -303,5 +304,16 @@ describe("JSON query in read tool", () => {
 		expect(text).toContain("item-one");
 		expect(text).toContain("item-two");
 		expect(text).not.toContain("item-three");
+	});
+
+	it("reports the read byte budget when a JSON query page is byte-truncated", async () => {
+		const wideJsonl = path.join(tempDir, "wide-events.jsonl");
+		await Bun.write(
+			wideJsonl,
+			`${JSON.stringify({ id: 0, text: "x".repeat(60_000) })}\n${JSON.stringify({ id: 1, text: "short" })}\n`,
+		);
+		const wrappedRead = wrapToolWithMetaNotice(new ReadTool(session));
+		const result = await wrappedRead.execute("call_wide_json", { path: `${wideJsonl}?q=.&limit=8` });
+		expect(getText(result)).toBe('{\n  "id": 0,\n\n[Showing lines 1-2 of 8 (50.0KB limit). Use :3 to continue]');
 	});
 });
