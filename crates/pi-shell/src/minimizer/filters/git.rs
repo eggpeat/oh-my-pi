@@ -381,7 +381,7 @@ fn condense_status(input: &str) -> String {
 		if !trimmed.starts_with('(')
 			&& !trimmed.ends_with(':')
 			&& !trimmed.starts_with("use ")
-			&& !trimmed.starts_with("no changes added")
+			&& !is_status_trailer(trimmed)
 			&& in_untracked
 		{
 			summary.untracked += 1;
@@ -516,12 +516,19 @@ fn parse_long_status_line(
 			return true;
 		}
 	}
-	if in_untracked && !line.starts_with('(') && !line.ends_with(':') {
+	// Closing advice is printed after the untracked listing. It is not a path.
+	// Accepting it here counted `no changes added…` / `nothing added to commit…`
+	// as untracked files before the outer loop could skip them.
+	if in_untracked && !is_status_trailer(line) && !line.starts_with('(') && !line.ends_with(':') {
 		summary.untracked += 1;
 		push_status_path(summary, "??", line);
 		return true;
 	}
 	false
+}
+
+fn is_status_trailer(line: &str) -> bool {
+	line.starts_with("no changes added") || line.starts_with("nothing added to commit")
 }
 
 fn push_status_path(summary: &mut StatusSummary, label: &str, path: &str) {
@@ -1551,12 +1558,7 @@ fn condense_stash(command: &str, input: &str, exit_code: i32) -> String {
 			return "ok stashed\n".to_string();
 		}
 		if sub == "apply" || sub == "pop" || sub == "branch" {
-			let compacted = condense_status(input);
-			return if compacted == input {
-				input.to_string()
-			} else {
-				compacted
-			};
+			return condense_stash_status(input);
 		}
 		if sub == "create" {
 			return input.to_string();
@@ -1569,6 +1571,73 @@ fn condense_stash(command: &str, input: &str, exit_code: i32) -> String {
 	}
 
 	condense_noisy_output(input)
+}
+
+fn condense_stash_status(input: &str) -> String {
+	let Some((status, dropped)) = split_stash_drop_confirmation(input) else {
+		let compacted = condense_status(input);
+		return if compacted == input {
+			input.to_string()
+		} else {
+			compacted
+		};
+	};
+	let mut out = condense_status(&status);
+	if !out.is_empty() && !out.ends_with('\n') {
+		out.push('\n');
+	}
+	out.push_str(&dropped);
+	out
+}
+
+/// Peel `Dropped refs/stash@{N}` / `Dropped stash@{N}` confirmations out of
+/// successful `stash apply`/`pop`/`branch` output. `None` when there is no
+/// confirmation, so the common path does not copy the buffer.
+fn split_stash_drop_confirmation(input: &str) -> Option<(String, String)> {
+	if !input.contains("Dropped ") {
+		return None;
+	}
+	let mut status = String::with_capacity(input.len());
+	let mut dropped = String::new();
+	let mut saw_drop = false;
+	for line in input.split_inclusive('\n') {
+		if is_stash_drop_confirmation(line.trim_end_matches(['\r', '\n']).trim()) {
+			saw_drop = true;
+			dropped.push_str(line);
+		} else {
+			status.push_str(line);
+		}
+	}
+	if !saw_drop {
+		return None;
+	}
+	Some((status, dropped))
+}
+
+fn is_stash_drop_confirmation(trimmed: &str) -> bool {
+	let Some(rest) = trimmed.strip_prefix("Dropped ") else {
+		return false;
+	};
+	let rest = rest.strip_prefix("refs/").unwrap_or(rest);
+	let Some(rest) = rest.strip_prefix("stash@{") else {
+		return false;
+	};
+	let Some((index, after)) = rest.split_once('}') else {
+		return false;
+	};
+	if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+		return false;
+	}
+	if after.is_empty() {
+		return true;
+	}
+	let Some(oid) = after
+		.strip_prefix(" (")
+		.and_then(|rest| rest.strip_suffix(')'))
+	else {
+		return false;
+	};
+	!oid.is_empty()
 }
 
 fn condense_stash_list(input: &str) -> String {
