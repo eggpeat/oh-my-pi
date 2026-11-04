@@ -391,7 +391,6 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 	if (init.retryFallback) {
 		installRetryFallbackRole(subagentSettings, subagentRetryFallbackRole(ref.id), init.retryFallback);
 	}
-	const agentName = persistedAgentName(ref.displayName, init);
 	// Account pools are owner policy, like the extension roots below: take the
 	// live exact-name `task.agentAccountPools` entry, never a transcript copy.
 	const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(spec.settings));
@@ -449,7 +448,24 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			sessionManager: reopened,
 			agentId: ref.id,
 			agentDisplayName: ref.displayName,
-			agentName,
+			// `agents` rule scoping keys on the durable definition name (`scout`,
+			// `reviewer`, …), not the registry display label — cold-revived refs
+			// register with `displayName: id` (registry/persisted-agents.ts), so a
+			// generated task id would silently drop every agent-scoped rule.
+			// `init.agent` carries the real name; only files predating that field
+			// fall back to the display label. A parked transcript may also predate
+			// the `main`/`sub` definition-name reservation (discovery/helpers.ts): a
+			// persisted `init.agent` of either sentinel value from such a legacy
+			// custom agent must not masquerade as that sentinel here, so it falls
+			// back to the display label too, keeping it scoped as an ordinary
+			// subagent under its generated id instead of `main` or the shared `sub`
+			// bucket.
+			agentName:
+				init.agent &&
+				init.agent.trim().toLowerCase() !== MAIN_AGENT_RULE_NAME &&
+				init.agent.trim().toLowerCase() !== SUB_AGENT_RULE_NAME
+					? init.agent
+					: ref.displayName,
 			parentTaskPrefix: ref.id,
 			asyncJobManager: spec.asyncJobManager,
 			parentAgentId: ref.parentId,
@@ -552,7 +568,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 		id: ref.id,
 		agent: persistedAgentDefinition(ref.displayName, init),
 		completionProbe: isCompletionProbeEnabled(spec.settings, taskDepth - 1),
-		...softRequestBudgetFor(agentName, spec.settings),
+		...softRequestBudgetFor(persistedAgentName(ref.displayName, init), spec.settings),
 		eventBus: spec.eventBus,
 		subagentEventBus: spec.subagentEventBus,
 		sessionFile,
