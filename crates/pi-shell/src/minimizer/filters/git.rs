@@ -375,13 +375,13 @@ fn condense_status(input: &str) -> String {
 			in_staged = false;
 			continue;
 		}
-		if parse_long_status_line(trimmed, in_staged, in_untracked, &mut summary) {
+		if parse_long_status_line(trimmed, line, in_staged, in_untracked, &mut summary) {
 			continue;
 		}
 		if !trimmed.starts_with('(')
 			&& !trimmed.ends_with(':')
 			&& !trimmed.starts_with("use ")
-			&& !is_status_trailer(trimmed)
+			&& !is_status_trailer(line)
 			&& in_untracked
 		{
 			summary.untracked += 1;
@@ -484,6 +484,7 @@ fn is_short_status(status: &str) -> bool {
 
 fn parse_long_status_line(
 	line: &str,
+	raw: &str,
 	in_staged: bool,
 	in_untracked: bool,
 	summary: &mut StatusSummary,
@@ -516,10 +517,9 @@ fn parse_long_status_line(
 			return true;
 		}
 	}
-	// Closing advice is printed after the untracked listing. It is not a path.
-	// Accepting it here counted `no changes added…` / `nothing added to commit…`
-	// as untracked files before the outer loop could skip them.
-	if in_untracked && !is_status_trailer(line) && !line.starts_with('(') && !line.ends_with(':') {
+	// Closing advice is flush left. Check `raw` before indent is trimmed: an
+	// indented `no changes added.md` is a path, not the status trailer.
+	if in_untracked && !is_status_trailer(raw) && !line.starts_with('(') && !line.ends_with(':') {
 		summary.untracked += 1;
 		push_status_path(summary, "??", line);
 		return true;
@@ -528,6 +528,9 @@ fn parse_long_status_line(
 }
 
 fn is_status_trailer(line: &str) -> bool {
+	if line.starts_with([' ', '\t']) {
+		return false;
+	}
 	line.starts_with("no changes added") || line.starts_with("nothing added to commit")
 }
 
@@ -1601,7 +1604,8 @@ fn split_stash_drop_confirmation(input: &str) -> Option<(String, String)> {
 	let mut dropped = String::new();
 	let mut saw_drop = false;
 	for line in input.split_inclusive('\n') {
-		if is_stash_drop_confirmation(line.trim_end_matches(['\r', '\n']).trim()) {
+		let bare = line.trim_end_matches(['\r', '\n']);
+		if is_stash_drop_confirmation(bare) {
 			saw_drop = true;
 			dropped.push_str(line);
 		} else {
@@ -1614,8 +1618,11 @@ fn split_stash_drop_confirmation(input: &str) -> Option<(String, String)> {
 	Some((status, dropped))
 }
 
-fn is_stash_drop_confirmation(trimmed: &str) -> bool {
-	let Some(rest) = trimmed.strip_prefix("Dropped ") else {
+fn is_stash_drop_confirmation(line: &str) -> bool {
+	if line.starts_with([' ', '\t']) {
+		return false;
+	}
+	let Some(rest) = line.strip_prefix("Dropped ") else {
 		return false;
 	};
 	let rest = rest.strip_prefix("refs/").unwrap_or(rest);
