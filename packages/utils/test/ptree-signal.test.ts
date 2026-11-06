@@ -1,4 +1,5 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import { watch as fsWatch } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -263,6 +264,101 @@ describe("ptree signal abort handling", () => {
 					try {
 						process.kill(-child.pid, "SIGKILL");
 					} catch {}
+				}
+			},
+		);
+	}
+
+	it.skipIf(process.platform === "win32")(
+		"keeps output open during graceful shutdown on abort and then cuts off leftover child output",
+		async () => {
+			// Closing stdout immediately on abort kills a SIGTERM cleanup handler
+			// with SIGPIPE when it prints. In the direct-signal fallback, the
+			// background child also survives SIGTERM to the shell, so readers must
+			// be cut off once the shell's graceful stop finishes.
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-utils-abort-cleanup-"));
+			const pidFile = path.join(dir, "pid");
+			const marker = path.join(dir, "cleaned");
+			const ready = Promise.withResolvers<void>();
+			const checkReady = async () => {
+				const text = await Bun.file(pidFile)
+					.text()
+					.catch(() => "");
+				if (Number.parseInt(text.trim(), 10) > 0) ready.resolve();
+			};
+			const watcher = fsWatch(dir, () => {
+				void checkReady();
+			});
+			const fromPidSpy = spyOn(Process, "fromPid").mockReturnValue(null);
+			let orphanPid: number | undefined;
+			try {
+				const controller = new AbortController();
+				const child = spawn(
+					[
+						"/bin/sh",
+						"-c",
+						`trap 'echo cleanup-stdout; echo cleaned > ${JSON.stringify(marker)}; exit 0' TERM; sleep 30 & echo $! > ${JSON.stringify(`${pidFile}.tmp`)} && mv ${JSON.stringify(`${pidFile}.tmp`)} ${JSON.stringify(pidFile)}; wait`,
+					],
+					{ signal: controller.signal },
+				);
+				const pending = child.wait({ allowAbort: true, allowNonZero: true });
+				await checkReady();
+				await ready.promise;
+				orphanPid = Number.parseInt((await Bun.file(pidFile).text()).trim(), 10);
+				expect(orphanPid).toBeGreaterThan(0);
+
+				controller.abort(new Error("graceful stop"));
+				const result = await pending;
+
+				expect(result.exitError).toBeInstanceOf(AbortError);
+				expect(result.stdout).toBe("cleanup-stdout\n");
+				expect(await Bun.file(marker).text()).toBe("cleaned\n");
+				expect(child.proc.signalCode).toBeNull();
+			} finally {
+				watcher.close();
+				fromPidSpy.mockRestore();
+				if (orphanPid) Process.fromPid(orphanPid)?.killTree(9);
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		},
+	);
+
+	for (const source of ["first", "second"] as const) {
+		it.skipIf(process.platform === "win32")(
+			`aborts collection from the ${source} signal when attachSignal is called twice`,
+			async () => {
+				const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-utils-abort-multi-"));
+				const pidFile = path.join(dir, "pid");
+				const first = new AbortController();
+				const second = new AbortController();
+				const child = spawn(["/bin/sh", "-c", `sleep 30 & echo $! > ${JSON.stringify(pidFile)}; echo token`], {
+					detached: true,
+					signal: first.signal,
+				});
+				const pending = child.wait({ allowAbort: true, allowNonZero: true });
+				child.attachSignal(second.signal);
+				let orphanPid: number | undefined;
+				try {
+					await child.exited;
+					expect(child.exitCode).toBe(0);
+					orphanPid = Number.parseInt((await Bun.file(pidFile).text()).trim(), 10);
+					expect(orphanPid).toBeGreaterThan(0);
+					await nextTurn();
+					const reason = new Error(`stop-${source}`);
+					if (source === "first") first.abort(reason);
+					else second.abort(reason);
+
+					const result = await pending;
+
+					expect(result.exitError).toBeInstanceOf(AbortError);
+					expect((result.exitError as AbortError).reason).toBe(reason);
+					expect(await orphanStopped(orphanPid)).toBe(true);
+				} finally {
+					if (orphanPid) Process.fromPid(orphanPid)?.killTree(9);
+					try {
+						process.kill(-child.pid, "SIGKILL");
+					} catch {}
+					await fs.rm(dir, { recursive: true, force: true });
 				}
 			},
 		);

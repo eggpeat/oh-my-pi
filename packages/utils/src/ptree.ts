@@ -193,8 +193,7 @@ export class ChildProcess<In extends InMask = InMask> {
 	#timeoutTimer?: NodeJS.Timeout;
 	// Abort handling stays armed through output collection. Root exit alone is
 	// not the end of the command when a descendant still holds a pipe.
-	#cancelSignal?: AbortSignal;
-	#abortListener?: () => void;
+	#cancelSignals = new Map<AbortSignal, (() => void) | undefined>();
 	#collectionDepth = 0;
 	#rootExitObserved = false;
 	#stderrStream?: ReadableStream<Uint8Array>;
@@ -677,69 +676,95 @@ export class ChildProcess<In extends InMask = InMask> {
 	// ── Signal / timeout ─────────────────────────────────────────────────
 
 	attachSignal(signal: AbortSignal): void {
-		this.#cancelSignal = signal;
-		// Observe the normalized exit so an abort rejection is not unhandled when
-		// the caller only consumes output or Bun's proc.exited.
-		const exited = this.#exited.catch(() => {});
+		const firstSignal = this.#cancelSignals.size === 0;
+		if (!this.#cancelSignals.has(signal)) {
+			this.#cancelSignals.set(signal, undefined);
+		}
+		if (firstSignal) {
+			// Observe the normalized exit so an abort rejection is not unhandled when
+			// the caller only consumes output or Bun's proc.exited.
+			const exited = this.#exited.catch(() => {});
+			// Root exit is not collection finishing: a descendant can still hold
+			// stdout or stderr. Drop the listeners only once that collection is idle.
+			void exited.finally(() => {
+				this.#rootExitObserved = true;
+				if (this.#collectionDepth === 0) this.#disarmAbortListeners();
+			});
+		}
 		if (signal.aborted) {
+			this.#disarmAbortListeners();
 			this.#abortFromSignal(signal);
 			return;
 		}
-		this.#armAbortListener();
-		// Root exit is not collection finishing: a descendant can still hold
-		// stdout or stderr. Drop the listener only once that collection is idle.
-		void exited.finally(() => {
-			this.#rootExitObserved = true;
-			if (this.#collectionDepth === 0) this.#disarmAbortListener();
-		});
+		if (!this.#rootExitObserved || this.#collectionDepth > 0) {
+			this.#armAbortListener(signal);
+		}
 	}
 
 	#cancellation(signal: AbortSignal): AbortError {
 		return new AbortError(signal.reason, "<cancelled>");
 	}
 
-	#armAbortListener(): void {
-		const signal = this.#cancelSignal;
-		if (!signal || signal.aborted || this.#abortListener) return;
+	#armAbortListener(signal: AbortSignal): void {
+		if (
+			signal.aborted ||
+			this.#exitReason?.aborted ||
+			this.#exitReasonPending?.aborted ||
+			this.#cancelSignals.get(signal) !== undefined
+		) {
+			return;
+		}
 		const onAbort = () => {
-			this.#abortListener = undefined;
+			this.#cancelSignals.set(signal, undefined);
+			this.#disarmAbortListeners();
 			this.#abortFromSignal(signal);
 		};
-		this.#abortListener = onAbort;
+		this.#cancelSignals.set(signal, onAbort);
 		signal.addEventListener("abort", onAbort, { once: true });
 	}
 
-	#disarmAbortListener(): void {
-		const signal = this.#cancelSignal;
-		const onAbort = this.#abortListener;
-		if (!signal || !onAbort) return;
-		signal.removeEventListener("abort", onAbort);
-		this.#abortListener = undefined;
+	#armAbortListeners(): void {
+		for (const signal of this.#cancelSignals.keys()) {
+			this.#armAbortListener(signal);
+		}
+	}
+
+	#disarmAbortListeners(): void {
+		for (const [signal, onAbort] of this.#cancelSignals) {
+			if (!onAbort) continue;
+			signal.removeEventListener("abort", onAbort);
+			this.#cancelSignals.set(signal, undefined);
+		}
 	}
 
 	/** Keep abort handling until this output collection finishes, even after root exit. */
 	#holdAbortListener(): () => void {
 		this.#collectionDepth++;
-		this.#armAbortListener();
+		this.#armAbortListeners();
 		let released = false;
 		return () => {
 			if (released) return;
 			released = true;
 			this.#collectionDepth--;
-			if (this.#collectionDepth === 0 && this.#rootExitObserved) this.#disarmAbortListener();
+			if (this.#collectionDepth === 0 && this.#rootExitObserved) this.#disarmAbortListeners();
 		};
 	}
 
 	#abortIfSignalled(): void {
-		const signal = this.#cancelSignal;
-		if (signal?.aborted) this.#abortFromSignal(signal);
+		for (const signal of this.#cancelSignals.keys()) {
+			if (signal.aborted) {
+				this.#abortFromSignal(signal);
+				return;
+			}
+		}
 	}
 
 	#abortFromSignal(signal: AbortSignal): void {
 		// A second abort (collection starting after a pre-aborted signal) must
 		// cancel readers that did not exist yet, not start another termination.
 		if (this.#exitReason?.aborted || this.#exitReasonPending?.aborted) {
-			this.#cutOffReaders();
+			const rootRunning = this.proc.exitCode === null && this.proc.signalCode === null;
+			this.#cutOffAfterStop(rootRunning && this.#terminating !== undefined);
 			return;
 		}
 		const reason = this.#cancellation(signal);
@@ -754,20 +779,31 @@ export class ChildProcess<In extends InMask = InMask> {
 
 	/**
 	 * Stop a command whose output is still being collected. Returns whether a
-	 * safe termination was started. Readers are cancelled either way so the
-	 * wait cannot outlive the caller's abort or deadline.
+	 * safe termination was started. Readers stay open during a graceful stop so
+	 * cleanup output does not hit SIGPIPE, and are cancelled once that stop (or
+	 * an immediate hard stop) finishes so leftover children cannot stall wait().
 	 */
 	#stopInFlightCommand(reason: Exception, gracefulMs: number | undefined): boolean {
 		const pipesHeld = this.#openPipeReaders > 0;
+		const rootRunning = this.proc.exitCode === null && this.proc.signalCode === null;
 		// A detached group can remain alive after its leader exits. Only use the
 		// dead-leader fallback while an inherited pipe proves that exact group
 		// still has a live member; this avoids stale-PGID reuse.
 		const canTerminate =
-			this.proc.exitCode === null ||
-			(pipesHeld && (this.#terminateGroup || this.#windowsRootProcess !== undefined));
+			rootRunning || (pipesHeld && (this.#terminateGroup || this.#windowsRootProcess !== undefined));
 		if (canTerminate) this.kill(reason, gracefulMs);
-		this.#cutOffReaders();
+		this.#cutOffAfterStop(rootRunning && (gracefulMs === undefined || gracefulMs >= 0));
 		return canTerminate;
+	}
+
+	#cutOffAfterStop(waitForGracefulStop: boolean): void {
+		if (!waitForGracefulStop) {
+			this.#cutOffReaders();
+			return;
+		}
+		void Promise.allSettled([this.proc.exited, this.#terminating]).then(() => {
+			this.#cutOffReaders();
+		});
 	}
 
 	#cutOffReaders(): void {
