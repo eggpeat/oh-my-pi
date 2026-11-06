@@ -374,6 +374,9 @@ export class ChildProcess<In extends InMask = InMask> {
 				return;
 			}
 		}
+		if (this.#terminating && (gracefulMs === undefined || gracefulMs >= 0)) {
+			return;
+		}
 		if (
 			this.proc.exitCode !== null &&
 			this.#terminateGroup &&
@@ -763,8 +766,7 @@ export class ChildProcess<In extends InMask = InMask> {
 		// A second abort (collection starting after a pre-aborted signal) must
 		// cancel readers that did not exist yet, not start another termination.
 		if (this.#exitReason?.aborted || this.#exitReasonPending?.aborted) {
-			const rootRunning = this.proc.exitCode === null && this.proc.signalCode === null;
-			this.#cutOffAfterStop(rootRunning && this.#terminating !== undefined);
+			this.#cutOffAfterStop(this.#terminating !== undefined);
 			return;
 		}
 		const reason = this.#cancellation(signal);
@@ -786,13 +788,14 @@ export class ChildProcess<In extends InMask = InMask> {
 	#stopInFlightCommand(reason: Exception, gracefulMs: number | undefined): boolean {
 		const pipesHeld = this.#openPipeReaders > 0;
 		const rootRunning = this.proc.exitCode === null && this.proc.signalCode === null;
+		const ongoingShutdown = this.#terminating !== undefined;
 		// A detached group can remain alive after its leader exits. Only use the
 		// dead-leader fallback while an inherited pipe proves that exact group
 		// still has a live member; this avoids stale-PGID reuse.
 		const canTerminate =
 			rootRunning || (pipesHeld && (this.#terminateGroup || this.#windowsRootProcess !== undefined));
 		if (canTerminate) this.kill(reason, gracefulMs);
-		this.#cutOffAfterStop(rootRunning && (gracefulMs === undefined || gracefulMs >= 0));
+		this.#cutOffAfterStop((rootRunning || ongoingShutdown) && (gracefulMs === undefined || gracefulMs >= 0));
 		return canTerminate;
 	}
 

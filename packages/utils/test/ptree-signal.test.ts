@@ -323,6 +323,77 @@ describe("ptree signal abort handling", () => {
 		},
 	);
 
+	it.skipIf(process.platform === "win32")(
+		"keeps output open when collection starts after abort and root exit while child shutdown is still in flight",
+		async () => {
+			// The root shell exits on SIGTERM while a child subshell is still
+			// running its SIGTERM cleanup. Starting wait() after root exit must
+			// keep stdout open until the ongoing termination finishes, then cut
+			// off any leftover pipe holder.
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-utils-abort-late-collect-"));
+			const pidFile = path.join(dir, "pid");
+			const orphanFile = path.join(dir, "orphan");
+			const marker = path.join(dir, "cleaned");
+			const gate = path.join(dir, "gate");
+			await Bun.spawn(["mkfifo", gate]).exited;
+			const ready = Promise.withResolvers<void>();
+			const checkReady = async () => {
+				const text = await Bun.file(pidFile)
+					.text()
+					.catch(() => "");
+				if (Number.parseInt(text.trim(), 10) > 0) ready.resolve();
+			};
+			const watcher = fsWatch(dir, () => {
+				void checkReady();
+			});
+			let subshellSleepPid: number | undefined;
+			let orphanPid: number | undefined;
+			try {
+				const controller = new AbortController();
+				const script = `
+(
+	trap 'read _ < ${JSON.stringify(gate)}; sleep 30 & echo $! > ${JSON.stringify(orphanFile)}; echo cleanup-stdout; echo cleaned > ${JSON.stringify(marker)}; exit 0' TERM
+	sleep 30 &
+	echo $! > ${JSON.stringify(`${pidFile}.tmp`)} && mv ${JSON.stringify(`${pidFile}.tmp`)} ${JSON.stringify(pidFile)}
+	wait
+) &
+trap 'exit 0' TERM
+wait
+`;
+				const child = spawn(["/bin/sh", "-c", script], { signal: controller.signal });
+				await checkReady();
+				await ready.promise;
+				subshellSleepPid = Number.parseInt((await Bun.file(pidFile).text()).trim(), 10);
+				expect(subshellSleepPid).toBeGreaterThan(0);
+
+				controller.abort(new Error("late collection"));
+				await child.proc.exited;
+				expect(child.proc.exitCode).toBe(0);
+
+				const pending = child.wait({ allowAbort: true, allowNonZero: true });
+				await Bun.write(gate, "go\n");
+				const result = await pending;
+
+				orphanPid = Number.parseInt(
+					(
+						await Bun.file(orphanFile)
+							.text()
+							.catch(() => "")
+					).trim(),
+					10,
+				);
+				expect(result.exitError).toBeInstanceOf(AbortError);
+				expect(result.stdout).toBe("cleanup-stdout\n");
+				expect(await Bun.file(marker).text()).toBe("cleaned\n");
+			} finally {
+				watcher.close();
+				if (subshellSleepPid) Process.fromPid(subshellSleepPid)?.killTree(9);
+				if (orphanPid) Process.fromPid(orphanPid)?.killTree(9);
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		},
+	);
+
 	for (const source of ["first", "second"] as const) {
 		it.skipIf(process.platform === "win32")(
 			`aborts collection from the ${source} signal when attachSignal is called twice`,
