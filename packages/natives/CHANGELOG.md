@@ -4,7 +4,6 @@
 
 ### Fixed
 
-- The native addon now builds against wasmtime 36.0.20 (WebAssembly grammars, via tree-sitter 0.26 and ast-grep-core 0.44), zip 9.4.1 (macOS on-device prediction, via candle 0.11.1) and rustls 0.23.46, which fix published advisories in the earlier wasmtime 29, zip 7.4 and rustls 0.23.45 releases
 - Fixed `find()` missing elements more than 24 levels down, such as VS Code's editor; it now searches 64 levels deep ([#18221](https://github.com/can1357/oh-my-pi/pull/18221) by [@will-bogusz](https://github.com/will-bogusz))
 - `glob`, `grep`, `fuzzyFind`, `ast_grep` and `ast_edit` now run their directory traversal on a filesystem runtime of their own, so a search over a large or cold tree can no longer take the worker threads that the embedded shell and every other native call are scheduled on. Those threads are named `pi-fs-worker`, so a stall in a search is tellable apart from a stall elsewhere.
 - Fixed a workspace tree whose native addon does not match its checkout failing with `undefined is not a constructor` at the callsite: a class the addon lacks now throws a message naming the addon file, both releases and `bun run build:native` — from its constructor and from any static entrypoint — and the loader reports that mismatch once as it loads ([#18230](https://github.com/can1357/oh-my-pi/pull/18230) by [@sjawhar](https://github.com/sjawhar))
