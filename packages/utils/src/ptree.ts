@@ -668,20 +668,28 @@ export class ChildProcess<In extends InMask = InMask> {
 		const onAbort = () => {
 			// The { once: true } listener has removed itself at this point.
 			attached = false;
+			const rootRunning = this.proc.exitCode === null && this.proc.signalCode === null;
+			if (rootRunning || this.#openPipeReaders > 0) {
+				this.#abortRegistrations?.delete(sync);
+			}
 			this.kill(new AbortError(signal.reason, "<cancelled>"));
 			this.#cutoffOutput();
 		};
 		const sync = () => {
 			const rootRunning = this.proc.exitCode === null && this.proc.signalCode === null;
-			const needed = !signal.aborted && (rootRunning || this.#openPipeReaders > 0);
-			if (needed === attached) return;
-			if (needed) signal.addEventListener("abort", onAbort, { once: true });
+			const active = rootRunning || this.#openPipeReaders > 0;
+			if (signal.aborted) {
+				if (active) onAbort();
+				return;
+			}
+			if (active === attached) return;
+			if (active) signal.addEventListener("abort", onAbort, { once: true });
 			else signal.removeEventListener("abort", onAbort);
-			attached = needed;
+			attached = active;
 		};
-		if (signal.aborted) return void onAbort();
 		(this.#abortRegistrations ??= new Set()).add(sync);
-		sync();
+		if (signal.aborted) onAbort();
+		else sync();
 	}
 
 	#syncAbortListeners(): void {

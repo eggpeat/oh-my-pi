@@ -101,8 +101,11 @@ describe("ptree signal abort handling", () => {
 				await child.exited;
 				orphan = Process.fromPid(Number.parseInt(await Bun.file(pidFile).text(), 10));
 				if (!orphan) throw new Error("the fixture must expose its pipe-holding descendant");
+				const nextTurn = Promise.withResolvers<void>();
+				setImmediate(nextTurn.resolve);
+				await nextTurn.promise;
 
-				// Start collection only after root-exit cleanup had a chance to detach
+				// Start collection only after root exit and stderr EOF have detached
 				// the signal listener. The read must re-arm cancellation for inherited pipes.
 				// Without a detached group, reader cutoff alone must release wait().
 				outcome = child.wait({ allowAbort: true });
@@ -115,6 +118,45 @@ describe("ptree signal abort handling", () => {
 				if (detached) {
 					expect(await orphan.waitForExit(), "the detached descendant must be terminated").toBe(true);
 				}
+			} finally {
+				if (orphan) {
+					orphan.killTree(9);
+					await orphan.waitForExit();
+				}
+				await outcome?.catch(() => {});
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"aborts wait() when cancelled after root exit and stderr closure before wait() starts",
+		async () => {
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-utils-abort-before-wait-"));
+			const pidFile = path.join(dir, "pid");
+			const controller = new AbortController();
+			using child = spawn(["/bin/sh", "-c", `${BLOCK_FOREVER} 2>/dev/null & echo $! > '${pidFile}'; echo token`], {
+				detached: true,
+				signal: controller.signal,
+			});
+			let orphan: Process | null = null;
+			let outcome: Promise<ExecResult> | undefined;
+			try {
+				await child.exited;
+				orphan = Process.fromPid(Number.parseInt(await Bun.file(pidFile).text(), 10));
+				if (!orphan) throw new Error("the fixture must expose its pipe-holding descendant");
+				const nextTurn = Promise.withResolvers<void>();
+				setImmediate(nextTurn.resolve);
+				await nextTurn.promise;
+
+				// Cancel while no pipe reader is active, then start wait().
+				controller.abort("abort before wait starts");
+				outcome = child.wait({ allowAbort: true });
+				expect(child.exitReason).toBeInstanceOf(AbortError);
+
+				const result = await outcome;
+				expect(result.exitError).toBeInstanceOf(AbortError);
+				expect(await orphan.waitForExit(), "the detached descendant must be terminated").toBe(true);
 			} finally {
 				if (orphan) {
 					orphan.killTree(9);
@@ -139,6 +181,9 @@ describe("ptree signal abort handling", () => {
 			await child.exited;
 			orphan = Process.fromPid(Number.parseInt(await Bun.file(pidFile).text(), 10));
 			if (!orphan) throw new Error("the fixture must expose its pipe-holding descendant");
+			const nextTurn = Promise.withResolvers<void>();
+			setImmediate(nextTurn.resolve);
+			await nextTurn.promise;
 
 			outcome = child.bytes();
 			controller.abort("abort inherited byte output");
