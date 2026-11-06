@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed cancelling a command after its root process had already exited while a descendant still held its output, so the wait ends with cancellation instead of hanging until that descendant closes the pipes ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+
 ## [18.17.0] - 2026-11-06
 
 ### Added

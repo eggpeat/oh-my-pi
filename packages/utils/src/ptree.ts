@@ -184,13 +184,19 @@ export class ChildProcess<In extends InMask = InMask> {
 	#stderrDone: Promise<void>;
 	#exited: Promise<number>;
 	#openPipeReaders = 1;
-	// Set by attachTimeout() at the command deadline; untimed commands keep
-	// complete EOF-based capture. Active pipe readers are cancelled at cutoff so
-	// their pending read() settles as done and partial output is kept.
+	// Set when a deadline or abort ends collection before inherited EOF.
+	// Active pipe readers are cancelled at cutoff so their pending read()
+	// settles and partial output is kept.
 	#cutoff = false;
-	/** Readers of piped stdio; the timeout cancels them so pending reads settle. */
+	/** Readers of piped stdio; a deadline or abort cancels them so pending reads settle. */
 	#pipeReaders = new Set<{ cancel(reason?: unknown): Promise<void> }>();
 	#timeoutTimer?: NodeJS.Timeout;
+	// Abort handling stays armed through output collection. Root exit alone is
+	// not the end of the command when a descendant still holds a pipe.
+	#cancelSignal?: AbortSignal;
+	#abortListener?: () => void;
+	#collectionDepth = 0;
+	#rootExitObserved = false;
 	#stderrStream?: ReadableStream<Uint8Array>;
 	// Termination in flight after kill(); aborted exits await it before reporting.
 	#terminating?: Promise<boolean | void>;
@@ -514,15 +520,21 @@ export class ChildProcess<In extends InMask = InMask> {
 	}
 
 	async text(): Promise<string> {
-		const p = this.#readStream(this.proc.stdout);
-		if (this.#nothrow) return p;
-		const [text] = await Promise.all([p, this.exitedCleanly]);
-		await this.#throwIfAborted();
-		return text;
+		const release = this.#holdAbortListener();
+		try {
+			const p = this.#readStream(this.proc.stdout);
+			this.#abortIfSignalled();
+			if (this.#nothrow) return await p;
+			const [text] = await Promise.all([p, this.exitedCleanly]);
+			await this.#throwIfAborted();
+			return text;
+		} finally {
+			release();
+		}
 	}
 
 	/**
-	 * Read a pipe fully, stopping early only at an explicit command deadline.
+	 * Read a pipe fully, stopping early only when a deadline or abort cuts collection off.
 	 */
 	async #readStream(stream: ReadableStream<Uint8Array>): Promise<string> {
 		this.#openPipeReaders++;
@@ -582,11 +594,17 @@ export class ChildProcess<In extends InMask = InMask> {
 	}
 
 	async #readOutputBytes(waitForCleanExit = false): Promise<Uint8Array<ArrayBuffer>> {
-		const p = this.#readBytes();
-		if (this.#nothrow) return p;
-		const bytes = waitForCleanExit ? (await Promise.all([p, this.exitedCleanly]))[0] : await p;
-		await this.#throwIfAborted();
-		return bytes;
+		const release = this.#holdAbortListener();
+		try {
+			const p = this.#readBytes();
+			this.#abortIfSignalled();
+			if (this.#nothrow) return await p;
+			const bytes = waitForCleanExit ? (await Promise.all([p, this.exitedCleanly]))[0] : await p;
+			await this.#throwIfAborted();
+			return bytes;
+		} finally {
+			release();
+		}
 	}
 
 	async blob(): Promise<Blob> {
@@ -614,50 +632,147 @@ export class ChildProcess<In extends InMask = InMask> {
 			throw new Error('Full stderr capture must be requested when spawning the process (pass stderr: "full")');
 		}
 
-		const stdoutP = this.#readStream(this.proc.stdout);
-		const stderrP =
-			stderrMode === "full" && stderrChunks
-				? this.#stderrDone.then(() => new TextDecoder().decode(Buffer.concat(stderrChunks)))
-				: this.#stderrDone.then(() => this.#stderrTail);
-
-		const [stdout, stderr] = await Promise.all([stdoutP, stderrP]);
-
-		let exitError: Exception | undefined;
+		const release = this.#holdAbortListener();
 		try {
-			await this.#exited;
-		} catch (err) {
-			if (err instanceof Exception) exitError = err;
-			else throw err;
+			const stdoutP = this.#readStream(this.proc.stdout);
+			const stderrP =
+				stderrMode === "full" && stderrChunks
+					? this.#stderrDone.then(() => new TextDecoder().decode(Buffer.concat(stderrChunks)))
+					: this.#stderrDone.then(() => this.#stderrTail);
+			this.#abortIfSignalled();
+
+			const [stdout, stderr] = await Promise.all([stdoutP, stderrP]);
+
+			let exitError: Exception | undefined;
+			try {
+				await this.#exited;
+			} catch (err) {
+				if (err instanceof Exception) exitError = err;
+				else throw err;
+			}
+			this.#clearTimeout();
+			if (!exitError) exitError = this.exitReason;
+			if (!exitError && this.exitCode !== null && this.exitCode !== 0) {
+				exitError = new NonZeroExitError(this.exitCode, this.#stderrTail);
+			}
+
+			// On abort/timeout, hold the result until the tree is actually gone: the
+			// native terminate() is graceful-first, and reporting before it finishes
+			// would leave timed-out descendants alive past the caller's budget.
+			if (exitError?.aborted && this.#terminating) await this.#terminating;
+
+			const exitCode = this.exitCode ?? (exitError && !exitError.aborted ? exitError.exitCode : null);
+			const ok = exitCode === 0;
+
+			if (exitError) {
+				if ((exitError.aborted && !allowAbort) || (!exitError.aborted && !allowNonZero)) throw exitError;
+			}
+
+			return { stdout, stderr, exitCode, ok, exitError };
+		} finally {
+			release();
 		}
-		this.#clearTimeout();
-		if (!exitError) exitError = this.exitReason;
-		if (!exitError && this.exitCode !== null && this.exitCode !== 0) {
-			exitError = new NonZeroExitError(this.exitCode, this.#stderrTail);
-		}
-
-		// On abort/timeout, hold the result until the tree is actually gone: the
-		// native terminate() is graceful-first, and reporting before it finishes
-		// would leave timed-out descendants alive past the caller's budget.
-		if (exitError?.aborted && this.#terminating) await this.#terminating;
-
-		const exitCode = this.exitCode ?? (exitError && !exitError.aborted ? exitError.exitCode : null);
-		const ok = exitCode === 0;
-
-		if (exitError) {
-			if ((exitError.aborted && !allowAbort) || (!exitError.aborted && !allowNonZero)) throw exitError;
-		}
-
-		return { stdout, stderr, exitCode, ok, exitError };
 	}
 
 	// ── Signal / timeout ─────────────────────────────────────────────────
 
 	attachSignal(signal: AbortSignal): void {
-		const cleanup = this.#exited.catch(() => {});
-		const onAbort = () => this.kill(new AbortError(signal.reason, "<cancelled>"));
-		if (signal.aborted) return void onAbort();
+		this.#cancelSignal = signal;
+		// Observe the normalized exit so an abort rejection is not unhandled when
+		// the caller only consumes output or Bun's proc.exited.
+		const exited = this.#exited.catch(() => {});
+		if (signal.aborted) {
+			this.#abortFromSignal(signal);
+			return;
+		}
+		this.#armAbortListener();
+		// Root exit is not collection finishing: a descendant can still hold
+		// stdout or stderr. Drop the listener only once that collection is idle.
+		void exited.finally(() => {
+			this.#rootExitObserved = true;
+			if (this.#collectionDepth === 0) this.#disarmAbortListener();
+		});
+	}
+
+	#cancellation(signal: AbortSignal): AbortError {
+		return new AbortError(signal.reason, "<cancelled>");
+	}
+
+	#armAbortListener(): void {
+		const signal = this.#cancelSignal;
+		if (!signal || signal.aborted || this.#abortListener) return;
+		const onAbort = () => {
+			this.#abortListener = undefined;
+			this.#abortFromSignal(signal);
+		};
+		this.#abortListener = onAbort;
 		signal.addEventListener("abort", onAbort, { once: true });
-		cleanup.finally(() => signal.removeEventListener("abort", onAbort));
+	}
+
+	#disarmAbortListener(): void {
+		const signal = this.#cancelSignal;
+		const onAbort = this.#abortListener;
+		if (!signal || !onAbort) return;
+		signal.removeEventListener("abort", onAbort);
+		this.#abortListener = undefined;
+	}
+
+	/** Keep abort handling until this output collection finishes, even after root exit. */
+	#holdAbortListener(): () => void {
+		this.#collectionDepth++;
+		this.#armAbortListener();
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			this.#collectionDepth--;
+			if (this.#collectionDepth === 0 && this.#rootExitObserved) this.#disarmAbortListener();
+		};
+	}
+
+	#abortIfSignalled(): void {
+		const signal = this.#cancelSignal;
+		if (signal?.aborted) this.#abortFromSignal(signal);
+	}
+
+	#abortFromSignal(signal: AbortSignal): void {
+		// A second abort (collection starting after a pre-aborted signal) must
+		// cancel readers that did not exist yet, not start another termination.
+		if (this.#exitReason?.aborted || this.#exitReasonPending?.aborted) {
+			this.#cutOffReaders();
+			return;
+		}
+		const reason = this.#cancellation(signal);
+		// A live root stays graceful so a SIGTERM handler can run. A dead leader
+		// is stopped only when an inherited pipe proves the group or retained
+		// Windows handle is still that command — the same rule as a deadline.
+		if (this.#stopInFlightCommand(reason, undefined) || this.#exitReasonPending || this.#openPipeReaders === 0)
+			return;
+		this.#exitReasonPending = reason;
+		if (this.proc.exitCode !== null) this.#exitReason = reason;
+	}
+
+	/**
+	 * Stop a command whose output is still being collected. Returns whether a
+	 * safe termination was started. Readers are cancelled either way so the
+	 * wait cannot outlive the caller's abort or deadline.
+	 */
+	#stopInFlightCommand(reason: Exception, gracefulMs: number | undefined): boolean {
+		const pipesHeld = this.#openPipeReaders > 0;
+		// A detached group can remain alive after its leader exits. Only use the
+		// dead-leader fallback while an inherited pipe proves that exact group
+		// still has a live member; this avoids stale-PGID reuse.
+		const canTerminate =
+			this.proc.exitCode === null ||
+			(pipesHeld && (this.#terminateGroup || this.#windowsRootProcess !== undefined));
+		if (canTerminate) this.kill(reason, gracefulMs);
+		this.#cutOffReaders();
+		return canTerminate;
+	}
+
+	#cutOffReaders(): void {
+		this.#cutoff = true;
+		for (const reader of this.#pipeReaders) void reader.cancel().catch(() => {});
 	}
 
 	#clearTimeout(): void {
@@ -675,17 +790,7 @@ export class ChildProcess<In extends InMask = InMask> {
 		// A clean command clears it in wait(), so fast invocations do not hold
 		// the event loop for the unused remainder.
 		const timer = setTimeout(() => {
-			// A detached group can remain alive after its leader exits. Only use
-			// the dead-leader fallback while an inherited pipe proves that exact
-			// group still has a live member; this avoids stale-PGID reuse.
-			if (
-				this.proc.exitCode === null ||
-				(this.#openPipeReaders > 0 && (this.#terminateGroup || this.#windowsRootProcess))
-			) {
-				this.kill(new TimeoutError(ms, this.#stderrTail), -1);
-			}
-			this.#cutoff = true;
-			for (const reader of this.#pipeReaders) reader.cancel().catch(() => {});
+			this.#stopInFlightCommand(new TimeoutError(ms, this.#stderrTail), -1);
 		}, ms);
 		timer.unref?.();
 		this.#timeoutTimer = timer;
