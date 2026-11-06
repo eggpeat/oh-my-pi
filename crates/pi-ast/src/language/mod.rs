@@ -8,7 +8,7 @@ pub mod grammar;
 mod parsers;
 pub mod wasm_grammars;
 
-use std::{borrow::Cow, fmt, path::Path, sync::LazyLock};
+use std::{borrow::Cow, collections::HashMap, fmt, path::Path, sync::LazyLock};
 
 use ast_grep_core::{
 	AstGrep, Doc, Language, Node,
@@ -276,15 +276,17 @@ impl LanguageExt for Html {
 	fn extract_injections<L: LanguageExt>(
 		&self,
 		root: Node<StrDoc<L>>,
-	) -> Vec<(String, Vec<TSRange>)> {
+	) -> HashMap<String, Vec<TSRange>> {
 		let lang = root.lang();
-		let mut injections = Vec::new();
+		let mut map = HashMap::new();
 		let matcher = KindMatcher::new("script_element", lang.clone());
 		for script in root.find_all(matcher) {
 			let injected = find_html_lang(&script).unwrap_or_else(|| "js".into());
 			let content = script.children().find(|c| c.kind() == "raw_text");
 			if let Some(content) = content {
-				push_injection(&mut injections, injected, node_to_range(&content));
+				map.entry(injected)
+					.or_insert_with(Vec::new)
+					.push(node_to_range(&content));
 			}
 		}
 		let matcher = KindMatcher::new("style_element", lang.clone());
@@ -292,19 +294,12 @@ impl LanguageExt for Html {
 			let injected = find_html_lang(&style).unwrap_or_else(|| "css".into());
 			let content = style.children().find(|c| c.kind() == "raw_text");
 			if let Some(content) = content {
-				push_injection(&mut injections, injected, node_to_range(&content));
+				map.entry(injected)
+					.or_insert_with(Vec::new)
+					.push(node_to_range(&content));
 			}
 		}
-		injections
-	}
-}
-
-/// Adds `range` to `lang`'s entry, keeping one entry per language in first-seen
-/// order.
-fn push_injection(injections: &mut Vec<(String, Vec<TSRange>)>, lang: String, range: TSRange) {
-	match injections.iter_mut().find(|(name, _)| *name == lang) {
-		Some((_, ranges)) => ranges.push(range),
-		None => injections.push((lang, vec![range])),
+		map
 	}
 }
 
@@ -623,10 +618,10 @@ impl LanguageExt for SupportLang {
 	fn extract_injections<L: LanguageExt>(
 		&self,
 		root: Node<StrDoc<L>>,
-	) -> Vec<(String, Vec<TSRange>)> {
+	) -> HashMap<String, Vec<TSRange>> {
 		match self {
 			Self::Html => Html.extract_injections(root),
-			_ => Vec::new(),
+			_ => HashMap::new(),
 		}
 	}
 }
