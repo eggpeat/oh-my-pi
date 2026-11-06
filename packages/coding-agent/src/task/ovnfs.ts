@@ -187,7 +187,11 @@ export function ovnfsWorkspace(command: string): OpenWorkspace {
 			const reply = await call<NewReply>(command, "new", { dir: repoRoot, name: checkout });
 			return new OvnfsWorkspace(reply.checkout.path, baseDir, command, checkout);
 		} catch (err) {
-			if (recorded) await releaseCheckoutRecord(baseDir, command, checkout);
+			// `exists` refused the name: that checkout predates this attempt, so
+			// only the new local record goes — removing the checkout would
+			// delete the older run's work.
+			const refusedExisting = err instanceof OvnfsError && err.code === "exists";
+			if (recorded && !refusedExisting) await releaseCheckoutRecord(baseDir, command, checkout);
 			else await fs.rm(baseDir, { recursive: true, force: true });
 			throw new Error(
 				`ovnfs isolation failed: ${err instanceof Error ? err.message : String(err)} (set isolation.backend to a native backend to bypass ovnfs)`,

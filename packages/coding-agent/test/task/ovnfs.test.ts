@@ -225,6 +225,31 @@ describe("ovnfs checkout recovery", () => {
 		await expect(fs.stat(baseDir)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
+	it("keeps the older checkout when creation is refused because its name already exists", async () => {
+		const removed: string[] = [];
+		let requested = "";
+		mockDaemon(op => {
+			if (op.op === "new") {
+				requested = op.name ?? "";
+				throw new client.OvnfsError("exists", "already exists");
+			}
+			if (op.op === "rm") {
+				removed.push(op.checkout ?? "");
+				return {};
+			}
+			throw new Error(op.op);
+		});
+		const repo = path.join(root, "collision");
+		await fs.mkdir(repo);
+		const baseDir = taskIsolationBaseDir(repo, "Collision");
+
+		await expect(ovnfsWorkspace(COMMAND)(repo, "Collision")).rejects.toThrow(/ovnfs: exists: already exists/);
+
+		expect(requested).toMatch(/^omp-collision-[0-9a-f]{6}$/);
+		expect(removed).toEqual([]);
+		await expect(fs.stat(baseDir)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
 	it("removes a new slot when the daemon cannot start", async () => {
 		vi.spyOn(daemon, "startDaemon").mockRejectedValue(new Error("cannot run /opt/ovnfs/ovnfs"));
 		const repo = path.join(root, "no-daemon");
