@@ -192,10 +192,19 @@ describe("ovnfs search fast path", () => {
 			);
 			await fs.chmod(stalledOvnfs, 0o755);
 
-			const timedOut = grep({ pattern: "needle", path: dir, timeoutMs: 50 }, null, stalledOvnfs);
 			const controller = new AbortController();
 			const aborted = glob({ pattern: "*", path: dir, signal: controller.signal }, null, stalledOvnfs);
-			await statusStarted.promise;
+			const started = await Promise.race([
+				statusStarted.promise.then(() => true),
+				aborted.then(
+					() => false,
+					() => false,
+				),
+			]);
+			expect(started).toBe(true);
+
+			const timedOut = grep({ pattern: "needle", path: dir, timeoutMs: 50 }, null, stalledOvnfs);
+			timedOut.catch(() => {});
 			controller.abort();
 			await expect(aborted).rejects.toMatchObject({ name: "AbortError", message: "Aborted: Signal" });
 			await expect(timedOut).rejects.toThrow("Aborted: Timeout");
@@ -234,7 +243,14 @@ describe("ovnfs search fast path", () => {
 
 		const controller = new AbortController();
 		const discoverySearch = grep({ pattern: "needle", path: dir, signal: controller.signal }, null, realpathOvnfs);
-		await mountRealpathStarted.promise;
+		const started = await Promise.race([
+			mountRealpathStarted.promise.then(() => true),
+			discoverySearch.then(
+				() => false,
+				() => false,
+			),
+		]);
+		expect(started).toBe(true);
 		controller.abort();
 		await expect(discoverySearch).rejects.toMatchObject({ name: "AbortError", message: "Aborted: Signal" });
 
@@ -273,25 +289,54 @@ describe("ovnfs search fast path", () => {
 			await Bun.write(unwelcomedOvnfs, `#!/bin/sh\necho '${status}'\n`);
 			await fs.chmod(unwelcomedOvnfs, 0o755);
 
-			// A lone caller that times out closes and forgets the unfinished connection.
-			const firstTimedOut = glob({ pattern: "*", path: dir, timeoutMs: 50 }, null, unwelcomedOvnfs);
-			const firstConn = await helloReceived.promise;
+			const firstController = new AbortController();
+			const firstAborted = grep(
+				{ pattern: "needle", path: dir, signal: firstController.signal },
+				null,
+				unwelcomedOvnfs,
+			);
+			const firstConn = await Promise.race([
+				helloReceived.promise,
+				firstAborted.then(
+					() => null,
+					() => null,
+				),
+			]);
+			expect(firstConn).not.toBeNull();
 			const firstClosed = Promise.withResolvers<void>();
-			firstConn.on("close", () => firstClosed.resolve());
-			await expect(firstTimedOut).rejects.toThrow("Aborted: Timeout");
+			firstConn!.on("close", () => firstClosed.resolve());
+
+			// A second caller joins the pending connection; aborting the first caller preserves it for the second,
+			// and when the second caller times out with no waiters left, the unfinished connection is closed and forgotten.
+			const timedOut = glob({ pattern: "*", path: dir, timeoutMs: 50 }, null, unwelcomedOvnfs);
+			timedOut.catch(() => {});
+			firstController.abort();
+			await expect(firstAborted).rejects.toMatchObject({ name: "AbortError", message: "Aborted: Signal" });
+			await expect(timedOut).rejects.toThrow("Aborted: Timeout");
 			await firstClosed.promise;
 
 			// A later retry opens a fresh connection; one caller aborting preserves it for another waiting caller.
 			helloReceived = Promise.withResolvers<net.Socket>();
-			const controller = new AbortController();
-			const aborted = grep({ pattern: "needle", path: dir, signal: controller.signal }, null, unwelcomedOvnfs);
+			const secondController = new AbortController();
+			const secondAborted = grep(
+				{ pattern: "needle", path: dir, signal: secondController.signal },
+				null,
+				unwelcomedOvnfs,
+			);
+			secondAborted.catch(() => {});
 			const survivor = grep({ pattern: "needle", path: dir }, null, unwelcomedOvnfs);
 
-			const secondConn = await helloReceived.promise;
+			const secondConn = await Promise.race([
+				helloReceived.promise,
+				survivor.then(
+					() => null,
+					() => null,
+				),
+			]);
+			expect(secondConn).not.toBeNull();
 			expect(secondConn).not.toBe(firstConn);
-			controller.abort();
-			await expect(aborted).rejects.toMatchObject({ name: "AbortError", message: "Aborted: Signal" });
-
+			secondController.abort();
+			await expect(secondAborted).rejects.toMatchObject({ name: "AbortError", message: "Aborted: Signal" });
 			reply = {
 				ok: {
 					matches: [{ path: "a.txt", line: 1, text: "needle here" }],
@@ -300,7 +345,7 @@ describe("ovnfs search fast path", () => {
 					files_searched: 1,
 				},
 			};
-			secondConn.write(frame({ welcome: { version: 5, ops: ["grep", "glob"] } }));
+			secondConn!.write(frame({ welcome: { version: 5, ops: ["grep", "glob"] } }));
 			const result = await survivor;
 			expect(result.matches).toEqual([{ path: "a.txt", lineNumber: 1, line: "needle here" }]);
 		} finally {

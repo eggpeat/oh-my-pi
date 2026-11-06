@@ -15,7 +15,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as natives from "@oh-my-pi/pi-natives";
-import { logger, relativePathWithinNormalizedRoot } from "@oh-my-pi/pi-utils";
+import { logger, relativePathWithinNormalizedRoot, untilAborted } from "@oh-my-pi/pi-utils";
 import { callSocket, OvnfsError } from "./client";
 import { forgetDaemon, runningDaemon } from "./daemon";
 
@@ -61,28 +61,6 @@ function onHost(p: string, filesystem: natives.ShellFilesystem | undefined): boo
 	);
 }
 
-/** Race `promise` against `signal`, rejecting with `signal.reason` as soon as `signal` aborts. */
-function raceSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-	if (signal.aborted) {
-		void promise.catch(() => {});
-		return Promise.reject(signal.reason);
-	}
-	const { promise: raced, resolve, reject } = Promise.withResolvers<T>();
-	const onAbort = () => reject(signal.reason);
-	signal.addEventListener("abort", onAbort, { once: true });
-	promise.then(
-		value => {
-			signal.removeEventListener("abort", onAbort);
-			resolve(value);
-		},
-		err => {
-			signal.removeEventListener("abort", onAbort);
-			reject(err);
-		},
-	);
-	return raced;
-}
-
 /** Clamp `options.timeoutMs` to the budget remaining after an attempted daemon call. */
 function withRemainingTimeout<T extends { timeoutMs?: number }>(options: T, startedAt: number): T {
 	if (!options.timeoutMs || options.timeoutMs <= 0) return options;
@@ -123,7 +101,7 @@ async function callDaemon<T>(
 		if (!daemon) return undefined;
 		let dir: string;
 		try {
-			dir = await raceSignal(fs.realpath(root), controller.signal);
+			dir = await untilAborted(controller.signal, () => fs.realpath(root));
 		} catch {
 			controller.signal.throwIfAborted();
 			return undefined;

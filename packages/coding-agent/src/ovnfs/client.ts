@@ -15,7 +15,7 @@
  * const reply = await callSocket<{ total: number }>(socket, "glob", { dir, pattern: "*.ts" }, signal);
  */
 import * as net from "node:net";
-import { isRecord } from "@oh-my-pi/pi-utils";
+import { isRecord, untilAborted } from "@oh-my-pi/pi-utils";
 
 /** The ovnfs admin protocol generation this client speaks. */
 export const PROTOCOL_VERSION = 5;
@@ -82,29 +82,18 @@ class Connection {
 		if (this.#ops) return Promise.resolve(this);
 		this.#waiters++;
 		this.#conn.ref();
-		const { promise, resolve, reject } = Promise.withResolvers<this>();
-		let settled = false;
-		const done = () => {
-			if (settled) return false;
-			settled = true;
-			signal?.removeEventListener("abort", onAbort);
-			this.#waiters--;
-			this.#idle();
-			return true;
-		};
-		const onAbort = () => {
-			if (done()) reject(signal?.reason);
-		};
-		signal?.addEventListener("abort", onAbort, { once: true });
-		this.#ready.promise.then(
+		return untilAborted(signal, this.#ready.promise).then(
 			conn => {
-				if (done()) resolve(conn);
+				this.#waiters--;
+				this.#idle();
+				return conn;
 			},
 			err => {
-				if (done()) reject(err);
+				this.#waiters--;
+				this.#idle();
+				throw signal?.aborted ? signal.reason : err;
 			},
 		);
-		return promise;
 	}
 
 	/**

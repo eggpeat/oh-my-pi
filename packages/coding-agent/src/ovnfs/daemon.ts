@@ -15,7 +15,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isRecord } from "@oh-my-pi/pi-utils";
+import { isRecord, untilAborted } from "@oh-my-pi/pi-utils";
 import { PROTOCOL_VERSION } from "./client";
 
 /** A running ovnfs daemon. */
@@ -45,29 +45,6 @@ interface StatusQuery {
 
 /** The last `status` query by command (pending or settled) and when it was asked. */
 const queries = new Map<string, StatusQuery>();
-
-/** Race `promise` against `signal`, rejecting with `signal.reason` as soon as `signal` aborts. */
-function raceSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
-	if (!signal) return promise;
-	if (signal.aborted) {
-		void promise.catch(() => {});
-		return Promise.reject(signal.reason);
-	}
-	const { promise: raced, resolve, reject } = Promise.withResolvers<T>();
-	const onAbort = () => reject(signal.reason);
-	signal.addEventListener("abort", onAbort, { once: true });
-	promise.then(
-		value => {
-			signal.removeEventListener("abort", onAbort);
-			resolve(value);
-		},
-		err => {
-			signal.removeEventListener("abort", onAbort);
-			reject(err);
-		},
-	);
-	return raced;
-}
 
 /** Run `command --json <verb>`; rejects when it cannot run, fails, or speaks another admin protocol. */
 async function report(command: string, verb: "start" | "status", signal?: AbortSignal): Promise<Daemon> {
@@ -115,9 +92,9 @@ async function report(command: string, verb: "start" | "status", signal?: AbortS
 		let stderr: string;
 		let code: number;
 		try {
-			[stdout, stderr, code] = await raceSignal(
-				Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]),
+			[stdout, stderr, code] = await untilAborted(
 				controller.signal,
+				Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]),
 			);
 		} finally {
 			controller.signal.removeEventListener("abort", kill);
@@ -137,10 +114,7 @@ async function report(command: string, verb: "start" | "status", signal?: AbortS
 		// Searches compare real paths. Resolving only the parent, as the daemon
 		// does (macOS /tmp is /private/tmp), never looks inside the mount.
 		const dir = path.dirname(status.mount);
-		const parent = await raceSignal(
-			fs.realpath(dir).catch(() => dir),
-			controller.signal,
-		);
+		const parent = await untilAborted(controller.signal, () => fs.realpath(dir).catch(() => dir));
 		return { socket: status.socket, mount: path.join(parent, path.basename(status.mount)) };
 	} finally {
 		clearTimeout(timer);
@@ -169,11 +143,11 @@ export function startDaemon(command: string): Promise<Daemon> {
 export async function runningDaemon(command: string, signal?: AbortSignal): Promise<Daemon | undefined> {
 	signal?.throwIfAborted();
 	const known = daemons.get(command);
-	if (known)
-		return raceSignal(
-			known.catch(() => undefined),
-			signal,
-		);
+	if (known) {
+		return untilAborted(signal, () => known.catch(() => undefined)).catch(err => {
+			throw signal?.aborted ? signal.reason : err;
+		});
+	}
 	let query = queries.get(command);
 	if (!query || Date.now() - query.at >= RECHECK_MS) {
 		const controller = new AbortController();
@@ -205,24 +179,17 @@ export async function runningDaemon(command: string, signal?: AbortSignal): Prom
 	if (query.settled) return query.found;
 	const active = query;
 	active.waiters++;
-	return new Promise<Daemon | undefined>((resolve, reject) => {
-		let done = false;
-		const onAbort = () => {
-			if (done) return;
-			done = true;
+	return untilAborted(signal, active.found).then(
+		daemon => {
+			active.waiters--;
+			return daemon;
+		},
+		err => {
 			active.waiters--;
 			if (!active.settled && active.waiters === 0) active.abort();
-			reject(signal?.reason);
-		};
-		signal?.addEventListener("abort", onAbort, { once: true });
-		void active.found.then(daemon => {
-			if (done) return;
-			done = true;
-			signal?.removeEventListener("abort", onAbort);
-			active.waiters--;
-			resolve(daemon);
-		});
-	});
+			throw signal?.aborted ? signal.reason : err;
+		},
+	);
 }
 
 /** Forget `command`'s daemon after its socket stopped answering, so the next call asks the command again. */
