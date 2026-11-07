@@ -277,8 +277,7 @@ function makeSession(
 	};
 }
 
-function createFixture(main = makeSession([danglingWait], true)) {
-	const worker = makeSession([], false);
+function createFixture(main = makeSession([danglingWait], true), worker = makeSession([], false)) {
 	const registry = new AgentRegistry();
 	registry.register({
 		id: "Worker",
@@ -313,7 +312,7 @@ function createFixture(main = makeSession([danglingWait], true)) {
 		get: () => focus.target ?? main.session,
 	});
 	ctx.unsubscribe = main.session.subscribe(event => eventController.handleEvent(event));
-	return { ctx, focus, main };
+	return { ctx, focus, main, worker };
 }
 
 beforeAll(async () => {
@@ -543,5 +542,132 @@ describe("live Cursor focus recovery without another delta", () => {
 		await focus.unfocus();
 		expect(Bun.stripANSI(ctx.chatContainer.render(120).join("\n"))).toContain("COMPLETED_MATCH");
 		expect(ctx.pendingTools.size).toBe(0);
+	});
+
+	it("serializes focused assistant-end link resolution ahead of the next turn and drops queued events on detach", async () => {
+		const mainLive: AssistantMessage = {
+			...paused,
+			content: [{ type: "text", text: "MAIN_ACTIVE_STREAM" }],
+			timestamp: 10,
+		};
+		const main = makeSession([], true);
+		main.setLiveAssistant(mainLive, []);
+		const worker = makeSession([], true);
+		const { ctx, focus } = createFixture(main, worker);
+		ctx.settings = Settings.isolated({ "display.smoothStreaming": false });
+		const firstAssistant: AssistantMessage = {
+			...paused,
+			content: [
+				{ type: "text", text: "FIRST_LINK_TEXT [guide](guide.md)" },
+				{ type: "toolCall", id: "paused-grep", name: "grep", arguments: { pattern: "sample" } },
+			],
+			stopReason: "toolUse",
+			timestamp: 1,
+		};
+		const secondAssistant: AssistantMessage = {
+			...paused,
+			content: [{ type: "text", text: "SECOND_LIVE_TEXT [next](next.md)" }],
+			timestamp: 3,
+		};
+		const continuedSecond: AssistantMessage = {
+			...secondAssistant,
+			content: [{ type: "text", text: "SECOND_LIVE_TEXT [next](next.md) CONTINUED" }],
+		};
+		const thirdAssistant: AssistantMessage = {
+			...paused,
+			content: [{ type: "text", text: "STALE_THIRD_WORKER_TEXT" }],
+			timestamp: 4,
+		};
+		let linkStarted = Promise.withResolvers<void>();
+		let linkGate = Promise.withResolvers<ReadonlyMap<string, string>>();
+		ctx.resolveAssistantMessageLinkHrefs = async () => {
+			linkStarted.resolve();
+			return linkGate.promise;
+		};
+		try {
+			await focus.focusAgent("Worker");
+
+			const firstEnd = worker.emit({ type: "message_end", message: firstAssistant });
+			await linkStarted.promise;
+
+			const toolStart = worker.emit({
+				type: "tool_execution_start",
+				toolCallId: "paused-grep",
+				toolName: "grep",
+				args: { pattern: "sample" },
+				intent: undefined,
+			});
+			const toolEnd = worker.emit({
+				type: "tool_execution_end",
+				toolCallId: "paused-grep",
+				toolName: "grep",
+				result: { content: result.content, details: {} },
+				isError: false,
+			});
+			const secondStart = worker.emit({ type: "message_start", message: secondAssistant });
+			const secondUpdate = worker.emit({
+				type: "message_update",
+				message: secondAssistant,
+				assistantMessageEvent: {
+					type: "text_delta",
+					contentIndex: 0,
+					delta: "SECOND_LIVE_TEXT [next](next.md)",
+					partial: secondAssistant,
+				},
+			});
+
+			linkGate.resolve(new Map([["guide.md", "file:///tmp/guide.md"]]));
+			await Promise.all([firstEnd, toolStart, toolEnd, secondStart, secondUpdate]);
+
+			const rendered = () => Bun.stripANSI(ctx.chatContainer.render(120).join("\n"));
+			expect(rendered()).toContain("FIRST_LINK_TEXT");
+			expect(rendered()).toContain("COMPLETED_MATCH");
+			expect(rendered()).toContain("SECOND_LIVE_TEXT");
+			expect(ctx.streamingMessage).toBe(secondAssistant);
+
+			await worker.emit({
+				type: "message_update",
+				message: continuedSecond,
+				assistantMessageEvent: {
+					type: "text_delta",
+					contentIndex: 0,
+					delta: " CONTINUED",
+					partial: continuedSecond,
+				},
+			});
+			expect(rendered().match(/SECOND_LIVE_TEXT/g)).toHaveLength(1);
+			expect(rendered()).toContain("CONTINUED");
+			expect(ctx.streamingMessage).toBe(continuedSecond);
+
+			linkStarted = Promise.withResolvers<void>();
+			linkGate = Promise.withResolvers<ReadonlyMap<string, string>>();
+			const secondEnd = worker.emit({ type: "message_end", message: continuedSecond });
+			await linkStarted.promise;
+			const thirdStart = worker.emit({ type: "message_start", message: thirdAssistant });
+			const thirdUpdate = worker.emit({
+				type: "message_update",
+				message: thirdAssistant,
+				assistantMessageEvent: {
+					type: "text_delta",
+					contentIndex: 0,
+					delta: "STALE_THIRD_WORKER_TEXT",
+					partial: thirdAssistant,
+				},
+			});
+
+			await focus.unfocus();
+			linkGate.resolve(new Map());
+			await Promise.all([secondEnd, thirdStart, thirdUpdate]);
+
+			expect(rendered()).toContain("MAIN_ACTIVE_STREAM");
+			expect(rendered()).not.toContain("SECOND_LIVE_TEXT");
+			expect(rendered()).not.toContain("STALE_THIRD_WORKER_TEXT");
+			expect(ctx.streamingMessage).toBe(mainLive);
+		} finally {
+			focus.dispose();
+			ctx.unsubscribe?.();
+			ctx.eventController.dispose();
+			for (const component of ctx.pendingTools.values()) component.seal();
+		}
 	});
 });

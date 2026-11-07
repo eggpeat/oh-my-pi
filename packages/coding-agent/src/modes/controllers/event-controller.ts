@@ -352,6 +352,7 @@ export class EventController {
 	#dispatchTail: Promise<void> = Promise.resolve();
 	/** Whether a chained run is currently in flight (awaiting its own awaits). */
 	#dispatchInFlight = false;
+	#dispatchGeneration = 0;
 	// Deltas already fed to speech at arrival by the coalescer. `#handleMessageUpdate`
 	// also vocalizes so the direct `handleEvent` path (tests, session focus replay)
 	// keeps working — the WeakSet makes the coalesced path speak each delta exactly
@@ -907,9 +908,21 @@ export class EventController {
 			this.#enqueueMessageUpdate(event);
 			return;
 		}
+		await this.runSerialized(async () => {
+			await this.handleEvent(event);
+		});
+	}
+
+	/**
+	 * Run `run` in the serialized session-event dispatch pipeline, flushing any
+	 * pending coalesced `message_update` first. This does not drop work when the
+	 * viewed session changes: a caller that queues across that change must skip
+	 * the stale work itself.
+	 */
+	async runSerialized(run: () => Promise<void>): Promise<void> {
 		await this.#runSerialized(async () => {
 			await this.#flushPendingMessageUpdate();
-			await this.handleEvent(event);
+			await run();
 		});
 	}
 
@@ -1046,6 +1059,7 @@ export class EventController {
 		}
 		this.#pendingMessageUpdate = undefined;
 		this.#pendingMessageRestart = false;
+		this.#dispatchGeneration++;
 		this.#resetReadGroup();
 		this.#lastVisibleBlockCount = 0;
 		this.#renderedCustomMessages.clear();
@@ -1859,6 +1873,7 @@ export class EventController {
 			}
 		}
 		if (this.ctx.streamingComponent && event.message.role === "assistant") {
+			const generation = this.#dispatchGeneration;
 			this.ctx.streamingMessage = event.message;
 			this.#streamingReveal.stop();
 			this.#toolArgsReveal.flushAll();
@@ -1888,6 +1903,7 @@ export class EventController {
 				: this.ctx.streamingMessage;
 			const displayTimeline = splitAssistantMessageToolTimeline(displayMessage);
 			const linkTargets = await refreshAssistantMessageLinkTargets(this.ctx, [displayMessage]);
+			if (generation !== this.#dispatchGeneration || !this.ctx.streamingComponent) return;
 			if (!this.ctx.streamingComponent.isTranscriptBlockFinalized()) {
 				this.ctx.streamingComponent.setLinkTargets(
 					assistantMessageLinkTargets(displayTimeline.beforeTools, linkTargets),

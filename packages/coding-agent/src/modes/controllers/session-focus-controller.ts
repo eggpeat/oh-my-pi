@@ -162,6 +162,12 @@ export class SessionFocusController {
 	invalidatePendingFocus(): void {
 		this.#focusRequestSeq++;
 	}
+	#runSerialized(generation: number, run: () => Promise<void>): Promise<void> {
+		return this.ctx.eventController.runSerialized(async () => {
+			if (generation !== this.#attachGeneration) return;
+			await run();
+		});
+	}
 
 	#onRegistryEvent(event: RegistryEvent): void {
 		if (event.ref.id !== this.#focusedAgentId) return;
@@ -192,28 +198,29 @@ export class SessionFocusController {
 				await this.ctx.eventController.syncAssistantMessage(message);
 				if (generation === this.#attachGeneration) this.ctx.eventController.restorePendingToolResults();
 			};
-			this.ctx.unsubscribe = target.subscribe(async event => {
-				if (generation !== this.#attachGeneration) return;
-				if (event.type === "message_start" && event.message.role === "assistant") {
-					assistantStreamSynced = true;
-				} else if (
-					(event.type === "message_update" || event.type === "message_end") &&
-					event.message.role === "assistant" &&
-					!assistantStreamSynced
-				) {
-					if (event.type === "message_end") await restoreAssistant(event.message);
-					else {
+			this.ctx.unsubscribe = target.subscribe(event =>
+				this.#runSerialized(generation, async () => {
+					if (event.type === "message_start" && event.message.role === "assistant") {
 						assistantStreamSynced = true;
-						// A replay `start` opens the message itself via the restart path.
-						if (event.assistantMessageEvent?.type !== "start") {
-							await this.ctx.eventController.handleEvent({ type: "message_start", message: event.message });
+					} else if (
+						(event.type === "message_update" || event.type === "message_end") &&
+						event.message.role === "assistant" &&
+						!assistantStreamSynced
+					) {
+						if (event.type === "message_end") await restoreAssistant(event.message);
+						else {
+							assistantStreamSynced = true;
+							// A replay `start` opens the message itself via the restart path.
+							if (event.assistantMessageEvent?.type !== "start") {
+								await this.ctx.eventController.handleEvent({ type: "message_start", message: event.message });
+							}
 						}
+						if (generation !== this.#attachGeneration) return;
 					}
-					if (generation !== this.#attachGeneration) return;
-				}
-				if (event.type === "message_end" && event.message.role === "assistant") assistantStreamSynced = false;
-				await this.ctx.eventController.handleEvent(event);
-			});
+					if (event.type === "message_end" && event.message.role === "assistant") assistantStreamSynced = false;
+					await this.ctx.eventController.handleEvent(event);
+				}),
+			);
 
 			await target.settleInFlightMessagePersistence();
 			if (generation !== this.#attachGeneration) return;
