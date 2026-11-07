@@ -655,14 +655,73 @@ describe("live Cursor focus recovery without another delta", () => {
 				},
 			});
 
-			await focus.unfocus();
+			const returning = focus.unfocus();
 			linkGate.resolve(new Map());
-			await Promise.all([secondEnd, thirdStart, thirdUpdate]);
+			await Promise.all([returning, secondEnd, thirdStart, thirdUpdate]);
 
 			expect(rendered()).toContain("MAIN_ACTIVE_STREAM");
 			expect(rendered()).not.toContain("SECOND_LIVE_TEXT");
 			expect(rendered()).not.toContain("STALE_THIRD_WORKER_TEXT");
 			expect(ctx.streamingMessage).toBe(mainLive);
+		} finally {
+			focus.dispose();
+			ctx.unsubscribe?.();
+			ctx.eventController.dispose();
+			for (const component of ctx.pendingTools.values()) component.seal();
+		}
+	});
+
+	it("does not duplicate a message that arrives during attachment behind a slow link check", async () => {
+		const arrivalMessage = {
+			role: "user",
+			content: [{ type: "text", text: "ARRIVAL_DURING_ATTACH" }],
+			timestamp: 5,
+		} as unknown as AgentMessage;
+		const main = makeSession([arrivalMessage], false);
+		const worker = makeSession([], true);
+		const { ctx, focus } = createFixture(main, worker);
+		ctx.settings = Settings.isolated({ "display.smoothStreaming": false });
+		const workerAssistant: AssistantMessage = {
+			...paused,
+			content: [{ type: "text", text: "WORKER_LINK [x](x.md)" }],
+			stopReason: "stop",
+			timestamp: 1,
+		};
+		const linkStarted = Promise.withResolvers<void>();
+		const linkGate = Promise.withResolvers<ReadonlyMap<string, string>>();
+		ctx.resolveAssistantMessageLinkHrefs = async () => {
+			linkStarted.resolve();
+			return linkGate.promise;
+		};
+		try {
+			await focus.focusAgent("Worker");
+			await worker.emit({ type: "message_start", message: workerAssistant });
+			const stuckEnd = worker.emit({ type: "message_end", message: workerAssistant });
+			await linkStarted.promise;
+
+			const renderInitialMessages = ctx.renderInitialMessages.bind(ctx);
+			const mainRenderDone = Promise.withResolvers<void>();
+			ctx.renderInitialMessages = async options => {
+				await renderInitialMessages(options);
+				mainRenderDone.resolve();
+			};
+
+			const returning = focus.unfocus();
+			const arrival = main.emit({ type: "message_start", message: arrivalMessage });
+			// Let attachment run as far as it can while the link check is held: the
+			// uncoordinated path completes the rebuild (painting the arrival from the
+			// snapshot) while its event is still queued; the coordinated path waits.
+			await Promise.race([
+				mainRenderDone.promise,
+				(async () => {
+					for (let i = 0; i < 50; i++) await Promise.resolve();
+				})(),
+			]);
+			linkGate.resolve(new Map());
+			await Promise.all([returning, arrival, stuckEnd]);
+
+			const rendered = Bun.stripANSI(ctx.chatContainer.render(120).join("\n"));
+			expect(rendered.match(/ARRIVAL_DURING_ATTACH/g)).toHaveLength(1);
 		} finally {
 			focus.dispose();
 			ctx.unsubscribe?.();

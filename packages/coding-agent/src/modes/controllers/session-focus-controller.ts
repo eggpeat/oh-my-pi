@@ -224,6 +224,14 @@ export class SessionFocusController {
 
 			await target.settleInFlightMessagePersistence();
 			if (generation !== this.#attachGeneration) return;
+			// Drain the dispatch chain before rebuilding: an in-flight handler from
+			// the previous view (e.g. a message_end awaiting link resolution) would
+			// otherwise delay this target's queued arrivals past the rebuild, whose
+			// snapshot already includes their messages, so the queued delivery would
+			// paint a second copy. Arrivals up to this point run first; the rebuild
+			// then replays the authoritative transcript.
+			await this.#runSerialized(generation, async () => {});
+			if (generation !== this.#attachGeneration) return;
 			this.ctx.statusLine.setSession(target, this.#focusedAgentId);
 			// Reset run bookkeeping before replay populates pending tool handles.
 			if (target.isStreaming) await this.ctx.eventController.handleEvent({ type: "agent_start" });
