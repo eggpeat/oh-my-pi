@@ -431,7 +431,6 @@ export function reconcileEmbeddingModel(beam: BeamMemoryState): void {
 					});
 				}
 
-				let committed = 0;
 				transaction(beam.db, () => {
 					// Only stale-model rows go. A vector that a concurrent remember() or update() stamped
 					// under the active model survives. Each staged insert also revalidates its source text.
@@ -456,7 +455,7 @@ export function reconcileEmbeddingModel(beam: BeamMemoryState): void {
 						)
 					`);
 					for (const row of staged) {
-						committed += insertEmbedding.run(
+						insertEmbedding.run(
 							row.memoryId,
 							row.json,
 							active,
@@ -464,7 +463,7 @@ export function reconcileEmbeddingModel(beam: BeamMemoryState): void {
 							row.content,
 							row.memoryId,
 							row.content,
-						).changes;
+						);
 					}
 				});
 				beam.caches.queryCache?.invalidate();
@@ -472,7 +471,7 @@ export function reconcileEmbeddingModel(beam: BeamMemoryState): void {
 				logger.info("mnemopi: embedding model changed, rebuilt", {
 					from: staleModels.map(row => row.model ?? "(unstamped)"),
 					to: active,
-					count: committed,
+					count: staged.length,
 				});
 			} catch (error) {
 				// A store closed during shutdown lands here; the next open resumes from the stamps.
