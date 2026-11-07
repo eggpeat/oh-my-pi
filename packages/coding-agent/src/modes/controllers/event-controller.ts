@@ -915,8 +915,9 @@ export class EventController {
 
 	/**
 	 * Run `run` in the serialized session-event dispatch pipeline, flushing any
-	 * pending coalesced `message_update` first and dropping queued operations
-	 * when the transcript/attachment generation changes.
+	 * pending coalesced `message_update` first. This does not drop work when the
+	 * viewed session changes: a caller that queues across that change must skip
+	 * the stale work itself.
 	 */
 	async runSerialized(run: () => Promise<void>): Promise<void> {
 		await this.#runSerialized(async () => {

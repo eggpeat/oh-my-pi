@@ -163,11 +163,10 @@ export class SessionFocusController {
 		this.#focusRequestSeq++;
 	}
 	#runSerialized(generation: number, run: () => Promise<void>): Promise<void> {
-		const gated = async () => {
+		return this.ctx.eventController.runSerialized(async () => {
 			if (generation !== this.#attachGeneration) return;
 			await run();
-		};
-		return this.ctx.eventController.runSerialized ? this.ctx.eventController.runSerialized(gated) : gated();
+		});
 	}
 
 	#onRegistryEvent(event: RegistryEvent): void {
