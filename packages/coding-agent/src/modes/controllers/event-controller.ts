@@ -1104,6 +1104,9 @@ export class EventController {
 	#seedHeldCompletionsFromPendingResults(): void {
 		const pending = this.ctx.viewSession.agent.getPendingToolResults();
 		for (const result of pending) {
+			if (this.#toolTimelineComponents.has(result.toolCallId) && !this.ctx.pendingTools.has(result.toolCallId)) {
+				continue;
+			}
 			this.#orphanedToolCompletions.set(result.toolCallId, {
 				type: "tool_execution_end",
 				toolCallId: result.toolCallId,
@@ -2054,7 +2057,7 @@ export class EventController {
 			setRunStatus(blocked);
 		}
 		this.#resolveDisplaceablePoll(renderToolName);
-		if (!this.ctx.pendingTools.has(event.toolCallId)) {
+		if (!this.ctx.pendingTools.has(event.toolCallId) && !this.#toolTimelineComponents.has(event.toolCallId)) {
 			const stale = this.#priorTurnToolComponents.get(event.toolCallId);
 			if (stale) {
 				this.#priorTurnToolComponents.delete(event.toolCallId);
@@ -2065,13 +2068,11 @@ export class EventController {
 			}
 			if (renderToolName === "read" && readArgsCollapseIntoGroup(event.args)) {
 				this.#trackReadToolCall(event.toolCallId, event.args);
-				if (!this.#toolTimelineComponents.has(event.toolCallId)) {
-					const group = this.#getReadGroup();
-					group.updateArgs(event.args, event.toolCallId);
-					this.ctx.pendingTools.set(event.toolCallId, group);
-					this.#toolTimelineComponents.set(event.toolCallId, group);
-					this.#settleHeldCompletionIfPresent(event.toolCallId, group);
-				}
+				const group = this.#getReadGroup();
+				group.updateArgs(event.args, event.toolCallId);
+				this.ctx.pendingTools.set(event.toolCallId, group);
+				this.#toolTimelineComponents.set(event.toolCallId, group);
+				this.#settleHeldCompletionIfPresent(event.toolCallId, group);
 				this.#startToolApprovalPreview(event.toolCallId);
 				this.ctx.ui.requestRender();
 				return;
@@ -2110,8 +2111,15 @@ export class EventController {
 			// authoritative args here and drop any live reveal so a late tick can't
 			// re-truncate them: tool_execution_start is the one event every
 			// execution path emits with the full args immediately before the result.
+			// Also reuses a card already settled in `#toolTimelineComponents` (when
+			// `restoreAssistant` consumed a buffered result ahead of a queued start).
 			this.#toolArgsReveal.finish(event.toolCallId);
-			const component = this.ctx.pendingTools.get(event.toolCallId);
+			if (renderToolName === "read" && readArgsCollapseIntoGroup(event.args)) {
+				this.#trackReadToolCall(event.toolCallId, event.args);
+			}
+			const component =
+				this.ctx.pendingTools.get(event.toolCallId) ??
+				(this.#toolTimelineComponents.get(event.toolCallId) as ToolExecutionHandle | undefined);
 			if (component && typeof component.updateArgs === "function") {
 				component.updateArgs(renderArgsWithIntent(event.args, event.intent), event.toolCallId);
 				if (typeof component.setArgsComplete === "function") {

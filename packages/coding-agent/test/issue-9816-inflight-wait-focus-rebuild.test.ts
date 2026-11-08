@@ -446,26 +446,60 @@ describe("live Cursor focus recovery without another delta", () => {
 	};
 
 	it("keeps post-tool text streaming when a live update races with focus restoration", async () => {
+		const settledResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "settled-grep",
+			toolName: "grep",
+			content: [{ type: "text", text: "SETTLED_DURING_SWITCH" }],
+			isError: false,
+			timestamp: 2,
+		};
+		const liveMessage: AssistantMessage = {
+			...paused,
+			content: [
+				{ type: "thinking", thinking: "PAUSED_REASONING" },
+				{ type: "toolCall", id: "settled-grep", name: "grep", arguments: { pattern: "settled" } },
+				{ type: "toolCall", id: "paused-grep", name: "grep", arguments: { pattern: "sample" } },
+				{ type: "text", text: "LAST_VISIBLE_TEXT" },
+			],
+		};
 		const main = makeSession([], true);
-		main.setLiveAssistant(paused, []);
+		main.setLiveAssistant(liveMessage, []);
 		const { ctx, focus } = createFixture(main);
 		try {
 			await focus.focusAgent("Worker");
 			const renderInitialMessages = ctx.renderInitialMessages.bind(ctx);
 			// Emitted mid-rebuild; delivery is queued behind it, so it is awaited only afterwards.
+			// `settled-grep` both starts and finishes before the switch ends (its buffered result is
+			// consumed by `restoreAssistant` ahead of its queued `tool_execution_start`).
 			let racing: Promise<unknown> = Promise.resolve();
 			ctx.renderInitialMessages = async options => {
 				await renderInitialMessages(options);
+				main.setLiveAssistant(liveMessage, [settledResult]);
 				racing = Promise.all([
 					main.emit({
 						type: "message_update",
-						message: paused,
+						message: liveMessage,
 						assistantMessageEvent: {
 							type: "text_delta",
-							contentIndex: 2,
+							contentIndex: 3,
 							delta: "LAST_VISIBLE_TEXT",
-							partial: paused,
+							partial: liveMessage,
 						},
+					}),
+					main.emit({
+						type: "tool_execution_start",
+						toolCallId: "settled-grep",
+						toolName: "grep",
+						args: { pattern: "settled" },
+						intent: undefined,
+					}),
+					main.emit({
+						type: "tool_execution_end",
+						toolCallId: "settled-grep",
+						toolName: "grep",
+						result: { content: settledResult.content, details: {} },
+						isError: false,
 					}),
 					main.emit({
 						type: "tool_execution_start",
@@ -480,16 +514,18 @@ describe("live Cursor focus recovery without another delta", () => {
 			await racing;
 
 			const continued: AssistantMessage = {
-				...paused,
-				content: [...paused.content.slice(0, 2), { type: "text", text: "LAST_VISIBLE_TEXT AFTER_FOCUS" }],
+				...liveMessage,
+				content: [...liveMessage.content.slice(0, 3), { type: "text", text: "LAST_VISIBLE_TEXT AFTER_FOCUS" }],
 			};
 			await main.emit({
 				type: "message_update",
 				message: continued,
-				assistantMessageEvent: { type: "text_delta", contentIndex: 2, delta: " AFTER_FOCUS", partial: continued },
+				assistantMessageEvent: { type: "text_delta", contentIndex: 3, delta: " AFTER_FOCUS", partial: continued },
 			});
 			const rendered = () => Bun.stripANSI(ctx.chatContainer.render(120).join("\n"));
 			expect(rendered()).toContain("AFTER_FOCUS");
+			expect(rendered().match(/SETTLED_DURING_SWITCH/g)).toHaveLength(1);
+			expect(ctx.pendingTools.has("settled-grep")).toBe(false);
 			expect(ctx.pendingTools.has("paused-grep")).toBe(true);
 
 			await main.emit({
@@ -502,9 +538,11 @@ describe("live Cursor focus recovery without another delta", () => {
 			await main.emit({ type: "message_end", message: continued });
 			const final = rendered();
 			expect(final.match(/AFTER_FOCUS/g)).toHaveLength(1);
+			expect(final.match(/SETTLED_DURING_SWITCH/g)).toHaveLength(1);
 			expect(final.match(/COMPLETED_MATCH/g)).toHaveLength(1);
 			expect(final.indexOf("PAUSED_REASONING")).toBeGreaterThanOrEqual(0);
-			expect(final.indexOf("PAUSED_REASONING")).toBeLessThan(final.indexOf("COMPLETED_MATCH"));
+			expect(final.indexOf("PAUSED_REASONING")).toBeLessThan(final.indexOf("SETTLED_DURING_SWITCH"));
+			expect(final.indexOf("SETTLED_DURING_SWITCH")).toBeLessThan(final.indexOf("COMPLETED_MATCH"));
 			expect(final.indexOf("COMPLETED_MATCH")).toBeLessThan(final.indexOf("LAST_VISIBLE_TEXT AFTER_FOCUS"));
 			expect(ctx.pendingTools.size).toBe(0);
 		} finally {
