@@ -500,8 +500,12 @@ describe("live Cursor focus recovery without another delta", () => {
 				isError: false,
 			});
 			await main.emit({ type: "message_end", message: continued });
-			expect(rendered().match(/AFTER_FOCUS/g)).toHaveLength(1);
-			expect(rendered().match(/COMPLETED_MATCH/g)).toHaveLength(1);
+			const final = rendered();
+			expect(final.match(/AFTER_FOCUS/g)).toHaveLength(1);
+			expect(final.match(/COMPLETED_MATCH/g)).toHaveLength(1);
+			expect(final.indexOf("PAUSED_REASONING")).toBeGreaterThanOrEqual(0);
+			expect(final.indexOf("PAUSED_REASONING")).toBeLessThan(final.indexOf("COMPLETED_MATCH"));
+			expect(final.indexOf("COMPLETED_MATCH")).toBeLessThan(final.indexOf("LAST_VISIBLE_TEXT AFTER_FOCUS"));
 			expect(ctx.pendingTools.size).toBe(0);
 		} finally {
 			focus.dispose();
@@ -901,7 +905,7 @@ describe("live Cursor focus recovery without another delta", () => {
 		}
 	});
 
-	it("draws a tool that finishes during the switch once", async () => {
+	it("draws a tool that finishes during the switch once, and still shows a retry after switching back", async () => {
 		const call: AssistantMessage = {
 			...paused,
 			content: [{ type: "toolCall", id: "switch-grep", name: "grep", arguments: { pattern: "TOOL_DURING_SWITCH" } }],
@@ -913,7 +917,7 @@ describe("live Cursor focus recovery without another delta", () => {
 			toolCallId: "switch-grep",
 			toolName: "grep",
 			content: [{ type: "text", text: "SWITCH_MATCH" }],
-			isError: false,
+			isError: true,
 			timestamp: 10,
 		};
 		const mainMessages: AgentMessage[] = [call];
@@ -927,15 +931,35 @@ describe("live Cursor focus recovery without another delta", () => {
 			const tool = { toolCallId: "switch-grep", toolName: "grep" };
 			const arrivals = [
 				main.emit({ type: "tool_execution_start", ...tool, args: { pattern: "TOOL_DURING_SWITCH" } }),
-				main.emit({ type: "tool_execution_end", ...tool, result: { content: finished.content }, isError: false }),
+				main.emit({ type: "tool_execution_end", ...tool, result: { content: finished.content }, isError: true }),
 				main.emit({ type: "message_start", message: finished }),
 				main.emit({ type: "message_end", message: finished }),
 			];
 			release();
 			await Promise.all([returning, stuckEnd, ...arrivals]);
 
-			const rendered = Bun.stripANSI(ctx.chatContainer.render(120).join("\n"));
-			expect(rendered.match(/TOOL_DURING_SWITCH/g)).toHaveLength(1);
+			const rendered = () => Bun.stripANSI(ctx.chatContainer.render(120).join("\n"));
+			expect(rendered().match(/TOOL_DURING_SWITCH/g)).toHaveLength(1);
+
+			// F5 retry after switching back re-runs the same toolCallId.
+			await main.emit({ type: "agent_start" });
+			await main.emit({ type: "tool_execution_start", ...tool, args: { pattern: "TOOL_DURING_SWITCH" } });
+			expect(ctx.pendingTools.has("switch-grep")).toBe(true);
+			await main.emit({
+				type: "tool_execution_update",
+				...tool,
+				args: { pattern: "TOOL_DURING_SWITCH" },
+				partialResult: { content: [{ type: "text", text: "RETRY_PROGRESS" }] },
+			});
+			expect(rendered()).toContain("RETRY_PROGRESS");
+			await main.emit({
+				type: "tool_execution_end",
+				...tool,
+				result: { content: [{ type: "text", text: "RETRY_MATCH" }] },
+				isError: false,
+			});
+			expect(ctx.pendingTools.has("switch-grep")).toBe(false);
+			expect(rendered()).toContain("RETRY_MATCH");
 		} finally {
 			dispose();
 		}

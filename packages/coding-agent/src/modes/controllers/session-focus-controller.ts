@@ -222,6 +222,7 @@ export class SessionFocusController {
 			let shown: ShownByRebuild | undefined;
 			this.ctx.unsubscribe = target.subscribe(event => {
 				const arrival = ++arrivals;
+				const streamMessage = target.agent.state.streamMessage;
 				return this.#runSerialized(generation, async () => {
 					if (shown?.(event, arrival)) return;
 					if (event.type === "message_start" && event.message.role === "assistant") {
@@ -239,6 +240,13 @@ export class SessionFocusController {
 								await this.ctx.eventController.handleEvent({ type: "message_start", message: event.message });
 							}
 						}
+						if (generation !== this.#attachGeneration) return;
+					} else if (
+						event.type === "tool_execution_start" &&
+						!assistantStreamSynced &&
+						streamMessage?.role === "assistant"
+					) {
+						await restoreAssistant(streamMessage);
 						if (generation !== this.#attachGeneration) return;
 					}
 					if (event.type === "message_end" && event.message.role === "assistant") assistantStreamSynced = false;
@@ -335,9 +343,10 @@ export class SessionFocusController {
 					// The status read started this run, or found it already over.
 					return arrival <= statusRead;
 				case "tool_execution_start":
-					// The replay drew this call with its result. Its updates and end still count: a
-					// detached task's persisted result says "running" and its job keeps reporting.
-					return resultTools.has(event.toolCallId);
+					// The replay drew this call with its result. Its updates and end still count (a
+					// detached task's persisted result says "running" and its job keeps reporting), as
+					// does a later retry of the same call id.
+					return arrival <= liveRead && resultTools.has(event.toolCallId);
 				case "tool_execution_update":
 					// `running` holds each running tool's newest update.
 					return arrival <= liveRead;
