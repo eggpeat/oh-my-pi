@@ -731,17 +731,33 @@ async function runEmbedding(beam: BeamMemoryState, items: readonly EmbedItem[]):
 		// stall is attributable. The embedding itself is awaited above, outside the label.
 		withLoopPhase("mnemopi.embed-persist", () => {
 			const model = currentEmbeddingModel();
-			using insertEmbedding = beam.db.prepare(
-				"INSERT OR REPLACE INTO memory_embeddings(memory_id, embedding_json, model) VALUES (?, ?, ?)",
-			);
+			using insertEmbedding = beam.db.prepare(`
+				INSERT OR REPLACE INTO memory_embeddings(memory_id, embedding_json, model)
+				SELECT ?, ?, ?
+				WHERE EXISTS (
+					SELECT 1 FROM working_memory
+					WHERE id = ? AND superseded_by IS NULL AND COALESCE(embed_text, content) = ?
+				) OR EXISTS (
+					SELECT 1 FROM episodic_memory
+					WHERE id = ? AND superseded_by IS NULL AND content = ?
+				)
+			`);
 			let committed = 0;
 			const insertMany = beam.db.transaction((rows: readonly EmbedItem[]) => {
 				for (let i = 0; i < rows.length; i += 1) {
 					const vector = matrix[i];
 					const item = rows[i];
 					if (vector === undefined || item === undefined) continue;
-					insertEmbedding.run(item.memoryId, JSON.stringify(Array.from(vector)), model);
-					committed += 1;
+					const result = insertEmbedding.run(
+						item.memoryId,
+						JSON.stringify(Array.from(vector)),
+						model,
+						item.memoryId,
+						item.content,
+						item.memoryId,
+						item.content,
+					);
+					committed += result.changes;
 				}
 			});
 			insertMany(items);
