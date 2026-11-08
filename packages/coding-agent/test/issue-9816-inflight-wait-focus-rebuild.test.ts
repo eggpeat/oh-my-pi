@@ -452,27 +452,32 @@ describe("live Cursor focus recovery without another delta", () => {
 		try {
 			await focus.focusAgent("Worker");
 			const renderInitialMessages = ctx.renderInitialMessages.bind(ctx);
+			// Emitted mid-rebuild; delivery is queued behind it, so it is awaited only afterwards.
+			let racing: Promise<unknown> = Promise.resolve();
 			ctx.renderInitialMessages = async options => {
 				await renderInitialMessages(options);
-				await main.emit({
-					type: "message_update",
-					message: paused,
-					assistantMessageEvent: {
-						type: "text_delta",
-						contentIndex: 2,
-						delta: "LAST_VISIBLE_TEXT",
-						partial: paused,
-					},
-				});
-				await main.emit({
-					type: "tool_execution_start",
-					toolCallId: "paused-grep",
-					toolName: "grep",
-					args: { pattern: "sample" },
-					intent: undefined,
-				});
+				racing = Promise.all([
+					main.emit({
+						type: "message_update",
+						message: paused,
+						assistantMessageEvent: {
+							type: "text_delta",
+							contentIndex: 2,
+							delta: "LAST_VISIBLE_TEXT",
+							partial: paused,
+						},
+					}),
+					main.emit({
+						type: "tool_execution_start",
+						toolCallId: "paused-grep",
+						toolName: "grep",
+						args: { pattern: "sample" },
+						intent: undefined,
+					}),
+				]);
 			};
 			await focus.unfocus();
+			await racing;
 
 			const continued: AssistantMessage = {
 				...paused,
@@ -727,6 +732,141 @@ describe("live Cursor focus recovery without another delta", () => {
 			ctx.unsubscribe?.();
 			ctx.eventController.dispose();
 			for (const component of ctx.pendingTools.values()) component.seal();
+		}
+	});
+
+	/** Focus `Worker`, then hold its finished reply's link check so the switch back to `main` queues behind it. */
+	async function focusBehindHeldLinkCheck(main: SessionStub) {
+		const worker = makeSession([], true);
+		const fixture = createFixture(main, worker);
+		fixture.ctx.settings = Settings.isolated({ "display.smoothStreaming": false });
+		const workerAssistant: AssistantMessage = {
+			...paused,
+			content: [{ type: "text", text: "WORKER_LINK [x](x.md)" }],
+			timestamp: 1,
+		};
+		const linkStarted = Promise.withResolvers<void>();
+		const linkGate = Promise.withResolvers<ReadonlyMap<string, string>>();
+		fixture.ctx.resolveAssistantMessageLinkHrefs = async () => {
+			linkStarted.resolve();
+			return linkGate.promise;
+		};
+		await fixture.focus.focusAgent("Worker");
+		await worker.emit({ type: "message_start", message: workerAssistant });
+		const stuckEnd = worker.emit({ type: "message_end", message: workerAssistant });
+		await linkStarted.promise;
+		const dispose = () => {
+			fixture.focus.dispose();
+			fixture.ctx.unsubscribe?.();
+			fixture.ctx.eventController.dispose();
+			for (const component of fixture.ctx.pendingTools.values()) component.seal();
+		};
+		return { ...fixture, stuckEnd, release: () => linkGate.resolve(new Map()), dispose };
+	}
+
+	it("draws messages that arrive after the switch queued its rebuild once, replayed or not", async () => {
+		const earlier: AssistantMessage = {
+			...paused,
+			content: [{ type: "text", text: "EARLIER_REPLY [b](b.md)" }],
+			timestamp: 2,
+		};
+		const arrivedReply: AssistantMessage = {
+			...paused,
+			content: [{ type: "text", text: "ARRIVED_REPLY [a](a.md)" }],
+			timestamp: 4,
+		};
+		const replayed = {
+			role: "user",
+			content: [{ type: "text", text: "REPLAYED_ARRIVAL" }],
+			timestamp: 5,
+		} as unknown as AgentMessage;
+		const liveOnly = {
+			role: "user",
+			content: [{ type: "text", text: "LIVE_ONLY_ARRIVAL" }],
+			timestamp: 6,
+		} as unknown as AgentMessage;
+		const mainMessages: AgentMessage[] = [earlier];
+		const main = makeSession(mainMessages, false);
+		const { ctx, focus, stuckEnd, release, dispose } = await focusBehindHeldLinkCheck(main);
+		// The arrived reply's own link check (it alone asks for just `a.md`; the rebuild resolves every
+		// replayed link at once) finishes only after the rebuild commits, so whatever is queued behind
+		// that check is delivered after the commit.
+		const committed = Promise.withResolvers<void>();
+		const renderInitialMessages = ctx.renderInitialMessages.bind(ctx);
+		ctx.renderInitialMessages = async options => {
+			await renderInitialMessages(options);
+			committed.resolve();
+		};
+		ctx.resolveAssistantMessageLinkHrefs = async hrefs => {
+			if (hrefs.length === 1 && hrefs[0] === "a.md") await committed.promise;
+			return new Map();
+		};
+		try {
+			const returning = focus.unfocus();
+			// Let the switch queue its own work behind the held link check before anything arrives.
+			for (let i = 0; i < 20; i++) await Promise.resolve();
+			// The reply and one prompt are persisted before the rebuild reads the transcript; one never is.
+			mainMessages.push(arrivedReply, replayed);
+			const arrivals = [arrivedReply, replayed, liveOnly].flatMap(message => [
+				main.emit({ type: "message_start", message }),
+				main.emit({ type: "message_end", message }),
+			]);
+			release();
+			await Promise.all([returning, stuckEnd, ...arrivals]);
+
+			const rendered = Bun.stripANSI(ctx.chatContainer.render(120).join("\n"));
+			expect(rendered.match(/ARRIVED_REPLY/g)).toHaveLength(1);
+			expect(rendered.match(/REPLAYED_ARRIVAL/g)).toHaveLength(1);
+			expect(rendered.match(/LIVE_ONLY_ARRIVAL/g)).toHaveLength(1);
+		} finally {
+			dispose();
+		}
+	});
+
+	it("keeps a reply that starts during the switch attached to the rebuilt transcript", async () => {
+		const reply: AssistantMessage = {
+			...paused,
+			content: [{ type: "text", text: "REPLY_DURING_SWITCH" }],
+			timestamp: 7,
+		};
+		const continued: AssistantMessage = {
+			...reply,
+			content: [{ type: "text", text: "REPLY_DURING_SWITCH AND_AFTER" }],
+		};
+		const main = makeSession([], true);
+		const { ctx, focus, stuckEnd, release, dispose } = await focusBehindHeldLinkCheck(main);
+		try {
+			const returning = focus.unfocus();
+			main.setLiveAssistant(reply, []);
+			const started = [
+				main.emit({ type: "message_start", message: reply }),
+				main.emit({
+					type: "message_update",
+					message: reply,
+					assistantMessageEvent: {
+						type: "text_delta",
+						contentIndex: 0,
+						delta: "REPLY_DURING_SWITCH",
+						partial: reply,
+					},
+				}),
+			];
+			release();
+			await Promise.all([returning, stuckEnd, ...started]);
+
+			main.setLiveAssistant(continued, []);
+			await main.emit({
+				type: "message_update",
+				message: continued,
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: " AND_AFTER", partial: continued },
+			});
+			const rendered = () => Bun.stripANSI(ctx.chatContainer.render(120).join("\n"));
+			expect(rendered()).toContain("AND_AFTER");
+			await main.emit({ type: "message_end", message: continued });
+			expect(rendered().match(/REPLY_DURING_SWITCH/g)).toHaveLength(1);
+			expect(rendered()).toContain("AND_AFTER");
+		} finally {
+			dispose();
 		}
 	});
 });

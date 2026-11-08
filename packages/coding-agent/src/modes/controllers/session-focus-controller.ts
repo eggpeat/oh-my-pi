@@ -1,3 +1,4 @@
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { type AgentLifecycleApi, AgentLifecycleManager } from "../../registry/agent-lifecycle";
 import {
@@ -8,8 +9,18 @@ import {
 	type RegistryEvent,
 } from "../../registry/agent-registry";
 import { type AgentViewSession, isAgentViewSession } from "../../session/agent-session-handle";
+import type { AgentSessionEvent } from "../../session/agent-session";
+import { sessionMessagePersistenceKey } from "../../session/turn-persistence";
 import { setRunStatus } from "../../utils/run-status";
 import type { InteractiveModeContext } from "../types";
+
+/** Whether a rebuild's own reads of the session already show `event`, the `arrival`-th it emitted. */
+type ShownByRebuild = (event: AgentSessionEvent, arrival: number) => boolean;
+
+/** A message's identity in both the persisted transcript and live events: its persistence key, else the object. */
+function transcriptKey(message: AgentMessage): unknown {
+	return sessionMessagePersistenceKey(message) ?? message;
+}
 
 /**
  * Pick the most recently active focusable subagent. Advisors are read-only
@@ -198,8 +209,15 @@ export class SessionFocusController {
 				await this.ctx.eventController.syncAssistantMessage(message);
 				if (generation === this.#attachGeneration) this.ctx.eventController.restorePendingToolResults();
 			};
-			this.ctx.unsubscribe = target.subscribe(event =>
-				this.#runSerialized(generation, async () => {
+			// Events are numbered as they arrive and queued behind the rebuild, which is queued in
+			// this same tick: no handler runs in the middle of it, and it drops each event its own
+			// reads of `target` already show, so nothing is drawn twice or into a replaced chat.
+			let arrivals = 0;
+			let shown: ShownByRebuild | undefined;
+			this.ctx.unsubscribe = target.subscribe(event => {
+				const arrival = ++arrivals;
+				return this.#runSerialized(generation, async () => {
+					if (shown?.(event, arrival)) return;
 					if (event.type === "message_start" && event.message.role === "assistant") {
 						assistantStreamSynced = true;
 					} else if (
@@ -219,38 +237,12 @@ export class SessionFocusController {
 					}
 					if (event.type === "message_end" && event.message.role === "assistant") assistantStreamSynced = false;
 					await this.ctx.eventController.handleEvent(event);
-				}),
-			);
-
-			await target.settleInFlightMessagePersistence();
+				});
+			});
+			await this.#runSerialized(generation, async () => {
+				shown = await this.#rebuild(target, generation, () => arrivals, restoreAssistant);
+			});
 			if (generation !== this.#attachGeneration) return;
-			// Drain the dispatch chain before rebuilding: an in-flight handler from
-			// the previous view (e.g. a message_end awaiting link resolution) would
-			// otherwise delay this target's queued arrivals past the rebuild, whose
-			// snapshot already includes their messages, so the queued delivery would
-			// paint a second copy. Arrivals up to this point run first; the rebuild
-			// then replays the authoritative transcript.
-			await this.#runSerialized(generation, async () => {});
-			if (generation !== this.#attachGeneration) return;
-			this.ctx.statusLine.setSession(target, this.#focusedAgentId);
-			// Reset run bookkeeping before replay populates pending tool handles.
-			if (target.isStreaming) await this.ctx.eventController.handleEvent({ type: "agent_start" });
-			else {
-				setRunStatus({ state: "idle" });
-				this.ctx.eventController.markViewIdle();
-			}
-			if (generation !== this.#attachGeneration) return;
-			await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
-			if (generation !== this.#attachGeneration) return;
-			this.ctx.eventController.restorePendingToolResults();
-
-			const live = target.agent.state.streamMessage;
-			if (live?.role === "assistant") await restoreAssistant(live);
-			if (generation !== this.#attachGeneration) return;
-			for (const event of target.activeToolExecutionUpdates()) {
-				await this.ctx.eventController.handleEvent(event);
-				if (generation !== this.#attachGeneration) return;
-			}
 			await this.ctx.reloadTodos(target);
 			if (generation !== this.#attachGeneration) return;
 			this.ctx.updatePendingMessagesDisplay();
@@ -274,5 +266,70 @@ export class SessionFocusController {
 			}
 			throw error;
 		}
+	}
+
+	/**
+	 * Rebuild the view of `target` from its own state (run status, transcript, buffered tool
+	 * results, live reply, running tools) as one run of the serialized dispatch chain. Returns
+	 * which events, numbered by `arrivals` as they came in, that state already shows; undefined
+	 * when a newer attachment took over.
+	 */
+	async #rebuild(
+		target: AgentViewSession,
+		generation: number,
+		arrivals: () => number,
+		restoreAssistant: (message: AssistantMessage) => Promise<void>,
+	): Promise<ShownByRebuild | undefined> {
+		// A tool result emitted while nothing listened must be in the transcript rebuilt below.
+		await target.settleInFlightMessagePersistence();
+		if (generation !== this.#attachGeneration) return undefined;
+		this.ctx.statusLine.setSession(target, this.#focusedAgentId);
+		// Reset run bookkeeping before replay populates pending tool handles.
+		const statusRead = arrivals();
+		if (target.isStreaming) await this.ctx.eventController.handleEvent({ type: "agent_start" });
+		else {
+			setRunStatus({ state: "idle" });
+			this.ctx.eventController.markViewIdle();
+		}
+		if (generation !== this.#attachGeneration) return undefined;
+		const replayed = new Set<unknown>();
+		await this.ctx.renderInitialMessages({
+			clearTerminalHistory: true,
+			onCommit: context => {
+				for (const message of context.messages) replayed.add(transcriptKey(message));
+			},
+		});
+		if (generation !== this.#attachGeneration) return undefined;
+		this.ctx.eventController.restorePendingToolResults();
+
+		const liveRead = arrivals();
+		const live = target.agent.state.streamMessage;
+		const running = target.activeToolExecutionUpdates();
+		if (live?.role === "assistant") await restoreAssistant(live);
+		if (generation !== this.#attachGeneration) return undefined;
+		for (const event of running) {
+			await this.ctx.eventController.handleEvent(event);
+			if (generation !== this.#attachGeneration) return undefined;
+		}
+		return (event, arrival) => {
+			switch (event.type) {
+				case "agent_start":
+					// The status read started this run, or found it already over.
+					return arrival <= statusRead;
+				case "tool_execution_update":
+					// `running` held each running tool's newest update.
+					return arrival <= liveRead;
+				case "message_start":
+				case "message_update":
+				case "message_end":
+					// The replay drew this message as persisted; `live` was the newest reply so far.
+					return (
+						replayed.has(transcriptKey(event.message)) ||
+						(event.message.role === "assistant" && event.type !== "message_end" && arrival <= liveRead)
+					);
+				default:
+					return false;
+			}
+		};
 	}
 }
