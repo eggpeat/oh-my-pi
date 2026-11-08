@@ -17,8 +17,14 @@ import type { InteractiveModeContext } from "../types";
 /** Whether a rebuild's own reads of the session already show `event`, the `arrival`-th it emitted. */
 type ShownByRebuild = (event: AgentSessionEvent, arrival: number) => boolean;
 
-/** A message's identity in both the persisted transcript and live events: its persistence key, else the object. */
+/**
+ * A message's identity in both the rebuilt transcript and live events. An extension message
+ * (`custom` or `hookMessage`) is persisted as a custom entry under its own timestamp and rebuilt as
+ * a new `custom` object, so it is keyed by type and timestamp; the rest by persistence key, else the object.
+ */
 function transcriptKey(message: AgentMessage): unknown {
+	if (message.role === "custom" || message.role === "hookMessage")
+		return `custom:${message.customType}:${message.timestamp}`;
 	return sessionMessagePersistenceKey(message) ?? message;
 }
 
@@ -239,9 +245,13 @@ export class SessionFocusController {
 					await this.ctx.eventController.handleEvent(event);
 				});
 			});
+			let restored: Promise<void> | undefined;
 			await this.#runSerialized(generation, async () => {
-				shown = await this.#rebuild(target, generation, () => arrivals, restoreAssistant);
+				const rebuilt = await this.#rebuild(target, generation, () => arrivals, restoreAssistant);
+				shown = rebuilt?.shown;
+				restored = rebuilt?.restored;
 			});
+			await restored;
 			if (generation !== this.#attachGeneration) return;
 			await this.ctx.reloadTodos(target);
 			if (generation !== this.#attachGeneration) return;
@@ -270,16 +280,17 @@ export class SessionFocusController {
 
 	/**
 	 * Rebuild the view of `target` from its own state (run status, transcript, buffered tool
-	 * results, live reply, running tools) as one run of the serialized dispatch chain. Returns
-	 * which events, numbered by `arrivals` as they came in, that state already shows; undefined
-	 * when a newer attachment took over.
+	 * results) as one run of the serialized dispatch chain, and queue the restore of its live reply
+	 * and running tools (`restored`) behind the events that arrived by then, so an older reply
+	 * ending in between is drawn first. `shown` says which events, numbered by `arrivals` as they
+	 * came in, those reads already show. Undefined when a newer attachment took over.
 	 */
 	async #rebuild(
 		target: AgentViewSession,
 		generation: number,
 		arrivals: () => number,
 		restoreAssistant: (message: AssistantMessage) => Promise<void>,
-	): Promise<ShownByRebuild | undefined> {
+	): Promise<{ shown: ShownByRebuild; restored: Promise<void> } | undefined> {
 		// A tool result emitted while nothing listened must be in the transcript rebuilt below.
 		await target.settleInFlightMessagePersistence();
 		if (generation !== this.#attachGeneration) return undefined;
@@ -293,36 +304,48 @@ export class SessionFocusController {
 		}
 		if (generation !== this.#attachGeneration) return undefined;
 		const replayed = new Set<unknown>();
+		const resultTools = new Set<string>();
 		await this.ctx.renderInitialMessages({
 			clearTerminalHistory: true,
 			onCommit: context => {
-				for (const message of context.messages) replayed.add(transcriptKey(message));
+				for (const message of context.messages) {
+					replayed.add(transcriptKey(message));
+					if (message.role === "toolResult") resultTools.add(message.toolCallId);
+				}
 			},
 		});
 		if (generation !== this.#attachGeneration) return undefined;
 		this.ctx.eventController.restorePendingToolResults();
 
+		// Read and queued in one tick: every event up to `liveRead` runs before the restore, every
+		// later one after it.
 		const liveRead = arrivals();
 		const live = target.agent.state.streamMessage;
 		const running = target.activeToolExecutionUpdates();
-		if (live?.role === "assistant") await restoreAssistant(live);
-		if (generation !== this.#attachGeneration) return undefined;
-		for (const event of running) {
-			await this.ctx.eventController.handleEvent(event);
-			if (generation !== this.#attachGeneration) return undefined;
-		}
-		return (event, arrival) => {
+		const restored = this.#runSerialized(generation, async () => {
+			if (live?.role === "assistant") await restoreAssistant(live);
+			for (const event of running) {
+				if (generation !== this.#attachGeneration) return;
+				await this.ctx.eventController.handleEvent(event);
+			}
+		});
+		const shown: ShownByRebuild = (event, arrival) => {
 			switch (event.type) {
 				case "agent_start":
 					// The status read started this run, or found it already over.
 					return arrival <= statusRead;
+				case "tool_execution_start":
+					// The replay drew this call with its result. Its updates and end still count: a
+					// detached task's persisted result says "running" and its job keeps reporting.
+					return resultTools.has(event.toolCallId);
 				case "tool_execution_update":
-					// `running` held each running tool's newest update.
+					// `running` holds each running tool's newest update.
 					return arrival <= liveRead;
 				case "message_start":
 				case "message_update":
 				case "message_end":
-					// The replay drew this message as persisted; `live` was the newest reply so far.
+					// The replay drew this message as persisted. A reply still streaming at `liveRead`
+					// is `live`, drawn by the restore; one that ended by then is drawn by its own end.
 					return (
 						replayed.has(transcriptKey(event.message)) ||
 						(event.message.role === "assistant" && event.type !== "message_end" && arrival <= liveRead)
@@ -331,5 +354,6 @@ export class SessionFocusController {
 					return false;
 			}
 		};
+		return { shown, restored };
 	}
 }

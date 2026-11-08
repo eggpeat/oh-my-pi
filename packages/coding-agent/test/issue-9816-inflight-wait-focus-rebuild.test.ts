@@ -869,4 +869,122 @@ describe("live Cursor focus recovery without another delta", () => {
 			dispose();
 		}
 	});
+
+	it("draws an extension message persisted during the switch once, though its rebuilt copy is a new object", async () => {
+		const note = {
+			role: "custom",
+			customType: "ext-note",
+			content: "EXT_DURING_SWITCH",
+			display: true,
+			timestamp: 8,
+		} as unknown as AgentMessage;
+		const mainMessages: AgentMessage[] = [];
+		const main = makeSession(mainMessages, false);
+		const { ctx, focus, stuckEnd, release, dispose } = await focusBehindHeldLinkCheck(main);
+		try {
+			const returning = focus.unfocus();
+			for (let i = 0; i < 20; i++) await Promise.resolve();
+			// The session persists an idle display message before emitting it; the rebuild reads it back
+			// from its entry as a new object.
+			mainMessages.push({ ...note });
+			const arrivals = [
+				main.emit({ type: "message_start", message: note }),
+				main.emit({ type: "message_end", message: note }),
+			];
+			release();
+			await Promise.all([returning, stuckEnd, ...arrivals]);
+
+			const rendered = Bun.stripANSI(ctx.chatContainer.render(120).join("\n"));
+			expect(rendered.match(/EXT_DURING_SWITCH/g)).toHaveLength(1);
+		} finally {
+			dispose();
+		}
+	});
+
+	it("draws a tool that finishes during the switch once", async () => {
+		const call: AssistantMessage = {
+			...paused,
+			content: [{ type: "toolCall", id: "switch-grep", name: "grep", arguments: { pattern: "TOOL_DURING_SWITCH" } }],
+			stopReason: "toolUse",
+			timestamp: 9,
+		};
+		const finished: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "switch-grep",
+			toolName: "grep",
+			content: [{ type: "text", text: "SWITCH_MATCH" }],
+			isError: false,
+			timestamp: 10,
+		};
+		const mainMessages: AgentMessage[] = [call];
+		const main = makeSession(mainMessages, true);
+		const { ctx, focus, stuckEnd, release, dispose } = await focusBehindHeldLinkCheck(main);
+		try {
+			const returning = focus.unfocus();
+			for (let i = 0; i < 20; i++) await Promise.resolve();
+			// The tool runs and its result is persisted before the rebuild reads the transcript.
+			mainMessages.push(finished);
+			const tool = { toolCallId: "switch-grep", toolName: "grep" };
+			const arrivals = [
+				main.emit({ type: "tool_execution_start", ...tool, args: { pattern: "TOOL_DURING_SWITCH" } }),
+				main.emit({ type: "tool_execution_end", ...tool, result: { content: finished.content }, isError: false }),
+				main.emit({ type: "message_start", message: finished }),
+				main.emit({ type: "message_end", message: finished }),
+			];
+			release();
+			await Promise.all([returning, stuckEnd, ...arrivals]);
+
+			const rendered = Bun.stripANSI(ctx.chatContainer.render(120).join("\n"));
+			expect(rendered.match(/TOOL_DURING_SWITCH/g)).toHaveLength(1);
+		} finally {
+			dispose();
+		}
+	});
+
+	it("draws an older reply that ends after the transcript is read before restoring the newer live reply", async () => {
+		const older: AssistantMessage = { ...paused, content: [{ type: "text", text: "OLDER_REPLY" }], timestamp: 11 };
+		const newer: AssistantMessage = { ...paused, content: [{ type: "text", text: "NEWER_REPLY" }], timestamp: 12 };
+		const continued: AssistantMessage = { ...newer, content: [{ type: "text", text: "NEWER_REPLY AND_AFTER" }] };
+		const main = makeSession([], true);
+		main.setLiveAssistant(older, []);
+		const { ctx, focus, stuckEnd, release, dispose } = await focusBehindHeldLinkCheck(main);
+		// Right after the rebuild reads the transcript, the older reply ends and the newer one starts.
+		const stub = main.session as unknown as { buildTranscriptSessionContext: () => SessionContext };
+		const read = stub.buildTranscriptSessionContext.bind(stub);
+		let raced: Promise<unknown> | undefined;
+		stub.buildTranscriptSessionContext = () => {
+			const context = read();
+			raced ??= Promise.resolve().then(() => {
+				const ended = main.emit({ type: "message_end", message: older });
+				main.setLiveAssistant(newer, []);
+				return Promise.all([ended, main.emit({ type: "message_start", message: newer })]);
+			});
+			return context;
+		};
+		try {
+			const returning = focus.unfocus();
+			release();
+			await Promise.all([returning, stuckEnd]);
+			await raced;
+			const rendered = () => Bun.stripANSI(ctx.chatContainer.render(120).join("\n"));
+			// Before the newer reply sends anything else, both are on screen, the older one first.
+			const switched = rendered();
+			expect(switched.match(/OLDER_REPLY/g)).toHaveLength(1);
+			expect(switched.match(/NEWER_REPLY/g)).toHaveLength(1);
+			expect(switched.indexOf("OLDER_REPLY")).toBeLessThan(switched.indexOf("NEWER_REPLY"));
+
+			main.setLiveAssistant(continued, []);
+			await main.emit({
+				type: "message_update",
+				message: continued,
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: " AND_AFTER", partial: continued },
+			});
+			await main.emit({ type: "message_end", message: continued });
+			expect(rendered().match(/OLDER_REPLY/g)).toHaveLength(1);
+			expect(rendered().match(/NEWER_REPLY/g)).toHaveLength(1);
+			expect(rendered()).toContain("AND_AFTER");
+		} finally {
+			dispose();
+		}
+	});
 });
