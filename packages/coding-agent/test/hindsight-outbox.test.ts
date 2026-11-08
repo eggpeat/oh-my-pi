@@ -253,14 +253,20 @@ describe("Hindsight retain outbox", () => {
 	it("deletes quarantined events once their 30-day review period ends", async () => {
 		status = 400;
 		const { tool, state } = fixture();
-		await tool.execute("first-refused", { items: [{ content: "first refused" }] });
+		await tool.execute("refused", {
+			items: [{ content: "expired refused" }, { content: "recent refused" }],
+		});
+		const pending = await events();
+		const expired = pending.find(event => event.content === "expired refused")!;
+		const recent = pending.find(event => event.content === "recent refused")!;
 		await state.flushRetainQueue();
-		const [expired] = await fs.readdir(quarantineDir());
-		await age(path.join(quarantineDir(), expired), 31 * DAY_MS);
-		await tool.execute("second-refused", { items: [{ content: "second refused" }] });
-		const [second] = await events();
+		await age(path.join(quarantineDir(), `${expired.id}.json`), 31 * DAY_MS);
+		await age(path.join(quarantineDir(), `${recent.id}.json`), 29 * DAY_MS);
+		requests = [];
+		status = 202;
 		await state.flushRetainQueue();
-		expect(await fs.readdir(quarantineDir())).toEqual([`${second.id}.json`]);
+		expect(await fs.readdir(quarantineDir())).toEqual([`${recent.id}.json`]);
+		expect(requests).toHaveLength(0);
 	});
 
 	it("retries a transient failure on its own backoff timer", async () => {
