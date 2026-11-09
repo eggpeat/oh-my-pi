@@ -353,19 +353,29 @@ function quarantineShellSession(
 		.catch(() => undefined);
 }
 
+const SESSION_SHELL_NAMESPACES = ["eval", "loop-condition"] as const;
+
+function matchesAgentSessionKey(key: string, agentSessionKey: string): boolean {
+	if (key.startsWith(`${agentSessionKey}\n`)) return true;
+	for (const namespace of SESSION_SHELL_NAMESPACES) {
+		if (key.startsWith(`${namespace}:${agentSessionKey}\n`)) return true;
+	}
+	return false;
+}
+
 /**
  * Drops every persistent Shell owned by an agent session (keys built with
- * `agentSessionKey` as the {@link BashExecutorOptions.sessionKey}). The map is
- * process-global, so without this each disposed session keeps its native shell
- * for the life of the process. A Shell with live background jobs is retained
- * until they exit, matching the `:async:` teardown; an in-flight run keeps its
- * own reference and drops the Shell when it settles.
+ * `agentSessionKey` or a session-scoped namespace such as `eval:` as the
+ * {@link BashExecutorOptions.sessionKey}). The map is process-global, so without
+ * this each disposed session keeps its native shell for the life of the process.
+ * A Shell with live background jobs is retained until they exit, matching the
+ * `:async:` teardown; an in-flight run keeps its own reference and drops the
+ * Shell when it settles.
  */
 export function releaseShellSessions(agentSessionKey: string | undefined): void {
 	if (!agentSessionKey) return;
-	const prefix = `${agentSessionKey}\n`;
 	for (const [key, shell] of shellSessions) {
-		if (!key.startsWith(prefix)) continue;
+		if (!matchesAgentSessionKey(key, agentSessionKey)) continue;
 		shellSessions.delete(key);
 		if (!shellSessionsInUse.has(key)) void retainShellWithLiveBackgroundJobs(shell);
 	}

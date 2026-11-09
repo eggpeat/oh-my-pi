@@ -9,6 +9,7 @@ import {
 	type PythonResult,
 } from "../eval/py/executor";
 import { defaultEvalSessionId } from "../eval/session-id";
+import { releaseShellSessions } from "../exec/bash-executor";
 import type { ExtensionRunner } from "../extensibility/extensions";
 import type { ToolSession } from "../tools";
 import { outputMeta } from "../tools/output-meta";
@@ -187,6 +188,7 @@ export class EvalRunner {
 			disposeKernelSessionsByOwner(this.#kernelOwnerId),
 			disposeVmContextsByOwner(this.#kernelOwnerId),
 		]);
+		releaseShellSessions(this.#host.sessionManager.getSessionId());
 		const errors: unknown[] = [];
 		for (const result of results) if (result.status === "rejected") errors.push(result.reason);
 		if (errors.length > 0) throw new AggregateError(errors, "Failed to dispose one or more eval kernels");
