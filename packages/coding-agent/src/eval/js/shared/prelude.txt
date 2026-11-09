@@ -82,11 +82,40 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 	// A template literal keeps its raw text and single-quotes each interpolation; an array becomes one word per element.
 	const shellQuote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 	const templateCommand = (strings, values) => {
-		let command = strings.raw[0];
-		for (let index = 0; index < values.length; index++) {
-			const value = values[index];
-			const words = Array.isArray(value) ? value.map(shellQuote).join(" ") : shellQuote(value);
-			command += words + strings.raw[index + 1];
+		let command = "";
+		const stack = [];
+		let escaped = false;
+		for (let index = 0; index < strings.raw.length; index++) {
+			const segment = strings.raw[index];
+			for (let i = 0; i < segment.length; i++) {
+				const ch = segment[i];
+				const top = stack[stack.length - 1] ?? null;
+				if (escaped) {
+					escaped = false;
+				} else if (ch === "\\" && top !== "'") {
+					escaped = true;
+				} else if (top === "'") {
+					if (ch === "'") stack.pop();
+				} else if (ch === "$" && segment[i + 1] === "(") {
+					stack.push("(");
+					i++;
+				} else if (top === '"') {
+					if (ch === '"') stack.pop();
+				} else if (ch === "'" || ch === '"') {
+					stack.push(ch);
+				} else if (top === "(" && ch === "(") {
+					stack.push("(");
+				} else if (top === "(" && ch === ")") {
+					stack.pop();
+				}
+			}
+			command += segment;
+			if (index < values.length) {
+				const top = stack[stack.length - 1] ?? null;
+				const value = values[index];
+				const words = Array.isArray(value) ? value.map(shellQuote).join(" ") : shellQuote(value);
+				command += top === '"' || top === "'" ? `${top}${words}${top}` : words;
+			}
 		}
 		return command;
 	};

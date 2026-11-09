@@ -92,10 +92,20 @@ function createHarness(initialSessionId: string) {
 		return JSON.parse(line.slice("SH_OUT:".length));
 	}
 
+	async function runJs(code: string): Promise<unknown> {
+		const wrapped = `const value = await (async () => { ${code} })(); print("JS_OUT:" + JSON.stringify(value));`;
+		const result = await evalTool.execute("eval-js", { language: "js", code: wrapped, timeout: 30 });
+		const text = result.content.map(part => (part.type === "text" ? part.text : "")).join("");
+		const line = text.split("\n").find(entry => entry.startsWith("JS_OUT:"));
+		if (!line) throw new Error(`missing JS_OUT line in eval result:\n${text}`);
+		return JSON.parse(line.slice("JS_OUT:".length));
+	}
+
 	return {
 		bashRunner,
 		evalRunner,
 		runSh,
+		runJs,
 		setSessionId(nextId: string) {
 			usedSessionIds.add(nextId);
 			currentSessionId = nextId;
@@ -155,6 +165,21 @@ describe("eval sh session shell lifecycle", () => {
 			await harness.evalRunner.disposeKernels();
 
 			expect(await harness.runSh('printf "[%s]" "$PI_EVAL_DISPOSE_VAR"')).toBe("[]");
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"quotes sh template interpolations safely inside surrounding quotes",
+		async () => {
+			const sessionId = `eval-sh-quotes-${crypto.randomUUID()}`;
+			const harness = createHarness(sessionId);
+			const literal = await harness.runJs(`
+				const payload = "$(printf injected)";
+				return await sh\`printf '%s|%s|%s|%s|%s' \${payload} "\${payload}" '\${payload}' "\\"\${payload}\\"" "$( (printf '%s' "\${payload}") )"\`;
+			`);
+			expect(literal).toBe(
+				'$(printf injected)|$(printf injected)|$(printf injected)|"$(printf injected)"|$(printf injected)',
+			);
 		},
 	);
 });

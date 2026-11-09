@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Persistent shells created by the eval tool's `sh` helper and `/loop` conditions are now released when their session switches or closes ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+
 ## [18.18.1] - 2026-11-08
 
 ### Breaking Changes
