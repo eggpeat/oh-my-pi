@@ -933,23 +933,33 @@ exit 64
 			await run(`loop-condition:${id}`, "PI_LOOP=kept");
 			await run(other, "PI_OTHER=kept");
 			await run(`eval:${other}`, "PI_OTHER_EVAL=kept");
-			// A key whose prefix before the colon is a path, not a surface label, is no
-			// namespace of `id` even though its tail reads like one.
-			await run(`/work/repo:${id}`, "PI_PATH_KEY=kept");
+			// A key whose front part is a path, not a surface label, is no namespace of
+			// `id` even though its tail reads like one.
+			const pathLike = `/work/repo:${id}`;
+			await run(pathLike, "PI_PATH_KEY=kept");
+			// A session id may itself contain a colon (a cwd-derived session name);
+			// that session's own shells are still its to release.
+			const colonId = `/work/repo:${crypto.randomUUID()}`;
+			await run(colonId, "PI_COLON=kept");
+			await run(`eval:${colonId}`, "PI_COLON_EVAL=kept");
 
 			releaseShellSessions(id);
+			releaseShellSessions(colonId);
 
 			expect((await run(id, 'printf "[%s]" "$PI_PLAIN"')).output).toBe("[]");
 			expect((await run(`eval:${id}`, 'printf "[%s]" "$PI_EVAL"')).output).toBe("[]");
 			expect((await run(`loop-condition:${id}`, 'printf "[%s]" "$PI_LOOP"')).output).toBe("[]");
-			// Another session's shells, plain and namespaced, survive, and so does a
-			// colon-bearing key that is not a `<label>:<id>` namespace.
-			expect((await run(`/work/repo:${id}`, 'printf "[%s]" "$PI_PATH_KEY"')).output).toBe("[kept]");
+			expect((await run(colonId, 'printf "[%s]" "$PI_COLON"')).output).toBe("[]");
+			expect((await run(`eval:${colonId}`, 'printf "[%s]" "$PI_COLON_EVAL"')).output).toBe("[]");
+			// A key that is neither the id nor a namespace of it survives the other
+			// session's release, and another session's shells survive both.
+			expect((await run(pathLike, 'printf "[%s]" "$PI_PATH_KEY"')).output).toBe("[kept]");
 			expect((await run(other, 'printf "[%s]" "$PI_OTHER"')).output).toBe("[kept]");
 			expect((await run(`eval:${other}`, 'printf "[%s]" "$PI_OTHER_EVAL"')).output).toBe("[kept]");
 		} finally {
 			releaseShellSessions(id);
 			releaseShellSessions(other);
+			releaseShellSessions(`/work/repo:${id}`);
 		}
 	});
 
