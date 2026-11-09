@@ -3024,33 +3024,189 @@ describe("runGcCommand replay data stripping", () => {
 		expect(JSON.parse(lines[8]).message.content).toEqual([{ type: "thinking", thinking: "" }]);
 	}
 
-	test("a trailing turn no replay reaches leaves the earlier turn latest", async () => {
+	test("a trailing turn dropped on resume leaves the earlier turn latest", async () => {
 		const id = Bun.randomUUIDv7();
 		const file = path.join(getSessionsDir(root), "project", `${id}.jsonl`);
 		const lines = [
 			header(id),
+			assistant(
+				[
+					{ type: "thinking", thinking: "step 1", thinkingSignature: "EqQBstep1" },
+					{ type: "toolCall", id: "call_1", name: "read", arguments: { path: "a" }, thoughtSignature: "c2ln" },
+				],
+				{ stopReason: "toolUse" },
+			),
+			toolResult("call_1"),
 			assistant([
 				{ type: "thinking", thinking: "kept", thinkingSignature: "EqQBkept" },
 				{ type: "text", text: "answer" },
 			]),
 			prompt("one more"),
-			// Cut off before any content: no replay sends it, so it never displaces the
-			// turn whose reasoning a resumed tool loop must replay.
+			// Failed with partial text: session-context drops it on resume, so it
+			// must neither keep its signature nor displace the earlier turn.
+			assistant(
+				[
+					{ type: "thinking", thinking: "failed", thinkingSignature: "EqQBfail" },
+					{ type: "text", text: "partial output" },
+				],
+				{ stopReason: "error" },
+			),
+			// Cut off before any content: dropped on replay too.
 			assistant([{ type: "thinking", thinking: "", thinkingSignature: "EqQBcut" }], { stopReason: "aborted" }),
 		];
 		await writeTranscript(file, lines, 40);
 
 		const result = await runGcCommand({ flags: { agentDir: root, strip: true, apply: true } });
 
-		// The cut-off response never reaches a replay, so it neither keeps its
-		// signature nor displaces the finished turn that is the latest one sent.
-		expect(result.strip).toMatchObject({ wouldStrip: 1, stripped: 1, records: 1 });
+		expect(result.strip).toMatchObject({ wouldStrip: 1, stripped: 1, records: 2 });
 		const after = (await Bun.file(file).text()).split("\n").slice(0, -1);
 		expect(after[1]).toBe(lines[1]);
-		expect(JSON.parse(after[3]).message.content).toEqual([{ type: "thinking", thinking: "" }]);
+		expect(after[2]).toBe(lines[2]);
+		expect(after[3]).toBe(lines[3]);
+		expect(JSON.parse(after[5]).message.content).toEqual([
+			{ type: "thinking", thinking: "failed" },
+			{ type: "text", text: "partial output" },
+		]);
+		expect(JSON.parse(after[6]).message.content).toEqual([{ type: "thinking", thinking: "" }]);
 	});
 
-	test("--apply strips idle transcripts except their latest replay turn, keeping mtimes", async () => {
+	test("resume rules keep the latest turn across excluded commands, mid-loop compaction, branching, and key order", async () => {
+		const id = Bun.randomUUIDv7();
+		const file = path.join(getSessionsDir(root), "project", `${id}.jsonl`);
+		const lines = [
+			header(id),
+			// Summarized away before firstKeptEntryId: stripped.
+			JSON.stringify({
+				type: "message",
+				id: "pre_compact",
+				parentId: null,
+				message: {
+					role: "assistant",
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-opus-4-5",
+					stopReason: "stop",
+					content: [
+						{ type: "thinking", thinking: "old", thinkingSignature: "EqQBold" },
+						{ type: "text", text: "old answer" },
+					],
+				},
+			}),
+			// Retained by compaction (firstKeptEntryId = "turn_a"), with `message`
+			// before `type` and `content` before `role`.
+			JSON.stringify({
+				id: "turn_a",
+				parentId: "pre_compact",
+				message: {
+					content: [
+						{ type: "thinking", thinking: "step A", thinkingSignature: "EqQBsignedA" },
+						{ type: "toolCall", id: "call_a", name: "read", arguments: { path: "a" }, thoughtSignature: "c2lnA" },
+					],
+					role: "assistant",
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-opus-4-5",
+					stopReason: "toolUse",
+				},
+				type: "message",
+			}),
+			JSON.stringify({
+				type: "message",
+				id: "tr_a",
+				parentId: "turn_a",
+				message: {
+					role: "toolResult",
+					toolCallId: "call_a",
+					toolName: "read",
+					isError: false,
+					content: [{ type: "text", text: "ok" }],
+				},
+			}),
+			// Hidden `!!` command excluded from provider input: does not split the turn.
+			JSON.stringify({
+				type: "message",
+				id: "hidden_bash",
+				parentId: "tr_a",
+				message: {
+					role: "bashExecution",
+					command: "pwd",
+					output: "/tmp",
+					cancelled: false,
+					excludeFromContext: true,
+				},
+			}),
+			// Mid-loop compaction retaining `turn_a`: summary is placed before `turn_a` on resume.
+			JSON.stringify({
+				type: "compaction",
+				id: "compact_1",
+				parentId: "hidden_bash",
+				summary: "compacted prefix",
+				firstKeptEntryId: "turn_a",
+				tokensBefore: 1000,
+			}),
+			// Abandoned user prompt on a sibling branch in file order: not on the active path.
+			JSON.stringify({
+				type: "message",
+				id: "abandoned_user",
+				parentId: "pre_compact",
+				message: { role: "user", content: [{ type: "text", text: "abandoned branch" }] },
+			}),
+			// Continues from `compact_1`, with `content` before `role`.
+			JSON.stringify({
+				id: "turn_b",
+				parentId: "compact_1",
+				message: {
+					content: [
+						{ type: "thinking", thinking: "step B", thinkingSignature: "EqQBsignedB" },
+						{ type: "text", text: "final answer" },
+					],
+					role: "assistant",
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-opus-4-5",
+					stopReason: "stop",
+				},
+				type: "message",
+			}),
+			// Off-branch response at the tail that preserves `activeLeafId: "turn_b"`: stripped.
+			JSON.stringify({
+				type: "message",
+				id: "off_branch",
+				parentId: "abandoned_user",
+				activeLeafId: "turn_b",
+				message: {
+					role: "assistant",
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-opus-4-5",
+					stopReason: "stop",
+					content: [
+						{ type: "thinking", thinking: "abandoned", thinkingSignature: "EqQBabandoned" },
+						{ type: "text", text: "unused" },
+					],
+				},
+			}),
+		];
+		await writeTranscript(file, lines, 40);
+
+		const result = await runGcCommand({ flags: { agentDir: root, strip: true, apply: true } });
+
+		expect(result.strip).toMatchObject({ wouldStrip: 1, stripped: 1, records: 2 });
+		const after = (await Bun.file(file).text()).split("\n").slice(0, -1);
+		expect(JSON.parse(after[1]).message.content).toEqual([
+			{ type: "thinking", thinking: "old" },
+			{ type: "text", text: "old answer" },
+		]);
+		expect(after[2]).toBe(lines[2]);
+		expect(after[3]).toBe(lines[3]);
+		expect(after[7]).toBe(lines[7]);
+		expect(JSON.parse(after[8]).message.content).toEqual([
+			{ type: "thinking", thinking: "abandoned" },
+			{ type: "text", text: "unused" },
+		]);
+	});
+
+	test("--apply strips idle transcripts except their latest replay turn, keeping mtimes and permissions", async () => {
 		const id = Bun.randomUUIDv7();
 		const file = await writeReplaySession(id);
 		const subagentId = Bun.randomUUIDv7();
@@ -3063,6 +3219,8 @@ describe("runGcCommand replay data stripping", () => {
 			assistant([{ type: "text", text: "found" }], { requestControls: { messageIndex: 3 } }),
 		];
 		await writeTranscript(subagent, subagentLines, 40);
+		await fs.chmod(file, 0o600);
+		await fs.chmod(subagent, 0o600);
 		const mtimes = await Promise.all([file, subagent].map(async target => (await fs.stat(target)).mtimeMs));
 
 		const result = await runGcCommand({ flags: { agentDir: root, strip: true, apply: true } });
@@ -3075,7 +3233,9 @@ describe("runGcCommand replay data stripping", () => {
 		// The subagent's own latest turn replays natively too.
 		expect(subagentAfter[4]).toBe(subagentLines[4]);
 		for (const [index, target] of [file, subagent].entries()) {
-			expect((await fs.stat(target)).mtimeMs).toBeCloseTo(mtimes[index], 0);
+			const stat = await fs.stat(target);
+			expect(stat.mtimeMs).toBeCloseTo(mtimes[index], 0);
+			expect(stat.mode & 0o777).toBe(0o600);
 		}
 
 		const rerun = await runGcCommand({ flags: { agentDir: root, strip: true, apply: true } });
@@ -3114,11 +3274,13 @@ describe("runGcCommand replay data stripping", () => {
 		const archive = path.join(root, "archive", "sessions", "project", `${id}.jsonl.gz`);
 		await fs.mkdir(path.dirname(archive), { recursive: true });
 		await Bun.write(archive, gzipSync(`${replayLines(id).join("\n")}\n`));
+		await fs.chmod(archive, 0o600);
 		await agePath(archive, 40);
 
 		const result = await runGcCommand({ flags: { agentDir: root, strip: true, apply: true } });
 
 		expect(result.strip).toMatchObject({ scanned: 0, wouldStrip: 1, stripped: 1, errors: [] });
+		expect((await fs.stat(archive)).mode & 0o777).toBe(0o600);
 		const lines = gunzipSync(await Bun.file(archive).bytes())
 			.toString()
 			.split("\n")

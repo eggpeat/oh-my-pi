@@ -30,75 +30,38 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import { createGzip } from "node:zlib";
-import type { AssistantMessage, ProviderPayload } from "@oh-my-pi/pi-ai";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { Message, ProviderPayload } from "@oh-my-pi/pi-ai";
 import { isSurvivingAssistant } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { isReasoningSourceSignature } from "@oh-my-pi/pi-ai/utils/reasoning-source";
 import { isRecord, readLines } from "@oh-my-pi/pi-utils";
+import { convertMessagesForContextView } from "../session/messages";
+import { buildSessionContext } from "../session/session-context";
+import type { CompactionEntry, SessionEntry } from "../session/session-entries";
 import { type FileSessionStorage, sessionStagingPath } from "../session/session-storage";
 
 const GZIP_SUFFIX = ".gz";
-/** Keys only replay data uses: a line without one has nothing to strip and is never parsed. */
-const REPLAY_KEY_RE =
-	/"(?:providerPayload|requestControls|inputTransformations|thinkingSignature|itemId|redactedThinking|thoughtSignature|partialArgs|streamIndex|providerFile)"/;
 const NEWLINE = new Uint8Array([0x0a]);
 const WRITE_CHUNK_BYTES = 1 << 20;
-/** Session entries start with their type; fields after it never change which record this is. */
-const ENTRY_TYPE_RE = /^\{"type":"([a-zA-Z_]+)"/;
-/** The entry's own message role, read from the message object rather than any text it quotes. */
-const ROLE_RE = /"message":\{"role":"([a-zA-Z]+)"/;
-/** A response, for a line whose entry type cannot be read. */
-const ASSISTANT_RE = /"role":"assistant"/;
+const FILE_PERMISSION_MASK = 0o7777n;
+/** Carries a message entry's physical JSONL line index through context rebuilding. */
+const LINE_INDEX = Symbol("lineIndex");
 
-/**
- * How a transcript record sits in the message list a provider replays. A turn is
- * one assistant message: the assistant responses a provider joins through tool
- * results, which it validates as a unit.
- */
-const enum RecordKind {
-	/** An assistant response: it opens the turn or joins the open one. */
-	Assistant,
-	/** A record that certainly ends the turn: a prompt, a note, a replaced context. */
-	Boundary,
-	/** Everything else, a tool result included: the turn may continue through it. */
-	Continues,
-}
-
-/**
- * {@link RecordKind} of `text`. A type or role this cannot read counts as
- * {@link RecordKind.Continues}, which can only lengthen a turn: a record it
- * cannot classify never narrows the kept set, so no replay a provider validates
- * as its latest turn is stripped.
- */
-function recordKind(text: string): RecordKind {
-	switch (ENTRY_TYPE_RE.exec(text)?.[1]) {
-		case "message": {
-			const role = ROLE_RE.exec(text)?.[1];
-			if (role === "assistant") return RecordKind.Assistant;
-			if (role === "toolResult") return RecordKind.Continues;
-			// A message without a readable role is malformed; keeping its turn is the safe read.
-			return role === undefined ? RecordKind.Continues : RecordKind.Boundary;
-		}
-		case "custom_message":
-		case "branch_summary":
-		case "compaction":
-		case "reset_boundary":
-			return RecordKind.Boundary;
-		default:
-			// A line whose entry type cannot be read but which carries a response
-			// is still a response; anything else stays inside the turn.
-			return ASSISTANT_RE.test(text) ? RecordKind.Assistant : RecordKind.Continues;
-	}
-}
+type TaggedMessage = AgentMessage & { [LINE_INDEX]?: number };
 
 /** What stripping one transcript removes, planned against the file as it was at `stat`. */
 export interface StripPlan {
 	file: string;
 	stat: BigIntStats;
 	/**
-	 * First and last line index of the latest replay turn, which stays verbatim:
-	 * its first assistant record through its last surviving assistant, the tool
-	 * results between them included. Both are -1 when there is no such turn.
+	 * Line indices of the latest replay turn on the active branch, kept verbatim:
+	 * its first assistant record through its last surviving assistant and the tool
+	 * results of that turn.
 	 */
+	keep: ReadonlySet<number>;
+	/** Line indices whose replay data is removed. */
+	strip: ReadonlySet<number>;
+	/** First and last kept line index, or -1 when `keep` is empty. */
 	keepStart: number;
 	keepEnd: number;
 	/** Records that lose replay data. */
@@ -187,17 +150,352 @@ function parseRecord(text: string): unknown {
 	}
 }
 
-/** Whether `record` is an assistant turn a provider would replay as its most recent response. */
-function isSurvivingAssistantRecord(record: unknown): boolean {
-	if (!isRecord(record) || record.type !== "message") return false;
-	const message = record.message;
-	return isAssistantMessage(message) && isSurvivingAssistant(message);
+/** Whether `message` emits a non-tool-result wire message that ends an assistant run. */
+function isBoundaryMessage(message: Message): boolean {
+	if (message.role === "assistant" || message.role === "toolResult") return false;
+	if (
+		message.role === "developer" &&
+		isRecord(message.providerPayload) &&
+		message.providerPayload.type === "anthropicMessage"
+	) {
+		const payload = message.providerPayload;
+		if (
+			payload.clearAt !== undefined ||
+			payload.effort !== undefined ||
+			(Array.isArray(payload.toolChanges) && payload.toolChanges.length > 0)
+		) {
+			return true;
+		}
+	}
+	if (typeof message.content === "string") return message.content.trim().length > 0;
+	if (!Array.isArray(message.content)) return false;
+	return message.content.some(
+		block =>
+			isRecord(block) &&
+			((block.type === "text" && typeof block.text === "string" && block.text.trim().length > 0) ||
+				block.type === "image"),
+	);
 }
 
-function isAssistantMessage(value: unknown): value is AssistantMessage {
-	return (
-		isRecord(value) && value.role === "assistant" && Array.isArray(value.content) && value.content.every(isRecord)
+/**
+ * Normalize a parsed JSONL object into a {@link SessionEntry} for
+ * {@link buildSessionContext} without mutating `record`. Entries that omit
+ * `id` or `parentId` (legacy v1 sessions, minimal fixtures) chain in file
+ * order; entries with explicit tree links keep them.
+ */
+function toSessionEntry(
+	record: Record<string, unknown>,
+	index: number,
+	prevId: string | null,
+	v1Compactions: Array<{ entry: CompactionEntry; firstKeptEntryIndex: number }>,
+): SessionEntry {
+	const id = typeof record.id === "string" && record.id.length > 0 ? record.id : `\0line:${index}`;
+	const parentId =
+		record.parentId === null
+			? null
+			: typeof record.parentId === "string" && record.parentId.length > 0
+				? record.parentId
+				: prevId;
+	const activeLeafId =
+		record.activeLeafId === null || (typeof record.activeLeafId === "string" && record.activeLeafId.length > 0)
+			? record.activeLeafId
+			: undefined;
+	const timestamp = typeof record.timestamp === "string" ? record.timestamp : "1970-01-01T00:00:00.000Z";
+
+	switch (record.type) {
+		case "message": {
+			if (!isRecord(record.message) || typeof record.message.role !== "string") {
+				return { type: "custom", customType: "", id, parentId, activeLeafId, timestamp };
+			}
+			const rawMsg = record.message;
+			const role = rawMsg.role === "hookMessage" ? "custom" : rawMsg.role;
+			const msgTimestamp =
+				typeof rawMsg.timestamp === "number" && Number.isFinite(rawMsg.timestamp) ? rawMsg.timestamp : 0;
+			if (role === "assistant") {
+				if (!Array.isArray(rawMsg.content) || !rawMsg.content.every(isRecord)) {
+					return { type: "custom", customType: "", id, parentId, activeLeafId, timestamp };
+				}
+				const content = rawMsg.content.map(block => {
+					if (block.type === "text" && typeof block.text !== "string") return { ...block, text: "" };
+					if (block.type === "thinking") {
+						return {
+							...block,
+							thinking: typeof block.thinking === "string" ? block.thinking : "",
+							...(block.thinkingSignature !== undefined && typeof block.thinkingSignature !== "string"
+								? { thinkingSignature: undefined }
+								: {}),
+						};
+					}
+					if (block.type === "redactedThinking" && typeof block.data !== "string") return { ...block, data: "" };
+					if (block.type === "toolCall" && typeof block.name !== "string") return { ...block, name: "" };
+					return block;
+				});
+				const stopReason = typeof rawMsg.stopReason === "string" ? rawMsg.stopReason : "stop";
+				return {
+					...record,
+					type: "message",
+					id,
+					parentId,
+					activeLeafId,
+					timestamp,
+					message: {
+						...rawMsg,
+						role: "assistant",
+						stopReason,
+						content,
+						timestamp: msgTimestamp,
+						[LINE_INDEX]: index,
+					},
+				} as unknown as SessionEntry;
+			}
+			if (rawMsg.excludeFromContext === true) {
+				return {
+					...record,
+					type: "message",
+					id,
+					parentId,
+					activeLeafId,
+					timestamp,
+					message: {
+						...rawMsg,
+						role: "bashExecution",
+						command: typeof rawMsg.command === "string" ? rawMsg.command : "",
+						output: typeof rawMsg.output === "string" ? rawMsg.output : "",
+						excludeFromContext: true,
+						timestamp: msgTimestamp,
+						[LINE_INDEX]: index,
+					},
+				} as unknown as SessionEntry;
+			}
+			if (role === "toolResult") {
+				return {
+					...record,
+					type: "message",
+					id,
+					parentId,
+					activeLeafId,
+					timestamp,
+					message: {
+						...rawMsg,
+						role: "toolResult",
+						content: Array.isArray(rawMsg.content) ? rawMsg.content.filter(isRecord) : [],
+						toolName: typeof rawMsg.toolName === "string" ? rawMsg.toolName : "",
+						toolCallId: typeof rawMsg.toolCallId === "string" ? rawMsg.toolCallId : "",
+						timestamp: msgTimestamp,
+						[LINE_INDEX]: index,
+					},
+				} as unknown as SessionEntry;
+			}
+			if (role === "bashExecution") {
+				return {
+					...record,
+					type: "message",
+					id,
+					parentId,
+					activeLeafId,
+					timestamp,
+					message: {
+						...rawMsg,
+						role: "bashExecution",
+						command: typeof rawMsg.command === "string" ? rawMsg.command : "",
+						output: typeof rawMsg.output === "string" ? rawMsg.output : "",
+						timestamp: msgTimestamp,
+						[LINE_INDEX]: index,
+					},
+				} as unknown as SessionEntry;
+			}
+			if (role === "pythonExecution") {
+				return {
+					...record,
+					type: "message",
+					id,
+					parentId,
+					activeLeafId,
+					timestamp,
+					message: {
+						...rawMsg,
+						role: "pythonExecution",
+						code: typeof rawMsg.code === "string" ? rawMsg.code : "",
+						output: typeof rawMsg.output === "string" ? rawMsg.output : "",
+						timestamp: msgTimestamp,
+						[LINE_INDEX]: index,
+					},
+				} as unknown as SessionEntry;
+			}
+			if (role === "fileMention") {
+				return {
+					...record,
+					type: "message",
+					id,
+					parentId,
+					activeLeafId,
+					timestamp,
+					message: {
+						...rawMsg,
+						role: "fileMention",
+						files: Array.isArray(rawMsg.files)
+							? rawMsg.files
+									.filter(isRecord)
+									.map(file => ({ ...file, path: typeof file.path === "string" ? file.path : "" }))
+							: [],
+						timestamp: msgTimestamp,
+						[LINE_INDEX]: index,
+					},
+				} as unknown as SessionEntry;
+			}
+			if (role === "branchSummary" || role === "compactionSummary") {
+				return {
+					...record,
+					type: "message",
+					id,
+					parentId,
+					activeLeafId,
+					timestamp,
+					message: {
+						...rawMsg,
+						role,
+						summary: typeof rawMsg.summary === "string" ? rawMsg.summary : "",
+						fromId: typeof rawMsg.fromId === "string" ? rawMsg.fromId : "",
+						tokensBefore: typeof rawMsg.tokensBefore === "number" ? rawMsg.tokensBefore : 0,
+						timestamp: msgTimestamp,
+						[LINE_INDEX]: index,
+					},
+				} as unknown as SessionEntry;
+			}
+			if (role === "user" || role === "developer" || role === "custom") {
+				return {
+					...record,
+					type: "message",
+					id,
+					parentId,
+					activeLeafId,
+					timestamp,
+					message: {
+						...rawMsg,
+						role,
+						content: typeof rawMsg.content === "string" || Array.isArray(rawMsg.content) ? rawMsg.content : "",
+						customType: typeof rawMsg.customType === "string" ? rawMsg.customType : "",
+						timestamp: msgTimestamp,
+						[LINE_INDEX]: index,
+					},
+				} as unknown as SessionEntry;
+			}
+			return {
+				...record,
+				type: "message",
+				id,
+				parentId,
+				activeLeafId,
+				timestamp,
+				message: {
+					...rawMsg,
+					role: "user",
+					content:
+						typeof rawMsg.content === "string" || Array.isArray(rawMsg.content)
+							? rawMsg.content
+							: [{ type: "text", text: role }],
+					timestamp: msgTimestamp,
+					[LINE_INDEX]: index,
+				},
+			} as unknown as SessionEntry;
+		}
+		case "custom_message":
+			return {
+				...record,
+				type: "custom_message",
+				id,
+				parentId,
+				activeLeafId,
+				timestamp,
+				customType: typeof record.customType === "string" ? record.customType : "",
+				content: typeof record.content === "string" || Array.isArray(record.content) ? record.content : "",
+				display: typeof record.display === "boolean" ? record.display : false,
+			} as unknown as SessionEntry;
+		case "branch_summary":
+			return {
+				...record,
+				type: "branch_summary",
+				id,
+				parentId,
+				activeLeafId,
+				timestamp,
+				summary: typeof record.summary === "string" ? record.summary : "",
+				fromId: typeof record.fromId === "string" ? record.fromId : "",
+			} as unknown as SessionEntry;
+		case "compaction": {
+			const entry = {
+				...record,
+				type: "compaction",
+				id,
+				parentId,
+				activeLeafId,
+				timestamp,
+				summary: typeof record.summary === "string" ? record.summary : "Compacted",
+				firstKeptEntryId: typeof record.firstKeptEntryId === "string" ? record.firstKeptEntryId : "",
+				tokensBefore: typeof record.tokensBefore === "number" ? record.tokensBefore : 0,
+			} as unknown as CompactionEntry;
+			if (typeof record.firstKeptEntryId !== "string" && typeof record.firstKeptEntryIndex === "number") {
+				v1Compactions.push({ entry, firstKeptEntryIndex: record.firstKeptEntryIndex });
+			}
+			return entry;
+		}
+		case "ttsr_injection":
+			return {
+				...record,
+				type: "ttsr_injection",
+				id,
+				parentId,
+				activeLeafId,
+				timestamp,
+				injectedRules: Array.isArray(record.injectedRules)
+					? record.injectedRules.filter((rule): rule is string => typeof rule === "string")
+					: [],
+			} as unknown as SessionEntry;
+		default:
+			return { ...record, id, parentId, activeLeafId, timestamp } as unknown as SessionEntry;
+	}
+}
+
+/**
+ * Line indices belonging to the latest replay turn on the active branch, as
+ * {@link buildSessionContext} and {@link convertMessagesForContextView} rebuild
+ * it on resume: the run of surviving assistant responses joined only by tool
+ * results that ends at the last surviving assistant response.
+ */
+function protectedTurnLines(entries: SessionEntry[]): Set<number> {
+	const keep = new Set<number>();
+	if (entries.length === 0) return keep;
+	const context = buildSessionContext(entries, undefined, undefined, {
+		maxFrameDataBytes: 0,
+	});
+	const converted = convertMessagesForContextView(context.messages);
+	const lastAssistant = converted.findLastIndex(
+		({ message }) => message.role === "assistant" && isSurvivingAssistant(message),
 	);
+	if (lastAssistant < 0) return keep;
+	let firstAssistant = lastAssistant;
+	for (let i = lastAssistant - 1; i >= 0; i--) {
+		const { message } = converted[i]!;
+		if (message.role === "assistant") {
+			if (isSurvivingAssistant(message)) firstAssistant = i;
+		} else if (message.role === "toolResult") {
+			continue;
+		} else if (isBoundaryMessage(message)) {
+			break;
+		}
+	}
+	let turnEnd = lastAssistant;
+	while (turnEnd + 1 < converted.length && converted[turnEnd + 1]!.message.role === "toolResult") {
+		turnEnd += 1;
+	}
+	for (let i = firstAssistant; i <= turnEnd; i++) {
+		const { message, sourceIndex } = converted[i]!;
+		if (message.role !== "assistant" && message.role !== "toolResult") continue;
+		if (message.role === "assistant" && !isSurvivingAssistant(message)) continue;
+		const lineIndex = (context.messages[sourceIndex] as TaggedMessage | undefined)?.[LINE_INDEX];
+		if (lineIndex !== undefined) keep.add(lineIndex);
+	}
+	return keep;
 }
 
 /** Decoded lines of a transcript, gunzipped for an archived `.jsonl.gz`. */
@@ -216,81 +514,53 @@ async function* transcriptLines(file: string): AsyncGenerator<{ bytes: Uint8Arra
 export async function planStrip(file: string, idleBeforeMs: number): Promise<StripPlan | undefined> {
 	const stat = await fs.lstat(file, { bigint: true });
 	if (!stat.isFile() || stat.nlink !== 1n || Number(stat.mtimeMs) > idleBeforeMs) return undefined;
-	const plan: StripPlan = { file, stat, keepStart: -1, keepEnd: -1, records: 0, bytes: 0 };
-	/** Replay data one record loses: the line index and the bytes it occupied. */
-	type Removed = { index: number; bytes: number };
-	/**
-	 * A run of assistant responses joined by tool results: the one assistant
-	 * message a provider replays and validates for the turn, so every response
-	 * that reaches a replay belongs to it.
-	 */
-	interface Turn {
-		/** First record of the run. */
-		start: number;
-		/** Last response of the run that reaches a replay; -1 when none does. */
-		survivor: number;
-		removed: Removed[];
-	}
-	let turn: Turn | undefined;
-	/** The last run holding a surviving response: the one a replay validates as its latest turn. */
-	let latest: Turn | undefined;
-
-	/** Count what `done` loses, keeping every record a replay sends as its latest turn. */
-	const count = (done: Turn, keep: boolean) => {
-		for (const { index, bytes } of done.removed) {
-			if (keep && index >= done.start && index <= done.survivor) continue;
-			plan.records += 1;
-			plan.bytes += bytes;
-		}
-	};
-	/** Count `record` on its own, outside any turn. */
-	const countRecord = (removed: Removed) => {
-		plan.records += 1;
-		plan.bytes += removed.bytes;
-	};
-	/** Close the open run: only one holding a surviving response supersedes `latest`. */
-	const close = (done: Turn | undefined) => {
-		if (done === undefined) return;
-		if (done.survivor < 0) {
-			// No response of it reaches a replay, so it is nobody's latest turn and
-			// `latest` keeps its place; nothing of `done` is kept.
-			count(done, false);
-			return;
-		}
-		if (latest !== undefined) count(latest, false);
-		latest = done;
-	};
+	const entries: SessionEntry[] = [];
+	const fileEntries: Array<SessionEntry | { type: "session" }> = [];
+	const v1Compactions: Array<{ entry: CompactionEntry; firstKeptEntryIndex: number }> = [];
+	const candidates: Array<{ index: number; byteLength: number; record: Record<string, unknown> }> = [];
+	let prevId: string | null = null;
 
 	let index = -1;
 	for await (const { bytes, text } of transcriptLines(file)) {
 		index += 1;
-		const kind = recordKind(text);
-		if (kind === RecordKind.Boundary) {
-			close(turn);
-			turn = undefined;
-		}
-		const replay = REPLAY_KEY_RE.test(text);
-		// Only a record carrying replay data is parsed, unless it is a response
-		// whose survival decides whether its turn is the latest one.
-		if (!replay && kind !== RecordKind.Assistant) continue;
 		const record = parseRecord(text);
-		const lost = replay && stripRecord(record) ? bytes.length - Buffer.byteLength(JSON.stringify(record)) : 0;
-		if (kind === RecordKind.Assistant) {
-			turn ??= { start: index, survivor: -1, removed: [] };
-			if (isSurvivingAssistantRecord(record)) turn.survivor = index;
+		if (!isRecord(record) || typeof record.type !== "string" || record.type === "title") continue;
+		if (record.type === "session") {
+			fileEntries.push({ type: "session" });
+			continue;
 		}
-		if (lost === 0) continue;
-		// A record between two responses is inside the window the turn spans, so
-		// it is kept or stripped with the turn; only a record no turn is open for
-		// is decided on its own.
-		if (turn) turn.removed.push({ index, bytes: lost });
-		else countRecord({ index, bytes: lost });
+		if (record.type === "message") {
+			candidates.push({ index, byteLength: bytes.length, record });
+		}
+		const entry = toSessionEntry(record, index, prevId, v1Compactions);
+		entries.push(entry);
+		fileEntries.push(entry);
+		if (entry.activeLeafId === undefined || entry.activeLeafId === entry.id) {
+			prevId = entry.id;
+		}
 	}
-	close(turn);
-	if (latest !== undefined) {
-		plan.keepStart = latest.start;
-		plan.keepEnd = latest.survivor;
-		count(latest, true);
+	if (candidates.length === 0) return undefined;
+	for (const { entry, firstKeptEntryIndex } of v1Compactions) {
+		const target = fileEntries[firstKeptEntryIndex] ?? entries[firstKeptEntryIndex];
+		if (target && target.type !== "session") {
+			entry.firstKeptEntryId = target.id;
+		}
+	}
+
+	const keep = protectedTurnLines(entries);
+	let keepStart = -1;
+	let keepEnd = -1;
+	for (const lineIndex of keep) {
+		if (keepStart < 0 || lineIndex < keepStart) keepStart = lineIndex;
+		if (lineIndex > keepEnd) keepEnd = lineIndex;
+	}
+	const strip = new Set<number>();
+	const plan: StripPlan = { file, stat, keep, strip, keepStart, keepEnd, records: 0, bytes: 0 };
+	for (const { index: lineIndex, byteLength, record } of candidates) {
+		if (keep.has(lineIndex) || !stripRecord(record)) continue;
+		strip.add(lineIndex);
+		plan.records += 1;
+		plan.bytes += byteLength - Buffer.byteLength(JSON.stringify(record));
 	}
 	return plan.records > 0 ? plan : undefined;
 }
@@ -302,8 +572,7 @@ async function* strippedChunks(plan: StripPlan): AsyncGenerator<Buffer> {
 	let index = -1;
 	for await (const { bytes, text } of transcriptLines(plan.file)) {
 		index += 1;
-		const keep = index >= plan.keepStart && index <= plan.keepEnd;
-		const record = !keep && REPLAY_KEY_RE.test(text) ? parseRecord(text) : undefined;
+		const record = plan.strip.has(index) ? parseRecord(text) : undefined;
 		const line = stripRecord(record) ? Buffer.from(JSON.stringify(record)) : bytes;
 		parts.push(line, NEWLINE);
 		size += line.length + 1;
@@ -322,7 +591,8 @@ function unchangedSincePlan(plan: StripPlan): boolean {
 		current.ino === plan.stat.ino &&
 		current.nlink === 1n &&
 		current.size === plan.stat.size &&
-		current.mtimeNs === plan.stat.mtimeNs
+		current.mtimeNs === plan.stat.mtimeNs &&
+		current.mode === plan.stat.mode
 	);
 }
 
@@ -341,8 +611,16 @@ function utimeSeconds(ns: bigint): number {
  */
 export async function applyStrip(plan: StripPlan, storage: FileSessionStorage): Promise<boolean> {
 	const staged = sessionStagingPath(plan.file);
+	const mode = Number(plan.stat.mode & FILE_PERMISSION_MASK);
 	try {
-		const sink = (await fs.open(staged, "wx")).createWriteStream();
+		const handle = await fs.open(staged, "wx", mode);
+		try {
+			await handle.chmod(mode);
+		} catch (error) {
+			await handle.close();
+			throw error;
+		}
+		const sink = handle.createWriteStream();
 		if (plan.file.endsWith(GZIP_SUFFIX)) await pipeline(strippedChunks(plan), createGzip({ level: 9 }), sink);
 		else await pipeline(strippedChunks(plan), sink);
 		await fs.utimes(staged, utimeSeconds(plan.stat.atimeNs), utimeSeconds(plan.stat.mtimeNs));
