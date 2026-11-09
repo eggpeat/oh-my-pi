@@ -54,7 +54,11 @@ export interface BashExecutorOptions {
 	onPreview?: (text: string) => void;
 	chunkThrottleMs?: number;
 	signal?: AbortSignal;
-	/** Session key suffix to isolate shell sessions per agent */
+	/**
+	 * Session key to isolate shell sessions per agent. A namespaced form
+	 * (`eval:<session id>`, `loop-condition:<session id>`) keeps a surface's shells
+	 * apart from the bash tool's while still being released with that session.
+	 */
 	sessionKey?: string;
 	/** Additional environment variables to inject */
 	env?: Record<string, string>;
@@ -353,19 +357,41 @@ function quarantineShellSession(
 		.catch(() => undefined);
 }
 
+/** A surface namespace in a shell key (`eval`, `loop-condition`), never a path prefix. */
+const SESSION_NAMESPACE_LABEL = /^[A-Za-z][A-Za-z0-9_-]*$/;
+
 /**
- * Drops every persistent Shell owned by an agent session (keys built with
- * `agentSessionKey` as the {@link BashExecutorOptions.sessionKey}). The map is
- * process-global, so without this each disposed session keeps its native shell
- * for the life of the process. A Shell with live background jobs is retained
- * until they exit, matching the `:async:` teardown; an in-flight run keeps its
- * own reference and drops the Shell when it settles.
+ * Whether a shell cache key's session field belongs to `agentSessionKey`. The
+ * field is either the bare id (the bash tool's own shells) or one namespace of
+ * it, `<label>:<id>` (`eval:<id>` for the eval `sh` helper,
+ * `loop-condition:<id>` for `/loop`), which keeps those shells isolated per
+ * surface while still being owned by, and released with, the session that
+ * created them. Only an identifier-shaped leading label counts, so the
+ * `:async:` job suffix and cwd-scoped keys name no session and stay untouched.
+ */
+function isSessionOwnedField(sessionField: string, agentSessionKey: string): boolean {
+	if (sessionField === agentSessionKey) return true;
+	const labelEnd = sessionField.indexOf(":");
+	if (labelEnd <= 0) return false;
+	if (!SESSION_NAMESPACE_LABEL.test(sessionField.slice(0, labelEnd))) return false;
+	return sessionField.slice(labelEnd + 1) === agentSessionKey;
+}
+
+/**
+ * Drops every persistent Shell owned by an agent session: keys whose session
+ * field is the id itself or one of its namespaces (see
+ * {@link isSessionOwnedField}). The map is process-global, so without this each
+ * disposed session keeps its native shells — the bash tool's, the eval `sh`
+ * helper's, and `/loop`'s — for the life of the process. A Shell with live
+ * background jobs is retained until they exit, matching the `:async:` teardown;
+ * an in-flight run keeps its own reference and drops the Shell when it settles.
  */
 export function releaseShellSessions(agentSessionKey: string | undefined): void {
 	if (!agentSessionKey) return;
-	const prefix = `${agentSessionKey}\n`;
 	for (const [key, shell] of shellSessions) {
-		if (!key.startsWith(prefix)) continue;
+		const separator = key.indexOf("\n");
+		const sessionField = separator === -1 ? key : key.slice(0, separator);
+		if (!isSessionOwnedField(sessionField, agentSessionKey)) continue;
 		shellSessions.delete(key);
 		if (!shellSessionsInUse.has(key)) void retainShellWithLiveBackgroundJobs(shell);
 	}

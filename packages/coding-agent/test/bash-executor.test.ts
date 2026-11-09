@@ -11,6 +11,7 @@ import {
 	buildMinimizerOptions,
 	executeBash,
 	isPersistentShellCdCommand,
+	releaseShellSessions,
 } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import * as direnvModule from "@oh-my-pi/pi-coding-agent/exec/direnv";
 import { DEFAULT_MAX_BYTES } from "@oh-my-pi/pi-tui/tools/streaming-output";
@@ -914,6 +915,33 @@ exit 64
 			sessionKey: "settled-native-abort",
 		});
 		expect(next.output.trim()).toBe("still_persistent");
+	});
+
+	it("releases a session's namespaced shells with its own, leaving other sessions alone", async () => {
+		// Session-owned shells are keyed `<label>:<id>` (eval `sh`, /loop conditions)
+		// beside the bash tool's bare `<id>`. Release must collect all of them, or a
+		// disposed session keeps a native shell for the life of the process.
+		const id = `release-namespaced-${crypto.randomUUID()}`;
+		const other = `${id}-other`;
+		const run = (sessionKey: string, command: string) =>
+			executeBash(command, { cwd: tempDir, timeout: 5000, sessionKey });
+		try {
+			await run(id, "PI_PLAIN=kept");
+			await run(`eval:${id}`, "PI_EVAL=kept");
+			await run(`loop-condition:${id}`, "PI_LOOP=kept");
+			await run(`eval:${other}`, "PI_OTHER=kept");
+
+			releaseShellSessions(id);
+
+			expect((await run(id, 'printf "[%s]" "$PI_PLAIN"')).output).toBe("[]");
+			expect((await run(`eval:${id}`, 'printf "[%s]" "$PI_EVAL"')).output).toBe("[]");
+			expect((await run(`loop-condition:${id}`, 'printf "[%s]" "$PI_LOOP"')).output).toBe("[]");
+			// A different session's namespaced shell is not ours to drop.
+			expect((await run(`eval:${other}`, 'printf "[%s]" "$PI_OTHER"')).output).toBe("[kept]");
+		} finally {
+			releaseShellSessions(id);
+			releaseShellSessions(other);
+		}
 	});
 
 	it("aborts the shell without aborting its native signal when the JavaScript timeout fallback wins", async () => {
