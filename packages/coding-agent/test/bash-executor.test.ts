@@ -917,27 +917,36 @@ exit 64
 		expect(next.output.trim()).toBe("still_persistent");
 	});
 
-	it("releases a session's namespaced shells with its own, leaving other sessions alone", async () => {
-		// Session-owned shells are keyed `<label>:<id>` (eval `sh`, /loop conditions)
-		// beside the bash tool's bare `<id>`. Release must collect all of them, or a
-		// disposed session keeps a native shell for the life of the process.
-		const id = `release-namespaced-${crypto.randomUUID()}`;
-		const other = `${id}-other`;
+	it("releases a session's own and namespaced shells, leaving other sessions alone", async () => {
+		// A session's shells are cached under the session key itself (the bash tool's
+		// own) or under one namespace of it, `<label>:<session id>` (the eval `sh`
+		// helper, a /loop condition). Release must collect both, or a disposed
+		// session keeps a native shell for the life of the process; another
+		// session's namespaced shell is not its to drop.
+		const id = crypto.randomUUID();
+		const other = crypto.randomUUID();
 		const run = (sessionKey: string, command: string) =>
 			executeBash(command, { cwd: tempDir, timeout: 5000, sessionKey });
 		try {
 			await run(id, "PI_PLAIN=kept");
 			await run(`eval:${id}`, "PI_EVAL=kept");
 			await run(`loop-condition:${id}`, "PI_LOOP=kept");
-			await run(`eval:${other}`, "PI_OTHER=kept");
+			await run(other, "PI_OTHER=kept");
+			await run(`eval:${other}`, "PI_OTHER_EVAL=kept");
+			// A key whose prefix before the colon is a path, not a surface label, is no
+			// namespace of `id` even though its tail reads like one.
+			await run(`/work/repo:${id}`, "PI_PATH_KEY=kept");
 
 			releaseShellSessions(id);
 
 			expect((await run(id, 'printf "[%s]" "$PI_PLAIN"')).output).toBe("[]");
 			expect((await run(`eval:${id}`, 'printf "[%s]" "$PI_EVAL"')).output).toBe("[]");
 			expect((await run(`loop-condition:${id}`, 'printf "[%s]" "$PI_LOOP"')).output).toBe("[]");
-			// A different session's namespaced shell is not ours to drop.
-			expect((await run(`eval:${other}`, 'printf "[%s]" "$PI_OTHER"')).output).toBe("[kept]");
+			// Another session's shells, plain and namespaced, survive, and so does a
+			// colon-bearing key that is not a `<label>:<id>` namespace.
+			expect((await run(`/work/repo:${id}`, 'printf "[%s]" "$PI_PATH_KEY"')).output).toBe("[kept]");
+			expect((await run(other, 'printf "[%s]" "$PI_OTHER"')).output).toBe("[kept]");
+			expect((await run(`eval:${other}`, 'printf "[%s]" "$PI_OTHER_EVAL"')).output).toBe("[kept]");
 		} finally {
 			releaseShellSessions(id);
 			releaseShellSessions(other);

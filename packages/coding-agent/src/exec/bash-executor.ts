@@ -54,11 +54,7 @@ export interface BashExecutorOptions {
 	onPreview?: (text: string) => void;
 	chunkThrottleMs?: number;
 	signal?: AbortSignal;
-	/**
-	 * Session key to isolate shell sessions per agent. A namespaced form
-	 * (`eval:<session id>`, `loop-condition:<session id>`) keeps a surface's shells
-	 * apart from the bash tool's while still being released with that session.
-	 */
+	/** Session key suffix to isolate shell sessions per agent */
 	sessionKey?: string;
 	/** Additional environment variables to inject */
 	env?: Record<string, string>;
@@ -357,41 +353,37 @@ function quarantineShellSession(
 		.catch(() => undefined);
 }
 
-/** A surface namespace in a shell key (`eval`, `loop-condition`), never a path prefix. */
-const SESSION_NAMESPACE_LABEL = /^[A-Za-z][A-Za-z0-9_-]*$/;
+/** A surface label as it appears in a namespaced shell key (`eval`, `loop-condition`). */
+const SHELL_SESSION_LABEL = /^[A-Za-z][A-Za-z0-9_-]*$/;
 
 /**
- * Whether a shell cache key's session field belongs to `agentSessionKey`. The
- * field is either the bare id (the bash tool's own shells) or one namespace of
- * it, `<label>:<id>` (`eval:<id>` for the eval `sh` helper,
- * `loop-condition:<id>` for `/loop`), which keeps those shells isolated per
- * surface while still being owned by, and released with, the session that
- * created them. Only an identifier-shaped leading label counts, so the
- * `:async:` job suffix and cwd-scoped keys name no session and stay untouched.
+ * Whether a shell cache key belongs to `agentSessionKey`, matching the session
+ * key the shell was cached under: the id itself (the bash tool's own shells) or
+ * one namespace of it, `<label>:<id>` (the eval `sh` helper uses `eval:<id>`, a
+ * `/loop` condition uses `loop-condition:<id>`). A per-job `<id>:async:<jobId>`
+ * key names no session, and a label must read like one, so a key whose prefix is
+ * a path (`/work/repo:main`) is another session's, not a namespace.
  */
-function isSessionOwnedField(sessionField: string, agentSessionKey: string): boolean {
-	if (sessionField === agentSessionKey) return true;
-	const labelEnd = sessionField.indexOf(":");
-	if (labelEnd <= 0) return false;
-	if (!SESSION_NAMESPACE_LABEL.test(sessionField.slice(0, labelEnd))) return false;
-	return sessionField.slice(labelEnd + 1) === agentSessionKey;
+function isShellSessionOwnedBy(key: string, agentSessionKey: string): boolean {
+	const sessionField = key.split("\n", 1)[0];
+	const separator = sessionField.indexOf(":");
+	if (separator === -1) return sessionField === agentSessionKey;
+	if (!SHELL_SESSION_LABEL.test(sessionField.slice(0, separator))) return false;
+	return sessionField.slice(separator + 1) === agentSessionKey;
 }
 
 /**
- * Drops every persistent Shell owned by an agent session: keys whose session
- * field is the id itself or one of its namespaces (see
- * {@link isSessionOwnedField}). The map is process-global, so without this each
- * disposed session keeps its native shells — the bash tool's, the eval `sh`
- * helper's, and `/loop`'s — for the life of the process. A Shell with live
- * background jobs is retained until they exit, matching the `:async:` teardown;
- * an in-flight run keeps its own reference and drops the Shell when it settles.
+ * Drops every persistent Shell owned by an agent session (see
+ * {@link isShellSessionOwnedBy}: the id itself or one namespace of it). The map
+ * is process-global, so without this each disposed session keeps its native
+ * shell for the life of the process. A Shell with live background jobs is
+ * retained until they exit, matching the `:async:` teardown; an in-flight run
+ * keeps its own reference and drops the Shell when it settles.
  */
 export function releaseShellSessions(agentSessionKey: string | undefined): void {
 	if (!agentSessionKey) return;
 	for (const [key, shell] of shellSessions) {
-		const separator = key.indexOf("\n");
-		const sessionField = separator === -1 ? key : key.slice(0, separator);
-		if (!isSessionOwnedField(sessionField, agentSessionKey)) continue;
+		if (!isShellSessionOwnedBy(key, agentSessionKey)) continue;
 		shellSessions.delete(key);
 		if (!shellSessionsInUse.has(key)) void retainShellWithLiveBackgroundJobs(shell);
 	}
