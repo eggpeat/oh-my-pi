@@ -3040,8 +3040,11 @@ describe("runGcCommand replay data stripping", () => {
 		];
 		await writeTranscript(file, lines, 40);
 
-		await runGcCommand({ flags: { agentDir: root, strip: true, apply: true } });
+		const result = await runGcCommand({ flags: { agentDir: root, strip: true, apply: true } });
 
+		// The cut-off response never reaches a replay, so it neither keeps its
+		// signature nor displaces the finished turn that is the latest one sent.
+		expect(result.strip).toMatchObject({ wouldStrip: 1, stripped: 1, records: 1 });
 		const after = (await Bun.file(file).text()).split("\n").slice(0, -1);
 		expect(after[1]).toBe(lines[1]);
 		expect(JSON.parse(after[3]).message.content).toEqual([{ type: "thinking", thinking: "" }]);
