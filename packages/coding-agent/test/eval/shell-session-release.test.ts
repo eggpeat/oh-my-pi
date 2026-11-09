@@ -169,17 +169,36 @@ describe("eval sh session shell lifecycle", () => {
 	);
 
 	it.skipIf(process.platform === "win32")(
-		"quotes sh template interpolations safely inside surrounding quotes",
+		"quotes sh template interpolations safely across quotes, comments, and case command substitutions",
 		async () => {
 			const sessionId = `eval-sh-quotes-${crypto.randomUUID()}`;
 			const harness = createHarness(sessionId);
-			const literal = await harness.runJs(`
+			const outcome = await harness.runJs(`
 				const payload = "$(printf injected)";
-				return await sh\`printf '%s|%s|%s|%s|%s' \${payload} "\${payload}" '\${payload}' "\\"\${payload}\\"" "$( (printf '%s' "\${payload}") )"\`;
+				const literal = await sh\`# don't
+printf '%s|%s|%s|%s|%s|%s|%s' \${payload} "\${payload}" '\${payload}' $'\\'\${payload}' "\\"\${payload}\\"" "$( (printf '%s' "\${payload}") )" "$(case case in (case|other) printf 'case:'; printf '%s' "\${payload}" ;; esac)"\`;
+				const rejected = [];
+				for (const fn of [
+					() => sh\`printf '%s' ok # don't \${payload}\`,
+					() => sh\`cat <<EOF
+\${payload}
+EOF\`,
+					() => sh\`printf '%s' "$((\${payload}))"\`,
+				]) {
+					try {
+						await fn();
+						rejected.push("resolved");
+					} catch (error) {
+						rejected.push(error.name);
+					}
+				}
+				return { literal, rejected };
 			`);
-			expect(literal).toBe(
-				'$(printf injected)|$(printf injected)|$(printf injected)|"$(printf injected)"|$(printf injected)',
-			);
+			expect(outcome).toEqual({
+				literal:
+					'$(printf injected)|$(printf injected)|$(printf injected)|\'$(printf injected)|"$(printf injected)"|$(printf injected)|case:$(printf injected)',
+				rejected: ["TypeError", "TypeError", "TypeError"],
+			});
 		},
 	);
 });

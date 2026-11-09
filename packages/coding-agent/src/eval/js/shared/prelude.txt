@@ -85,36 +85,163 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 		let command = "";
 		const stack = [];
 		let escaped = false;
+		let comment = false;
+		let heredoc = false;
+		let word = "";
+		let cmdStart = true;
+		const flushWord = () => {
+			if (!word) return;
+			const top = stack[stack.length - 1] ?? null;
+			if (top?.kind === "case" && top.header) {
+				if (word === "in") {
+					top.header = false;
+					top.pattern = true;
+				}
+			} else if (top?.kind === "case" && top.pattern) {
+				if (word === "esac") {
+					stack.pop();
+					cmdStart = false;
+				}
+			} else if (cmdStart) {
+				if (word === "case") {
+					stack.push({ kind: "case", header: true, pattern: false });
+					cmdStart = false;
+				} else if (word === "esac" && top?.kind === "case") {
+					stack.pop();
+					cmdStart = false;
+				} else {
+					cmdStart =
+						word === "then" ||
+						word === "do" ||
+						word === "else" ||
+						word === "elif" ||
+						word === "{" ||
+						word === "!";
+				}
+			}
+			word = "";
+		};
 		for (let index = 0; index < strings.raw.length; index++) {
 			const segment = strings.raw[index];
 			for (let i = 0; i < segment.length; i++) {
 				const ch = segment[i];
 				const top = stack[stack.length - 1] ?? null;
-				if (escaped) {
+				if (comment) {
+					if (ch === "\n") {
+						comment = false;
+						cmdStart = true;
+					}
+				} else if (escaped) {
 					escaped = false;
+					if (top !== "'" && top !== "$'" && top !== '"') word += ch;
 				} else if (ch === "\\" && top !== "'") {
-					escaped = true;
-				} else if (top === "'") {
-					if (ch === "'") stack.pop();
+					if (segment[i + 1] === "\n") i++;
+					else escaped = true;
+				} else if (top === "'" || top === "$'") {
+					if (ch === "'") {
+						stack.pop();
+						word = "'";
+					}
+				} else if (top === "`") {
+					if (ch === "`") {
+						stack.pop();
+						word = "`";
+					}
+				} else if (ch === "`") {
+					stack.push("`");
 				} else if (ch === "$" && segment[i + 1] === "(") {
-					stack.push("(");
+					flushWord();
+					if (segment[i + 2] === "(") {
+						stack.push("((");
+						i += 2;
+					} else {
+						stack.push("(");
+						cmdStart = true;
+						i++;
+					}
+				} else if (ch === "$" && segment[i + 1] === "'" && top !== '"') {
+					stack.push("$'");
 					i++;
 				} else if (top === '"') {
-					if (ch === '"') stack.pop();
+					if (ch === '"') {
+						stack.pop();
+						word = '"';
+					}
+				} else if (ch === "#" && !word) {
+					comment = true;
+				} else if (ch === "<" && segment[i + 1] === "<" && segment[i + 2] !== "<") {
+					flushWord();
+					heredoc = true;
+					i++;
 				} else if (ch === "'" || ch === '"') {
 					stack.push(ch);
-				} else if (top === "(" && ch === "(") {
-					stack.push("(");
-				} else if (top === "(" && ch === ")") {
-					stack.pop();
+				} else if (ch === " " || ch === "\t" || ch === "\r") {
+					flushWord();
+				} else if (ch === ";") {
+					flushWord();
+					const cur = stack[stack.length - 1] ?? null;
+					if (
+						cur?.kind === "case" &&
+						!cur.header &&
+						!cur.pattern &&
+						(segment[i + 1] === ";" || segment[i + 1] === "&")
+					) {
+						cur.pattern = true;
+						cmdStart = false;
+						if (segment[i + 1] === ";" && segment[i + 2] === "&") i += 2;
+						else i++;
+					} else {
+						cmdStart = true;
+					}
+				} else if (ch === "\n" || ch === "&" || ch === "|") {
+					flushWord();
+					const cur = stack[stack.length - 1] ?? null;
+					if (!(cur?.kind === "case" && (cur.header || (cur.pattern && ch === "|")))) {
+						cmdStart = true;
+					}
+				} else if (ch === "(") {
+					const hadWord = word !== "";
+					flushWord();
+					const cur = stack[stack.length - 1] ?? null;
+					if (segment[i + 1] === "(" && !(cur?.kind === "case" && cur.pattern)) {
+						stack.push("((");
+						i++;
+					} else if (!(cur?.kind === "case" && cur.pattern && !hadWord)) {
+						stack.push("(");
+						cmdStart = true;
+					}
+				} else if (ch === ")") {
+					flushWord();
+					const cur = stack[stack.length - 1] ?? null;
+					if (cur === "((" && segment[i + 1] === ")") {
+						stack.pop();
+						i++;
+					} else if (cur === "(") {
+						stack.pop();
+					} else if (cur?.kind === "case" && cur.pattern) {
+						cur.pattern = false;
+					}
+					cmdStart = true;
+				} else {
+					word += ch;
 				}
 			}
 			command += segment;
 			if (index < values.length) {
 				const top = stack[stack.length - 1] ?? null;
+				if (escaped || comment || heredoc || stack.includes("`") || stack.includes("((")) {
+					throw new TypeError("sh`...` interpolation is not supported in this shell context");
+				}
 				const value = values[index];
 				const words = Array.isArray(value) ? value.map(shellQuote).join(" ") : shellQuote(value);
-				command += top === '"' || top === "'" ? `${top}${words}${top}` : words;
+				if (top === '"' || top === "'") {
+					command += `${top}${words}${top}`;
+				} else if (top === "$'") {
+					command += `'${words}$'`;
+				} else {
+					command += words;
+					word = "'";
+				}
 			}
 		}
 		return command;
