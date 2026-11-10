@@ -363,10 +363,8 @@ const SHELL_SESSION_LABEL = /^[A-Za-z][A-Za-z0-9_-]*$/;
  * `/loop` condition uses `loop-condition:<id>`). A per-job `<id>:async:<jobId>`
  * key names no session, and a label must read like one, so a key whose prefix is
  * a path (`/work/repo:main`) is another session's, not a namespace.
- *
- * The id itself is matched before any colon is read: a session id may contain
- * one (a cwd-derived `/work/repo:main`), and such a session must still release
- * its own shells.
+ * The id itself is matched before any colon is read, so a session whose own id
+ * contains one (a cwd-derived `/work/repo:main`) still releases its shells.
  */
 function isShellSessionOwnedBy(key: string, agentSessionKey: string): boolean {
 	const sessionField = key.split("\n", 1)[0];

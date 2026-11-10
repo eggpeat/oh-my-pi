@@ -925,6 +925,7 @@ exit 64
 		// session's namespaced shell is not its to drop.
 		const id = crypto.randomUUID();
 		const other = crypto.randomUUID();
+		const colonId = `/work/repo:${crypto.randomUUID()}`;
 		const run = (sessionKey: string, command: string) =>
 			executeBash(command, { cwd: tempDir, timeout: 5000, sessionKey });
 		try {
@@ -939,7 +940,6 @@ exit 64
 			await run(pathLike, "PI_PATH_KEY=kept");
 			// A session id may itself contain a colon (a cwd-derived session name);
 			// that session's own shells are still its to release.
-			const colonId = `/work/repo:${crypto.randomUUID()}`;
 			await run(colonId, "PI_COLON=kept");
 			await run(`eval:${colonId}`, "PI_COLON_EVAL=kept");
 
@@ -959,6 +959,7 @@ exit 64
 		} finally {
 			releaseShellSessions(id);
 			releaseShellSessions(other);
+			releaseShellSessions(colonId);
 			releaseShellSessions(`/work/repo:${id}`);
 		}
 	});
