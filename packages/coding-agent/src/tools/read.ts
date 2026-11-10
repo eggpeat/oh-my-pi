@@ -909,15 +909,15 @@ const kSpotlightWindow = Symbol("read.spotlightWindow");
 const kSpotlightWide = Symbol("read.spotlightWide");
 
 /**
- * Marks a result of a `;` path list holding a `:raw` part: the joined text carries those exact bytes, so the
- * Spotlight experiment must not shape it (see {@link ReadTool.execute}).
+ * Results of a `;` path list holding a `:raw` part: the joined text carries those exact bytes, so the Spotlight
+ * experiment must not shape it (see {@link ReadTool.execute}). The details cannot say so: `raw` there means the whole
+ * result is one selector's bytes, which a list of parts is not.
  */
-const kVerbatim = Symbol("read.verbatim");
+const verbatimResults = new WeakSet<AgentToolResult<ReadToolDetails>>();
 
 interface ReadDetailsWithWindow extends ReadToolDetails {
 	[kSpotlightWindow]?: ShapeInput["read"];
 	[kSpotlightWide]?: true;
-	[kVerbatim]?: true;
 }
 
 /**
@@ -1397,9 +1397,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		}
 		flushText();
 
-		const details: ReadDetailsWithWindow = { notes, displayReadTargets, displayReadTargetLinks };
-		if (verbatim) details[kVerbatim] = true;
-		return toolResult<ReadToolDetails>(details).content(content).done();
+		const result = toolResult<ReadToolDetails>({ notes, displayReadTargets, displayReadTargetLinks })
+			.content(content)
+			.done();
+		if (verbatim) verbatimResults.add(result);
+		return result;
 	}
 
 	/**
@@ -1880,7 +1882,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		// A `:raw` result is its selector's exact bytes; shaping (outlining, folding, compaction, seen-line collapse,
 		// relevance cuts) would replace them with a rendering that only claims to be raw. A `;` list holding a `:raw`
 		// part is such a result too, its other parts inside the same text.
-		const verbatim = innerDetails?.raw === true || innerDetails?.[kVerbatim] === true;
+		const verbatim = innerDetails?.raw === true || verbatimResults.has(inner);
 		const result = verbatim
 			? inner
 			: await shapeToolResult(
