@@ -908,9 +908,16 @@ const kSpotlightWindow = Symbol("read.spotlightWindow");
  */
 const kSpotlightWide = Symbol("read.spotlightWide");
 
+/**
+ * Marks a result of a `;` path list holding a `:raw` part: the joined text carries those exact bytes, so the
+ * Spotlight experiment must not shape it (see {@link ReadTool.execute}).
+ */
+const kVerbatim = Symbol("read.verbatim");
+
 interface ReadDetailsWithWindow extends ReadToolDetails {
 	[kSpotlightWindow]?: ShapeInput["read"];
 	[kSpotlightWide]?: true;
+	[kVerbatim]?: true;
 }
 
 /**
@@ -1341,6 +1348,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const notice = `Note: interpreted as ${parts.length} paths: ${parts.join(", ")}`;
 		const notes = [notice];
 		const content: Array<TextContent | ImageContent> = [];
+		/** A `:raw` part is its selector's exact bytes; the joined text must not be shaped. */
+		let verbatim = false;
 		const displayReadTargets: string[] = [];
 		const displayReadTargetLinks: Array<string | null> = [];
 		let pendingText = notice;
@@ -1356,6 +1365,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		for (const part of parts) {
 			try {
 				const result = await this.execute("read-delimited-part", { path: part }, signal, undefined, toolContext);
+				if (result.details?.raw === true) verbatim = true;
 				const nestedTargets = result.details?.displayReadTargets;
 				if (nestedTargets?.length) {
 					const nestedLinks = result.details?.displayReadTargetLinks;
@@ -1387,7 +1397,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		}
 		flushText();
 
-		return toolResult<ReadToolDetails>({ notes, displayReadTargets, displayReadTargetLinks }).content(content).done();
+		const details: ReadDetailsWithWindow = { notes, displayReadTargets, displayReadTargetLinks };
+		if (verbatim) details[kVerbatim] = true;
+		return toolResult<ReadToolDetails>(details).content(content).done();
 	}
 
 	/**
@@ -1865,29 +1877,40 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	): Promise<AgentToolResult<ReadToolDetails>> {
 		const inner = await this.#executeInner(toolCallId, params, signal, onUpdate, toolContext);
 		const innerDetails: ReadDetailsWithWindow | undefined = inner.details;
-		const result = await shapeToolResult(
-			this.session,
-			toolCallId,
-			{ tool: "read", source: `read ${params.path}`, path: params.path, read: innerDetails?.[kSpotlightWindow] },
-			inner,
-			signal,
-			{
-				plain: innerDetails?.[kSpotlightWide]
-					? () =>
-							this.#executeInner(
-								toolCallId,
-								params,
-								signal,
-								undefined,
-								toolContext,
-								undefined,
-								undefined,
-								undefined,
-								true,
-							)
-					: undefined,
-			},
-		);
+		// A `:raw` result is its selector's exact bytes; shaping (outlining, folding, compaction, seen-line collapse,
+		// relevance cuts) would replace them with a rendering that only claims to be raw. A `;` list holding a `:raw`
+		// part is such a result too, its other parts inside the same text.
+		const verbatim = innerDetails?.raw === true || innerDetails?.[kVerbatim] === true;
+		const result = verbatim
+			? inner
+			: await shapeToolResult(
+					this.session,
+					toolCallId,
+					{
+						tool: "read",
+						source: `read ${params.path}`,
+						path: params.path,
+						read: innerDetails?.[kSpotlightWindow],
+					},
+					inner,
+					signal,
+					{
+						plain: innerDetails?.[kSpotlightWide]
+							? () =>
+									this.#executeInner(
+										toolCallId,
+										params,
+										signal,
+										undefined,
+										toolContext,
+										undefined,
+										undefined,
+										undefined,
+										true,
+									)
+							: undefined,
+					},
+				);
 		const displayTarget = InternalUrlRouter.instance().locateSync(params.path);
 		if (displayTarget && result.details) result.details.displayTarget = displayTarget;
 		appendRepeatReadHint(this.session, params.path, result);
