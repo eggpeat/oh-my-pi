@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed agents showing as idle in the Agent Hub while still running after a failed streaming edit preview (`edit.streamingAbort`) auto-recovered the turn ([#18790](https://github.com/can1357/oh-my-pi/pull/18790) by [@H4vC](https://github.com/H4vC))
 - A browser call on a tab that is not open now says to open it with `await browser.open({ name })` (Python: `await browser.open(name=…)`) and the url and app it was opened with, instead of pointing at the removed `action:"open"` ([#18739](https://github.com/can1357/oh-my-pi/pull/18739) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed `computer.window({ app })` and `computer.windows({ app })` matching similarly named apps when the exact app name has an open window, such as Google Chrome alongside Google Chrome for Testing ([#18744](https://github.com/can1357/oh-my-pi/pull/18744) by [@will-bogusz](https://github.com/will-bogusz))
 - In Tern, browser `role/` selectors keep input roles and names under Turkish and Azeri locales ([#18658](https://github.com/can1357/oh-my-pi/pull/18658) by [@will-bogusz](https://github.com/will-bogusz))
@@ -11,6 +12,10 @@
 - An `omp -p` or other omp that your session's bash tool or eval cell starts inside Tern or cmux no longer picks Tern or cmux from the pane it inherited, so its browser tabs stop floating over your pane ([#18773](https://github.com/can1357/oh-my-pi/pull/18773) by [@will-bogusz](https://github.com/will-bogusz))
 - Browser relay connections sharing a tab no longer lose cross-site frames when another connection disables auto-attachment on its page; automatic children detach locally when their last armed page leaves, while explicitly attached frame subtrees remain usable after opting out ([#18657](https://github.com/can1357/oh-my-pi/pull/18657) by [@will-bogusz](https://github.com/will-bogusz))
 - Browser agents now say when a step can't be done through the page, instead of patching the page with scripts and reporting the step as done ([#18761](https://github.com/can1357/oh-my-pi/pull/18761) by [@will-bogusz](https://github.com/will-bogusz))
+### Changed
+
+- `curl -fsSL https://omp.sh/install | sh` and `install.ps1` now install the standalone binary by default, even when bun is present, so installs get delta updates; pass `--source`/`-Source` for a bun package install
+- Ask forms can attach notes to selected options; those notes accompany the answers separately from submitted form values ([#18779](https://github.com/can1357/oh-my-pi/pull/18779) by [@Shadorain](https://github.com/Shadorain))
 
 ## [18.18.7] - 2026-11-10
 
