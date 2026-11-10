@@ -24,6 +24,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
+import * as scrapers from "@oh-my-pi/pi-coding-agent/web/scrapers/types";
 import { reasonShows, type SpotlightReason, spotlightDetails } from "@oh-my-pi/pi-tui/chat/spotlight";
 import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
@@ -385,11 +386,124 @@ describe("spotlight whole reads", () => {
 		const read = async ({ session }: { session: ToolSession }, target: string) =>
 			resultText(await new ReadTool(session).execute("r1", { path: target }));
 
-		for (const target of ["wide.md", "wide.md:1-10,20-30", "wide.ts:5-40", "wide.ts:5+30"]) {
+		for (const target of ["wide.md", "wide.md:1-10,20-30", "wide.ts:5-40", "wide.ts:5+30", "wide.ts:raw:5-40"]) {
 			expect(await read(shaped, target)).toBe(await read(plain, target));
 		}
-		for (const target of ["wide.ts:1-10,20-30", "wide.ts:raw:5-40"]) {
-			expect(await read(shaped, target)).not.toBe(await read(plain, target));
+		expect(await read(shaped, "wide.ts:1-10,20-30")).not.toBe(await read(plain, "wide.ts:1-10,20-30"));
+	});
+});
+
+describe("spotlight raw reads", () => {
+	/** Twelve nested Python functions: long enough to be outlined, folded and cut when shaped. */
+	const SOURCE = Array.from({ length: 12 }, (_, k) => [
+		`def handler${k}(payload, ledger):`,
+		...Array.from(
+			{ length: 20 },
+			(_, j) => `    total_${j} = payload["amount"] * ${j} + ledger[${k}][${j}]  # step ${j}`,
+		),
+		"    return total_0",
+		"",
+	])
+		.flat()
+		.join("\n");
+	/** A formatted JSON object past the compaction size, inside one read page. */
+	const JSON_DUMP = JSON.stringify(
+		{
+			meta: { generated: true },
+			rows: Array.from({ length: 20 }, (_, i) => ({
+				id: i,
+				name: `item-${i}`,
+				detail: `row ${i} reconciles the ledger against shard ${i % 4}`.repeat(6),
+			})),
+		},
+		null,
+		2,
+	);
+
+	/** Writes `files` to a shaping session and a plain one, returns both, and reads them the same way. */
+	async function readBoth(files: Record<string, string>, target: string) {
+		const shaped = await experimentSession(undefined, {}, { scoreFree: 1 });
+		const plain = await plainSession();
+		for (const { session } of [shaped, plain]) {
+			for (const [name, text] of Object.entries(files)) await Bun.write(path.join(session.cwd, name), text);
+		}
+		const run = async ({ session }: { session: ToolSession }) =>
+			new ReadTool(session).execute("r1", { path: target });
+		return { shaped: await run(shaped), plain: await run(plain) };
+	}
+
+	it("returns a whole-file `:raw` read byte for byte, with no shaping trace", async () => {
+		const { shaped, plain } = await readBoth({ "raw.py": SOURCE }, "raw.py:raw");
+
+		expect(resultText(shaped)).toBe(resultText(plain));
+		expect(resultText(shaped)).toBe(SOURCE);
+		expect(resultText(shaped)).not.toMatch(/… \[|…\[/);
+		expect(shaped.details?.raw).toBe(true);
+		expect(spotlightDetails(shaped.details)).toBeUndefined();
+	});
+
+	it("returns a ranged `:raw` read byte for byte", async () => {
+		const { shaped, plain } = await readBoth({ "raw.py": SOURCE }, "raw.py:20-140:raw");
+
+		const lines = SOURCE.split("\n").slice(19, 140);
+		expect(resultText(shaped)).toBe(lines.join("\n"));
+		expect(resultText(shaped)).toBe(resultText(plain));
+		expect(spotlightDetails(shaped.details)).toBeUndefined();
+	});
+
+	it("returns a URL `:raw` read's bytes, not a shaping of the fetched text", async () => {
+		const run = await experimentSession(undefined, {}, { scoreFree: 1 });
+		const body = Array.from({ length: 200 }, (_, i) => `row ${i}: the ledger reconciles against shard ${i % 4}`).join(
+			"\n",
+		);
+		vi.spyOn(scrapers, "loadPage").mockImplementation(async (requestedUrl: string) => ({
+			ok: true,
+			status: 200,
+			finalUrl: requestedUrl,
+			contentType: "text/plain",
+			content: body,
+		}));
+
+		const result = await new ReadTool(run.session).execute("r1", { path: "https://example.test/data.txt:raw" });
+
+		expect(resultText(result)).toBe(body);
+		expect(result.details?.raw).toBe(true);
+		expect(spotlightDetails(result.details)).toBeUndefined();
+	});
+
+	it("returns a formatted JSON `:raw` read verbatim, not compacted", async () => {
+		const { shaped, plain } = await readBoth({ "raw.json": JSON_DUMP }, "raw.json:raw");
+
+		expect(resultText(shaped)).toBe(JSON_DUMP);
+		expect(resultText(shaped)).toBe(resultText(plain));
+		expect(resultText(shaped)).not.toContain("[display only:");
+		expect(shaped.details?.raw).toBe(true);
+	});
+
+	it("repeats a `:raw` read verbatim instead of collapsing lines already shown", async () => {
+		const { session, manager } = await experimentSession(undefined, {}, { scoreFree: 1 });
+		await Bun.write(path.join(session.cwd, "raw.py"), SOURCE);
+		const tool = new ReadTool(session);
+
+		const first = resultText(await tool.execute("r1", { path: "raw.py:raw" }));
+		const again = await tool.execute("r2", { path: "raw.py:raw" });
+
+		expect(first).toBe(SOURCE);
+		expect(resultText(again)).toBe(SOURCE);
+		expect(spotlightDetails(again.details)).toBeUndefined();
+		expect(entries(manager, SPOTLIGHT_ENTRY.shape)).toEqual([]);
+	});
+
+	it("keeps a `:raw` part of a delimited path list verbatim in the joined result", async () => {
+		const files = { "raw.py": SOURCE, "b.txt": "b\n", "c.txt": "c\n" };
+		for (const target of ["raw.py:raw;b.txt", "raw.py:raw,b.txt;c.txt"]) {
+			const { shaped, plain } = await readBoth(files, target);
+
+			const text = resultText(shaped);
+			expect(text).toBe(resultText(plain));
+			expect(text).toContain(SOURCE);
+			expect(text).not.toContain("[display only:");
+			expect(spotlightDetails(shaped.details)).toBeUndefined();
 		}
 	});
 });

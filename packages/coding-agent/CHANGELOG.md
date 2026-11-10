@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A `read` with `:raw` returns exactly the selected bytes again when the Spotlight experiment shapes tool output, instead of an outlined, compacted, collapsed or cut rendering ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+
 ## [18.18.1] - 2026-11-08
 
 ### Breaking Changes
