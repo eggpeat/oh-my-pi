@@ -386,6 +386,7 @@ describe("spotlight whole reads", () => {
 		const read = async ({ session }: { session: ToolSession }, target: string) =>
 			resultText(await new ReadTool(session).execute("r1", { path: target }));
 
+		// A `:raw` read is not sent to the shaper, so it matches plain.
 		for (const target of ["wide.md", "wide.md:1-10,20-30", "wide.ts:5-40", "wide.ts:5+30", "wide.ts:raw:5-40"]) {
 			expect(await read(shaped, target)).toBe(await read(plain, target));
 		}
@@ -491,6 +492,7 @@ describe("spotlight raw reads", () => {
 		expect(first).toBe(SOURCE);
 		expect(resultText(again)).toBe(SOURCE);
 		expect(spotlightDetails(again.details)).toBeUndefined();
+		// Outside the experiment's sample: this call is not journaled.
 		expect(entries(manager, SPOTLIGHT_ENTRY.shape)).toEqual([]);
 	});
 

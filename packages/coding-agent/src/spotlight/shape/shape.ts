@@ -129,7 +129,7 @@ const WHOLE_READ = /^(?:agent|local|skill|rule):\/\//i;
 
 /**
  * Whether a result is shown whole besides page-backs: a {@link WHOLE_READ} target, or a `read` of Markdown or of one
- * line range without `:raw` (`file.ts:120-180`). Cuts of those two were mostly read back, or saved only on rereads
+ * line range (`file.ts:120-180`). Cuts of those two were mostly read back, or saved only on rereads
  * of the same few files.
  */
 function isWholeRead(input: ShapeInput): boolean {
@@ -140,9 +140,7 @@ function isWholeRead(input: ShapeInput): boolean {
 	if (isMarkdownPath(file)) return true;
 	try {
 		const parsed = parseSel(sel);
-		return (
-			parsed.kind === "lines" && !parsed.raw && parsed.ranges.length === 1 && parsed.ranges[0].endLine !== undefined
-		);
+		return parsed.kind === "lines" && parsed.ranges.length === 1 && parsed.ranges[0].endLine !== undefined;
 	} catch {
 		// `read` rejects a malformed range before shaping; what only another reader parses (a video frame) is no range.
 		return false;

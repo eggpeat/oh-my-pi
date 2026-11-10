@@ -909,15 +909,16 @@ const kSpotlightWindow = Symbol("read.spotlightWindow");
 const kSpotlightWide = Symbol("read.spotlightWide");
 
 /**
- * Results of a `;` path list holding a `:raw` part: the joined text carries those exact bytes, so the Spotlight
- * experiment must not shape it (see {@link ReadTool.execute}). The details cannot say so: `raw` there means the whole
- * result is one selector's bytes, which a list of parts is not.
+ * Marks a `;` path list whose joined text holds a `:raw` part's exact bytes, so {@link ReadTool.execute} must not
+ * shape it. `raw` on the details cannot say so: that flag means the whole result is one selector's bytes, which a
+ * list of parts is not. The symbol stays on the details if the result is copied, unlike a side set of result objects.
  */
-const verbatimResults = new WeakSet<AgentToolResult<ReadToolDetails>>();
+const kSpotlightVerbatim = Symbol("read.spotlightVerbatim");
 
 interface ReadDetailsWithWindow extends ReadToolDetails {
 	[kSpotlightWindow]?: ShapeInput["read"];
 	[kSpotlightWide]?: true;
+	[kSpotlightVerbatim]?: true;
 }
 
 /**
@@ -1365,7 +1366,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		for (const part of parts) {
 			try {
 				const result = await this.execute("read-delimited-part", { path: part }, signal, undefined, toolContext);
-				if (result.details?.raw === true || verbatimResults.has(result)) verbatim = true;
+				const marked = result.details as ReadDetailsWithWindow | undefined;
+				if (marked?.raw === true || marked?.[kSpotlightVerbatim] === true) verbatim = true;
 				const nestedTargets = result.details?.displayReadTargets;
 				if (nestedTargets?.length) {
 					const nestedLinks = result.details?.displayReadTargetLinks;
@@ -1400,7 +1402,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const result = toolResult<ReadToolDetails>({ notes, displayReadTargets, displayReadTargetLinks })
 			.content(content)
 			.done();
-		if (verbatim) verbatimResults.add(result);
+		if (verbatim) {
+			const details = (result.details ??= {}) as ReadDetailsWithWindow;
+			details[kSpotlightVerbatim] = true;
+		}
 		return result;
 	}
 
@@ -1881,8 +1886,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const innerDetails: ReadDetailsWithWindow | undefined = inner.details;
 		// A `:raw` result is its selector's exact bytes; shaping (outlining, folding, compaction, seen-line collapse,
 		// relevance cuts) would replace them with a rendering that only claims to be raw. A `;` list holding a `:raw`
-		// part is such a result too, its other parts inside the same text.
-		const verbatim = innerDetails?.raw === true || verbatimResults.has(inner);
+		// part is marked {@link kSpotlightVerbatim}: its other parts sit in the same text, and `raw` on the details
+		// would mean the whole result is one selector's bytes. These calls are not journaled: they are outside the
+		// experiment's sample.
+		const verbatim = innerDetails?.raw === true || innerDetails?.[kSpotlightVerbatim] === true;
 		const result = verbatim
 			? inner
 			: await shapeToolResult(
