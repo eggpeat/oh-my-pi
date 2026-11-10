@@ -102,7 +102,7 @@ export interface ShapeInput {
 	/**
 	 * `read`: the path or URL as the agent wrote it, selectors included; any other tool: its `path` argument (a search
 	 * of `artifact://` output pages it back and is left whole, as are `agent://`, `local://`, `skill://`, `rule://`, and
-	 * a `read` of Markdown or of one line range without `:raw`).
+	 * a `read` of Markdown or of one line range).
 	 */
 	path?: string;
 	/** `read` of a text file: its path as the agent named it, and the file's own content lines of the window. */

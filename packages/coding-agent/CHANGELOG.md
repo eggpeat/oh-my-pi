@@ -209,6 +209,7 @@
 ### Fixed
 
 - A disposed or switched session now releases every persistent shell it owns, including the ones a surface keeps under a name of its own (eval `sh`, `/loop` conditions), instead of holding one native shell per surface for the life of the process ([#18717](https://github.com/can1357/oh-my-pi/pull/18717) by [@eggpeat](https://github.com/eggpeat))
+- A `read` with `:raw` is no longer shaped by the Spotlight experiment, so the selected bytes come back instead of an outlined, compacted, collapsed or cut rendering ([#18713](https://github.com/can1357/oh-my-pi/pull/18713) by [@eggpeat](https://github.com/eggpeat))
 
 ## [18.18.1] - 2026-11-08
 
