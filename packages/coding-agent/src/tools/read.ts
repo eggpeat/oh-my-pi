@@ -1365,7 +1365,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		for (const part of parts) {
 			try {
 				const result = await this.execute("read-delimited-part", { path: part }, signal, undefined, toolContext);
-				if (result.details?.raw === true) verbatim = true;
+				if (result.details?.raw === true || verbatimResults.has(result)) verbatim = true;
 				const nestedTargets = result.details?.displayReadTargets;
 				if (nestedTargets?.length) {
 					const nestedLinks = result.details?.displayReadTargetLinks;

@@ -494,18 +494,17 @@ describe("spotlight raw reads", () => {
 		expect(entries(manager, SPOTLIGHT_ENTRY.shape)).toEqual([]);
 	});
 
-	it("keeps a `:raw` part of a `;` path list verbatim in the joined result", async () => {
-		const notes = Array.from(
-			{ length: 60 },
-			(_, i) => `- note ${i}: the ledger reconciles against shard ${i % 4}`,
-		).join("\n");
-		const { shaped, plain } = await readBoth({ "raw.py": SOURCE, "notes.md": `${notes}\n` }, "raw.py:raw;notes.md");
+	it("keeps a `:raw` part of a delimited path list verbatim in the joined result", async () => {
+		const files = { "raw.py": SOURCE, "b.txt": "b\n", "c.txt": "c\n" };
+		for (const target of ["raw.py:raw;b.txt", "raw.py:raw,b.txt;c.txt"]) {
+			const { shaped, plain } = await readBoth(files, target);
 
-		const text = resultText(shaped);
-		expect(text).toBe(resultText(plain));
-		expect(text).toContain(SOURCE);
-		expect(text).not.toContain("[display only:");
-		expect(spotlightDetails(shaped.details)).toBeUndefined();
+			const text = resultText(shaped);
+			expect(text).toBe(resultText(plain));
+			expect(text).toContain(SOURCE);
+			expect(text).not.toContain("[display only:");
+			expect(spotlightDetails(shaped.details)).toBeUndefined();
+		}
 	});
 });
 
