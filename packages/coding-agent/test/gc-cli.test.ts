@@ -3336,7 +3336,7 @@ describe("runGcCommand replay data stripping", () => {
 
 		expect(await applyStrip(plan!, new FileSessionStorage())).toBe(false);
 		expect(await Bun.file(file).text()).toBe(afterAppend);
-		expect(await Bun.file(sessionStagingPath(file)).exists()).toBe(false);
+		expect((await fs.readdir(path.dirname(file))).filter(name => name.endsWith(".tmp"))).toEqual([]);
 
 		const archiveId = Bun.randomUUIDv7();
 		const archive = path.join(root, "archive", "sessions", "project", `${archiveId}.jsonl.gz`);
@@ -3350,7 +3350,7 @@ describe("runGcCommand replay data stripping", () => {
 
 		expect(await applyStrip(archivePlan!, new FileSessionStorage())).toBe(false);
 		expect(await Bun.file(archive).bytes()).toEqual(new Uint8Array(updatedArchive));
-		expect(await Bun.file(sessionStagingPath(archive)).exists()).toBe(false);
+		expect((await fs.readdir(path.dirname(archive))).filter(name => name.endsWith(".tmp"))).toEqual([]);
 	});
 
 	test("refuses to strip a hard-linked transcript so its links stay intact", async () => {
