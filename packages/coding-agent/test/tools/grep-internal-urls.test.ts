@@ -314,6 +314,48 @@ describe("GrepTool internal URL resolution", () => {
 		expect(text).not.toContain("local://PLAN.md;notes.txt");
 	});
 
+	it("splits a URL-first semicolon list followed by a host glob for find and search", async () => {
+		const localRoot = path.join(artifactsDir, "local");
+		await fs.mkdir(localRoot, { recursive: true });
+		await Bun.write(path.join(localRoot, "notes.md"), "local needle\n");
+		await fs.mkdir(path.join(tmpDir, "src"));
+		await Bun.write(path.join(tmpDir, "src", "example.ts"), "host needle\n");
+		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
+		const session = createSession();
+
+		const globText = getResultText(
+			await new GlobTool(session).execute("glob-url-first-host-glob", {
+				path: "local://notes.md;src/*.ts",
+			}),
+		);
+		const grepText = getResultText(
+			await new GrepTool(session).execute("grep-url-first-host-glob", {
+				pattern: "needle",
+				path: "local://notes.md;src/*.ts",
+			}),
+		);
+
+		expect(globText).toContain("notes.md");
+		expect(globText).toContain("example.ts");
+		expect(grepText).toContain("local needle");
+		expect(grepText).toContain("host needle");
+	});
+
+	it("reports a missing host path after a URL-first semicolon entry", async () => {
+		const localRoot = path.join(artifactsDir, "local");
+		await fs.mkdir(localRoot, { recursive: true });
+		await Bun.write(path.join(localRoot, "notes.md"), "# Notes\n");
+		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
+
+		const result = await new GlobTool(createSession()).execute("glob-url-first-missing-host", {
+			path: "local://notes.md;missing",
+		});
+
+		expect(getResultText(result)).toContain("notes.md");
+		expect(getResultText(result)).toContain("Skipped missing paths: missing");
+		expect(result.details?.missingPaths).toEqual(["missing"]);
+	});
+
 	it("keeps a single internal URL with a semicolon in its path whole", async () => {
 		const localRoot = path.join(artifactsDir, "local");
 		await fs.mkdir(localRoot, { recursive: true });
