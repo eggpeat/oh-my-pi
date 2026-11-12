@@ -23,6 +23,7 @@ import {
 	pathIsWithin,
 	stringifyJson,
 	toError,
+	withLoopPhase,
 } from "@oh-my-pi/pi-utils";
 import { isTaskToolDetails, type StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
@@ -137,6 +138,8 @@ import { recordSessionRecap, recordSessionTitle } from "./session-index";
 const JSONL_SUFFIX_LENGTH = ".jsonl".length;
 const DRAFT_ONLY_SESSION_MARKER = ".draft-only-session";
 const DISCARDED_ENTRY_BRANCH_MARKER = "discarded-entry-branch";
+/** `model_usage` purpose carrying the billed usage of an assistant turn removed by `discardEntryDurably`. */
+const DISCARDED_TURN_USAGE_PURPOSE = "discarded-turn";
 /**
  * Read-back-and-retry passes one full rewrite makes after meeting another
  * writer's entries. Each pass re-reads the file, so only a writer that appends
@@ -1631,18 +1634,23 @@ export class SessionManager {
 		});
 	}
 
-	/** Serialize the whole file — title slot, header, entries — as lines, stamped with the state they came from. */
+	/**
+	 * Serialize the whole file — title slot, header, entries — as lines, stamped with the state they came from.
+	 * Runs as the `session.rewrite` loop phase: a long transcript takes hundreds of milliseconds to stringify.
+	 */
 	#serializeBody(): SessionFileBody {
 		const titleLine = this.#titleSlotLine();
 		const headerLine = this.#lineFor(this.#header);
 		const entries = this.#entries;
 		const lines = [titleLine, headerLine];
 		let bytes = Buffer.byteLength(titleLine, "utf8") + Buffer.byteLength(headerLine, "utf8");
-		for (const entry of entries) {
-			const line = this.#lineFor(entry);
-			bytes += Buffer.byteLength(line, "utf8");
-			lines.push(line);
-		}
+		withLoopPhase("session.rewrite", () => {
+			for (const entry of entries) {
+				const line = this.#lineFor(entry);
+				bytes += Buffer.byteLength(line, "utf8");
+				lines.push(line);
+			}
+		});
 		const stamp: SessionBodyStamp = {
 			entries,
 			entryCount: entries.length,
@@ -4066,6 +4074,10 @@ export class SessionManager {
 	 * entry is removed. If any child may carry content, the subtree is preserved
 	 * off-branch instead. Both paths append a metadata-only branch marker and
 	 * rewrite the journal, making the selected path durable.
+	 *
+	 * A removed assistant turn was still billed, so its usage is re-journaled as
+	 * an off-branch `model_usage` entry; session totals and `omp stats` keep
+	 * counting it. A subtree preserved off-branch keeps its own usage.
 	 */
 	async discardEntryDurably(entryId: string): Promise<void> {
 		const entry = this.#index.get(entryId);
@@ -4080,6 +4092,26 @@ export class SessionManager {
 			}
 			this.#entries = this.#entries.filter(candidate => candidate.id !== entryId);
 			this.#index.rebuild(this.#entries);
+			if (entry.type === "message" && entry.message.role === "assistant") {
+				const { api, provider, model, usage, stopReason, errorMessage } = entry.message;
+				// Off-branch like late usage: totals count every entry, and the kept
+				// chain stays made of entries collab guests replicate.
+				this.#recordEntry({
+					type: "model_usage",
+					id: generateId(this.#index),
+					parentId: leafId,
+					timestamp: entry.timestamp,
+					runtime: currentRuntimeIdentity(),
+					activeLeafId: leafId,
+					purpose: DISCARDED_TURN_USAGE_PURPOSE,
+					api,
+					provider,
+					model,
+					usage,
+					stopReason,
+					...(errorMessage === undefined ? {} : { errorMessage }),
+				});
+			}
 		}
 		this.branchWithSummary(leafId, "", {
 			kind: DISCARDED_ENTRY_BRANCH_MARKER,
