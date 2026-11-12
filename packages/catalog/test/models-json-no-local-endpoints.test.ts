@@ -10,10 +10,10 @@ import { getBundledModels, getBundledProviders } from "@oh-my-pi/pi-catalog/mode
 //
 // This guards against the litellm leak (1202 localhost:4000 models committed)
 // and any future regression. Local providers are excluded from generation via
-// DISCOVERY_ONLY_PROVIDERS in scripts/generate-models.ts.
+// DISCOVERY_ONLY_PROVIDERS in packages/catalog/scripts/generate-models.ts.
 //
 // Failure here means: a local provider slipped into the bundled catalog — add it to
-// DISCOVERY_ONLY_PROVIDERS, then `bun run gen:models` and commit the diff.
+// DISCOVERY_ONLY_PROVIDERS in packages/catalog/scripts/generate-models.ts, then `bun run gen:models` and commit the diff.
 describe("bundled catalog local-endpoint leak guard (regression)", () => {
 	const providers = getBundledProviders();
 

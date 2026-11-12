@@ -3,9 +3,9 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { readModelCache, writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
+import type { Model } from "@oh-my-pi/pi-catalog/types";
 import { removeWithRetries } from "../../utils/src/temp";
 
 const TTL_MS = 24 * 60 * 60 * 1000;
@@ -35,7 +35,7 @@ describe("model cache migrations", () => {
 	let dbPath = "";
 
 	beforeEach(async () => {
-		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-model-cache-"));
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-model-cache-"));
 		dbPath = path.join(tempDir, "models.db");
 	});
 
@@ -50,7 +50,7 @@ describe("model cache migrations", () => {
 	it("invalidates and scrubs pre-v10 header-bearing cache rows", async () => {
 		const legacyModel = {
 			...createModel("legacy-cloud-model", "Legacy Cloud Model"),
-			headers: { "X-Access-Token": "legacy-cached-secret" },
+			headers: { "X-Custom-Route": "legacy-cached-route-marker" },
 		};
 		const legacyDb = new Database(dbPath, { create: true });
 		legacyDb.run(`
@@ -70,7 +70,7 @@ describe("model cache migrations", () => {
 
 		const migrated = readModelCache<"openai-completions">("ollama-cloud", TTL_MS, Date.now, dbPath);
 		expect(migrated).toBeNull();
-		expect((await fs.readFile(dbPath)).includes("legacy-cached-secret")).toBe(false);
+		expect((await fs.readFile(dbPath)).includes("legacy-cached-route-marker")).toBe(false);
 
 		const replacementModel = createModel("fresh-cloud-model", "Fresh Cloud Model");
 		writeModelCache("ollama-cloud", Date.now(), [replacementModel], true, "static-v3", dbPath);
@@ -93,24 +93,22 @@ describe("model cache migrations", () => {
 			contextWindow: 4096,
 			maxTokens: 1024,
 			headers: {
-				Authorization: "Bearer standard-secret",
-				"X-Goog-Api-Key": "google-secret",
-				"X-Access-Token": "access-secret",
+				"X-Custom-Gate": "gate-header-marker",
+				"X-Tenant-Route": "tenant-route-marker",
 				"X-Project-Id": "proj-42",
 			},
 		});
 		writeModelCache("runtime-ext", Date.now(), [model], true, "static-v1", dbPath);
 
-		// Header names are provider-defined and any value may be a credential.
+		// Header names are provider-defined and any value may be sensitive.
 		// The plaintext SQLite payload therefore persists no model headers.
 		const raw = new Database(dbPath, { readonly: true });
 		const row = raw
 			.query<{ models: string }, []>("SELECT models FROM model_cache WHERE provider_id = 'runtime-ext'")
 			.get();
 		raw.close();
-		expect(row?.models).not.toContain("standard-secret");
-		expect(row?.models).not.toContain("google-secret");
-		expect(row?.models).not.toContain("access-secret");
+		expect(row?.models).not.toContain("gate-header-marker");
+		expect(row?.models).not.toContain("tenant-route-marker");
 		expect(row?.models).not.toContain("proj-42");
 
 		const cached = readModelCache<"openai-completions">("runtime-ext", TTL_MS, Date.now, dbPath);
