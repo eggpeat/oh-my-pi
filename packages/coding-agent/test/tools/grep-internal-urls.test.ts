@@ -385,6 +385,106 @@ describe("GrepTool internal URL resolution", () => {
 		expect(opaqueTailText).not.toContain("plain needle");
 	});
 
+	it("retains line-range selectors on a semicolon-containing URL in search", async () => {
+		const localRoot = path.join(artifactsDir, "local");
+		await fs.mkdir(localRoot, { recursive: true });
+		await Bun.write(path.join(localRoot, "report;version.md"), "first needle\nsecond needle\nthird needle\n");
+		await Bun.write(path.join(localRoot, "report"), "wrong report needle\n");
+		await Bun.write(path.join(tmpDir, "version.md"), "wrong line 1\nwrong host needle\n");
+		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
+
+		const text = getResultText(
+			await new GrepTool(createSession()).execute("semicolon-url-range", {
+				pattern: "needle",
+				path: "local://report;version.md:2-2",
+			}),
+		);
+
+		expect(text).toContain("second needle");
+		expect(text).not.toContain("first needle");
+		expect(text).not.toContain("third needle");
+		expect(text).not.toContain("wrong report needle");
+		expect(text).not.toContain("wrong host needle");
+	});
+
+	it("preserves globs rooted in an existing semicolon-containing URL directory for find and search", async () => {
+		const localRoot = path.join(artifactsDir, "local");
+		await fs.mkdir(path.join(localRoot, "reports;old"), { recursive: true });
+		await fs.mkdir(path.join(localRoot, "reports"), { recursive: true });
+		await fs.mkdir(path.join(tmpDir, "old"), { recursive: true });
+		await Bun.write(path.join(localRoot, "reports;old", "archived.md"), "archived needle\n");
+		await Bun.write(path.join(localRoot, "reports;old", "notes.txt"), "ignored text needle\n");
+		await Bun.write(path.join(localRoot, "reports", "decoy.md"), "decoy report needle\n");
+		await Bun.write(path.join(tmpDir, "old", "decoy.md"), "decoy host needle\n");
+		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
+		const session = createSession();
+
+		const globResult = await new GlobTool(session).execute("glob-semicolon-dir", {
+			path: "local://reports;old/*.md",
+		});
+		const grepResult = await new GrepTool(session).execute("grep-semicolon-dir", {
+			pattern: "needle",
+			path: "local://reports;old/*.md",
+		});
+
+		expect(globResult.details?.files).toEqual(["local://reports;old/archived.md"]);
+		expect(grepResult.details?.files).toEqual(["local://reports;old/archived.md"]);
+		const grepText = getResultText(grepResult);
+		expect(grepText).toContain("archived needle");
+		expect(grepText).not.toContain("ignored text needle");
+		expect(grepText).not.toContain("decoy");
+	});
+
+	it("preserves ssh:// permission and file-size errors instead of splitting on a semicolon", async () => {
+		vi.spyOn(capability, "loadCapability").mockResolvedValue({
+			items: [],
+			all: [],
+			warnings: [],
+			providers: [],
+		} as CapabilityResult<unknown>);
+		await Bun.write(path.join(tmpDir, "version.md"), "wrong host needle\n");
+		vi.spyOn(sshFileTransfer, "statRemotePath").mockResolvedValue("file");
+		const readSpy = vi.spyOn(sshFileTransfer, "readRemoteFile").mockImplementation(async (_target, remotePath) => {
+			if (remotePath === "/report;version.md") {
+				throw new Error("head: cannot open '/report;version.md' for reading: Permission denied");
+			}
+			return { bytes: new TextEncoder().encode("wrong remote needle\n"), truncated: false };
+		});
+		const session = createSession();
+
+		await expect(
+			new GrepTool(session).execute("ssh-semicolon-perm-grep", {
+				pattern: "needle",
+				path: "ssh://h/report;version.md",
+			}),
+		).rejects.toThrow(/Permission denied/i);
+		await expect(
+			new GlobTool(session).execute("ssh-semicolon-perm-glob", {
+				path: "ssh://h/report;version.md",
+			}),
+		).rejects.toThrow(/Permission denied/i);
+		expect(readSpy).not.toHaveBeenCalledWith(expect.anything(), "/report", expect.anything());
+
+		readSpy.mockImplementation(async (_target, remotePath) => {
+			if (remotePath === "/report;version.md") {
+				return { bytes: new Uint8Array(1024 * 1024), truncated: true };
+			}
+			return { bytes: new TextEncoder().encode("wrong remote needle\n"), truncated: false };
+		});
+		await expect(
+			new GrepTool(session).execute("ssh-semicolon-size-grep", {
+				pattern: "needle",
+				path: "ssh://h/report;version.md",
+			}),
+		).rejects.toThrow(/1 MiB/);
+		await expect(
+			new GlobTool(session).execute("ssh-semicolon-size-glob", {
+				path: "ssh://h/report;version.md",
+			}),
+		).rejects.toThrow(/1 MiB/);
+		expect(readSpy).not.toHaveBeenCalledWith(expect.anything(), "/report", expect.anything());
+	});
+
 	it("searches virtual internal URL content without a backing file", async () => {
 		registerVirtualDocs(new Map([["doc.md", "alpha line\nneedle in virtual content\ngamma line\n"]]));
 

@@ -18,7 +18,7 @@ import {
 	windowsPathToWslMount,
 } from "@oh-my-pi/pi-utils";
 import { InternalUrlRouter } from "../internal-urls";
-import { type InternalUrlFilesystem, joinUrlPath, UrlFsError } from "../internal-urls/url-filesystem";
+import { InternalUrlFilesystem, joinUrlPath, UrlFsError } from "../internal-urls/url-filesystem";
 import { ToolAbortError } from "./tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
@@ -703,6 +703,41 @@ function isExclusionPart(part: string): boolean {
 	return part.length > 1 && part.startsWith("!") && !part.includes("://");
 }
 
+const MISSING_OR_INVALID_URL_CODES = new Set(["ENOENT", "ENOTDIR", "ENAMETOOLONG", "EINVAL"]);
+
+async function probeInternalUrlTarget(
+	url: string,
+	filesystem: InternalUrlFilesystem,
+	requireDirectory = false,
+): Promise<boolean> {
+	try {
+		const stat = await filesystem.stat(url);
+		return !requireDirectory || stat.type === "directory";
+	} catch (err) {
+		return !(err instanceof UrlFsError && MISSING_OR_INVALID_URL_CODES.has(err.code));
+	}
+}
+
+async function internalUrlEntryResolves(entry: string, filesystem: InternalUrlFilesystem): Promise<boolean> {
+	const router = InternalUrlRouter.instance();
+	const peeledUrl = router.split(expandPath(entry)).path;
+	if (router.isGlob(peeledUrl)) {
+		let parsedUrl: ParsedSearchPath | undefined;
+		try {
+			parsedUrl = parseUrlSearchPath(peeledUrl);
+		} catch {
+			return false;
+		}
+		if (parsedUrl?.glob !== undefined) {
+			const rawGlobTail = peeledUrl.slice(parsedUrl.basePath.length);
+			if (splitTopLevelDelimitedPath(rawGlobTail, "semicolon").length === 1) {
+				return probeInternalUrlTarget(parsedUrl.basePath, filesystem, true);
+			}
+		}
+	}
+	return probeInternalUrlTarget(peeledUrl, filesystem);
+}
+
 export async function splitDelimitedPathEntry(
 	entry: string,
 	cwd: string,
@@ -735,24 +770,16 @@ export async function splitDelimitedPathEntry(
 	if (options.mixedLocalPaths === true && isInternalUrlPath(normalizedEntry)) {
 		// Before the all-internal branch, which keeps the whole string when any
 		// part is not itself an internal URL. All-URL lists always split. For a
-		// mixed list, only a full URL that resolves stays whole, preserving its
-		// own semicolons; every failed lookup splits for per-part handling.
+		// mixed list, probe the range-free URL (or its non-glob base directory)
+		// and split only on confirmed missing or invalid targets so semicolons
+		// inside real URLs and read/permission/size errors stay intact.
 		const isUrlPart = (part: string): boolean =>
 			isInternalUrlPath(part) || (options.exclusionParts === true && isExclusionPart(part));
 		const parts = await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "semicolon", "none");
-		if (parts && parts.length > 1) {
-			if (parts.every(isUrlPart)) return parts;
-			if (options.filesystem) {
-				try {
-					await options.filesystem.stat(normalizedEntry);
-					return null;
-				} catch {
-					return parts;
-				}
-			}
-		}
-		const mixed = await splitMixedUrlPathList(normalizedEntry, cwd, isUrlPart);
-		if (mixed && mixed.length > 1) return mixed;
+		if (!parts || parts.length <= 1) return null;
+		if (parts.every(isUrlPart)) return parts;
+		const filesystem = options.filesystem ?? new InternalUrlFilesystem({ context: { cwd }, tier: "read" });
+		return (await internalUrlEntryResolves(normalizedEntry, filesystem)) ? null : parts;
 	}
 	if (isInternalUrlPath(normalizedEntry)) {
 		// A `;` list of internal URLs (`artifact://44;artifact://43`) names
