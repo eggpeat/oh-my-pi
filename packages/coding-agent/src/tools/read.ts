@@ -910,17 +910,9 @@ const kSpotlightWindow = Symbol("read.spotlightWindow");
  */
 const kSpotlightWide = Symbol("read.spotlightWide");
 
-/**
- * Marks a `;` path list whose joined text holds a `:raw` part's exact bytes, so {@link ReadTool.execute} must not
- * shape it. `raw` on the details cannot say so: that flag means the whole result is one selector's bytes, which a
- * list of parts is not. The symbol stays on the details if the result is copied, unlike a side set of result objects.
- */
-const kSpotlightVerbatim = Symbol("read.spotlightVerbatim");
-
 interface ReadDetailsWithWindow extends ReadToolDetails {
 	[kSpotlightWindow]?: ShapeInput["read"];
 	[kSpotlightWide]?: true;
-	[kSpotlightVerbatim]?: true;
 }
 
 /**
@@ -1375,8 +1367,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const notice = `Note: interpreted as ${parts.length} paths: ${parts.join(", ")}`;
 		const notes = [notice];
 		const content: Array<TextContent | ImageContent> = [];
-		/** A `:raw` part is its selector's exact bytes; the joined text must not be shaped. */
-		let verbatim = false;
 		const displayReadTargets: string[] = [];
 		const displayReadTargetLinks: Array<string | null> = [];
 		let pendingText = notice;
@@ -1392,8 +1382,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		for (const part of parts) {
 			try {
 				const result = await this.execute("read-delimited-part", { path: part }, signal, undefined, toolContext);
-				const marked = result.details as ReadDetailsWithWindow | undefined;
-				if (marked?.raw === true || marked?.[kSpotlightVerbatim] === true) verbatim = true;
 				const nestedTargets = result.details?.displayReadTargets;
 				if (nestedTargets?.length) {
 					const nestedLinks = result.details?.displayReadTargetLinks;
@@ -1425,14 +1413,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		}
 		flushText();
 
-		const result = toolResult<ReadToolDetails>({ notes, displayReadTargets, displayReadTargetLinks })
-			.content(content)
-			.done();
-		if (verbatim) {
-			const details = (result.details ??= {}) as ReadDetailsWithWindow;
-			details[kSpotlightVerbatim] = true;
-		}
-		return result;
+		return toolResult<ReadToolDetails>({ notes, displayReadTargets, displayReadTargetLinks }).content(content).done();
 	}
 
 	/**
@@ -1916,42 +1897,29 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		if (earlierEffects) await untilAborted(signal, earlierEffects);
 		const inner = await this.#executeInner(toolCallId, params, signal, onUpdate, toolContext);
 		const innerDetails: ReadDetailsWithWindow | undefined = inner.details;
-		// A `:raw` result is its selector's exact bytes; shaping (outlining, folding, compaction, seen-line collapse,
-		// relevance cuts) would replace them with a rendering that only claims to be raw. A `;` list holding a `:raw`
-		// part is marked {@link kSpotlightVerbatim}: its other parts sit in the same text, and `raw` on the details
-		// would mean the whole result is one selector's bytes. These calls are not journaled: they are outside the
-		// experiment's sample.
-		const verbatim = innerDetails?.raw === true || innerDetails?.[kSpotlightVerbatim] === true;
-		const result = verbatim
-			? inner
-			: await shapeToolResult(
-					this.session,
-					toolCallId,
-					{
-						tool: "read",
-						source: `read ${params.path}`,
-						path: params.path,
-						read: innerDetails?.[kSpotlightWindow],
-					},
-					inner,
-					signal,
-					{
-						plain: innerDetails?.[kSpotlightWide]
-							? () =>
-									this.#executeInner(
-										toolCallId,
-										params,
-										signal,
-										undefined,
-										toolContext,
-										undefined,
-										undefined,
-										undefined,
-										true,
-									)
-							: undefined,
-					},
-				);
+		const result = await shapeToolResult(
+			this.session,
+			toolCallId,
+			{ tool: "read", source: `read ${params.path}`, path: params.path, read: innerDetails?.[kSpotlightWindow] },
+			inner,
+			signal,
+			{
+				plain: innerDetails?.[kSpotlightWide]
+					? () =>
+							this.#executeInner(
+								toolCallId,
+								params,
+								signal,
+								undefined,
+								toolContext,
+								undefined,
+								undefined,
+								undefined,
+								true,
+							)
+					: undefined,
+			},
+		);
 		const displayTarget = InternalUrlRouter.instance().locateSync(params.path);
 		if (displayTarget && result.details) result.details.displayTarget = displayTarget;
 		appendRepeatReadHint(this.session, params.path, result);
