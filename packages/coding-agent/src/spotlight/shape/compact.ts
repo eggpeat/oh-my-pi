@@ -4,15 +4,10 @@
  * where it makes the text shorter.
  */
 
-/** A number whose source spelling `JSON.stringify` would not preserve (`9007199254740993`, `1.0`), kept as-is. */
-interface RawJson {
-	readonly rawJSON: string;
-}
+type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
-type Json = null | boolean | number | string | RawJson | Json[] | { [key: string]: Json };
-
-const rawJson = (JSON as unknown as { rawJSON(text: string): RawJson }).rawJSON;
-const isRaw = (JSON as unknown as { isRawJSON(v: unknown): v is RawJson }).isRawJSON;
+const rawJson = (JSON as unknown as { rawJSON(text: string): Json }).rawJSON;
+const isRaw = (JSON as unknown as { isRawJSON(v: unknown): boolean }).isRawJSON;
 const isObj = (v: Json): v is { [key: string]: Json } =>
 	v !== null && typeof v === "object" && !Array.isArray(v) && !isRaw(v);
 const isScalar = (v: Json) => v === null || typeof v !== "object" || isRaw(v);

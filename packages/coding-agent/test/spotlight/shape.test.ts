@@ -1093,5 +1093,20 @@ describe("spotlight shaping", () => {
 		expect(bashOut.steps).toEqual(["dump"]);
 		expect(bashOut.text).toContain("9007199254740993|1.0|item-60");
 		expect(bashOut.text).not.toContain("9007199254740992");
+
+		const pyDump = Array.from(
+			{ length: 60 },
+			(_, i) => `{'id': 9007199254740993, 'weight': 1.0, 'name': 'item-${i + 1}'}`,
+		).join("\n");
+		const pyOut = await shapeResult(
+			bash("python3 dump.py", pyDump),
+			context(),
+			scorer(null),
+			newShapeState(),
+			sink(),
+		);
+		expect(pyOut.steps).toEqual(["dump"]);
+		expect(pyOut.text).toContain("9007199254740993|1.0|item-60");
+		expect(pyOut.text).not.toContain("9007199254740992");
 	});
 });
