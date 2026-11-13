@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { createAuthGatewayRouter } from "@oh-my-pi/pi-ai/auth-gateway";
 import { AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
-import { clearGitLabDuoDirectAccessCache, getGitLabDuoModels } from "@oh-my-pi/pi-ai/providers/gitlab-duo";
+import { clearGitLabDuoDirectAccessCache } from "@oh-my-pi/pi-ai/providers/gitlab-duo";
+import { getGitLabDuoModels } from "@oh-my-pi/pi-catalog/provider-models";
 import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type { Api, Context, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
