@@ -123,9 +123,9 @@ describe("in-process VCS bindings", () => {
 	test.skipIf(process.platform === "win32")("restore recreates symlinks without touching targets", async () => {
 		const root = await repository();
 		const link = join(root, "link");
-		await writeFile(join(root, "original.txt"), "original\n");
-		await symlink("original.txt", link);
-		await git(root, "add", "link", "original.txt");
+		await writeFile(join(root, ".gitattributes"), "link ident\n");
+		await symlink("$Id$", link);
+		await git(root, "add", "link", ".gitattributes");
 		await git(root, "commit", "-m", "add symlink");
 
 		const outsideRoot = await mkdtemp(join(tmpdir(), "pi-natives-vcs-outside-"));
@@ -139,7 +139,7 @@ describe("in-process VCS bindings", () => {
 
 		expect(await Bun.file(outside).text()).toBe("outside\n");
 		expect((await lstat(link)).isSymbolicLink()).toBe(true);
-		expect(await readlink(link)).toBe("original.txt");
+		expect(await readlink(link)).toBe("$Id$");
 	});
 
 	test.skipIf(process.platform === "win32")("restore replaces links with files safely", async () => {
