@@ -188,8 +188,7 @@ impl GitRepo {
 
 	/// Create a commit and return its object id. With `commit.gpgSign` enabled
 	/// the object is written by `git commit-tree -S` so Git runs the
-	/// configured signer; a signer failure leaves HEAD unchanged. An index
-	/// with unresolved stages is refused before hooks or HEAD updates.
+	/// configured signer; a signer failure leaves HEAD unchanged.
 	pub fn commit_create(&self, message: &str, options: &CommitOptions) -> Result<String> {
 		let repo = self.gix()?;
 		// Git rejects a malformed value before doing any work; reading it as
@@ -600,8 +599,7 @@ impl GitRepo {
 			.map_err(|e| Error::backend("git read-tree", e))
 	}
 
-	/// Write an index as a tree object and return its object id. Unresolved
-	/// stages are an error, matching `git write-tree`, rather than omitted.
+	/// Write an index as a tree object and return its object id.
 	pub fn write_tree(&self, index_path: Option<&Path>) -> Result<String> {
 		let repo = self.gix()?;
 		let index = match index_path {
