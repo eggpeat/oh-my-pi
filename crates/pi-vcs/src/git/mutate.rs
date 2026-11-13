@@ -17,6 +17,7 @@ use super::{
 	normalize_path,
 	open::{load_index_or_empty, load_index_or_head, status_with_fresh_index, status_with_index},
 	read::literal_pathspec,
+	worktree::materialize,
 };
 use crate::{
 	error::{Error, Result},
@@ -1739,11 +1740,8 @@ fn restore_index_paths(
 			let mut blob = object
 				.try_into_blob()
 				.map_err(|e| Error::backend("git restore", e))?;
-			let full = root.join(path.as_ref());
-			if let Some(parent) = full.parent() {
-				fs::create_dir_all(parent)?;
-			}
-			fs::write(full, filter.git_to_worktree(&path, blob.take_data())?)?;
+			let bytes = blob.take_data();
+			materialize(root, &path, entry.mode, bytes, &mut filter)?;
 		}
 	}
 	Ok(())

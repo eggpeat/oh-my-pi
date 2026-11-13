@@ -27,6 +27,7 @@ use super::{
 	filter::WorktreeFilter,
 	mutate::update_reference,
 	open::{load_index_or_head, status_with_index},
+	worktree::materialize,
 };
 use crate::{
 	error::{Error, Result},
@@ -1881,34 +1882,8 @@ fn write_worktree_entry(
 	entry: &FileEntry,
 ) -> Result<()> {
 	validate_repo_path(path).map_err(ApplyFailure::into_error)?;
-	let absolute = repo.root().join(path);
-	if let Some(parent) = absolute.parent() {
-		fs::create_dir_all(parent)?;
-	}
 	let bytes = blob_bytes(gix_repo, entry.id)?;
-	if entry.mode == Mode::SYMLINK {
-		let _ = fs::remove_file(&absolute);
-		#[cfg(unix)]
-		{
-			use std::os::unix::{ffi::OsStrExt, fs::symlink};
-			symlink(std::ffi::OsStr::from_bytes(&bytes), &absolute)?;
-		}
-		#[cfg(not(unix))]
-		fs::write(&absolute, bytes)?;
-		return Ok(());
-	}
-	fs::write(&absolute, filter.git_to_worktree(path, bytes)?)?;
-	#[cfg(unix)]
-	{
-		use std::os::unix::fs::PermissionsExt;
-		let permissions = fs::Permissions::from_mode(if entry.mode == Mode::FILE_EXECUTABLE {
-			0o755
-		} else {
-			0o644
-		});
-		fs::set_permissions(&absolute, permissions)?;
-	}
-	Ok(())
+	materialize(repo.root(), path, entry.mode, bytes, filter)
 }
 
 /// Remove `path` and the parent directories it leaves empty. A directory at

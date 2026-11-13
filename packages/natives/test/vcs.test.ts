@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { vcsDiscover, vcsGitClone, vcsGitDiscover, vcsGitRepoInfo } from "../native/index.js";
@@ -118,6 +118,71 @@ describe("in-process VCS bindings", () => {
 		expect(await git(root, "write-tree")).toBe(headTree);
 		expect(await repo.writeTree(indexPath)).not.toBe(headTree);
 		expect(await git(root, "diff", "--cached")).toBe("");
+	});
+
+	test.skipIf(process.platform === "win32")("restore recreates symlinks without touching targets", async () => {
+		const root = await repository();
+		const link = join(root, "link");
+		await writeFile(join(root, "original.txt"), "original\n");
+		await symlink("original.txt", link);
+		await git(root, "add", "link", "original.txt");
+		await git(root, "commit", "-m", "add symlink");
+
+		const outsideRoot = await mkdtemp(join(tmpdir(), "pi-natives-vcs-outside-"));
+		roots.push(outsideRoot);
+		const outside = join(outsideRoot, "outside.txt");
+		await writeFile(outside, "outside\n");
+		await rm(link);
+		await symlink(outside, link);
+
+		await vcsGitDiscover(root)!.restore({ files: ["link"], worktree: true });
+
+		expect(await Bun.file(outside).text()).toBe("outside\n");
+		expect((await lstat(link)).isSymbolicLink()).toBe(true);
+		expect(await readlink(link)).toBe("original.txt");
+	});
+
+	test.skipIf(process.platform === "win32")("restore replaces links with files safely", async () => {
+		const root = await repository();
+		const tracked = join(root, "tracked.txt");
+		const outsideRoot = await mkdtemp(join(tmpdir(), "pi-natives-vcs-outside-"));
+		roots.push(outsideRoot);
+		const outside = join(outsideRoot, "outside.txt");
+		await writeFile(outside, "outside\n");
+		await rm(tracked);
+		await symlink(outside, tracked);
+
+		await vcsGitDiscover(root)!.restore({ files: ["tracked.txt"], worktree: true });
+
+		expect(await Bun.file(outside).text()).toBe("outside\n");
+		expect((await lstat(tracked)).isSymbolicLink()).toBe(false);
+		expect(await Bun.file(tracked).text()).toBe("one\ntwo\n");
+	});
+
+	test.skipIf(process.platform === "win32")("cherry-pick replaces links with files safely", async () => {
+		const root = await repository();
+		const link = join(root, "link");
+		const outsideRoot = await mkdtemp(join(tmpdir(), "pi-natives-vcs-outside-"));
+		roots.push(outsideRoot);
+		const outside = join(outsideRoot, "outside.txt");
+		await writeFile(outside, "outside\n");
+		await symlink(outside, link);
+		await git(root, "add", "link");
+		await git(root, "commit", "-m", "add symlink");
+
+		await git(root, "checkout", "-b", "topic");
+		await rm(link);
+		await writeFile(link, "regular\n");
+		await git(root, "add", "link");
+		await git(root, "commit", "-m", "replace symlink with file");
+		const topic = await git(root, "rev-parse", "HEAD");
+		await git(root, "checkout", "main");
+
+		await vcsGitDiscover(root)!.cherryPick(topic);
+
+		expect(await Bun.file(outside).text()).toBe("outside\n");
+		expect((await lstat(link)).isSymbolicLink()).toBe(false);
+		expect(await Bun.file(link).text()).toBe("regular\n");
 	});
 
 	test("aborts clone promptly", async () => {
