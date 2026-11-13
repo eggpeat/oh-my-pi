@@ -7,6 +7,7 @@
 - Advisors no longer get repeat-read warnings for reads another advisor made; each advisor now keeps its own tool state (snapshots, conflict history, repeat-read counts) ([#18834](https://github.com/can1357/oh-my-pi/issues/18834))
 - `/new` and switching sessions now start tools fresh: `conflict://` ids, already-reported diagnostics and repeat-read counts no longer carry over from the previous conversation, for the main agent and advisors alike
 - `/annotate session` now opens the same fullscreen message picker as `/copy` in classic terminals and Tern ([#19145](https://github.com/can1357/oh-my-pi/pull/19145) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy))
+- Task progress, task results, and restored-agent context gauges now show the provider-reported occupied context instead of token totals summed across segmented continuation requests, so they no longer hit the context ceiling early ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 
 ## [18.20.0] - 2026-11-12
 
