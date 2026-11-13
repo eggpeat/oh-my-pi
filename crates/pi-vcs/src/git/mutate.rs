@@ -188,7 +188,8 @@ impl GitRepo {
 
 	/// Create a commit and return its object id. With `commit.gpgSign` enabled
 	/// the object is written by `git commit-tree -S` so Git runs the
-	/// configured signer; a signer failure leaves HEAD unchanged.
+	/// configured signer; a signer failure leaves HEAD unchanged. An index
+	/// with unresolved stages is refused before hooks or HEAD updates.
 	pub fn commit_create(&self, message: &str, options: &CommitOptions) -> Result<String> {
 		let repo = self.gix()?;
 		// Git rejects a malformed value before doing any work; reading it as
@@ -199,6 +200,11 @@ impl GitRepo {
 			.transpose()
 			.map_err(|err| Error::backend("git commit read commit.gpgSign", err))?
 			.unwrap_or(false);
+		// Refuse unresolved stages before hooks or HEAD updates. Omitting
+		// stages 1-3 while writing the tree deletes those paths from the
+		// commit; `git commit` rejects them in prepare_index and does not
+		// run hooks.
+		reject_unmerged_index(&load_index_or_head(&repo, "git commit")?, "git commit")?;
 		run_commit_hook(self, "pre-commit", &[])?;
 		let mut head = repo
 			.head()
@@ -208,6 +214,10 @@ impl GitRepo {
 			.map_err(|err| Error::backend("git commit", err))?
 			.map(|id| id.detach());
 		let index = load_index_or_head(&repo, "git commit")?;
+		// The hook may have edited the index. A pathspec commit copies only
+		// the selected paths onto the parent tree, so conflict stages outside
+		// that set never reach `write_index_tree`.
+		reject_unmerged_index(&index, "git commit")?;
 		let tree = if options.files.is_empty() {
 			write_index_tree(&repo, &index)?
 		} else {
@@ -590,7 +600,8 @@ impl GitRepo {
 			.map_err(|e| Error::backend("git read-tree", e))
 	}
 
-	/// Write an index as a tree object and return its object id.
+	/// Write an index as a tree object and return its object id. Unresolved
+	/// stages are an error, matching `git write-tree`, rather than omitted.
 	pub fn write_tree(&self, index_path: Option<&Path>) -> Result<String> {
 		let repo = self.gix()?;
 		let index = match index_path {
@@ -1519,10 +1530,34 @@ struct TreeNode {
 	dirs:  BTreeMap<BString, Self>,
 }
 
+/// Refuse to serialize `index` while any entry is still at a conflict stage.
+/// A tree can store only stage 0; dropping stages 1-3 deletes that path.
+fn reject_unmerged_index(index: &gix::index::File, context: &'static str) -> Result<()> {
+	let mut paths = BTreeSet::new();
+	for entry in index.entries() {
+		if entry.stage() != gix::index::entry::Stage::Unconflicted {
+			paths.insert(entry.path(index).to_str_lossy().into_owned());
+		}
+	}
+	if paths.is_empty() {
+		return Ok(());
+	}
+	Err(Error::backend(
+		context,
+		format!(
+			"the index has unmerged entries: {}",
+			paths.into_iter().collect::<Vec<_>>().join(", ")
+		),
+	))
+}
+
 fn write_index_tree(
 	repo: &gix::Repository,
 	index: &gix::index::File,
 ) -> Result<gix::hash::ObjectId> {
+	// Filtering to stage 0 would omit a path that exists only as conflict
+	// stages and delete it from the tree. `git write-tree` refuses instead.
+	reject_unmerged_index(index, "git write-tree")?;
 	let mut root = TreeNode::default();
 	for entry in index
 		.entries()
@@ -3467,5 +3502,150 @@ mod tests {
 		);
 		assert!(repo.worktree_prune().is_ok());
 		let _ = fs::remove_dir_all(linked);
+	}
+
+	/// Content-conflict `a` (stages 1-3, no stage 0) and stage `extra`.
+	fn conflict_with_staged_extra(temp: &TempDir, repo: &GitRepo) -> String {
+		git(temp.path(), &["checkout", "-qb", "side"]);
+		fs::write(temp.path().join("a"), "side\n").unwrap();
+		git(temp.path(), &["commit", "-qam", "side"]);
+		git(temp.path(), &["checkout", "-q", "main"]);
+		fs::write(temp.path().join("a"), "main\n").unwrap();
+		git(temp.path(), &["commit", "-qam", "main"]);
+		let head = git(temp.path(), &["rev-parse", "HEAD"]);
+		let merge = Command::new("git")
+			.arg("-C")
+			.arg(temp.path())
+			.args(["merge", "side"])
+			.output()
+			.unwrap();
+		assert!(
+			!merge.status.success(),
+			"merge should conflict: {}",
+			String::from_utf8_lossy(&merge.stderr)
+		);
+		let stages = git(temp.path(), &["ls-files", "-s", "--", "a"]);
+		assert!(
+			stages
+				.lines()
+				.any(|line| line.split_whitespace().nth(2) == Some("1")),
+			"conflict must keep stage 1: {stages}"
+		);
+		assert!(
+			stages
+				.lines()
+				.all(|line| line.split_whitespace().nth(2) != Some("0")),
+			"deletion bug requires no stage 0: {stages}"
+		);
+		fs::write(temp.path().join("extra"), "extra\n").unwrap();
+		repo.stage_files(&["extra".into()]).unwrap();
+		assert!(
+			!git(temp.path(), &["ls-files", "-u", "--", "a"]).is_empty(),
+			"staging extra must not resolve a"
+		);
+		head
+	}
+
+	fn assert_unmerged(error: &Error, context: &str, path: &str) {
+		let message = error.to_string();
+		assert!(matches!(error, Error::Backend { .. }), "{message}");
+		assert!(message.starts_with(context), "{message}");
+		assert!(message.contains("unmerged entries"), "{message}");
+		assert!(message.contains(path), "{message}");
+	}
+
+	#[test]
+	fn commit_and_write_tree_reject_unmerged_index() {
+		let (temp, repo) = fixture();
+		let head = conflict_with_staged_extra(&temp, &repo);
+		write_hook(&temp.path().join(".git/hooks/pre-commit"), "echo ran > hook-ran\nexit 0", true);
+		let tree_before = git(temp.path(), &["rev-parse", "HEAD^{tree}"]);
+
+		let error = repo
+			.commit_create("should refuse", &CommitOptions::default())
+			.unwrap_err();
+		assert_unmerged(&error, "git commit:", "a");
+		assert!(!temp.path().join("hook-ran").exists(), "hooks must not run");
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), head);
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD^{tree}"]), tree_before);
+		assert!(!git(temp.path(), &["ls-files", "-u", "--", "a"]).is_empty());
+
+		let empty = repo
+			.commit_create("empty", &CommitOptions { allow_empty: true, ..Default::default() })
+			.unwrap_err();
+		assert_unmerged(&empty, "git commit:", "a");
+		let amended = repo
+			.commit_create("amend", &CommitOptions { amend: true, ..Default::default() })
+			.unwrap_err();
+		assert_unmerged(&amended, "git commit:", "a");
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), head);
+
+		let write_err = repo.write_tree(None).unwrap_err();
+		assert_unmerged(&write_err, "git write-tree:", "a");
+		let alternate = temp.path().join("conflicted.index");
+		fs::copy(temp.path().join(".git/index"), &alternate).unwrap();
+		let alternate_err = repo.write_tree(Some(&alternate)).unwrap_err();
+		assert_unmerged(&alternate_err, "git write-tree:", "a");
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), head);
+
+		let partial = repo
+			.commit_create("partial", &CommitOptions {
+				files: vec!["extra".into()],
+				..Default::default()
+			})
+			.unwrap_err();
+		assert_unmerged(&partial, "git commit:", "a");
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), head);
+		assert!(
+			!git(temp.path(), &["ls-tree", "-r", "--name-only", "HEAD"])
+				.lines()
+				.any(|path| path == "extra")
+		);
+
+		// A resolved index still commits the staged file and the resolved path.
+		git(temp.path(), &["add", "a"]);
+		let sha = repo
+			.commit_create("resolved", &CommitOptions::default())
+			.unwrap();
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), sha);
+		let names = git(temp.path(), &["ls-tree", "-r", "--name-only", "HEAD"]);
+		assert!(names.lines().any(|path| path == "a"), "{names}");
+		assert!(names.lines().any(|path| path == "extra"), "{names}");
+	}
+
+	#[test]
+	fn pathspec_commit_rejects_conflicts_a_hook_introduces() {
+		let (temp, repo) = fixture();
+		fs::write(temp.path().join("extra"), "extra\n").unwrap();
+		repo.stage_files(&["extra".into()]).unwrap();
+		let head = git(temp.path(), &["rev-parse", "HEAD"]);
+		write_hook(
+			&temp.path().join(".git/hooks/pre-commit"),
+			concat!(
+				"set -e\n",
+				"base=$(git rev-parse HEAD:a)\n",
+				"ours=$(printf 'ours\\n' | git hash-object -w --stdin)\n",
+				"git update-index --force-remove a\n",
+				"printf '100644 %s 1\\ta\\n100644 %s 2\\ta\\n' \"$base\" \"$ours\"",
+				" | git update-index --index-info\n",
+				"echo ran > hook-ran",
+			),
+			true,
+		);
+		let error = repo
+			.commit_create("partial", &CommitOptions {
+				files: vec!["extra".into()],
+				..Default::default()
+			})
+			.unwrap_err();
+		assert_unmerged(&error, "git commit:", "a");
+		assert!(temp.path().join("hook-ran").is_file(), "hook must run, then the index is rechecked");
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), head);
+		assert!(
+			!git(temp.path(), &["ls-tree", "-r", "--name-only", "HEAD"])
+				.lines()
+				.any(|path| path == "extra")
+		);
+		assert!(!git(temp.path(), &["ls-files", "-u", "--", "a"]).is_empty());
 	}
 }
