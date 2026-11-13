@@ -743,6 +743,7 @@ export class InternalUrlFilesystem {
 			const message = error instanceof Error ? error.message : String(error);
 			throw new UrlFsError(message.startsWith("MCP resource read error") ? "EIO" : "ENOENT", message);
 		}
+		if (resource.absent === true) throw new UrlFsError("ENOENT", `JSON path not found: ${url}`);
 		if (resource.isDirectory) {
 			return {
 				kind: "virtual",

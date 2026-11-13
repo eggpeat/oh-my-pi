@@ -485,6 +485,41 @@ describe("GrepTool internal URL resolution", () => {
 		expect(readSpy).not.toHaveBeenCalledWith(expect.anything(), "/report", expect.anything());
 	});
 
+	it("splits a missing agent result field from a following local file instead of searching null", async () => {
+		await Bun.write(
+			path.join(artifactsDir, "worker.md"),
+			JSON.stringify({ report: "agent report needle", "report;version": "kept semicolon needle", empty: null }),
+		);
+		await Bun.write(path.join(tmpDir, "README.md"), "readme needle\n");
+		const session = createSession();
+
+		const listed = getResultText(
+			await new GrepTool(session).execute("agent-field-list", {
+				pattern: "needle",
+				path: "agent://worker/report;README.md",
+			}),
+		);
+		expect(listed).toContain("agent report needle");
+		expect(listed).toContain("readme needle");
+
+		const kept = getResultText(
+			await new GrepTool(session).execute("agent-semicolon-field", {
+				pattern: "needle",
+				path: "agent://worker/report;version",
+			}),
+		);
+		expect(kept).toContain("kept semicolon needle");
+		expect(kept).not.toContain("agent report needle");
+
+		const realNull = getResultText(
+			await new GrepTool(session).execute("agent-null-field", {
+				pattern: "null",
+				path: "agent://worker/empty",
+			}),
+		);
+		expect(realNull).toContain("null");
+	});
+
 	it("searches virtual internal URL content without a backing file", async () => {
 		registerVirtualDocs(new Map([["doc.md", "alpha line\nneedle in virtual content\ngamma line\n"]]));
 
