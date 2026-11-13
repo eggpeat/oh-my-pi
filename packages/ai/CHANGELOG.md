@@ -9,6 +9,7 @@
 ### Fixed
 
 - Fixed Gemini 4 (Argon, Carbon and Hydrogen) answers longer than one 65,536-token output segment failing with finish reason `CONTINUATION`: Google, Vertex AI, Gemini CLI and Antigravity requests now resume the generation, retrying transient failures, and stream it as one reply ([#19081](https://github.com/can1357/oh-my-pi/pull/19081) by [@eggpeat](https://github.com/eggpeat))
+- Fixed the README quick start and catalog examples importing `getModel`/`getModels`/`getProviders` from `@oh-my-pi/pi-ai`, which no longer exports them; the snippets now import `getBundledModel`/`getBundledModels`/`getBundledProviders` from `@oh-my-pi/pi-catalog/models` and use current bundled model ids ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 
 ## [18.20.0] - 2026-11-12
 
