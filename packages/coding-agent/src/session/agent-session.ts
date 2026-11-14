@@ -1386,6 +1386,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	#clientOwnedRunId = 0;
 	#clientOwnedRunSeq = 0;
+	/**
+	 * Kept after the claimed run ends so a recovery continue of that same
+	 * client prompt (automatic retry, empty-stop retry, and the like) can
+	 * restore {@link #clientOwnedRunId} and wake parked steers. Cleared when
+	 * the client prompt bracket settles or aborts. 0 if the prompt never claimed.
+	 */
+	#clientRecoveryOwnerId = 0;
+	#clientRecoveryGeneration = 0;
 	/** Dialogs open and waiting for the user's answer; while any is, the computer turn is ended. */
 	#userWaitCount = 0;
 	/** Whether the open dialogs ended a prompt's computer turn, which goes on once they settle. */
@@ -2064,6 +2072,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#promptInFlightCount = 0;
 		this.#clientPromptInFlightCount = 0;
 		this.#clientOwnedRunId = 0;
+		this.#clientRecoveryOwnerId = 0;
 		this.yieldQueue.requestIdleFlush();
 		this.#releasePowerAssertion();
 		this.#endComputerTurn();
@@ -5557,8 +5566,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			for (;;) {
 				try {
-					if (!this.agent.state.isStreaming) onStart?.();
-					await this.agent.continue(signal);
+					const wasStreaming = this.agent.state.isStreaming;
+					if (!wasStreaming) onStart?.();
+					const run = this.agent.continue(signal);
+					// continue() claims streaming in its synchronous prefix.
+					// Only that claim — not a run that was already streaming,
+					// which makes continue() fail busy — may take the
+					// ownership agent_end cleared, and wake steers that parked
+					// while the retry was still backing off.
+					if (!wasStreaming && this.agent.state.isStreaming) this.#restoreClientRecoveryOwnership(request);
+					await run;
 					return { status: "completed" };
 				} catch (error) {
 					if (!(error instanceof AgentBusyError)) throw error;
@@ -8856,6 +8873,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				// refuse (keeping their content) instead of admitting after
 				// settle, mirroring #resetInFlight's wake.
 				if (this.#clientPromptInFlightCount === 0) {
+					// The bracket that owned recovery continues is gone. A
+					// later continue must not inherit it.
+					this.#clientRecoveryOwnerId = 0;
+					if (this.#clientOwnedRunId !== 0) this.#clientOwnedRunId = 0;
 					this.#wakeDispatchLiveWaiters();
 				}
 			}
@@ -9082,6 +9103,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		try {
 			dispatched = await this.#promptWithMessage(message, expandedText, {
 				...options,
+				claimClientRun: true,
 				followUpBatch: followUps,
 				images: normalizedImages,
 				prependMessages:
@@ -9540,6 +9562,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			acceptTerminalEmptyStop?: boolean;
 			/** Follow-ups held until this run goes live; queued behind it then. */
 			followUpBatch?: PromptFollowUps;
+			/**
+			 * Set only by the client prompt (`#prompt` / `#dispatchPrompt`).
+			 * Other callers (auto-continue, queued hidden next-turn drains)
+			 * are background runs and must not become the steer target.
+			 */
+			claimClientRun?: boolean;
 		},
 	): Promise<boolean> {
 		// Returns false when the prompt was dropped before reaching the agent —
@@ -9805,22 +9833,26 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (planReferenceMessage) {
 				this.#planReferenceSent = true;
 			}
-			const clientOwnedRunId = ++this.#clientOwnedRunSeq;
+			const clientOwnedRunId = options?.claimClientRun ? ++this.#clientOwnedRunSeq : 0;
 			try {
 				const run = this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions, () => {
 					// `agent.prompt` claims streaming synchronously before its
-					// first await: this callback fires exactly when THIS
-					// client-owned run goes live (never on a busy-retry that
-					// waits behind an autonomous run). Stamp that identity and
-					// wake steers parked on the dispatch so they admit into
-					// the run they targeted, not whatever else is streaming.
-					this.#clientOwnedRunId = clientOwnedRunId;
-					this.#wakeDispatchLiveWaiters();
+					// first await: this callback fires exactly when THIS run
+					// goes live (never on a busy-retry that waits behind
+					// another run). Only the client prompt stamps ownership
+					// and wakes parked steers; a background caller must not
+					// collect them.
+					if (clientOwnedRunId !== 0) {
+						this.#clientOwnedRunId = clientOwnedRunId;
+						this.#clientRecoveryOwnerId = clientOwnedRunId;
+						this.#clientRecoveryGeneration = generation;
+						this.#wakeDispatchLiveWaiters();
+					}
 					options?.followUpBatch?.release();
 				});
 				await run;
 			} finally {
-				if (this.#clientOwnedRunId === clientOwnedRunId) this.#clientOwnedRunId = 0;
+				if (clientOwnedRunId !== 0 && this.#clientOwnedRunId === clientOwnedRunId) this.#clientOwnedRunId = 0;
 				this.#stats.setPendingSnapshot(undefined);
 			}
 			if (!options?.skipPostPromptRecoveryWait) {
@@ -10470,6 +10502,21 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	#clientOwnedRunIsLive(): boolean {
 		return this.#clientOwnedRunId !== 0 && this.agent.state.isStreaming;
+	}
+
+	/**
+	 * Re-stamp the client prompt's ownership onto a recovery continue that
+	 * just claimed the stream, and wake steers parked on that prompt.
+	 * Unscoped continues (no generation) are not that prompt's recovery.
+	 */
+	#restoreClientRecoveryOwnership(request: ScheduledAgentContinueRequest): void {
+		if (!this.agent.state.isStreaming || this.#abortInProgress) return;
+		if (this.#clientRecoveryOwnerId === 0 || this.#clientPromptInFlightCount === 0) return;
+		if (request.options.generation === undefined || request.options.generation !== this.#clientRecoveryGeneration) {
+			return;
+		}
+		this.#clientOwnedRunId = this.#clientRecoveryOwnerId;
+		this.#wakeDispatchLiveWaiters();
 	}
 
 	/** Resolve every parked dispatch-live waiter (streaming rose, or drained). */

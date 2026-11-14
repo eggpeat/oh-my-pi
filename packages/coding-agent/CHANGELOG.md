@@ -20,7 +20,7 @@
 
 ### Fixed
 
-- ACP steering no longer injects into a background run while your prompt is still starting; it waits for that prompt's own turn, or is handed back if the prompt ends first ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+- ACP steering waits for your own prompt instead of a background run, still reaches that prompt's automatic retry, and is handed back if the prompt ends first ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 
 - Fixed `^` model mentions and `/switch` argument completions missing discovered models for the rest of a session after provider discovery failed at startup; using those lists now retries the failed discovery, and an open `^` list updates once it recovers models.
 - A background job result that arrives after an ACP prompt ends no longer starts a turn the client cannot see; it is folded into the next prompt

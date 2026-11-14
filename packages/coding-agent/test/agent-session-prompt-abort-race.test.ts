@@ -6,6 +6,7 @@
  * and abort() must cancel an in-flight vision description rather than wait on it.
  */
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { scheduler } from "node:timers/promises";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
@@ -16,6 +17,12 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import {
+	cfgRetryBaseDelayMs,
+	cfgRetryEnabled,
+	cfgRetryMaxRetries,
+	cfgRetryModelFallback,
+} from "@oh-my-pi/pi-coding-agent/session/settings";
 import * as imageVisionFallback from "@oh-my-pi/pi-coding-agent/utils/image-vision-fallback";
 import * as imageLoading from "@oh-my-pi/pi-coding-agent/utils/image-loading";
 import { withTimeout } from "@oh-my-pi/pi-utils";
@@ -808,6 +815,149 @@ describe("AgentSession prompt admission racing abort", () => {
 
 		releaseAutonomous.resolve();
 		await turnA;
+		await session.waitForIdle();
+	});
+
+	it("does not inject a steer into a hidden next-turn run while the client prompt is still dispatching", async () => {
+		const hiddenStarted = Promise.withResolvers<void>();
+		const releaseHidden = Promise.withResolvers<void>();
+		const clientStarted = Promise.withResolvers<void>();
+		const releaseClient = Promise.withResolvers<void>();
+		const clientSetupReached = Promise.withResolvers<void>();
+		const releaseClientSetup = Promise.withResolvers<void>();
+		let apiKeyCalls = 0;
+		const modelRegistry = {
+			getApiKey: async () => {
+				apiKeyCalls++;
+				if (apiKeyCalls === 1) {
+					clientSetupReached.resolve();
+					await releaseClientSetup.promise;
+					return "test-key";
+				}
+				return "test-key";
+			},
+		};
+		const { session } = await createSession(
+			[
+				async () => {
+					hiddenStarted.resolve();
+					await releaseHidden.promise;
+					return { content: ["hidden next turn"] };
+				},
+				async () => {
+					clientStarted.resolve();
+					await releaseClient.promise;
+					return { content: ["client answer"] };
+				},
+			],
+			false,
+			{ modelRegistry },
+		);
+
+		const clientPrompt = session.prompt("client turn");
+		void clientPrompt.catch(() => undefined);
+		await withTimeout(clientSetupReached.promise, 2_000, "Client prompt never reached setup");
+
+		session.queueDeferredMessage({
+			role: "custom",
+			customType: "test-hidden-message",
+			content: "HIDDEN_NEXT_TURN",
+			display: false,
+			timestamp: Date.now(),
+		});
+		await withTimeout(hiddenStarted.promise, 2_000, "Hidden next-turn run never started");
+		expect(session.agent.state.isStreaming).toBe(true);
+
+		let settled = false;
+		const steer = session.joinActiveTurn("steer the client turn").then(admitted => {
+			settled = true;
+			return admitted;
+		});
+		await drainAdmissionMicrotasks();
+		// The background drain must not be treated as the client prompt's run.
+		expect(settled).toBe(false);
+		expect(session.getQueuedMessages().steering).toEqual([]);
+
+		releaseHidden.resolve();
+		await session.agent.waitForIdle();
+		expect(settled).toBe(false);
+
+		releaseClientSetup.resolve();
+		await withTimeout(clientStarted.promise, 2_000, "Client prompt never claimed the stream");
+		expect(await steer).toBe(true);
+
+		releaseClient.resolve();
+		await clientPrompt;
+		await session.waitForIdle();
+		const hiddenIndex = session.agent.state.messages.findIndex(message =>
+			JSON.stringify(message).includes("hidden next turn"),
+		);
+		const steerIndex = session.agent.state.messages.findIndex(message =>
+			JSON.stringify(message).includes("steer the client turn"),
+		);
+		expect(hiddenIndex).toBeGreaterThanOrEqual(0);
+		expect(steerIndex).toBeGreaterThan(hiddenIndex);
+	});
+
+	it("injects a parked steer into the client prompt's automatic retry", async () => {
+		const retryStreaming = Promise.withResolvers<void>();
+		const releaseRetry = Promise.withResolvers<void>();
+		const retryStarted = Promise.withResolvers<void>();
+		const backoffEntered = Promise.withResolvers<void>();
+		const releaseBackoff = Promise.withResolvers<void>();
+		let holdWaits = false;
+		const waitSpy = spyOn(scheduler, "wait").mockImplementation(async (_delayMs, options) => {
+			options?.signal?.throwIfAborted();
+			if (holdWaits) {
+				backoffEntered.resolve();
+				await releaseBackoff.promise;
+			}
+			options?.signal?.throwIfAborted();
+		});
+		restores.push(() => waitSpy.mockRestore());
+
+		const { session } = await createSession([
+			() => ({ throw: "503 service unavailable: overloaded_error" }),
+			async () => {
+				retryStreaming.resolve();
+				await releaseRetry.promise;
+				return { content: ["retried answer"] };
+			},
+		]);
+		cfgRetryEnabled.set(session.settings, true);
+		cfgRetryBaseDelayMs.set(session.settings, 1_000);
+		cfgRetryMaxRetries.set(session.settings, 1);
+		cfgRetryModelFallback.set(session.settings, false);
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") {
+				holdWaits = true;
+				retryStarted.resolve();
+			}
+		});
+
+		const prompting = session.prompt("fail then retry");
+		void prompting.catch(() => undefined);
+		await withTimeout(retryStarted.promise, 2_000, "Automatic retry never started");
+		await withTimeout(backoffEntered.promise, 2_000, "Retry backoff never started");
+
+		let settled = false;
+		const steer = session.joinActiveTurn("steer the retry").then(admitted => {
+			settled = true;
+			return admitted;
+		});
+		await drainAdmissionMicrotasks();
+		expect(settled).toBe(false);
+		expect(session.getQueuedMessages().steering).toEqual([]);
+
+		releaseBackoff.resolve();
+		await withTimeout(retryStreaming.promise, 2_000, "Retry run never started");
+		await drainAdmissionMicrotasks();
+		expect(settled).toBe(true);
+		expect(await steer).toBe(true);
+		expect(session.getQueuedMessages().steering).toContain("steer the retry");
+
+		releaseRetry.resolve();
+		await prompting;
 		await session.waitForIdle();
 	});
 });
