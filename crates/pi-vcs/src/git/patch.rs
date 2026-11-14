@@ -3110,6 +3110,19 @@ mod tests {
 	}
 
 	#[test]
+	fn patch_parses_quoted_paths_on_all_platforms() {
+		let raw = concat!(
+			"diff --git \"a/weird \\\"name\\\".bin\" \"b/weird \\\"name\\\".bin\"\n",
+			"old mode 100644\n",
+			"new mode 100755\n",
+		);
+		let patch = parse_file_patch(raw).expect("parse quoted header");
+		assert_eq!(patch.old_path.as_deref(), Some("weird \"name\".bin"));
+		assert_eq!(patch.new_path.as_deref(), Some("weird \"name\".bin"));
+	}
+
+	#[cfg(not(windows))]
+	#[test]
 	fn patch_quotes_paths_that_cannot_be_written_verbatim() {
 		let temp = init(&[("tracked.txt", b"base\n")]);
 		let weird = "weird \"name\".bin";
