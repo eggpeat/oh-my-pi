@@ -601,4 +601,213 @@ describe("AgentSession prompt admission racing abort", () => {
 		await session.waitForIdle();
 		expect(calls).toBe(1);
 	});
+
+	/** Yield long enough for a non-parked admission to enqueue, without sleeping. */
+	async function drainAdmissionMicrotasks(): Promise<void> {
+		for (let i = 0; i < 8; i++) await Promise.resolve();
+	}
+
+	it("joinActiveTurn parks while an autonomous run owns the stream and a client prompt is still dispatching", async () => {
+		const autonomousStarted = Promise.withResolvers<void>();
+		const releaseAutonomous = Promise.withResolvers<void>();
+		const clientStarted = Promise.withResolvers<void>();
+		const releaseClient = Promise.withResolvers<void>();
+		const clientSetupReached = Promise.withResolvers<void>();
+		const releaseClientSetup = Promise.withResolvers<void>();
+		let apiKeyCalls = 0;
+		const modelRegistry = {
+			getApiKey: async () => {
+				apiKeyCalls++;
+				if (apiKeyCalls === 1) {
+					clientSetupReached.resolve();
+					await releaseClientSetup.promise;
+					return "test-key";
+				}
+				return "test-key";
+			},
+		};
+		const { session } = await createSession(
+			[
+				async () => {
+					autonomousStarted.resolve();
+					await releaseAutonomous.promise;
+					return { content: ["autonomous answer"] };
+				},
+				async () => {
+					clientStarted.resolve();
+					await releaseClient.promise;
+					return { content: ["client answer"] };
+				},
+			],
+			false,
+			{ modelRegistry },
+		);
+
+		// Client prompt is reserved (`#clientPromptInFlightCount > 0`) but has
+		// not claimed the agent: setup is held at API-key validation, which
+		// sits after the in-flight bracket and before `onClaimed`.
+		const clientPrompt = session.prompt("client turn");
+		void clientPrompt.catch(() => undefined);
+		await withTimeout(clientSetupReached.promise, 2_000, "Client prompt never reached setup");
+
+		// An IRC/scheduler-shaped run claims the agent directly. It streams
+		// with no client forwarder while the client prompt is still dispatching.
+		const autonomous = session.agent.prompt({
+			role: "user",
+			content: [{ type: "text", text: "AUTONOMOUS" }],
+			attribution: "agent",
+			timestamp: Date.now(),
+		});
+		await withTimeout(autonomousStarted.promise, 2_000, "Autonomous run never started");
+		expect(session.agent.state.isStreaming).toBe(true);
+
+		let settled = false;
+		const steer = session.joinActiveTurn("steer the client turn").then(admitted => {
+			settled = true;
+			return admitted;
+		});
+		await drainAdmissionMicrotasks();
+		// Must not inject into the autonomous run and report the client turn
+		// as the owner. Park until that prompt's own claim.
+		expect(settled).toBe(false);
+		expect(session.getQueuedMessages().steering).toEqual([]);
+
+		releaseAutonomous.resolve();
+		await autonomous;
+		await session.agent.waitForIdle();
+
+		releaseClientSetup.resolve();
+		await withTimeout(clientStarted.promise, 2_000, "Client prompt never claimed the stream");
+		expect(await steer).toBe(true);
+
+		releaseClient.resolve();
+		await clientPrompt;
+		await session.waitForIdle();
+
+		const messages = session.agent.state.messages;
+		const autonomousIndex = messages.findIndex(message => JSON.stringify(message).includes("autonomous answer"));
+		const steerIndex = messages.findIndex(message => JSON.stringify(message).includes("steer the client turn"));
+		// Queued while the client run was already streaming, so the loop
+		// delivers it at the next boundary — after that run's first answer,
+		// never as input to the autonomous run that was streaming at arrival.
+		expect(autonomousIndex).toBeGreaterThanOrEqual(0);
+		expect(steerIndex).toBeGreaterThan(autonomousIndex);
+	});
+
+	it("joinActiveTurn refuses a parked steer when the dispatching client prompt fails under an autonomous stream", async () => {
+		const autonomousStarted = Promise.withResolvers<void>();
+		const releaseAutonomous = Promise.withResolvers<void>();
+		const clientSetupReached = Promise.withResolvers<void>();
+		const releaseClientSetup = Promise.withResolvers<void>();
+		let apiKeyCalls = 0;
+		const modelRegistry = {
+			getApiKey: async () => {
+				apiKeyCalls++;
+				if (apiKeyCalls === 1) {
+					clientSetupReached.resolve();
+					await releaseClientSetup.promise;
+					return undefined;
+				}
+				return "test-key";
+			},
+		};
+		const { session } = await createSession(
+			[
+				async () => {
+					autonomousStarted.resolve();
+					await releaseAutonomous.promise;
+					return { content: ["autonomous answer"] };
+				},
+			],
+			false,
+			{ modelRegistry },
+		);
+
+		const failing = session.prompt("client turn");
+		void failing.catch(() => undefined);
+		await withTimeout(clientSetupReached.promise, 2_000, "Client prompt never reached setup");
+		const autonomous = session.agent.prompt({
+			role: "user",
+			content: [{ type: "text", text: "AUTONOMOUS" }],
+			attribution: "agent",
+			timestamp: Date.now(),
+		});
+		await withTimeout(autonomousStarted.promise, 2_000, "Autonomous run never started");
+
+		const steer = session.joinActiveTurn("steer the failing turn");
+		await drainAdmissionMicrotasks();
+		expect(session.getQueuedMessages().steering).toEqual([]);
+
+		releaseClientSetup.resolve();
+		await expect(failing).rejects.toThrow("No API key found");
+		expect(await steer).toBe(false);
+		expect(session.getQueuedMessages().steering).toEqual([]);
+
+		releaseAutonomous.resolve();
+		await autonomous;
+		await session.waitForIdle();
+		expect(
+			session.agent.state.messages.some(message => JSON.stringify(message).includes("steer the failing turn")),
+		).toBe(false);
+	});
+
+	it("refuses an image steer after its client run ends while an autonomous run has taken the stream", async () => {
+		const normalization = holdImageNormalization();
+		const turnStarted = Promise.withResolvers<void>();
+		const releaseTurn = Promise.withResolvers<void>();
+		const autonomousStarted = Promise.withResolvers<void>();
+		const releaseAutonomous = Promise.withResolvers<void>();
+		let clientSettled = false;
+		const { session } = await createSession([
+			async () => {
+				turnStarted.resolve();
+				await releaseTurn.promise;
+				return { content: ["turn a"] };
+			},
+			async () => {
+				autonomousStarted.resolve();
+				await releaseAutonomous.promise;
+				return { content: ["autonomous answer"] };
+			},
+		]);
+		// The client run's agent_end starts a successor before prompt() can
+		// leave its recovery wait, so the client bracket is still open while
+		// the autonomous run owns the stream.
+		let startedSuccessor = false;
+		const unsubscribe = session.agent.subscribe(event => {
+			if (event.type !== "agent_end" || startedSuccessor) return;
+			startedSuccessor = true;
+			void session.agent.prompt({
+				role: "user",
+				content: [{ type: "text", text: "AUTONOMOUS" }],
+				attribution: "agent",
+				timestamp: Date.now(),
+			});
+		});
+		restores.push(unsubscribe);
+
+		const turnA = session.prompt("start").finally(() => {
+			clientSettled = true;
+		});
+		await withTimeout(turnStarted.promise, 2_000, "Turn A never started");
+
+		const steer = session.joinActiveTurn("steer with an image", [IMAGE]);
+		await withTimeout(normalization.started, 2_000, "Steer normalization never started");
+
+		releaseTurn.resolve();
+		await withTimeout(autonomousStarted.promise, 2_000, "Autonomous run never started");
+		expect(clientSettled).toBe(false);
+		expect(session.agent.state.isStreaming).toBe(true);
+
+		normalization.release();
+		expect(await steer).toBe(false);
+		expect(session.getQueuedMessages().steering).toEqual([]);
+		expect(
+			session.agent.state.messages.some(message => JSON.stringify(message).includes("steer with an image")),
+		).toBe(false);
+
+		releaseAutonomous.resolve();
+		await turnA;
+		await session.waitForIdle();
+	});
 });

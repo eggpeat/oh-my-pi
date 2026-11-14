@@ -1377,6 +1377,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * dropped by the ACP host).
 	 */
 	#clientPromptInFlightCount = 0;
+	/**
+	 * Identity of the streaming run claimed by a client prompt's `onClaimed`
+	 * hook. 0 while no such run is live. `#clientPromptInFlightCount` only
+	 * proves a client prompt is dispatching; an autonomous run can own
+	 * `agent.state.isStreaming` in that window. Steer admission must match
+	 * this id, or it injects into a run the client cannot see.
+	 */
+	#clientOwnedRunId = 0;
+	#clientOwnedRunSeq = 0;
 	/** Dialogs open and waiting for the user's answer; while any is, the computer turn is ended. */
 	#userWaitCount = 0;
 	/** Whether the open dialogs ended a prompt's computer turn, which goes on once they settle. */
@@ -2054,6 +2063,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#inFlightEpoch++;
 		this.#promptInFlightCount = 0;
 		this.#clientPromptInFlightCount = 0;
+		this.#clientOwnedRunId = 0;
 		this.yieldQueue.requestIdleFlush();
 		this.#releasePowerAssertion();
 		this.#endComputerTurn();
@@ -4208,7 +4218,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.agent.abort(TERMINAL_TOOL_RESULT_ABORT_REASON);
 			}
 		}
-		if (event.type === "agent_end") this.#agentEndRunEpochs.set(event, this.#runEpoch);
+		if (event.type === "agent_end") {
+			// The stream that just ended is no longer a client-owned run.
+			// Clear before this handler yields, so a successor started from
+			// the same event cannot inherit the identity and collect a steer
+			// meant for the ended turn. A synthetic `agent_end` emitted while
+			// the agent is still streaming is not that end.
+			if (!this.agent.state.isStreaming) this.#clientOwnedRunId = 0;
+			this.#agentEndRunEpochs.set(event, this.#runEpoch);
+		}
 		if (event.type !== "agent_end") {
 			const processing = this.#processAgentEvent(event);
 			if ((event.type === "message_start" || event.type === "message_end") && isAdvisorCard(event.message)) {
@@ -9787,18 +9805,22 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (planReferenceMessage) {
 				this.#planReferenceSent = true;
 			}
+			const clientOwnedRunId = ++this.#clientOwnedRunSeq;
 			try {
 				const run = this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions, () => {
 					// `agent.prompt` claims streaming synchronously before its
 					// first await: this callback fires exactly when THIS
 					// client-owned run goes live (never on a busy-retry that
-					// waits behind an autonomous run) — wake steers parked on
-					// the dispatch so they admit into the run they targeted.
+					// waits behind an autonomous run). Stamp that identity and
+					// wake steers parked on the dispatch so they admit into
+					// the run they targeted, not whatever else is streaming.
+					this.#clientOwnedRunId = clientOwnedRunId;
 					this.#wakeDispatchLiveWaiters();
 					options?.followUpBatch?.release();
 				});
 				await run;
 			} finally {
+				if (this.#clientOwnedRunId === clientOwnedRunId) this.#clientOwnedRunId = 0;
 				this.#stats.setPendingSnapshot(undefined);
 			}
 			if (!options?.skipPostPromptRecoveryWait) {
@@ -10074,15 +10096,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * - a run that settled mid-admission classifies as `false` (not admitted)
 	 *   and the caller keeps its content — no invisible autonomous continuation
 	 *   can claim it;
-	 * - a run that stays live owns delivery: its agent loop polls the steering
-	 *   queue at tool-batch and model-call boundaries.
+	 * - the client prompt's own claimed run, if it stays live, owns delivery:
+	 *   its agent loop polls the steering queue at tool-batch and model-call
+	 *   boundaries. Another run streaming while that prompt is still
+	 *   dispatching does not.
 	 *
 	 * Everything else that enqueues user input (`prompt()`, `steer()`,
 	 * `followUp()`, the idle paths) schedules the idle drain as before; only
-	 * this admission does not, because it only ever targets a live run.
+	 * this admission does not, because it only ever targets that client run.
 	 *
-	 * @returns `true` when the message was admitted onto the live run's queue;
-	 *   `false` when no run was live at (or survived) admission.
+	 * @returns `true` when the message was admitted onto the client-claimed
+	 *   run's queue; `false` when that run was not live at (or did not survive)
+	 *   admission.
 	 */
 	async joinActiveTurn(
 		text: string,
@@ -10116,30 +10141,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
-		// Park-until-live: a steer that lands while the owning prompt is
-		// still dispatching (setup awaits; `agent.state.isStreaming` not
-		// yet raised) cannot inject mid-dispatch, and refusing it back to
-		// the host loses it — agent-shell answers `promptRequired` while
-		// busy by interrupting the very turn the steer targeted. Hold it
-		// until the owning prompt goes live, then admit: the steer injects
-		// at the first batch boundary of the run it was meant for, and the
-		// ACP bridge answers `injected`.
-		if (!this.agent.state.isStreaming) {
-			for (;;) {
-				await this.#waitForPromptDispatchLive();
-				// The owning prompt settled without going live (setup
-				// failure, abort, disposal) or an abort took the window:
-				// keep the caller's content instead of injecting into a
-				// dead run.
-				if (this.#abortInProgress || this.#clientPromptInFlightCount === 0) return false;
-				if (this.agent.state.isStreaming) break;
-				// The client prompt is still dispatching behind an
-				// autonomous run (e.g. an IRC wake its busy-retry is
-				// waiting out) that has since ended: keep parking — only
-				// the client run's own claim (the dispatch-live wake)
-				// admits, never an autonomous run's streaming.
-			}
-		}
+		// Park until the client prompt's own claimed run owns the stream.
+		// `agent.state.isStreaming` is not that run: an autonomous wake (IRC,
+		// idle drain, scheduler) can stream while this prompt is still
+		// dispatching. Admitting then mutates a run whose output the client
+		// drops, while the bridge reports `injected`. A prompt that settles
+		// or aborts first keeps the caller's content.
+		const ownedRunId = await this.#waitForClientOwnedRun();
+		if (ownedRunId === undefined) return false;
 		const mode = options?.queue === "followUp" ? "followUp" : "steer";
 		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
 		return await this.#queueUserMessage(expandedText, images, mode, {
@@ -10147,6 +10156,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			rawText: text,
 			requireActiveRun: true,
 			skipIdleDrain: true,
+			clientOwnedRunId: ownedRunId,
 		});
 	}
 
@@ -10215,6 +10225,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			 */
 			requireActiveRun?: boolean;
 			/**
+			 * `joinActiveTurn` admission: the client-claimed run that owned the
+			 * stream when this steer was admitted. After image preprocessing the
+			 * same id must still own the stream; a successor autonomous run does
+			 * not, even while `#clientPromptInFlightCount` is still raised.
+			 */
+			clientOwnedRunId?: number;
+			/**
 			 * `joinActiveTurn` admission: never schedule the idle queue drain —
 			 * the live run owns delivery (its loop polls the steering queue at
 			 * batch/model-call boundaries), and a message admitted while no run
@@ -10269,16 +10286,20 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// `joinActiveTurn` admission: after every await above, the run that was
 		// live at call time may have settled — or `abort()` may have started
 		// (its `#abortInProgress` flag is raised synchronously at entry, while
-		// `isStreaming` can stay true until cleanup drains) — or, with
-		// `requireActiveRun`, the CLIENT turn that admitted this steer may
-		// have settled during the preprocessing awaits while an autonomous
-		// wake (IRC, scheduler) took over `isStreaming`. Classify either as
-		// not-admitted so the caller (the ACP bridge) keeps its content for the
-		// host; the enqueue below is synchronous, so nothing interleaves
-		// between this check and the message landing on the queue.
+		// `isStreaming` can stay true until cleanup drains) — or the CLIENT
+		// turn that admitted this steer may have ended while an autonomous
+		// wake took over the stream. `#clientPromptInFlightCount` stays raised
+		// until that prompt's bracket settles, so it cannot tell those apart;
+		// the claimed-run id can. Classify either as not-admitted so the caller
+		// keeps its content. The enqueue below is synchronous, so nothing
+		// interleaves between this check and the message landing on the queue.
 		if (
 			options?.requireActiveRun &&
-			(this.#abortInProgress || !this.isStreaming || this.#clientPromptInFlightCount === 0)
+			(this.#abortInProgress ||
+				!this.agent.state.isStreaming ||
+				this.#clientPromptInFlightCount === 0 ||
+				options.clientOwnedRunId === undefined ||
+				this.#clientOwnedRunId !== options.clientOwnedRunId)
 		) {
 			return false;
 		}
@@ -10410,14 +10431,30 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#dispatchLiveWaiters = new Set<() => void>();
 
 	/**
+	 * Park until the dispatching CLIENT prompt's own run owns the stream, or
+	 * that prompt settles. An autonomous run streaming in the meantime is not
+	 * a go-live. Returns the claimed run's id, or undefined when the prompt
+	 * settled or aborted first.
+	 */
+	async #waitForClientOwnedRun(): Promise<number | undefined> {
+		for (;;) {
+			if (this.#abortInProgress || this.#clientPromptInFlightCount === 0) return undefined;
+			const ownedRunId = this.#clientOwnedRunId;
+			if (ownedRunId !== 0 && this.agent.state.isStreaming) return ownedRunId;
+			await this.#waitForPromptDispatchLive();
+		}
+	}
+
+	/**
 	 * Park until the dispatching CLIENT prompt goes live or settles. No-op
-	 * when no client prompt is in flight — an autonomous run streaming in
-	 * the meantime is not a go-live for a parked steer and must not un-park
-	 * it (`joinActiveTurn`'s loop decides admission from the client claim
-	 * wake alone).
+	 * when no client prompt is in flight, or when that prompt's own run
+	 * already owns the stream — an autonomous run streaming in the meantime
+	 * is not a go-live for a parked steer and must not un-park it
+	 * (`#waitForClientOwnedRun` decides admission from the client claim
+	 * alone).
 	 */
 	async #waitForPromptDispatchLive(): Promise<void> {
-		if (this.#clientPromptInFlightCount === 0) return;
+		if (this.#clientPromptInFlightCount === 0 || this.#clientOwnedRunIsLive()) return;
 		const gate = Promise.withResolvers<void>();
 		const wake = (): void => {
 			this.#dispatchLiveWaiters.delete(wake);
@@ -10425,9 +10462,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		};
 		this.#dispatchLiveWaiters.add(wake);
 		// Double-checked after registration: the client prompt may have
-		// settled between the caller's reads and this registration.
-		if (this.#clientPromptInFlightCount === 0) wake();
+		// settled, or its own run may have claimed, between the caller's
+		// reads and this registration.
+		if (this.#clientPromptInFlightCount === 0 || this.#clientOwnedRunIsLive()) wake();
 		else await gate.promise;
+	}
+
+	#clientOwnedRunIsLive(): boolean {
+		return this.#clientOwnedRunId !== 0 && this.agent.state.isStreaming;
 	}
 
 	/** Resolve every parked dispatch-live waiter (streaming rose, or drained). */
