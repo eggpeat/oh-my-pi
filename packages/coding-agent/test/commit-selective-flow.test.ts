@@ -117,6 +117,65 @@ describe("selective commit flow", () => {
 		expect((await git(root, ["show", "--name-only", "--format=", "HEAD"])).trim()).toBe("parser.ts");
 	});
 
+	it("commits whole-file changes as the draft captured them, not later worktree edits", async () => {
+		const { root, journal } = await sharedWorkspace();
+		const seedBytes = new Uint8Array([0, 159, 146, 150, 255, 0, 11]);
+		const agentBytes = new Uint8Array([0, 159, 146, 150, 255, 0, 11, 42]);
+		const addedBytes = new Uint8Array([7, 0, 255, 254, 1]);
+		const goneBytes = new Uint8Array([3, 1, 4, 1, 5, 9, 2, 6, 0]);
+		await Bun.write(path.join(root, "tracked.bin"), seedBytes);
+		await Bun.write(path.join(root, "deleted.bin"), goneBytes);
+		await git(root, ["add", "tracked.bin", "deleted.bin"]);
+		await git(root, ["commit", "-qm", "add binaries"]);
+
+		// Main's writes: modify the tracked binary, add an untracked one, delete another.
+		const record = (file: string, before: string | null, after: string | null) =>
+			journal.recordChange({
+				agent: "Main",
+				parent: undefined,
+				tool: "edit",
+				path: path.join(root, file),
+				before,
+				after,
+			});
+		await Bun.write(path.join(root, "tracked.bin"), agentBytes);
+		record("tracked.bin", "old", "new");
+		await Bun.write(path.join(root, "added.bin"), addedBytes);
+		record("added.bin", null, "new");
+		await fs.rm(path.join(root, "deleted.bin"));
+		record("deleted.bin", "old", null);
+		await journal.flush();
+
+		const draft = await createDraft({ cwd: root, journal, caller: "Main", agents: "self" });
+		draft.only(["*.bin"]);
+		draft.take({ path: "*.bin" });
+
+		// Another process rewrites all three paths before the commit lands.
+		const lateBytes = new Uint8Array([0, 0, 0, 0, 0, 0, 0, 0]);
+		await Bun.write(path.join(root, "tracked.bin"), lateBytes);
+		await Bun.write(path.join(root, "added.bin"), new Uint8Array([1, 2, 3]));
+		await Bun.write(path.join(root, "deleted.bin"), new Uint8Array([9, 9, 9, 9]));
+
+		const outcome = await commitSelection(
+			draft,
+			{ subject: "chore: binaries" },
+			{ journal, agent: { agent: "Main" } },
+		);
+		expect(outcome.paths.sort()).toEqual(["added.bin", "deleted.bin", "tracked.bin"]);
+
+		const showBytes = async (file: string) => {
+			const proc = Bun.spawn(["git", "-C", root, "show", `HEAD:${file}`], { stdout: "pipe", stderr: "pipe" });
+			const [bytes, code] = await Promise.all([new Response(proc.stdout).arrayBuffer(), proc.exited]);
+			if (code !== 0) throw new Error(`git show HEAD:${file} failed (${code})`);
+			return new Uint8Array(bytes);
+		};
+		expect(await showBytes("tracked.bin")).toEqual(agentBytes);
+		expect(await showBytes("added.bin")).toEqual(addedBytes);
+		expect(await git(root, ["ls-tree", "--name-only", "HEAD", "--", "deleted.bin"])).toBe("");
+		// The worktree keeps the later bytes; only the commit froze the draft's.
+		expect(new Uint8Array(await Bun.file(path.join(root, "tracked.bin")).arrayBuffer())).toEqual(lateBytes);
+	});
+
 	it("refuses to commit on a HEAD that moved onto the same lines", async () => {
 		const { root, journal } = await sharedWorkspace();
 		const draft = await createDraft({ cwd: root, journal, caller: "Main", agents: "self" });

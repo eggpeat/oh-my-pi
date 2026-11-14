@@ -865,6 +865,12 @@ export declare class VcsGitRepo {
   diffText(options: VcsDiffOptions, signal?: unknown | undefined | null): Promise<string>
   /** Render a no-index patch between two filesystem paths. */
   diffNoIndex(left: string, right: string, binary: boolean, signal?: unknown | undefined | null): Promise<string>
+  /**
+   * Render a patch for `path` between the blob `base` resolves to and
+   * `new_bytes` (`null` deletes the path). `new_mode` is the git mode bits
+   * of the new content; required when `new_bytes` is non-null.
+   */
+  diffFileBytes(path: string, base: string, newBytes: Uint8Array | undefined | null, newMode: number | undefined | null, binary: boolean, signal?: unknown | undefined | null): Promise<string>
   /** Changed paths. */
   changedFiles(options: VcsDiffOptions, signal?: unknown | undefined | null): Promise<Array<string>>
   /** Per-file line counts. */

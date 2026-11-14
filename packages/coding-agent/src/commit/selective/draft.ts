@@ -65,8 +65,11 @@ export interface DraftSource {
 /** Content to commit for one path; produced by {@link Draft.selection}. */
 export type SelectedChange =
 	| { kind: "text"; path: string; head: string | null; content: string | null; mode: string }
-	/** Binary, non-UTF-8, or oversized file committed as its current worktree state. */
-	| { kind: "whole"; path: string; untracked: boolean };
+	/**
+	 * Binary, non-UTF-8, or oversized file committed as the worktree bytes the
+	 * draft captured; `work` is `null` when the file was absent at draft time.
+	 */
+	| { kind: "whole"; path: string; work: Uint8Array | null; mode: string };
 
 /** What to select or deselect: a path (exact, glob, or unique suffix), hunk/unit ids, and/or a regex over change lines. */
 export interface SelectionTarget {
@@ -78,9 +81,10 @@ export interface SelectionTarget {
 
 interface FileChange {
 	path: string;
-	untracked: boolean;
 	head: string | null;
 	work: string | null;
+	/** Frozen worktree bytes of a whole-file change; `null` when the file was absent at draft time. */
+	workBytes?: Uint8Array | null;
 	/** Mode for the file if the commit creates it. */
 	mode: string;
 	/** Line attribution; absent for binary, non-UTF-8, or oversized files, which select whole. */
@@ -266,7 +270,7 @@ export async function createDraft(source: DraftSource): Promise<Draft> {
 	const dirty = parseDirtyPathsWithStatus(statusText);
 	const files: FileChange[] = [];
 	const skipped: string[] = [];
-	const load = async (entry: { path: string; untracked: boolean }) => {
+	const load = async (entry: { path: string }) => {
 		const result = await loadFile(repo, root, head, entry, byPath.get(entry.path) ?? [], source.journal, windowCall);
 		if (result === "skip") skipped.push(entry.path);
 		else if (result) files.push(result);
@@ -307,7 +311,7 @@ async function loadFile(
 	repo: VcsGitRepo,
 	root: string,
 	head: string,
-	entry: { path: string; untracked: boolean },
+	entry: { path: string },
 	records: readonly ChangeRecord[],
 	journal: ChangeJournal | null,
 	windowCall: (ms: number | undefined) => CallRecord | undefined,
@@ -337,14 +341,19 @@ async function loadFile(
 	const workText = workBytes === null ? null : decodeText(workBytes);
 	const base = {
 		path: entry.path,
-		untracked: entry.untracked,
 		mode,
 		selected: new Set<number>(),
 		wholeSelected: false,
 		editors,
 	};
 	if (headText === undefined || workText === undefined) {
-		return { ...base, head: null, work: null, hint: records.length === 0 ? windowCall(mtimeMs) : undefined };
+		return {
+			...base,
+			head: null,
+			work: null,
+			workBytes,
+			hint: records.length === 0 ? windowCall(mtimeMs) : undefined,
+		};
 	}
 	if (headText === workText) return undefined;
 	const headLines = toLines(headText);
@@ -433,7 +442,9 @@ export class Draft {
 		const changes: SelectedChange[] = [];
 		for (const file of this.#files) {
 			if (!file.attribution) {
-				if (file.wholeSelected) changes.push({ kind: "whole", path: file.path, untracked: file.untracked });
+				if (file.wholeSelected) {
+					changes.push({ kind: "whole", path: file.path, work: file.workBytes ?? null, mode: file.mode });
+				}
 				continue;
 			}
 			if (file.selected.size === 0) continue;
@@ -693,7 +704,7 @@ export class Draft {
 		const parts = this.selection().map(change =>
 			change.kind === "text"
 				? formatTextPatch(change.path, change.head, change.content, change.mode)
-				: `diff --git a/${change.path} b/${change.path}\n(whole-file change committed as in the worktree)\n`,
+				: `diff --git a/${change.path} b/${change.path}\n(whole-file change committed with the bytes captured by the draft)\n`,
 		);
 		return parts.join("") || "Nothing selected.";
 	}

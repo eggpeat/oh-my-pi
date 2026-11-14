@@ -1077,6 +1077,24 @@ impl VcsGitRepo {
 		})
 	}
 
+	/// Render a patch for `path` between the blob `base` resolves to and
+	/// `new_bytes` (`null` deletes the path). `new_mode` is the git mode bits
+	/// of the new content; required when `new_bytes` is non-null.
+	#[napi]
+	pub fn diff_file_bytes(
+		&self,
+		path: String,
+		base: String,
+		new_bytes: Option<Uint8Array>,
+		new_mode: Option<u32>,
+		binary: bool,
+		signal: Option<Unknown>,
+	) -> Promise<String> {
+		blocking("vcs.diffFileBytes", self.inner.clone(), signal, move |repo| {
+			repo.diff_file_bytes(&path, &base, new_bytes.as_deref(), new_mode, binary)
+		})
+	}
+
 	/// Changed paths.
 	#[napi]
 	pub fn changed_files(
