@@ -135,6 +135,66 @@ impl GitRepo {
 		render_change(&repo, &mut cache, &change, 3, binary, None).map(|rendered| rendered.text)
 	}
 
+	/// Render a patch for `path` between the blob `base` resolves to in its
+	/// tree and `new_bytes` (`None` deletes the path). `new_mode` is the git
+	/// mode bits of the new content (e.g. `0o100644`); required when
+	/// `new_bytes` is `Some`, ignored otherwise. Returns `""` when the result
+	/// matches the base entry. Neither the index nor the worktree is read.
+	pub fn diff_file_bytes(
+		&self,
+		path: &str,
+		base: &str,
+		new_bytes: Option<&[u8]>,
+		new_mode: Option<u32>,
+		binary: bool,
+	) -> Result<String> {
+		let repo = self.gix()?;
+		let tree = revision_tree(&repo, base)?;
+		let entry = tree
+			.lookup_entry_by_path(path)
+			.map_err(|err| Error::backend("git diff", err))?;
+		let (old_id, old_mode) = entry.map_or_else(
+			|| (repo.object_hash().null(), None),
+			|entry| (entry.id().detach(), Some(entry.mode())),
+		);
+		let new_id = new_bytes
+			.map(|bytes| {
+				repo
+					.write_blob(bytes)
+					.map(|id| id.detach())
+					.map_err(|err| Error::backend("git diff", err))
+			})
+			.transpose()?;
+		let new_mode = match (new_bytes, new_mode) {
+			(None, _) => None,
+			(Some(_), Some(mode)) => {
+				Some(gix::objs::tree::EntryMode::try_from(mode).map_err(|mode| {
+					Error::backend("git diff", format!("invalid file mode {mode:06o}"))
+				})?)
+			},
+			(Some(_), None) => {
+				return Err(Error::backend("git diff", "file mode required for new content"));
+			},
+		};
+		let change = FileChange {
+			old_path: path.to_owned(),
+			new_path: path.to_owned(),
+			old_id,
+			new_id: new_id.unwrap_or_else(|| repo.object_hash().null()),
+			old_mode,
+			new_mode,
+			similarity: None,
+			worktree_new: false,
+		};
+		if change.old_id == change.new_id && change.old_mode == change.new_mode {
+			return Ok(String::new());
+		}
+		let mut cache = repo
+			.diff_resource_cache_for_tree_diff()
+			.map_err(|err| Error::backend("git diff", err))?;
+		render_change(&repo, &mut cache, &change, 3, binary, None).map(|rendered| rendered.text)
+	}
+
 	/// Render a commit header and its patch against its first parent.
 	pub fn show_commit(&self, rev: &str, max_bytes: Option<usize>) -> Result<ShowResult> {
 		let repo = self.gix()?;

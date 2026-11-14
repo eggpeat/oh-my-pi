@@ -59,9 +59,13 @@ export function composeMessage(request: CommitRequest): string {
 
 async function patchFor(repo: VcsGitRepo, head: string, change: SelectedChange): Promise<string> {
 	if (change.kind === "text") return formatTextPatch(change.path, change.head, change.content, change.mode);
-	return change.untracked
-		? repo.diffNoIndex("/dev/null", change.path, true)
-		: repo.diffText({ base: head, files: [change.path], binary: true });
+	return repo.diffFileBytes(
+		change.path,
+		head,
+		change.work,
+		change.work === null ? null : Number.parseInt(change.mode, 8),
+		true,
+	);
 }
 
 /**
