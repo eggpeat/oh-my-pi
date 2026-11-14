@@ -866,9 +866,11 @@ export declare class VcsGitRepo {
   /** Render a no-index patch between two filesystem paths. */
   diffNoIndex(left: string, right: string, binary: boolean, signal?: unknown | undefined | null): Promise<string>
   /**
-   * Render a patch for `path` between the blob `base` resolves to and
-   * `new_bytes` (`null` deletes the path). `new_mode` is the git mode bits
-   * of the new content; required when `new_bytes` is non-null.
+   * Render an applyable patch for `path` from the blob `base` resolves to
+   * onto `new_bytes` (`null` deletes the path). `new_bytes` are
+   * clean-filtered and the patch is always binary, so the stored bytes
+   * round-trip. `new_mode` is the git mode bits of the new content;
+   * required when `new_bytes` is non-null.
    */
   diffFileBytes(path: string, base: string, newBytes: Uint8Array | undefined | null, newMode: number | undefined | null, binary: boolean, signal?: unknown | undefined | null): Promise<string>
   /** Changed paths. */

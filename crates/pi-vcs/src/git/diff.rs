@@ -10,6 +10,7 @@ use gix::bstr::{BStr, BString, ByteSlice};
 
 use super::{
 	GitRepo,
+	filter::WorktreeFilter,
 	open::{load_index_or_empty, status_with_fresh_index},
 };
 use crate::{
@@ -136,10 +137,17 @@ impl GitRepo {
 	}
 
 	/// Render a patch for `path` between the blob `base` resolves to in its
-	/// tree and `new_bytes` (`None` deletes the path). `new_mode` is the git
-	/// mode bits of the new content (e.g. `0o100644`); required when
-	/// `new_bytes` is `Some`, ignored otherwise. Returns `""` when the result
-	/// matches the base entry. Neither the index nor the worktree is read.
+	/// tree and `new_bytes` (`None` deletes the path).
+	///
+	/// `new_bytes` are worktree bytes: they pass through the clean filters
+	/// (`text`/`eol`, `ident`, LFS and other drivers) before being stored, as
+	/// `git add` would. The patch is always a binary patch, so bytes Git would
+	/// treat as text — non-UTF-8 without a NUL — round-trip instead of being
+	/// lossily re-encoded. `new_mode` is the git mode bits of the new content
+	/// (e.g. `0o100644`); required when `new_bytes` is `Some`, ignored
+	/// otherwise. Returns `""` when the filtered result matches the base
+	/// entry. The worktree file itself is not read. `binary` is accepted for
+	/// callers and ignored: a text rendering cannot preserve these snapshots.
 	pub fn diff_file_bytes(
 		&self,
 		path: &str,
@@ -148,6 +156,8 @@ impl GitRepo {
 		new_mode: Option<u32>,
 		binary: bool,
 	) -> Result<String> {
+		// See the doc comment: text rendering corrupts non-UTF-8 snapshots.
+		let _ = binary;
 		let repo = self.gix()?;
 		let tree = revision_tree(&repo, base)?;
 		let entry = tree
@@ -157,7 +167,15 @@ impl GitRepo {
 			|| (repo.object_hash().null(), None),
 			|entry| (entry.id().detach(), Some(entry.mode())),
 		);
-		let new_id = new_bytes
+		let stored = match new_bytes {
+			Some(bytes) => {
+				let mut filter = WorktreeFilter::staging(&repo, "git diff")?;
+				Some(filter.worktree_to_git(path, bytes.to_vec())?)
+			},
+			None => None,
+		};
+		let new_id = stored
+			.as_deref()
 			.map(|bytes| {
 				repo
 					.write_blob(bytes)
@@ -189,10 +207,7 @@ impl GitRepo {
 		if change.old_id == change.new_id && change.old_mode == change.new_mode {
 			return Ok(String::new());
 		}
-		let mut cache = repo
-			.diff_resource_cache_for_tree_diff()
-			.map_err(|err| Error::backend("git diff", err))?;
-		render_change(&repo, &mut cache, &change, 3, binary, None).map(|rendered| rendered.text)
+		render_byte_patch(&repo, &change)
 	}
 
 	/// Render a commit header and its patch against its first parent.
@@ -867,6 +882,27 @@ fn render_change(
 			Err(Error::backend("git diff", "external diff drivers cannot be rendered in-process"))
 		},
 	}
+}
+
+/// Binary patch of `change`, including when Git would classify the bytes as
+/// text. A unified diff re-encodes lines as UTF-8 and cannot be applied back
+/// onto non-UTF-8 snapshots. Identical content emits mode lines only.
+fn render_byte_patch(repo: &gix::Repository, change: &FileChange) -> Result<String> {
+	let mut text = String::new();
+	text.push_str("diff --git a/");
+	text.push_str(&change.old_path);
+	text.push_str(" b/");
+	text.push_str(&change.new_path);
+	text.push('\n');
+	append_metadata(&mut text, change, None, true);
+	if change.old_id != change.new_id {
+		text.push_str("GIT binary patch\n");
+		let old = object_bytes(repo, change.old_id)?;
+		let new = object_bytes(repo, change.new_id)?;
+		append_binary_body(&mut text, &old, &new, None)?;
+		append_binary_body(&mut text, &new, &old, None)?;
+	}
+	Ok(text)
 }
 
 fn render_gitlink(change: &FileChange) -> Rendered {

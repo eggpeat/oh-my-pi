@@ -855,6 +855,19 @@ fn apply_patches_to_map(
 			}
 			continue;
 		}
+		// A literal binary block is the result itself, so unlike a text hunk it
+		// never notices that the current blob is someone else's. Git refuses
+		// unless the index line's preimage hash is the blob being patched.
+		if !patch.binary.is_empty()
+			&& !binary_preimage_matches(source.as_ref(), binary_preimage_oid(patch, options.reverse))
+		{
+			return Err(Error::PatchFailed {
+				message: format!(
+					"binary patch does not match {}",
+					source_path.or(target_path).unwrap_or_default()
+				),
+			});
+		}
 		let source_bytes = match source.as_ref() {
 			Some(entry) => blob_bytes(repo, entry.id)?,
 			None => Vec::new(),
@@ -908,6 +921,31 @@ fn patch_sides(
 		(patch.new_path.as_deref(), patch.old_path.as_deref(), patch.new_mode, patch.old_mode)
 	} else {
 		(patch.old_path.as_deref(), patch.new_path.as_deref(), patch.old_mode, patch.new_mode)
+	}
+}
+
+/// Index-line oid the binary patch must match: the old blob forward, the new
+/// blob when reversed.
+fn binary_preimage_oid(patch: &FilePatch, reverse: bool) -> Option<&str> {
+	if reverse {
+		patch.new_oid.as_deref()
+	} else {
+		patch.old_oid.as_deref()
+	}
+}
+
+/// Git applies a binary patch only when the index line names the current blob
+/// in full. A missing source (creation) matches only the null id.
+fn binary_preimage_matches(source: Option<&FileEntry>, expected: Option<&str>) -> bool {
+	let Some(expected) = expected else {
+		return false;
+	};
+	match source {
+		None => expected.len() >= 4 && expected.bytes().all(|byte| byte == b'0'),
+		Some(entry) => {
+			let actual = entry.id.to_string();
+			expected.len() == actual.len() && expected.eq_ignore_ascii_case(&actual)
+		},
 	}
 }
 

@@ -1077,9 +1077,11 @@ impl VcsGitRepo {
 		})
 	}
 
-	/// Render a patch for `path` between the blob `base` resolves to and
-	/// `new_bytes` (`null` deletes the path). `new_mode` is the git mode bits
-	/// of the new content; required when `new_bytes` is non-null.
+	/// Render an applyable patch for `path` from the blob `base` resolves to
+	/// onto `new_bytes` (`null` deletes the path). `new_bytes` are
+	/// clean-filtered and the patch is always binary, so the stored bytes
+	/// round-trip. `new_mode` is the git mode bits of the new content;
+	/// required when `new_bytes` is non-null.
 	#[napi]
 	pub fn diff_file_bytes(
 		&self,

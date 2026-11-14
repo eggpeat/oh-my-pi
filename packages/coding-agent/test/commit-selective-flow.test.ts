@@ -25,6 +25,35 @@ async function git(cwd: string, args: string[]): Promise<string> {
 	return out;
 }
 
+async function gitBytes(cwd: string, args: string[]): Promise<Uint8Array> {
+	const env = { ...process.env, HOME: cwd, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+	const proc = Bun.spawn(["git", "-C", cwd, ...args], { env, stdout: "pipe", stderr: "pipe" });
+	const [bytes, err, code] = await Promise.all([
+		new Response(proc.stdout).arrayBuffer(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	if (code !== 0) throw new Error(`git ${args.join(" ")} failed (${code}): ${err}`);
+	return new Uint8Array(bytes);
+}
+
+/** Empty repo with a seed commit, so a draft has a HEAD to freeze against. */
+async function trackedRepo() {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-selective-"));
+	const artifacts = await fs.mkdtemp(path.join(os.tmpdir(), "omp-selective-artifacts-"));
+	tempDirs.push(root, artifacts);
+	await git(root, ["init", "-q", "-b", "main"]);
+	await git(root, ["config", "user.email", "test@example.com"]);
+	await git(root, ["config", "user.name", "Test"]);
+	await git(root, ["config", "commit.gpgSign", "false"]);
+	await git(root, ["config", "core.autocrlf", "false"]);
+	await git(root, ["config", "core.safecrlf", "false"]);
+	await Bun.write(path.join(root, "README.md"), "seed\n");
+	await git(root, ["add", "README.md"]);
+	await git(root, ["commit", "-qm", "seed"]);
+	return { root, artifacts, journal: ChangeJournal.at(artifacts) };
+}
+
 const CHANGELOG = "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- Fixed an old bug\n";
 
 /**
@@ -174,6 +203,163 @@ describe("selective commit flow", () => {
 		expect(await git(root, ["ls-tree", "--name-only", "HEAD", "--", "deleted.bin"])).toBe("");
 		// The worktree keeps the later bytes; only the commit froze the draft's.
 		expect(new Uint8Array(await Bun.file(path.join(root, "tracked.bin")).arrayBuffer())).toEqual(lateBytes);
+	});
+
+	it("commits non-UTF-8 whole files as captured, even when Git would diff them as text", async () => {
+		const { root, journal } = await trackedRepo();
+		// No NUL byte: Git's binary sniff treats this as text, and a text patch
+		// would replace these bytes with U+FFFD or refuse to apply.
+		const seed = new Uint8Array([0xff, 0xfe, 0x80, 0x41, 0xc3, 0x28, 0x0a]);
+		const agent = new Uint8Array([0xff, 0xfe, 0x80, 0x41, 0xc3, 0x28, 0x42, 0x0a]);
+		const added = new Uint8Array([0xfe, 0xff, 0x80, 0x7f, 0xc0, 0x41]);
+		await Bun.write(path.join(root, "latin.bin"), seed);
+		await git(root, ["add", "latin.bin"]);
+		await git(root, ["commit", "-qm", "add latin"]);
+		await Bun.write(path.join(root, "latin.bin"), agent);
+		await Bun.write(path.join(root, "added.bin"), added);
+		journal.recordChange({
+			agent: "Main",
+			parent: undefined,
+			tool: "edit",
+			path: path.join(root, "latin.bin"),
+			before: "old",
+			after: "new",
+		});
+		journal.recordChange({
+			agent: "Main",
+			parent: undefined,
+			tool: "edit",
+			path: path.join(root, "added.bin"),
+			before: null,
+			after: "new",
+		});
+		await journal.flush();
+
+		const draft = await createDraft({ cwd: root, journal, caller: "Main", agents: "self" });
+		draft.take({ path: "*.bin" });
+		const outcome = await commitSelection(draft, { subject: "chore: latin" }, { journal, agent: { agent: "Main" } });
+		expect(outcome.paths.sort()).toEqual(["added.bin", "latin.bin"]);
+		expect(await gitBytes(root, ["cat-file", "blob", "HEAD:latin.bin"])).toEqual(agent);
+		expect(await gitBytes(root, ["cat-file", "blob", "HEAD:added.bin"])).toEqual(added);
+	});
+
+	it("commits whole-file bytes after clean filters, not the raw worktree bytes", async () => {
+		const { root, artifacts, journal } = await trackedRepo();
+		const script = path.join(artifacts, "clean-filter.js");
+		await Bun.write(
+			script,
+			[
+				"#!/usr/bin/env bun",
+				"const input = Buffer.from(await Bun.stdin.bytes());",
+				"const from = Buffer.from('WORKTREE');",
+				"const to = Buffer.from('STORED');",
+				"const parts = [];",
+				"let i = 0;",
+				"while (i < input.length) {",
+				"  const at = input.indexOf(from, i);",
+				"  if (at < 0) { parts.push(input.subarray(i)); break; }",
+				"  parts.push(input.subarray(i, at), to);",
+				"  i = at + from.length;",
+				"}",
+				"await Bun.write(Bun.stdout, Buffer.concat(parts));",
+				"",
+			].join("\n"),
+		);
+		await fs.chmod(script, 0o755);
+		await git(root, ["config", "filter.pointer.clean", script]);
+		await git(root, ["config", "filter.pointer.required", "true"]);
+		await Bun.write(path.join(root, ".gitattributes"), "*.lfs filter=pointer\n*.crlf text eol=lf\n");
+		await git(root, ["add", ".gitattributes"]);
+		await git(root, ["commit", "-qm", "attributes"]);
+
+		const rawLfs = new Uint8Array([0, ...Buffer.from("prefix WORKTREE suffix")]);
+		const rawCrlf = new Uint8Array([0, 0x41, 0x0d, 0x0a, 0x42, 0x0d, 0x0a]);
+		await Bun.write(path.join(root, "asset.lfs"), rawLfs);
+		await Bun.write(path.join(root, "line.crlf"), rawCrlf);
+		for (const file of ["asset.lfs", "line.crlf"]) {
+			journal.recordChange({
+				agent: "Main",
+				parent: undefined,
+				tool: "edit",
+				path: path.join(root, file),
+				before: null,
+				after: "new",
+			});
+		}
+		await journal.flush();
+
+		const draft = await createDraft({ cwd: root, journal, caller: "Main", agents: "self" });
+		draft.take({ path: "asset.lfs" });
+		draft.take({ path: "line.crlf" });
+		await commitSelection(draft, { subject: "chore: filtered" }, { journal, agent: { agent: "Main" } });
+
+		const storedLfs = Buffer.from(await gitBytes(root, ["cat-file", "blob", "HEAD:asset.lfs"]));
+		expect(storedLfs.includes(Buffer.from("STORED"))).toBe(true);
+		expect(storedLfs.includes(Buffer.from("WORKTREE"))).toBe(false);
+		expect(await gitBytes(root, ["cat-file", "blob", "HEAD:line.crlf"])).toEqual(
+			new Uint8Array([0, 0x41, 0x0a, 0x42, 0x0a]),
+		);
+	});
+
+	it("refuses a whole-file commit when HEAD moved onto that binary", async () => {
+		const { root, journal } = await trackedRepo();
+		const seed = new Uint8Array([0, 1, 2, 3, 4]);
+		const agent = new Uint8Array([0, 1, 2, 3, 4, 9]);
+		const newer = new Uint8Array([0, 9, 9, 9, 9, 9]);
+		await Bun.write(path.join(root, "tracked.bin"), seed);
+		await git(root, ["add", "tracked.bin"]);
+		await git(root, ["commit", "-qm", "add binary"]);
+		await Bun.write(path.join(root, "tracked.bin"), agent);
+		journal.recordChange({
+			agent: "Main",
+			parent: undefined,
+			tool: "edit",
+			path: path.join(root, "tracked.bin"),
+			before: "old",
+			after: "new",
+		});
+		await journal.flush();
+		const draft = await createDraft({ cwd: root, journal, caller: "Main", agents: "self" });
+		draft.take({ path: "tracked.bin" });
+
+		await Bun.write(path.join(root, "tracked.bin"), newer);
+		await git(root, ["add", "tracked.bin"]);
+		await git(root, ["commit", "-qm", "newer", "--only", "tracked.bin"]);
+
+		await expect(
+			commitSelection(draft, { subject: "chore: binary" }, { journal, agent: { agent: "Main" } }),
+		).rejects.toThrow(/HEAD moved .* changed tracked\.bin/);
+		expect(await gitBytes(root, ["cat-file", "blob", "HEAD:tracked.bin"])).toEqual(newer);
+	});
+
+	it("leaves someone else's staged binary in the shared index", async () => {
+		const { root, journal } = await trackedRepo();
+		const seed = new Uint8Array([0, 1, 2, 3, 4]);
+		const agent = new Uint8Array([0, 1, 2, 3, 4, 9]);
+		const staged = new Uint8Array([0, 7, 7, 7, 7, 7]);
+		await Bun.write(path.join(root, "tracked.bin"), seed);
+		await git(root, ["add", "tracked.bin"]);
+		await git(root, ["commit", "-qm", "add binary"]);
+		await Bun.write(path.join(root, "tracked.bin"), agent);
+		journal.recordChange({
+			agent: "Main",
+			parent: undefined,
+			tool: "edit",
+			path: path.join(root, "tracked.bin"),
+			before: "old",
+			after: "new",
+		});
+		await journal.flush();
+		const draft = await createDraft({ cwd: root, journal, caller: "Main", agents: "self" });
+		draft.take({ path: "tracked.bin" });
+
+		await Bun.write(path.join(root, "tracked.bin"), staged);
+		await git(root, ["add", "tracked.bin"]);
+
+		const outcome = await commitSelection(draft, { subject: "chore: binary" }, { journal, agent: { agent: "Main" } });
+		expect(outcome.indexNotes.join("\n")).toContain("tracked.bin");
+		expect(await gitBytes(root, ["cat-file", "blob", "HEAD:tracked.bin"])).toEqual(agent);
+		expect(await gitBytes(root, ["cat-file", "blob", ":tracked.bin"])).toEqual(staged);
 	});
 
 	it("refuses to commit on a HEAD that moved onto the same lines", async () => {
