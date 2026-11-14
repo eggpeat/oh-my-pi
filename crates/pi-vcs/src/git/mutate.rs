@@ -17,7 +17,7 @@ use super::{
 	normalize_path,
 	open::{load_index_or_empty, load_index_or_head, status_with_fresh_index, status_with_index},
 	read::literal_pathspec,
-	worktree::materialize,
+	worktree::{MaterializeOptions, materialize},
 };
 use crate::{
 	error::{Error, Result},
@@ -437,7 +437,7 @@ impl GitRepo {
 
 	/// Restore index and/or worktree paths from a selected source.
 	pub fn restore(&self, options: &RestoreOptions) -> Result<()> {
-		let repo = self.gix()?;
+		let repo = self.gix_fresh()?;
 		let restore_worktree = options.worktree || !options.staged;
 		let mut index = load_index_or_head(&repo, "git restore")?;
 		if options.staged {
@@ -1731,6 +1731,7 @@ fn restore_index_paths(
 	files: &[String],
 ) -> Result<()> {
 	let mut filter = WorktreeFilter::staging(repo, "git restore")?;
+	let options = MaterializeOptions::for_repo(repo, "git restore")?;
 	for entry in index.entries() {
 		let path = entry.path(index).to_str_lossy();
 		if files.is_empty() || files.iter().any(|wanted| path_matches(&path, wanted)) {
@@ -1741,7 +1742,7 @@ fn restore_index_paths(
 				.try_into_blob()
 				.map_err(|e| Error::backend("git restore", e))?;
 			let bytes = blob.take_data();
-			materialize(root, &path, entry.mode, bytes, &mut filter)?;
+			materialize(root, &path, entry.mode, bytes, &mut filter, options)?;
 		}
 	}
 	Ok(())

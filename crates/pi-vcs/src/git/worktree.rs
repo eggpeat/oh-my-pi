@@ -1,80 +1,185 @@
 //! Filesystem materialization for blobs destined for a worktree.
 
-use std::{fs, path::Path};
+use std::{fs, io::Write, path::Path};
 
 use gix::index::entry::Mode;
 
 use super::filter::WorktreeFilter;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
-/// Write `bytes` at repo-relative `path` according to its Git mode. Symlink
-/// blobs are raw target names, never filtered content. Replacing a symlink
-/// with a regular file must unlink it first so the write cannot reach its
-/// target, including one outside the repository.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MaterializeOptions {
+	pub(crate) symlinks:       bool,
+	pub(crate) executable_bit: bool,
+}
+
+impl MaterializeOptions {
+	pub(crate) fn for_repo(repo: &gix::Repository, op: &'static str) -> Result<Self> {
+		let caps = repo
+			.filesystem_options()
+			.map_err(|err| Error::backend(op, err))?;
+		Ok(Self { symlinks: cfg!(unix) && caps.symlink, executable_bit: caps.executable_bit })
+	}
+}
+
+/// Write `bytes` at repo-relative `path` according to its Git mode and
+/// repository filesystem capabilities. Symlink blobs are raw target names,
+/// never filtered content; with `core.symlinks=false` (or off Unix) they are
+/// materialized as plain files. Replacing a symlink with a regular file unlinks
+/// the link first so the write cannot reach its target, including one outside
+/// the repository.
 pub(crate) fn materialize(
 	root: &Path,
 	path: &str,
 	mode: Mode,
 	bytes: Vec<u8>,
 	filter: &mut WorktreeFilter<'_>,
+	options: MaterializeOptions,
 ) -> Result<()> {
 	let absolute = root.join(path);
 	if let Some(parent) = absolute.parent() {
 		fs::create_dir_all(parent)?;
 	}
 	if mode == Mode::SYMLINK {
-		remove_file(&absolute)?;
-		write_symlink(&absolute, &bytes)?;
-		return Ok(());
+		#[cfg(unix)]
+		if options.symlinks {
+			return write_symlink(&absolute, &bytes);
+		}
+		return write_regular_file(&absolute, &bytes, false, options.executable_bit);
 	}
 
 	let bytes = filter.git_to_worktree(path, bytes)?;
-	remove_symlink(&absolute)?;
-	fs::write(&absolute, bytes)?;
+	let executable = mode == Mode::FILE_EXECUTABLE;
+	write_regular_file(&absolute, &bytes, executable, options.executable_bit)
+}
+
+fn write_regular_file(
+	path: &Path,
+	bytes: &[u8],
+	executable: bool,
+	honor_executable_bit: bool,
+) -> Result<()> {
+	let want_executable = executable && honor_executable_bit;
+	match open_new_regular_file(path, want_executable) {
+		Ok(mut file) => {
+			file.write_all(bytes)?;
+			return Ok(());
+		},
+		Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {},
+		Err(err) => return Err(err.into()),
+	}
+
+	let metadata = fs::symlink_metadata(path)?;
+	if !metadata.is_file() && !metadata.is_dir() {
+		fs::remove_file(path)?;
+		let mut file = open_new_regular_file(path, want_executable)?;
+		file.write_all(bytes)?;
+		return Ok(());
+	}
+
+	let mut file = open_existing_regular_file(path)?;
+	file.write_all(bytes)?;
+	#[cfg(unix)]
+	if honor_executable_bit {
+		sync_executable_bit(&file, executable)?;
+	}
+	Ok(())
+}
+
+fn open_new_regular_file(path: &Path, executable: bool) -> std::io::Result<fs::File> {
+	let mut options = fs::OpenOptions::new();
+	options.write(true).create_new(true);
 	#[cfg(unix)]
 	{
-		use std::os::unix::fs::PermissionsExt;
-		let permissions = fs::Permissions::from_mode(if mode == Mode::FILE_EXECUTABLE {
-			0o755
-		} else {
-			0o644
-		});
-		fs::set_permissions(&absolute, permissions)?;
+		use std::os::unix::fs::OpenOptionsExt;
+		options.mode(if executable { 0o777 } else { 0o666 });
+	}
+	#[cfg(not(unix))]
+	let _ = executable;
+	options.open(path)
+}
+
+fn open_existing_regular_file(path: &Path) -> std::io::Result<fs::File> {
+	let mut options = fs::OpenOptions::new();
+	options.write(true).truncate(true);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::OpenOptionsExt;
+		options.custom_flags(libc::O_NOFOLLOW);
+	}
+	options.open(path)
+}
+
+/// Preserve existing read/write restrictions (such as `0600`) while updating
+/// executable bits: `Mode::FILE_EXECUTABLE` grants execute where read is
+/// already permitted (plus owner execute), and `Mode::FILE` clears execute.
+#[cfg(unix)]
+fn sync_executable_bit(file: &fs::File, executable: bool) -> std::io::Result<()> {
+	use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+	let current = file.metadata()?.mode() & 0o7777;
+	let desired = if executable {
+		let exec_bits = ((current & 0o444) >> 2) | 0o100;
+		(current & 0o777) | exec_bits
+	} else {
+		(current & 0o777) & !0o111
+	};
+	if desired != current {
+		file.set_permissions(fs::Permissions::from_mode(desired))?;
 	}
 	Ok(())
 }
 
-/// Remove a file or symlink, but never recursively remove a directory.
-fn remove_file(path: &Path) -> Result<()> {
-	match fs::remove_file(path) {
-		Ok(()) => {},
-		Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
+/// Create or atomically replace a symlink without unlinking an existing entry
+/// until a replacement symlink has been created.
+#[cfg(unix)]
+fn write_symlink(path: &Path, target: &[u8]) -> Result<()> {
+	use std::{
+		ffi::OsStr,
+		os::unix::{ffi::OsStrExt, fs::symlink},
+	};
+
+	let target = OsStr::from_bytes(target);
+	match symlink(target, path) {
+		Ok(()) => return Ok(()),
+		Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {},
 		Err(err) => return Err(err.into()),
 	}
-	Ok(())
-}
-
-fn remove_symlink(path: &Path) -> Result<()> {
-	match fs::symlink_metadata(path) {
-		Ok(metadata) if metadata.file_type().is_symlink() => fs::remove_file(path)?,
-		Ok(_) => {},
-		Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
-		Err(err) => return Err(err.into()),
+	if fs::symlink_metadata(path)?.is_dir() {
+		return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into());
+	}
+	let parent = path.parent().unwrap_or_else(|| Path::new("."));
+	let temp = create_temp_symlink(parent, target)?;
+	if let Err(err) = fs::rename(&temp, path) {
+		let _ = fs::remove_file(&temp);
+		return Err(err.into());
 	}
 	Ok(())
 }
 
 #[cfg(unix)]
-fn write_symlink(path: &Path, target: &[u8]) -> Result<()> {
-	use std::os::unix::{ffi::OsStrExt, fs::symlink};
-	symlink(std::ffi::OsStr::from_bytes(target), path)?;
-	Ok(())
-}
+fn create_temp_symlink(
+	parent: &Path,
+	target: &std::ffi::OsStr,
+) -> std::io::Result<std::path::PathBuf> {
+	use std::{
+		os::unix::fs::symlink,
+		sync::atomic::{AtomicU64, Ordering},
+	};
 
-/// On platforms without Unix symlinks, match `core.symlinks=false`: the link
-/// target is stored as plain file content.
-#[cfg(not(unix))]
-fn write_symlink(path: &Path, target: &[u8]) -> Result<()> {
-	fs::write(path, target)?;
-	Ok(())
+	static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+	let pid = std::process::id();
+	for _ in 0..64 {
+		let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+		let candidate = parent.join(format!(".omp-tmp-link-{pid}-{id}"));
+		match symlink(target, &candidate) {
+			Ok(()) => return Ok(candidate),
+			Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {},
+			Err(err) => return Err(err),
+		}
+	}
+	Err(std::io::Error::new(
+		std::io::ErrorKind::AlreadyExists,
+		"failed to allocate temporary symlink name",
+	))
 }

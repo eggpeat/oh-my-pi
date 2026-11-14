@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { lstat, mkdir, mkdtemp, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { vcsDiscover, vcsGitClone, vcsGitDiscover, vcsGitRepoInfo } from "../native/index.js";
@@ -184,6 +184,120 @@ describe("in-process VCS bindings", () => {
 		expect((await lstat(link)).isSymbolicLink()).toBe(false);
 		expect(await Bun.file(link).text()).toBe("regular\n");
 	});
+
+	test.skipIf(process.platform === "win32")(
+		"restore preserves private permissions and umask while restoring executable bits",
+		async () => {
+			const root = await repository();
+			const privateTxt = join(root, "private.txt");
+			const strayExec = join(root, "stray-exec.txt");
+			const privateSh = join(root, "private.sh");
+			await writeFile(privateTxt, "secret\n");
+			await writeFile(strayExec, "plain\n");
+			await writeFile(privateSh, "#!/bin/sh\necho ok\n");
+			await chmod(privateTxt, 0o600);
+			await chmod(strayExec, 0o600);
+			await chmod(privateSh, 0o700);
+			await git(root, "add", "private.txt", "stray-exec.txt", "private.sh");
+			await git(root, "commit", "-m", "add private files");
+
+			await writeFile(privateTxt, "dirty\n");
+			await writeFile(strayExec, "dirty\n");
+			await chmod(strayExec, 0o700);
+			await writeFile(privateSh, "#!/bin/sh\ndirty\n");
+			await chmod(privateSh, 0o600);
+
+			const repo = vcsGitDiscover(root)!;
+			await repo.restore({ files: ["private.txt", "stray-exec.txt", "private.sh"], worktree: true });
+
+			expect(await Bun.file(privateTxt).text()).toBe("secret\n");
+			expect((await lstat(privateTxt)).mode & 0o777).toBe(0o600);
+			expect(await Bun.file(strayExec).text()).toBe("plain\n");
+			expect((await lstat(strayExec)).mode & 0o777).toBe(0o600);
+			expect(await Bun.file(privateSh).text()).toBe("#!/bin/sh\necho ok\n");
+			expect((await lstat(privateSh)).mode & 0o777).toBe(0o700);
+
+			await rm(privateTxt);
+			await rm(privateSh);
+			const child = Bun.spawn(
+				[
+					process.execPath,
+					"-e",
+					`import { vcsGitDiscover } from "./native/index.js";
+					process.umask(0o077);
+					await vcsGitDiscover(${JSON.stringify(root)})!.restore({ files: ["private.txt", "private.sh"], worktree: true });`,
+				],
+				{ cwd: join(import.meta.dir, ".."), stderr: "pipe", stdout: "pipe" },
+			);
+			const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+			expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+			expect((await lstat(privateTxt)).mode & 0o777).toBe(0o600);
+			expect((await lstat(privateSh)).mode & 0o777).toBe(0o700);
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"restore honors core.symlinks=false and keeps existing files when link creation fails",
+		async () => {
+			const root = await repository();
+			const plainLink = join(root, "plain-link");
+			const safeLink = join(root, "safe-link");
+			await writeFile(join(root, ".gitattributes"), "plain-link ident\nsafe-link ident\n");
+			await symlink("$Id$", plainLink);
+			await symlink("$Id$", safeLink);
+			await git(root, "add", ".gitattributes", "plain-link", "safe-link");
+			await git(root, "commit", "-m", "add symlinks");
+
+			const repo = vcsGitDiscover(root)!;
+			expect(await repo.isDirty()).toBe(false);
+			await git(root, "config", "core.symlinks", "false");
+
+			const outsideRoot = await mkdtemp(join(tmpdir(), "pi-natives-vcs-outside-"));
+			roots.push(outsideRoot);
+			const outside = join(outsideRoot, "outside.txt");
+			await writeFile(outside, "outside\n");
+
+			await rm(plainLink);
+			await writeFile(plainLink, "edited-target");
+			await chmod(plainLink, 0o600);
+			await rm(safeLink);
+			await symlink(outside, safeLink);
+
+			await repo.restore({ files: ["plain-link", "safe-link"], worktree: true });
+
+			expect(await Bun.file(outside).text()).toBe("outside\n");
+			const plainStat = await lstat(plainLink);
+			expect(plainStat.isSymbolicLink()).toBe(false);
+			expect(plainStat.isFile()).toBe(true);
+			expect(plainStat.mode & 0o777).toBe(0o600);
+			expect(await Bun.file(plainLink).text()).toBe("$Id$");
+			const safeStat = await lstat(safeLink);
+			expect(safeStat.isSymbolicLink()).toBe(false);
+			expect(safeStat.isFile()).toBe(true);
+			expect(await Bun.file(safeLink).text()).toBe("$Id$");
+
+			await git(root, "config", "core.symlinks", "true");
+			const hashProc = Bun.spawn(["git", "hash-object", "-w", "--stdin"], {
+				cwd: root,
+				stdin: new TextEncoder().encode("a".repeat(70_000)),
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+			const [badOidRaw, hashErr, hashExit] = await Promise.all([
+				new Response(hashProc.stdout).text(),
+				new Response(hashProc.stderr).text(),
+				hashProc.exited,
+			]);
+			expect({ hashExit, hashErr }).toEqual({ hashExit: 0, hashErr: "" });
+			await git(root, "update-index", "--cacheinfo", `120000,${badOidRaw.trim()},plain-link`);
+			await writeFile(plainLink, "keep-on-failure\n");
+
+			await expect(repo.restore({ files: ["plain-link"], worktree: true })).rejects.toMatchObject({
+				name: "VcsError",
+			});
+			expect(await Bun.file(plainLink).text()).toBe("keep-on-failure\n");
+		},
+	);
 
 	test("aborts clone promptly", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-natives-vcs-clone-"));
