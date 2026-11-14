@@ -40,14 +40,14 @@ export function formatTextPatch(path: string, before: FileState | null, after: F
 	if (before?.text === after?.text && before?.mode === after?.mode) return "";
 	const oldLines = patchLines(before?.text ?? null);
 	const newLines = patchLines(after?.text ?? null);
-	let out = `diff --git a/${path} b/${path}\n`;
+	let out = gitDiffHeader(path);
 	if (!before && after) out += `new file mode ${after.mode}\n`;
 	else if (before && !after) out += `deleted file mode ${before.mode}\n`;
 	else if (before && after && before.mode !== after.mode) out += `old mode ${before.mode}\nnew mode ${after.mode}\n`;
 	const regions = changedRegions(oldLines, newLines);
 	if (regions.length === 0) return out;
-	out += `--- ${before === null ? "/dev/null" : `a/${path}`}\n`;
-	out += `+++ ${after === null ? "/dev/null" : `b/${path}`}\n`;
+	out += `--- ${before === null ? "/dev/null" : gitSidePath("a", path)}\n`;
+	out += `+++ ${after === null ? "/dev/null" : gitSidePath("b", path)}\n`;
 	let first = 0;
 	while (first < regions.length) {
 		let last = first;
@@ -67,6 +67,38 @@ export function formatTextPatch(path: string, before: FileState | null, after: F
 		}
 		for (; cursor < oldEnd; cursor++) out += renderLine(" ", oldLines[cursor]);
 		first = last + 1;
+	}
+	return out;
+}
+
+/** A `diff --git` header whose path tokens survive spaces and non-ASCII names. */
+export function gitDiffHeader(filePath: string): string {
+	return `diff --git ${gitSidePath("a", filePath)} ${gitSidePath("b", filePath)}\n`;
+}
+
+/** One `a/` or `b/` path token, C-quoted when git would otherwise split or escape it. */
+export function gitSidePath(side: "a" | "b", filePath: string): string {
+	const token = `${side}/${filePath}`;
+	return needsGitQuote(token) ? `"${quoteGitPath(token)}"` : token;
+}
+
+function needsGitQuote(token: string): boolean {
+	for (let index = 0; index < token.length; index++) {
+		const code = token.charCodeAt(index);
+		if (code <= 0x20 || code >= 0x7f || token[index] === '"' || token[index] === "\\") return true;
+	}
+	return false;
+}
+
+function quoteGitPath(token: string): string {
+	let out = "";
+	for (const byte of new TextEncoder().encode(token)) {
+		if (byte === 0x5c) out += "\\\\";
+		else if (byte === 0x22) out += '\\"';
+		else if (byte === 0x09) out += "\\t";
+		else if (byte === 0x0a) out += "\\n";
+		else if (byte < 0x20 || byte >= 0x7f) out += `\\${byte.toString(8).padStart(3, "0")}`;
+		else out += String.fromCharCode(byte);
 	}
 	return out;
 }

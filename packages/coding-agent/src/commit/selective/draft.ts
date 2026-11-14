@@ -35,12 +35,16 @@ import {
 	UNRECORDED,
 } from "./attribution";
 import type { CallRecord, ChangeJournal, ChangeRecord } from "./journal";
-import { formatTextPatch } from "./patch";
+import { formatTextPatch, gitDiffHeader } from "./patch";
 
 /** Files above this size are selected whole, without line attribution. */
 const MAX_TEXT_BYTES = 4 * 1024 * 1024;
 /** Git mode of a symlink. */
 const SYMLINK_MODE = "120000";
+
+function isGitFalse(value: string | null | undefined): boolean {
+	return value != null && /^(?:false|no|off|0)$/i.test(value.trim());
+}
 /** Tolerance when matching a file's mtime to a tool call window (event and fs clock skew). */
 const WINDOW_SLACK_MS = 1500;
 /** Concurrent file reads while building a draft. */
@@ -74,8 +78,19 @@ export interface FileState {
 export type SelectedChange =
 	/** HEAD's state (`null`: absent) → the selected state (`null`: deleted). */
 	| { kind: "text"; path: string; before: FileState | null; after: FileState | null }
-	/** Committed as its current worktree state; `added` when HEAD lacks the path. */
-	| { kind: "whole"; path: string; added: boolean };
+	/**
+	 * Binary, non-UTF-8, oversized, symlink, or mode-only file, committed from the bytes
+	 * captured with the draft. `content` and `mode` are the worktree side; `before` and
+	 * `beforeMode` are HEAD at draft time. Null means that side was absent.
+	 */
+	| {
+			kind: "whole";
+			path: string;
+			content: Uint8Array | null;
+			mode: string | null;
+			before: Uint8Array | null;
+			beforeMode: string | null;
+	  };
 
 /**
  * Why a file has no line attribution and is committed whole: binary, non-UTF-8, or oversized
@@ -106,7 +121,10 @@ interface FileChange {
 	classification?: Classification;
 	selected: Set<number>;
 	wholeSelected: boolean;
-	/** Agents with recorded edits of this path. */
+	/** Frozen worktree bytes for a whole-file change; null when the path was absent. */
+	bytes?: Uint8Array | null;
+	/** Frozen HEAD bytes for a whole-file change; null when HEAD lacked the path. */
+	headBytes?: Uint8Array | null;
 	editors: string[];
 	/** Call window covering the last modification of a file no usable record explains. */
 	hint?: CallRecord;
@@ -289,10 +307,12 @@ export async function createDraft(source: DraftSource): Promise<Draft> {
 		else byPath.set(rel, [record]);
 	}
 
-	const [statusText, staged] = await Promise.all([
+	const [statusText, staged, fileMode] = await Promise.all([
 		repo.statusPorcelain({ untracked: "all", nulTerminated: true }, source.signal),
 		repo.changedFiles({ cached: true }, source.signal),
+		repo.configGet("core.filemode", source.signal),
 	]);
+	const honorFileMode = !isGitFalse(fileMode);
 	const dirty = parseDirtyPathsWithStatus(statusText);
 	const tracked = dirty.filter(entry => !entry.untracked).map(entry => entry.path);
 	const headModes = new Map(
@@ -311,6 +331,7 @@ export async function createDraft(source: DraftSource): Promise<Draft> {
 			byPath.get(entry.path) ?? [],
 			source.journal,
 			windowCall,
+			honorFileMode,
 		);
 		if (result === "skip") skipped.push(entry.path);
 		else if (result) files.push(result);
@@ -359,6 +380,7 @@ async function loadFile(
 	records: readonly ChangeRecord[],
 	journal: ChangeJournal | null,
 	windowCall: (ms: number | undefined) => CallRecord | undefined,
+	honorFileMode: boolean,
 ): Promise<FileChange | "skip" | undefined> {
 	const absolute = path.join(root, file);
 	let workBytes: Uint8Array | null = null;
@@ -367,10 +389,20 @@ async function loadFile(
 	try {
 		const stat = await fs.lstat(absolute);
 		mtimeMs = stat.mtimeMs;
-		if (stat.isSymbolicLink()) mode = SYMLINK_MODE;
-		else if (!stat.isFile()) return "skip";
+		if (stat.isSymbolicLink()) {
+			mode = SYMLINK_MODE;
+			workBytes = new TextEncoder().encode(await fs.readlink(absolute));
+		} else if (!stat.isFile()) return "skip";
 		else {
-			mode = stat.mode & 0o111 ? "100755" : "100644";
+			// Git ignores the executable bit when core.filemode is false, so a tracked
+			// file keeps the mode already recorded and a new file is a normal file.
+			mode = !honorFileMode
+				? head.mode === "100755"
+					? "100755"
+					: "100644"
+				: stat.mode & 0o111
+					? "100755"
+					: "100644";
 			workBytes = await fs.readFile(absolute);
 		}
 	} catch (error) {
@@ -385,16 +417,18 @@ async function loadFile(
 		wholeSelected: false,
 		editors: [...new Set(records.map(record => record.agent))],
 	};
+	const headBytes = head.sha && head.mode ? (await repo.showBlob(`${head.sha}:${file}`)).data : null;
 	const whole = (reason: WholeReason): FileChange => ({
 		...base,
 		head: null,
 		work: null,
 		whole: reason,
+		bytes: workBytes,
+		headBytes,
 		hint: records.length === 0 ? windowCall(mtimeMs) : undefined,
 	});
 	// Symlinks commit as their link target, whole; this also covers a file replaced by a link and back.
 	if (head.mode === SYMLINK_MODE || mode === SYMLINK_MODE) return whole("symlink");
-	const headBytes = head.sha && head.mode ? (await repo.showBlob(`${head.sha}:${file}`)).data : null;
 	const headText = headBytes === null ? null : decodeText(headBytes);
 	const workText = workBytes === null ? null : decodeText(workBytes);
 	if (headText === undefined || workText === undefined) return whole("content");
@@ -509,7 +543,16 @@ export class Draft {
 		const changes: SelectedChange[] = [];
 		for (const file of this.#files) {
 			if (!file.attribution) {
-				if (file.wholeSelected) changes.push({ kind: "whole", path: file.path, added: file.headMode === null });
+				if (file.wholeSelected) {
+					changes.push({
+						kind: "whole",
+						path: file.path,
+						content: file.bytes ?? null,
+						mode: file.mode,
+						before: file.headBytes ?? null,
+						beforeMode: file.headMode,
+					});
+				}
 				continue;
 			}
 			if (file.selected.size === 0) continue;
@@ -775,7 +818,7 @@ export class Draft {
 		const parts = this.selection().map(change =>
 			change.kind === "text"
 				? formatTextPatch(change.path, change.before, change.after)
-				: `diff --git a/${change.path} b/${change.path}\n(whole-file change committed as in the worktree)\n`,
+				: `${gitDiffHeader(change.path)}(whole-file change captured with this draft)\n`,
 		);
 		return parts.join("") || "Nothing selected.";
 	}

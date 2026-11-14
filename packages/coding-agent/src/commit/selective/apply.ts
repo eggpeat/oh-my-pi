@@ -10,11 +10,11 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { VcsGitRepo } from "@oh-my-pi/pi-natives";
+import { deflateSync } from "node:zlib";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import type { Draft, SelectedChange } from "./draft";
 import type { ChangeJournal, JournalAgent } from "./journal";
-import { formatTextPatch } from "./patch";
+import { formatTextPatch, gitDiffHeader } from "./patch";
 
 /** Attempts when HEAD moves between building the private index and committing it. */
 const HEAD_RACE_ATTEMPTS = 3;
@@ -64,11 +64,77 @@ function shortSha(sha: string | null): string {
 	return sha?.slice(0, 10) ?? "(no commits yet)";
 }
 
-async function patchFor(repo: VcsGitRepo, head: string | null, change: SelectedChange): Promise<string> {
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+	if (left.byteLength !== right.byteLength) return false;
+	for (let index = 0; index < left.byteLength; index++) {
+		if (left[index] !== right[index]) return false;
+	}
+	return true;
+}
+
+/** Git's binary-patch alphabet, in the order `git apply` decodes. */
+const BASE85 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
+
+/**
+ * One `literal` block: zlib-compressed bytes, base85, 52 raw bytes per line.
+ * A literal replaces the file outright, so bytes that are not UTF-8 stay intact;
+ * a unified diff would turn them into U+FFFD.
+ */
+function encodeLiteral(payload: Uint8Array): string {
+	const compressed = deflateSync(payload);
+	const lines = [`literal ${payload.byteLength}`];
+	for (let offset = 0; offset < compressed.length; offset += 52) {
+		const line = compressed.subarray(offset, offset + 52);
+		const len = line.length;
+		let encoded = len <= 26 ? String.fromCharCode(65 + len - 1) : String.fromCharCode(97 + len - 27);
+		for (let index = 0; index < len; index += 4) {
+			const b0 = line[index] ?? 0;
+			const b1 = line[index + 1] ?? 0;
+			const b2 = line[index + 2] ?? 0;
+			const b3 = line[index + 3] ?? 0;
+			let value = b0 * 0x1000000 + b1 * 0x10000 + b2 * 0x100 + b3;
+			let group = "";
+			for (let place = 0; place < 5; place++) {
+				group = (BASE85[value % 85] ?? "") + group;
+				value = Math.floor(value / 85);
+			}
+			encoded += group;
+		}
+		lines.push(encoded);
+	}
+	return `${lines.join("\n")}\n\n`;
+}
+
+/**
+ * Patch from the draft's saved HEAD bytes to the saved worktree bytes.
+ * Both literal blocks are present, including for a mode-only change, so applying
+ * the patch fails when those bytes are no longer what is committed or staged.
+ */
+function formatWholePatch(change: Extract<SelectedChange, { kind: "whole" }>): string {
+	const { path: filePath, content, mode, before, beforeMode } = change;
+	if (before === null && content === null) return "";
+	if (
+		before !== null &&
+		content !== null &&
+		sameBytes(before, content) &&
+		(beforeMode === null || beforeMode === mode)
+	) {
+		return "";
+	}
+	let out = gitDiffHeader(filePath);
+	if (before === null) out += `new file mode ${mode ?? "100644"}\n`;
+	else if (content === null) out += `deleted file mode ${beforeMode ?? "100644"}\n`;
+	else if (beforeMode && mode && beforeMode !== mode) out += `old mode ${beforeMode}\nnew mode ${mode}\n`;
+	else if (beforeMode) out += `index 0000000..0000001 ${beforeMode}\n`;
+	out += "GIT binary patch\n";
+	out += encodeLiteral(content ?? new Uint8Array());
+	out += encodeLiteral(before ?? new Uint8Array());
+	return out;
+}
+
+function patchFor(change: SelectedChange): string {
 	if (change.kind === "text") return formatTextPatch(change.path, change.before, change.after);
-	return change.added || head === null
-		? repo.diffNoIndex("/dev/null", change.path, true)
-		: repo.diffText({ base: head, files: [change.path], binary: true });
+	return formatWholePatch(change);
 }
 
 /**
@@ -87,7 +153,7 @@ export async function commitSelection(
 	const repo = vcs.requireGit(draft.root);
 	const patches: Array<{ path: string; patch: string }> = [];
 	for (const change of changes) {
-		const patch = await patchFor(repo, draft.head, change);
+		const patch = patchFor(change);
 		if (patch) patches.push({ path: change.path, patch });
 	}
 	if (patches.length === 0) throw new Error("The selection matches HEAD; nothing to commit.");

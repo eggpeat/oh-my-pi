@@ -568,10 +568,10 @@ fn parse_file_patch(raw: &str) -> std::result::Result<FilePatch, ApplyFailure> {
 	let paths = first
 		.strip_prefix("diff --git ")
 		.ok_or_else(|| ApplyFailure::Invalid("invalid diff header".into()))?;
-	let (old_token, new_token) = split_diff_paths(paths)?;
+	let (old_path, new_path) = split_diff_paths(paths)?;
 	let mut patch = FilePatch {
-		old_path: Some(strip_side_path(old_token, 'a')),
-		new_path: Some(strip_side_path(new_token, 'b')),
+		old_path: Some(old_path),
+		new_path: Some(new_path),
 		old_mode: None,
 		new_mode: None,
 		old_oid:  None,
@@ -594,9 +594,9 @@ fn parse_file_patch(raw: &str) -> std::result::Result<FilePatch, ApplyFailure> {
 			patch.new_path = None;
 			patch.old_mode = parse_mode(value);
 		} else if let Some(value) = line.strip_prefix("rename from ") {
-			patch.old_path = Some(unquote_path(value));
+			patch.old_path = Some(decode_git_path(value));
 		} else if let Some(value) = line.strip_prefix("rename to ") {
-			patch.new_path = Some(unquote_path(value));
+			patch.new_path = Some(decode_git_path(value));
 		} else if let Some(value) = line.strip_prefix("index ") {
 			let ids = value.split_whitespace().next().unwrap_or_default();
 			if let Some((old, new)) = ids.split_once("..") {
@@ -608,9 +608,9 @@ fn parse_file_patch(raw: &str) -> std::result::Result<FilePatch, ApplyFailure> {
 				patch.new_mode.get_or_insert(mode);
 			}
 		} else if let Some(value) = line.strip_prefix("--- ") {
-			patch.old_path = parse_marker_path(value, 'a');
+			patch.old_path = parse_marker_path(value);
 		} else if let Some(value) = line.strip_prefix("+++ ") {
-			patch.new_path = parse_marker_path(value, 'b');
+			patch.new_path = parse_marker_path(value);
 		} else if line.starts_with("@@") {
 			let (hunk, next) = parse_hunk(&lines, index)?;
 			patch.hunks.push(hunk);
@@ -653,31 +653,195 @@ fn parse_file_patch(raw: &str) -> std::result::Result<FilePatch, ApplyFailure> {
 	Ok(patch)
 }
 
-fn split_diff_paths(paths: &str) -> std::result::Result<(&str, &str), ApplyFailure> {
-	if paths.starts_with('"') {
-		return Err(ApplyFailure::Invalid("quoted paths in diff headers are unsupported".into()));
+fn split_diff_paths(paths: &str) -> std::result::Result<(String, String), ApplyFailure> {
+	let (old_token, new_token) = split_header_tokens(paths)
+		.ok_or_else(|| ApplyFailure::Invalid("invalid diff paths".into()))?;
+	let old =
+		side_path(old_token).ok_or_else(|| ApplyFailure::Invalid("invalid diff paths".into()))?;
+	let new =
+		side_path(new_token).ok_or_else(|| ApplyFailure::Invalid("invalid diff paths".into()))?;
+	Ok((old, new))
+}
+
+/// Split a `diff --git` payload into its two path tokens.
+/// Quoted tokens keep spaces and C-style escapes; an unquoted name with spaces
+/// is `a/<path> b/<path>`, so the split is the ` b/` whose sides name one path.
+fn split_header_tokens(rest: &str) -> Option<(&str, &str)> {
+	if rest.starts_with('"') {
+		let (left, next) = read_quoted_token(rest, 0)?;
+		if rest.as_bytes().get(next) != Some(&b' ') {
+			return None;
+		}
+		let right_raw = &rest[next + 1..];
+		if right_raw.starts_with('"') {
+			let (right, end) = read_quoted_token(right_raw, 0)?;
+			return (end == right_raw.len()).then_some((left, right));
+		}
+		return (!right_raw.is_empty()).then_some((left, right_raw));
 	}
-	paths
-		.split_once(' ')
-		.ok_or_else(|| ApplyFailure::Invalid("invalid diff paths".into()))
+	if rest.ends_with('"') {
+		let mut from = 0;
+		while from < rest.len() {
+			let Some(rel) = rest[from..].find(" \"") else {
+				break;
+			};
+			let space = from + rel;
+			if let Some((right, end)) = read_quoted_token(rest, space + 1)
+				&& end == rest.len()
+				&& space > 0
+			{
+				return Some((&rest[..space], right));
+			}
+			from = space + 1;
+		}
+	}
+	split_unquoted_diff_paths(rest)
 }
 
-fn unquote_path(path: &str) -> String {
-	path.trim_matches('"').to_owned()
+fn split_unquoted_diff_paths(rest: &str) -> Option<(&str, &str)> {
+	let mut candidates = Vec::new();
+	if rest.starts_with("a/") {
+		let mut from = 0;
+		while from < rest.len() {
+			let Some(rel) = rest[from..].find(" b/") else {
+				break;
+			};
+			let index = from + rel;
+			let right = &rest[index + 1..];
+			if right.len() > 2 {
+				candidates.push((&rest[..index], right));
+			}
+			from = index + 1;
+		}
+	}
+	if let Some(equal) = candidates
+		.iter()
+		.find(|(left, right)| left.len() > 2 && right.len() > 2 && left[2..] == right[2..])
+	{
+		return Some(*equal);
+	}
+	if candidates.len() == 1 {
+		return Some(candidates[0]);
+	}
+	if let Some(right) = rest.strip_prefix("/dev/null ") {
+		return Some(("/dev/null", right));
+	}
+	if let Some(left) = rest.strip_suffix(" /dev/null") {
+		return Some((left, "/dev/null"));
+	}
+	let space = rest.find(' ')?;
+	if space == 0 || space + 1 >= rest.len() {
+		return None;
+	}
+	Some((&rest[..space], &rest[space + 1..]))
 }
 
-fn strip_side_path(token: &str, side: char) -> String {
-	let prefix = format!("{side}/");
-	unquote_path(token.strip_prefix(&prefix).unwrap_or(token))
+fn read_quoted_token(input: &str, offset: usize) -> Option<(&str, usize)> {
+	let bytes = input.as_bytes();
+	if bytes.get(offset) != Some(&b'"') {
+		return None;
+	}
+	let mut index = offset + 1;
+	let mut escaped = false;
+	while index < bytes.len() {
+		let character = bytes[index];
+		index += 1;
+		if character == b'"' && !escaped {
+			return Some((&input[offset..index], index));
+		}
+		escaped = character == b'\\' && !escaped;
+	}
+	None
 }
 
-fn parse_marker_path(value: &str, side: char) -> Option<String> {
-	let path = value.split('\t').next().unwrap_or(value);
-	if path == "/dev/null" {
-		None
+/// Decode a Git C-quoted path (`"a/caf\303\251.txt"`) or return an unquoted
+/// path as written.
+fn decode_git_path(token: &str) -> String {
+	if !(token.starts_with('"') && token.ends_with('"') && token.len() >= 2) {
+		return token.to_owned();
+	}
+	let mut bytes = Vec::new();
+	let mut chars = token[1..token.len() - 1].chars().peekable();
+	while let Some(character) = chars.next() {
+		if character != '\\' {
+			let mut encoded = [0_u8; 4];
+			bytes.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+			continue;
+		}
+		let Some(escaped) = chars.next() else { break };
+		match escaped {
+			'"' => bytes.push(b'"'),
+			'\\' => bytes.push(b'\\'),
+			'a' => bytes.push(0x07),
+			'b' => bytes.push(0x08),
+			'f' => bytes.push(0x0c),
+			'n' => bytes.push(b'\n'),
+			'r' => bytes.push(b'\r'),
+			't' => bytes.push(b'\t'),
+			'v' => bytes.push(0x0b),
+			digit if ('0'..='7').contains(&digit) => {
+				let mut octal = String::from(digit);
+				while octal.len() < 3 {
+					let Some(next) = chars.peek().copied() else {
+						break;
+					};
+					if !('0'..='7').contains(&next) {
+						break;
+					}
+					octal.push(next);
+					chars.next();
+				}
+				if let Ok(value) = u8::from_str_radix(&octal, 8) {
+					bytes.push(value);
+				}
+			},
+			other => {
+				let mut encoded = [0_u8; 4];
+				bytes.extend_from_slice(other.encode_utf8(&mut encoded).as_bytes());
+			},
+		}
+	}
+	String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn side_path(token: &str) -> Option<String> {
+	let decoded = decode_git_path(token);
+	if decoded.is_empty() || decoded == "/dev/null" {
+		return None;
+	}
+	Some(strip_side_prefix(&decoded))
+}
+
+fn strip_side_prefix(path: &str) -> String {
+	match path.split_once('/') {
+		Some((_, rest)) if !rest.is_empty() => rest.to_owned(),
+		_ => path.to_owned(),
+	}
+}
+
+fn strip_diff_timestamp(path: &str) -> &str {
+	let Some((head, after)) = path.rsplit_once('\t') else {
+		return path;
+	};
+	let bytes = after.as_bytes();
+	let timestamp = bytes.len() >= 11
+		&& bytes[4] == b'-'
+		&& bytes[7] == b'-'
+		&& bytes[10] == b' '
+		&& bytes[..4].iter().all(u8::is_ascii_digit);
+	if after.is_empty() || timestamp {
+		head
 	} else {
-		Some(strip_side_path(path, side))
+		path
 	}
+}
+
+fn parse_marker_path(value: &str) -> Option<String> {
+	if value.starts_with('"') {
+		let (token, _) = read_quoted_token(value, 0)?;
+		return side_path(token);
+	}
+	side_path(strip_diff_timestamp(value))
 }
 
 fn parse_mode(value: &str) -> Option<Mode> {
@@ -859,6 +1023,21 @@ fn apply_patches_to_map(
 			Some(entry) => blob_bytes(repo, entry.id)?,
 			None => Vec::new(),
 		};
+		if !patch.binary.is_empty()
+			&& let Some(oid) = if options.reverse {
+				patch.new_oid.as_deref()
+			} else {
+				patch.old_oid.as_deref()
+			}
+			&& !binary_base_matches(repo, &source_bytes, oid)
+		{
+			return Err(Error::PatchFailed {
+				message: format!(
+					"binary patch does not match {}",
+					source_path.unwrap_or(target_path.unwrap_or_default())
+				),
+			});
+		}
 		let direct = apply_file_bytes(patch, &source_bytes, options.reverse);
 		let bytes = match direct {
 			Ok(bytes) => bytes,
@@ -910,6 +1089,18 @@ fn patch_sides(
 		(patch.old_path.as_deref(), patch.new_path.as_deref(), patch.old_mode, patch.new_mode)
 	}
 }
+fn binary_base_matches(repo: &gix::Repository, bytes: &[u8], oid: &str) -> bool {
+	let full = oid.len() == 40 || oid.len() == 64;
+	if !full || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+		return true;
+	}
+	let Ok(expected) = gix::ObjectId::from_hex(oid.as_bytes()) else {
+		return true;
+	};
+	gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, bytes)
+		.ok()
+		.is_some_and(|id| id == expected)
+}
 
 fn apply_file_bytes(
 	patch: &FilePatch,
@@ -917,12 +1108,33 @@ fn apply_file_bytes(
 	reverse: bool,
 ) -> std::result::Result<Vec<u8>, ApplyFailure> {
 	if !patch.binary.is_empty() {
-		let block = if reverse {
-			patch.binary.get(1).or_else(|| patch.binary.first())
+		let (result, expected) = if reverse && patch.binary.len() >= 2 {
+			(1, Some(0))
 		} else {
-			patch.binary.first()
+			(
+				0,
+				if !reverse && patch.binary.len() >= 2 {
+					Some(1)
+				} else {
+					None
+				},
+			)
+		};
+		if let Some(index) = expected {
+			let block = &patch.binary[index];
+			if matches!(block.kind, BinaryKind::Literal) {
+				let expected_bytes = decode_binary_block(block, source)?;
+				if expected_bytes.as_slice() != source {
+					return Err(ApplyFailure::Context(
+						"binary patch does not match the current contents".into(),
+					));
+				}
+			}
 		}
-		.ok_or_else(|| ApplyFailure::Invalid("binary patch has no data block".into()))?;
+		let block = patch
+			.binary
+			.get(result)
+			.ok_or_else(|| ApplyFailure::Invalid("binary patch has no data block".into()))?;
 		return decode_binary_block(block, source);
 	}
 	if patch.hunks.is_empty() {
