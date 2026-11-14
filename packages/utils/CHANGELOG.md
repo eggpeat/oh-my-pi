@@ -6,6 +6,10 @@
 
 - Added `mixHex` for blending two hex colors ([#19167](https://github.com/can1357/oh-my-pi/pull/19167) by [@materemias](https://github.com/materemias))
 
+### Fixed
+
+- Supported Cloud Code Assist compound `Resets in XhYmZs`, `quotaResetDelay`, and `quotaResetTimeStamp` in `extractRetryHint` ([#17327](https://github.com/can1357/oh-my-pi/pull/17327) by [@ironbabatekkral](https://github.com/ironbabatekkral))
+
 ## [18.19.0] - 2026-11-12
 
 ### Added

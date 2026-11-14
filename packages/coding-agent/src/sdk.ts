@@ -148,7 +148,7 @@ import {
 import { type FileSlashCommand, loadSlashCommands as loadSlashCommandsInternal } from "./extensibility/slash-commands";
 import type { HindsightSessionStateApi } from "./hindsight/state";
 import { LocalProtocolHandler, type LocalProtocolOptions, outRepliesActive } from "./internal-urls";
-import { stripXdUrlPrefix } from "@oh-my-pi/pi-tui/tools/xd-url";
+import { stripXdUnderscorePrefix, stripXdUrlPrefix } from "@oh-my-pi/pi-tui/tools/xd-url";
 import { holdSharedLsp } from "./lsp/client";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "./lsp/startup-events";
 import {
@@ -2070,9 +2070,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		totalLines: 0,
 		agentsMdFiles: [],
 	};
-	const scanWorkspaceTree = (): Promise<WorkspaceTree> => {
+	const scanWorkspaceTree = (root: string): Promise<WorkspaceTree> => {
 		const scan = logger.time("buildWorkspaceTree", () =>
-			buildWorkspaceTree(cwd, { timeoutMs: STARTUP_SCAN_DEADLINE_MS }),
+			buildWorkspaceTree(root, { timeoutMs: STARTUP_SCAN_DEADLINE_MS }),
 		);
 		scan.catch(() => {});
 		return scan;
@@ -2082,8 +2082,21 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	let workspaceTreePromise: Promise<WorkspaceTree> | undefined = options.workspaceTree
 		? Promise.resolve(options.workspaceTree)
 		: cfgIncludeWorkspaceTree.get(settings)
-			? scanWorkspaceTree()
+			? scanWorkspaceTree(cwd)
 			: undefined;
+	// Conversation, directory, and transcript epoch the current tree describes.
+	// A rebuild after the conversation's cwd changes (`/move`, resuming a
+	// session from another project) or a fresh transcript starts (`/clear`,
+	// `/new`) rescans so the prompt reflects the tree on disk (e.g. after a
+	// branch checkout). Every other rebuild keeps the conversation's own tree,
+	// so its cached prompt prefix stays byte-stable: `workspaceTrees` hands a
+	// resumed conversation back the scan it was last sent with, even when
+	// another conversation rescanned in between. A tree the caller supplied is
+	// theirs: it is never replaced by a scan.
+	let workspaceTreeConversation: string | undefined;
+	let workspaceTreeRoot = path.resolve(cwd);
+	let workspaceTreeEpoch = 0;
+	const workspaceTrees = new Map<string, { root: string; scan: Promise<WorkspaceTree> }>();
 	// Tree from a mid-session scan; supersedes the startup value handed to subagents.
 	let lateWorkspaceTree: WorkspaceTree | undefined;
 
@@ -4126,7 +4139,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// advertised while exact dispatch still answered from the snapshot.
 		// Callers with no request snapshot (the Cursor exec bridge) pass none and
 		// get device resolution only.
-		const resolveDeviceTool = (name: string, advertised: readonly AgentTool[] = []): AgentTool | undefined => {
+		const resolveDeviceSpelling = (name: string, advertised: readonly AgentTool[]): AgentTool | undefined => {
 			const bareName = stripXdUrlPrefix(name);
 			const state = toolSession.xdev;
 			// An exact mounted name is the name itself, not a guess.
@@ -4149,6 +4162,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				candidate =>
 					(state ? resolveMountedXdevExecutable(state, candidate) : undefined) ??
 					advertised.find(tool => tool.name === candidate),
+			);
+		};
+		// A model whose tool-name charset cannot carry `://` spells the prefix with
+		// underscores (`xd__recall`). Only a name every exact spelling missed is
+		// read that way, so a tool actually named `xd_<something>` keeps its own
+		// dispatch.
+		const resolveDeviceTool = (name: string, advertised: readonly AgentTool[] = []): AgentTool | undefined => {
+			const unprefixed = stripXdUnderscorePrefix(name);
+			return (
+				resolveDeviceSpelling(name, advertised) ??
+				(unprefixed === name ? undefined : resolveDeviceSpelling(unprefixed, advertised))
 			);
 		};
 		// Mounted devices are absent from the advertised tool set, so a miss on a
@@ -4396,15 +4420,37 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// namespace catalog; native tool calling lets the compact name list suffice.
 			const nativeTools = resolveDialect(cfgToolsFormat.get(settings), agent?.state.model ?? model) === undefined;
 			const includeWorkspaceTree = cfgIncludeWorkspaceTree.get(settings);
-			if (includeWorkspaceTree && !workspaceTreePromise) {
-				const scan = scanWorkspaceTree();
-				workspaceTreePromise = scan;
-				scan.then(
-					tree => {
-						lateWorkspaceTree = tree;
-					},
-					() => {},
-				);
+			if (includeWorkspaceTree && !options.workspaceTree) {
+				const treeRoot = path.resolve(promptCwd);
+				const treeEpoch = hasSession ? session.transcriptEpoch : 0;
+				const conversation = sessionManager.getSessionId();
+				const held = workspaceTrees.get(conversation);
+				const stale =
+					treeEpoch !== workspaceTreeEpoch ||
+					((workspaceTreeConversation ?? conversation) === conversation && treeRoot !== workspaceTreeRoot);
+				// Not stale: a conversation seen before gets its own scan back; one first
+				// seen here shares the current scan when it describes the same directory.
+				const kept = stale
+					? undefined
+					: held?.root === treeRoot
+						? held.scan
+						: treeRoot === workspaceTreeRoot
+							? workspaceTreePromise
+							: undefined;
+				const scan = kept ?? scanWorkspaceTree(treeRoot);
+				workspaceTrees.set(conversation, { root: treeRoot, scan });
+				workspaceTreeConversation = conversation;
+				workspaceTreeRoot = treeRoot;
+				workspaceTreeEpoch = treeEpoch;
+				if (scan !== workspaceTreePromise) {
+					workspaceTreePromise = scan;
+					scan.then(
+						tree => {
+							if (workspaceTreePromise === scan) lateWorkspaceTree = tree;
+						},
+						() => {},
+					);
+				}
 			}
 			// Mounted xd:// readers stay out of the direct inventory, but their skill
 			// capability still drives catalog/URI guidance: project them into the
@@ -5119,7 +5165,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// write transport), so xd:// devices are unreachable. Images are inlined,
 			// and the provider boundary handles text-only advisor models.
 			xdev: undefined,
-			isToolActive: name => toolSession.isToolActive?.(name) === true,
+			// Each slate binds its own predicate in `create`. The primary's active
+			// set, and the callback that mutates it, are not advisor state.
+			isToolActive: undefined,
+			setActiveToolNames: undefined,
 		});
 		// Advisor rosters build synchronously; `task` is the one built-in that
 		// discovers asynchronously, so resolve its agents once up front.
@@ -5142,18 +5191,28 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			},
 			create: granted => {
 				const advisorSession = createAdvisorToolSession();
+				// Descriptions, schemas, and execute-time gates read this live. A name
+				// is active only once its factory returns a tool, so a grant for an
+				// unavailable built-in (lsp with language servers off) is not advertised.
+				const activeToolNames = new Set<string>();
+				advisorSession.isToolActive = name => activeToolNames.has(name);
 				const tools: Tool[] = [];
 				for (const name of advisorBuiltinNames) {
 					if (!granted.has(name)) continue;
+					// Visible to this tool while it builds: bash reads its own launch gate live.
+					activeToolNames.add(name);
 					const tool = buildAdvisorTool(name, advisorSession);
+					if (!tool) {
+						activeToolNames.delete(name);
+						continue;
+					}
 					// Wrapped like every registry tool: `ExtensionToolWrapper` is where the
 					// approval mode, per-tool `tools.approval.<tool>` policies and
 					// `autoApprove` are enforced. The advisor's loop and its Cursor exec
 					// bridge both run these instances directly, so a raw one would execute a
 					// `bash`/`write` the user configured as `ask` or `deny`. Meta-notice
 					// first, matching the registry's wrap order.
-					if (tool)
-						tools.push(new ExtensionToolWrapper(wrapToolWithMetaNotice(tool), extensionRunner, advisorAgent));
+					tools.push(new ExtensionToolWrapper(wrapToolWithMetaNotice(tool), extensionRunner, advisorAgent));
 				}
 				return {
 					tools,

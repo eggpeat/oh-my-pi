@@ -7,12 +7,17 @@
 - Press Delete at the end of the Ctrl+R search field to remove the selected prompt from history
 - Markdown links an extension handles itself (a registered extension scheme) get their own `mdExtensionLink` theme color, so they no longer look like links that open a URL; themes that omit it get a muted blend of `mdLink` and `text` ([#19167](https://github.com/can1357/oh-my-pi/pull/19167) by [@materemias](https://github.com/materemias))
 - Approval dialogs style covered (`✓ … (allowed: …)`) and prompted (`? … (…)`) compound bash command segments with distinct colours and native spans, opening scrolled to the first prompted segment ([#18749](https://github.com/can1357/oh-my-pi/pull/18749) by [@asuffield](https://github.com/asuffield))
+- `Terminal.onProgramStatusSupport()` reports whether the terminal answered an OSC 7501 feature query, and `setPromptZonesEnabled()` (`chat/user-message`) turns user messages' OSC 133 prompt marks off and on ([#17307](https://github.com/can1357/oh-my-pi/issues/17307), [#18969](https://github.com/can1357/oh-my-pi/pull/18969) by [@robfeldmann](https://github.com/robfeldmann))
+- Added an optional Branch to chat action and `b` shortcut to the BTW history sheet ([#19135](https://github.com/can1357/oh-my-pi/pull/19135) by [@Clannad47](https://github.com/Clannad47)).
 
 ### Fixed
 
 - A `bash` call that returns as a background job right away (`async: true`) keeps showing its command in the interpreted shell view instead of switching to the raw command line ([#19202](https://github.com/can1357/oh-my-pi/pull/19202) by [@JustasMasiulis](https://github.com/JustasMasiulis))
 - Switching to a subagent, resuming, or rebuilding a long transcript paints the newest messages at full size immediately instead of flashing a stack of one-line block stubs while older history drains into scrollback
 - Switching to a subagent, resuming, or rebuilding a long transcript paints the newest messages at full size immediately instead of flashing a stack of one-line block stubs while older history drains into scrollback ([#19204](https://github.com/can1357/oh-my-pi/pull/19204) by [@JustasMasiulis](https://github.com/JustasMasiulis))
+- Fixed Markdown task lists dropping their checkboxes, so done (`- [x]`) and open (`- [ ]`) items looked the same in the transcript ([#16557](https://github.com/can1357/oh-my-pi/pull/16557) by [@mottopanikeiku](https://github.com/mottopanikeiku))
+- Fixed DEC 2048 in-band resize reports typing `48;rows;cols;…` into the composer on iTerm2 ([#16695](https://github.com/can1357/oh-my-pi/pull/16695) by [@demon-i386](https://github.com/demon-i386))
+- Fixed the working-row shimmer dropping to a few frames a second while omp waits on a tool or the model, on terminals without synchronized output such as tmux 3.6 ([#19032](https://github.com/can1357/oh-my-pi/pull/19032) by [@nategriffin26](https://github.com/nategriffin26))
 
 ## [18.20.0] - 2026-11-12
 
