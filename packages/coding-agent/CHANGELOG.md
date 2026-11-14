@@ -4,10 +4,14 @@
 
 ### Added
 
+- `bash.patterns` and `bashInterceptor.patterns` now support path-scoped `{ path, patterns: [...] }` entries in `config.yml`, resolving per working directory like `enabledModels` ([#18350](https://github.com/can1357/oh-my-pi/pull/18350) by [@asuffield](https://github.com/asuffield))
+- Added `bash.allowedEnvVars` and per-rule `env` lists on `bash.patterns` to allow leading `KEY=VALUE` prefixes for exactly named environment variables on `allow` rules without duplicating rules for each variable combination ([#18351](https://github.com/can1357/oh-my-pi/pull/18351) by [@asuffield](https://github.com/asuffield))
+- Project (`.omp/config.yml`) and `--config` overlay `bash.patterns` and `bashInterceptor.patterns` now prepend ahead of global rules instead of replacing them wholesale ([#18352](https://github.com/can1357/oh-my-pi/pull/18352) by [@asuffield](https://github.com/asuffield))
 - Subagents now preserve @upstream provider pinning on inherited models
 - Press Delete at the end of the Ctrl+R search field to remove the selected prompt from history.
 - Added `--no-judge` and `--no-spotlight` to restrict those services to the active model's provider, and `--offline` to restrict auxiliary services.
 - Added per-rule `repeatMode` frontmatter (`once`, `after-gap`, or `always`) that overrides `ttsr.repeatMode` for one TTSR rule; `always` fires the rule again on later matching turns, at most once per turn and never on the retry or follow-up turn its own reminder started ([#19163](https://github.com/can1357/oh-my-pi/pull/19163) by [@Xytronix](https://github.com/Xytronix))
+- Compound bash approval prompts (`bash.allowCompoundCommands: true`) list each `&&` segment on its own line, marking segments covered by `bash.patterns` allow rules (`✓ … (allowed: <pattern>)`) separately from segments being prompted for (`? … (requires approval | prompt: <pattern> | critical pattern)`) ([#18749](https://github.com/can1357/oh-my-pi/pull/18749) by [@asuffield](https://github.com/asuffield))
 
 ### Changed
 
@@ -29,8 +33,13 @@
 
 ### Fixed
 
+- Leading `KEY=VALUE` environment assignments are now stripped when evaluating `deny` and `prompt` rules in `bash.patterns` so they cannot bypass command restrictions ([#18351](https://github.com/can1357/oh-my-pi/pull/18351) by [@asuffield](https://github.com/asuffield))
+- omp's WebKit engine is now pinned per omp release and updated in place: an engine in `~/.o2/lib/abkit` that names no version or an older release is replaced before the first open that runs it (once no process runs from it), so the ABKit 0.1.1 fix for plain-http cookies (sign-ins to router and LAN admin pages) reaches existing installs. Local builds (`VERSION` `dev`), newer releases and an engine another app manages (Tern's `manager.json` two folders above its real path, as for omp itself) are kept
+- Chromium and WebKit tabs: a click or key press that opens a `confirm()` or `prompt()` returns instead of timing out after 8 s, and while one is pending, calls that need the page (reads, actions, `evaluate`, waits on page content, screenshots) fail at once naming the dialog and `tab.handleDialog()`, instead of each running out its deadline with "could not count matches" or a bare timeout
+- `tab.waitForUrl()` given anything but a string or a RegExp (a predicate function, say) now fails at once on every backend with an error naming what it takes, instead of an internal `pattern.test is not a function` on WebKit, Tern and cmux
+- WebKit tabs' request log: an XHR or `fetch` to a plain-http host that answers `text/html` (as many router UIs' APIs do) is `fetch`, not `subdocument`; only a frame's document request is a `subdocument`. Request body sizes, which the engine does not report, are left out (HAR `bodySize` -1) instead of 0, and a response without `Content-Length` no longer reports a body size of 0. `sizes.requestBody` is now optional in the request-record type
 - `write` no longer fails with "content is required" on strict-mode providers such as Wafer and Fireworks, where models sent `content: null` for an ordinary file write
-- A seance `task` whose `sourceSession` id belongs to another project now fails with a hint to pass that session's `.jsonl` path, which works from any project, instead of only "was not found" ([#19095](https://github.com/can1357/oh-my-pi/pull/19095) by [@zhivko-kocev](https://github.com/zhivko-kocev))
+- A seance `task` now accepts a `sourceSession` id from any project, such as the short ids `archive` lists, instead of failing preflight until given the session's `.jsonl` path; `/seance <id>` resolves cross-project ids in about a second instead of scanning every session
 - On Windows, a `mnemopi.dbPath` of `~/…` now resolves to a native path (`C:\Users\you\mnemopi\custom.db`) instead of mixing `\` and `/` ([#19106](https://github.com/can1357/oh-my-pi/pull/19106) by [@zhivko-kocev](https://github.com/zhivko-kocev))
 - Advisors no longer get repeat-read warnings for reads another advisor made; each advisor now keeps its own tool state (snapshots, conflict history, repeat-read counts) ([#18834](https://github.com/can1357/oh-my-pi/issues/18834))
 - `/new` and switching sessions now start tools fresh: `conflict://` ids, already-reported diagnostics and repeat-read counts no longer carry over from the previous conversation, for the main agent and advisors alike
