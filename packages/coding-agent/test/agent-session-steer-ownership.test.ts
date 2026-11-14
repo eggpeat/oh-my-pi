@@ -1,15 +1,18 @@
 /**
  * Steer admission must follow run ownership: a `joinActiveTurn` steer may only
  * inject into a run claimed by a client prompt dispatch (`session.prompt`) or a
- * recovery retry of that turn. An autonomous run — a queued-hidden drain, a
- * background turn's retry — streaming while a client prompt is still
- * dispatching must never swallow the steer: it parks until the client's own run
- * goes live, and refuses when the dispatch settles first.
+ * continuation of that turn (recovery retry, compaction length-stop retry, rule
+ * interrupt retry). An autonomous run — a queued-hidden drain, a background
+ * turn's retry — streaming while a client prompt is still dispatching must
+ * never swallow the steer: it parks until the client's own run goes live, and
+ * refuses when the dispatch settles first.
  */
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { CustomMessage } from "@oh-my-pi/pi-agent-core";
 import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
+import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
+import { TtsrManager } from "@oh-my-pi/pi-coding-agent/export/ttsr";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -62,13 +65,17 @@ describe("AgentSession steer run ownership", () => {
 		options: {
 			/** Per-call session-level key resolution (call numbers start at 1). */
 			getApiKey?: (call: number) => string | undefined | Promise<string | undefined>;
+			settings?: Record<string, unknown>;
+			ttsrManager?: TtsrManager;
+			/** Identity stamped on mock responses; compaction recovery requires it to match the session model. */
+			mockIdentity?: { provider: string; id: string };
 		} = {},
 	) {
 		authStorage = await AuthStorage.create(":memory:");
 		authStorage.keys.setRuntime("anthropic", "test-key");
 		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!bundled) throw new Error("Expected claude-sonnet-4-5 model to exist");
-		const mock = createMockModel({ responses });
+		const mock = createMockModel({ responses, ...options.mockIdentity });
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: { model: bundled, systemPrompt: ["Test"], tools: [] },
@@ -88,8 +95,10 @@ describe("AgentSession steer run ownership", () => {
 				"compaction.enabled": false,
 				"todo.enabled": false,
 				"retry.baseDelayMs": 50,
+				...options.settings,
 			}),
 			modelRegistry,
+			...(options.ttsrManager ? { ttsrManager: options.ttsrManager } : {}),
 		});
 		return { session, mock };
 	}
@@ -320,5 +329,86 @@ describe("AgentSession steer run ownership", () => {
 		expect(retryAnswer).toBeGreaterThanOrEqual(0);
 		expect(steerMessage).toBeGreaterThan(retryAnswer);
 		expect(steerAnswer).toBeGreaterThan(steerMessage);
+	});
+
+	it("admits a steer into the client prompt's length-stop compaction retry", async () => {
+		const retryStarted = Promise.withResolvers<void>();
+		const releaseRetry = Promise.withResolvers<void>();
+		const { session } = await createSession(
+			[
+				() => ({ content: [], stopReason: "length" }),
+				async () => {
+					retryStarted.resolve();
+					await releaseRetry.promise;
+					return { content: ["continued after length stop"] };
+				},
+				() => ({ content: ["steer answer"] }),
+			],
+			{
+				settings: { "compaction.enabled": true, "contextPromotion.enabled": false },
+				mockIdentity: { provider: "anthropic", id: "claude-sonnet-4-5" },
+			},
+		);
+
+		const promptDone = session.prompt("client question");
+		await withTimeout(retryStarted.promise, 4_000, "Length-stop retry never streamed");
+		expect(session.agent.state.isStreaming).toBe(true);
+
+		// The compaction retry continues the client's turn, so a steer joins it
+		// instead of waiting until the prompt ends and then being refused.
+		expect(await withTimeout(session.joinActiveTurn("steer the length retry"), 1_000, "steer parked")).toBe(true);
+
+		releaseRetry.resolve();
+		await promptDone;
+		await session.waitForIdle();
+		const messages = session.agent.state.messages;
+		expect(assistantIndexContaining(messages, "continued after length stop")).toBeGreaterThanOrEqual(0);
+		expect(userIndexContaining(messages, "steer the length retry")).toBeGreaterThanOrEqual(0);
+		expect(assistantIndexContaining(messages, "steer answer")).toBeGreaterThan(
+			userIndexContaining(messages, "steer the length retry"),
+		);
+	});
+
+	it("admits a steer into the client prompt's rule-triggered retry", async () => {
+		const ttsrManager = new TtsrManager({ enabled: true, interruptMode: "always" });
+		const rule: Rule = {
+			name: "no-unwrap",
+			path: "/tmp/no-unwrap.md",
+			content: "Do not use .unwrap()",
+			condition: ["\\.unwrap\\("],
+			interruptMode: "always",
+			_source: { provider: "test", providerName: "test", path: "/tmp/no-unwrap.md", level: "project" },
+		};
+		ttsrManager.addRule(rule);
+		const retryStarted = Promise.withResolvers<void>();
+		const releaseRetry = Promise.withResolvers<void>();
+		const { session } = await createSession(
+			[
+				() => ({ content: ["let val = result.unwrap("] }),
+				async () => {
+					retryStarted.resolve();
+					await releaseRetry.promise;
+					return { content: ["fixed the unwrap"] };
+				},
+				() => ({ content: ["steer answer"] }),
+			],
+			{ ttsrManager },
+		);
+
+		const promptDone = session.prompt("write some rust");
+		await withTimeout(retryStarted.promise, 4_000, "Rule retry never streamed");
+		expect(session.agent.state.isStreaming).toBe(true);
+
+		expect(await withTimeout(session.joinActiveTurn("steer the rule retry"), 1_000, "steer parked")).toBe(true);
+
+		releaseRetry.resolve();
+		await promptDone;
+		await session.waitForIdle();
+		const messages = session.agent.state.messages;
+		expect(assistantIndexContaining(messages, "fixed the unwrap")).toBeGreaterThanOrEqual(0);
+		expect(userIndexContaining(messages, "steer the rule retry")).toBeGreaterThanOrEqual(0);
+		expect(assistantIndexContaining(messages, "steer answer")).toBeGreaterThan(
+			userIndexContaining(messages, "steer the rule retry"),
+		);
 	});
 });

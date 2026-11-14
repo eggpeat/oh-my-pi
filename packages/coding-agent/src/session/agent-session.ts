@@ -636,6 +636,14 @@ const IMAGE_DESCRIPTION_ADMISSION_TIMEOUT_MS = 20_000;
 /** Marks work running inside the deferred extension load so it never waits on itself. */
 const deferredExtensionLoadScope = new AsyncLocalStorage<true>();
 /**
+ * Owner of the agent run whose events are being dispatched. Held for that
+ * dispatch's awaits and for the post-prompt tasks it schedules, so a compaction
+ * or rule continuation of the run keeps the same owner. Overlapping dispatches
+ * each keep their own store: a background retry waiting on a save cannot pick
+ * up a client run that claimed in between.
+ */
+const continuationOwnerScope = new AsyncLocalStorage<unknown>();
+/**
  * One session transition in its session's tree of transitions. Transitions it starts itself queue
  * on its `childTail`; it hands its parent's queue on once it and every one in `nested` settled.
  */
@@ -4237,7 +4245,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 		if (event.type === "agent_end") this.#agentEndRunEpochs.set(event, this.#runEpoch);
 		if (event.type !== "agent_end") {
-			const processing = this.#processAgentEvent(event, eventRunOwner);
+			const processing = continuationOwnerScope.run(eventRunOwner, () =>
+				this.#processAgentEvent(event, eventRunOwner),
+			);
 			if ((event.type === "message_start" || event.type === "message_end") && isAdvisorCard(event.message)) {
 				this.#advisors.trackCardEvent(processing);
 			}
@@ -4250,7 +4260,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// Maintenance starts now, not behind the revocation ack: it classifies this run's end
 			// against live abort state, and a deferred start lets `abort()` settle first, so a
 			// deliberate empty abort reads as a reasonless one and is auto-retried.
-			await Promise.all([this.#processAgentEvent(event, eventRunOwner), computerControlRevocation]);
+			await Promise.all([
+				continuationOwnerScope.run(eventRunOwner, () => this.#processAgentEvent(event, eventRunOwner)),
+				computerControlRevocation,
+			]);
 		} catch (error) {
 			// Post-turn maintenance (compaction, pruning rewrites, hooks) threw before
 			// publishing the settle. Without it the run never reports idle and every
@@ -5501,6 +5514,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	): void {
 		const delayMs = options?.delayMs ?? 0;
 		const signal = this.#postPromptTasksAbortController.signal;
+		// Captured now, before this task's own awaits: the dispatch that
+		// scheduled it may have moved on by the time the task runs. A rule
+		// interrupt schedules its continue from this task and must still name
+		// the run the rule interrupted.
+		const owner = continuationOwnerScope.getStore();
 		const scheduled = (async () => {
 			if (delayMs > 0) {
 				try {
@@ -5518,7 +5536,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				options.onSkip?.("stale-generation");
 				return;
 			}
-			await task(signal);
+			await (owner === undefined ? task(signal) : continuationOwnerScope.run(owner, () => task(signal)));
 		})();
 		this.#trackPostPromptTask(scheduled);
 	}
@@ -5630,9 +5648,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	#scheduleAgentContinue(options: ScheduledAgentContinueOptions): void {
+		// A caller that already named an owner (a recovery retry, captured with
+		// the terminal event) wins. Otherwise inherit the dispatch in progress:
+		// compaction and rule continuations are scheduled from that dispatch,
+		// possibly after awaits, and must keep its owner.
+		const owner = options.owner ?? continuationOwnerScope.getStore();
 		const request: ScheduledAgentContinueRequest = {
 			schedulerToken: ++this.#agentContinueSchedulerToken,
-			options,
+			options: owner === undefined ? options : { ...options, owner },
 		};
 		logger.debug("agent.continue scheduled", {
 			source: options.source,
@@ -5757,6 +5780,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	#scheduleAutoContinuePrompt(generation: number): boolean {
+		// The compaction that schedules this runs inside the ended run's event
+		// dispatch. Capture that owner now; the prompt itself runs later, from a
+		// post-prompt task.
+		const owner = continuationOwnerScope.getStore();
 		const continuePrompt = async () => {
 			// Compaction summarizes away the first-message eager preludes, so re-assert the
 			// delegate-via-tasks / phased-todo reminders on this auto-resumed turn. This runs
@@ -5778,6 +5805,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				{
 					skipPostPromptRecoveryWait: true,
 					prependMessages: eagerNudges.length > 0 ? eagerNudges : undefined,
+					runOwner: owner,
 				},
 			);
 		};
@@ -5789,6 +5817,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					this.#scheduleAgentContinue({
 						source: "auto-continue-queued-message",
 						generation,
+						owner,
 						shouldContinue: () => this.agent.hasQueuedMessages(),
 					});
 					return;
