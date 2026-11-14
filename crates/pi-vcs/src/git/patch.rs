@@ -27,6 +27,7 @@ use super::{
 	filter::WorktreeFilter,
 	mutate::update_reference,
 	open::{load_index_or_head, status_with_index},
+	worktree::{WorktreeOptions, materialize},
 };
 use crate::{
 	error::{Error, Result},
@@ -112,7 +113,7 @@ impl GitRepo {
 			return Ok(());
 		}
 		let patches = parse_patch(patch_text).map_err(ApplyFailure::into_error)?;
-		let repo = self.gix()?;
+		let repo = self.gix_fresh()?;
 		if options.cached {
 			let mut state = index_map_at(&repo, options.index_path.as_deref())?;
 			apply_patches_to_map(&repo, &mut state, &patches, options)?;
@@ -132,7 +133,7 @@ impl GitRepo {
 		let Ok(patches) = parse_patch(patch_text) else {
 			return Ok(false);
 		};
-		let repo = self.gix()?.with_object_memory();
+		let repo = self.gix_fresh()?.with_object_memory();
 		let mut state = if options.cached {
 			index_map_at(&repo, options.index_path.as_deref())?
 		} else {
@@ -212,7 +213,7 @@ impl GitRepo {
 
 	/// Cherry-pick one commit with a fail-clean three-way tree merge.
 	pub fn cherry_pick(&self, rev: &str) -> Result<()> {
-		let repo = self.gix()?;
+		let repo = self.gix_fresh()?;
 		let picked_id = repo
 			.rev_parse_single(rev)
 			.map_err(|err| Error::backend("git cherry-pick resolve", err))?
@@ -286,7 +287,7 @@ impl GitRepo {
 				.map_err(|err| Error::backend("git cherry-pick edit tree", err))?;
 			for path in &unstaged {
 				let mode = head_map.get(path).map_or(Mode::FILE, |entry| entry.mode);
-				match read_worktree_entry(self, &mut filter, path, mode)? {
+				match read_worktree_entry(self, &repo, &mut filter, path, mode)? {
 					Some((bytes, mode)) => {
 						let id = repo
 							.write_blob(bytes)
@@ -358,7 +359,7 @@ impl GitRepo {
 
 	/// Stash index, tracked worktree changes, and untracked files.
 	pub fn stash_push(&self, message: Option<&str>) -> Result<bool> {
-		let repo = self.gix()?;
+		let repo = self.gix_fresh()?;
 		let head = repo
 			.head_commit()
 			.map_err(|err| Error::backend("git stash HEAD", err))?;
@@ -409,7 +410,7 @@ impl GitRepo {
 
 	/// Try to pop the top stash without leaving partial conflict state.
 	pub fn stash_try_pop(&self, reinstate_index: bool) -> Result<bool> {
-		let repo = self.gix()?;
+		let repo = self.gix_fresh()?;
 		let Some(stash_ref) = repo
 			.try_find_reference("refs/stash")
 			.map_err(|err| Error::backend("git stash resolve", err))?
@@ -1438,7 +1439,7 @@ fn patch_worktree_map(
 			.or(source_mode)
 			.or(target_mode)
 			.unwrap_or(Mode::FILE);
-		if let Some((bytes, mode)) = read_worktree_entry(repo, filter, path, mode)? {
+		if let Some((bytes, mode)) = read_worktree_entry(repo, gix_repo, filter, path, mode)? {
 			let id = gix_repo
 				.write_blob(bytes)
 				.map_err(|err| Error::backend("git hash patch source", err))?
@@ -1485,7 +1486,7 @@ fn tracked_worktree_map(
 ) -> Result<BTreeMap<String, FileEntry>> {
 	let mut map = BTreeMap::new();
 	for (path, entry) in index {
-		if let Some((bytes, mode)) = read_worktree_entry(repo, filter, path, entry.mode)? {
+		if let Some((bytes, mode)) = read_worktree_entry(repo, gix_repo, filter, path, entry.mode)? {
 			let id = gix_repo
 				.write_blob(bytes)
 				.map_err(|err| Error::backend("git hash worktree blob", err))?
@@ -1531,7 +1532,7 @@ fn untracked_worktree_map(
 		if index.contains_key(&path) {
 			continue;
 		}
-		if let Some((bytes, mode)) = read_worktree_entry(repo, filter, &path, Mode::FILE)? {
+		if let Some((bytes, mode)) = read_worktree_entry(repo, gix_repo, filter, &path, Mode::FILE)? {
 			let id = gix_repo
 				.write_blob(bytes)
 				.map_err(|err| Error::backend("git hash untracked blob", err))?
@@ -1546,6 +1547,7 @@ fn untracked_worktree_map(
 /// symlink targets as-is, regular files through the clean filters.
 fn read_worktree_entry(
 	repo: &GitRepo,
+	gix_repo: &gix::Repository,
 	filter: &mut WorktreeFilter<'_>,
 	rela_path: &str,
 	index_mode: Mode,
@@ -1570,13 +1572,24 @@ fn read_worktree_entry(
 	if !metadata.is_file() {
 		return Ok(None);
 	}
-	let mode = worktree_file_mode(&metadata, index_mode);
+	let options = WorktreeOptions::for_repo(gix_repo, "git worktree read")?;
+	if !options.symlinks && index_mode == Mode::SYMLINK {
+		return Ok(Some((fs::read(path)?, Mode::SYMLINK)));
+	}
+	let mode = worktree_file_mode(&metadata, index_mode, options.executable_bit);
 	Ok(Some((filter.worktree_to_git(rela_path, fs::read(path)?)?, mode)))
 }
 
 #[cfg(unix)]
-fn worktree_file_mode(metadata: &fs::Metadata, _index_mode: Mode) -> Mode {
+fn worktree_file_mode(metadata: &fs::Metadata, index_mode: Mode, executable_bit: bool) -> Mode {
 	use std::os::unix::fs::PermissionsExt;
+	if !executable_bit {
+		return if matches!(index_mode, Mode::FILE | Mode::FILE_EXECUTABLE) {
+			index_mode
+		} else {
+			Mode::FILE
+		};
+	}
 	if metadata.permissions().mode() & 0o111 != 0 {
 		Mode::FILE_EXECUTABLE
 	} else {
@@ -1586,7 +1599,7 @@ fn worktree_file_mode(metadata: &fs::Metadata, _index_mode: Mode) -> Mode {
 
 #[cfg(not(unix))]
 #[allow(clippy::missing_const_for_fn, reason = "matches non-const unix signature")]
-fn worktree_file_mode(_metadata: &fs::Metadata, index_mode: Mode) -> Mode {
+fn worktree_file_mode(_metadata: &fs::Metadata, index_mode: Mode, _executable_bit: bool) -> Mode {
 	index_mode
 }
 
@@ -1881,34 +1894,9 @@ fn write_worktree_entry(
 	entry: &FileEntry,
 ) -> Result<()> {
 	validate_repo_path(path).map_err(ApplyFailure::into_error)?;
-	let absolute = repo.root().join(path);
-	if let Some(parent) = absolute.parent() {
-		fs::create_dir_all(parent)?;
-	}
+	let options = WorktreeOptions::for_repo(gix_repo, "git checkout")?;
 	let bytes = blob_bytes(gix_repo, entry.id)?;
-	if entry.mode == Mode::SYMLINK {
-		let _ = fs::remove_file(&absolute);
-		#[cfg(unix)]
-		{
-			use std::os::unix::{ffi::OsStrExt, fs::symlink};
-			symlink(std::ffi::OsStr::from_bytes(&bytes), &absolute)?;
-		}
-		#[cfg(not(unix))]
-		fs::write(&absolute, bytes)?;
-		return Ok(());
-	}
-	fs::write(&absolute, filter.git_to_worktree(path, bytes)?)?;
-	#[cfg(unix)]
-	{
-		use std::os::unix::fs::PermissionsExt;
-		let permissions = fs::Permissions::from_mode(if entry.mode == Mode::FILE_EXECUTABLE {
-			0o755
-		} else {
-			0o644
-		});
-		fs::set_permissions(&absolute, permissions)?;
-	}
-	Ok(())
+	materialize(repo.root(), path, entry.mode, bytes, filter, options)
 }
 
 /// Remove `path` and the parent directories it leaves empty. A directory at
