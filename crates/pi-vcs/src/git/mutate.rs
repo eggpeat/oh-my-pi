@@ -199,6 +199,11 @@ impl GitRepo {
 			.transpose()
 			.map_err(|err| Error::backend("git commit read commit.gpgSign", err))?
 			.unwrap_or(false);
+		// Refuse unresolved stages before hooks or HEAD updates. Omitting
+		// stages 1-3 while writing the tree deletes those paths from the
+		// commit; `git commit` rejects them in prepare_index and does not
+		// run hooks.
+		reject_unmerged_index(&load_index_or_head(&repo, "git commit")?, "git commit")?;
 		run_commit_hook(self, "pre-commit", &[])?;
 		let mut head = repo
 			.head()
@@ -208,6 +213,10 @@ impl GitRepo {
 			.map_err(|err| Error::backend("git commit", err))?
 			.map(|id| id.detach());
 		let index = load_index_or_head(&repo, "git commit")?;
+		// The hook may have edited the index. A pathspec commit copies only
+		// the selected paths onto the parent tree, so conflict stages outside
+		// that set never reach `write_index_tree`.
+		reject_unmerged_index(&index, "git commit")?;
 		let tree = if options.files.is_empty() {
 			write_index_tree(&repo, &index)?
 		} else {
@@ -1519,10 +1528,34 @@ struct TreeNode {
 	dirs:  BTreeMap<BString, Self>,
 }
 
+/// Refuse to serialize `index` while any entry is still at a conflict stage.
+/// A tree can store only stage 0; dropping stages 1-3 deletes that path.
+fn reject_unmerged_index(index: &gix::index::File, context: &'static str) -> Result<()> {
+	let mut paths = BTreeSet::new();
+	for entry in index.entries() {
+		if entry.stage() != gix::index::entry::Stage::Unconflicted {
+			paths.insert(entry.path(index).to_str_lossy().into_owned());
+		}
+	}
+	if paths.is_empty() {
+		return Ok(());
+	}
+	Err(Error::backend(
+		context,
+		format!(
+			"the index has unmerged entries: {}",
+			paths.into_iter().collect::<Vec<_>>().join(", ")
+		),
+	))
+}
+
 fn write_index_tree(
 	repo: &gix::Repository,
 	index: &gix::index::File,
 ) -> Result<gix::hash::ObjectId> {
+	// Filtering to stage 0 would omit a path that exists only as conflict
+	// stages and delete it from the tree. `git write-tree` refuses instead.
+	reject_unmerged_index(index, "git write-tree")?;
 	let mut root = TreeNode::default();
 	for entry in index
 		.entries()
