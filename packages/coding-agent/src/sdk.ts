@@ -1,4 +1,6 @@
 import * as path from "node:path";
+import { type CallRecord, ChangeJournal, callLabel } from "./commit/selective/journal";
+import { createCommitPrelude } from "./commit/selective/prelude-definition";
 import {
 	Agent,
 	type AgentEvent,
@@ -199,10 +201,12 @@ import {
 import type { AgentSessionDisposeOptions } from "./session/agent-session-types";
 import type { AdvisorToolFactory } from "./session/session-advisors";
 import {
+	applyUnpausedProviders,
 	createAuthStorageSettingsSync,
 	discoverAuthStorage as discoverAuthStorageFromConfig,
 	type EffectiveSettingsScope,
 	loadEffectiveAuthAccountPolicyConfig,
+	resolveEffectiveSettings,
 } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
 import { CostCapError, type CostGateApi, guardStreamFn } from "./session/cost-gate";
@@ -364,6 +368,7 @@ import { buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 import {
 	cfgArchiveEnabled,
 	cfgAsyncMaxJobs,
+	cfgCommitEnabled,
 	cfgAsyncWidgets,
 	cfgComputerEnabled,
 	cfgRatchetEnabled,
@@ -1153,7 +1158,9 @@ export async function discoverAuthStorage(
 		Omit<EffectiveSettingsScope, "agentDir"> = {},
 ): Promise<AuthStorage> {
 	const { settings, cwd, ...discoveryOptions } = options;
-	const policy = await loadEffectiveAuthAccountPolicyConfig({ settings, cwd, agentDir });
+	const effective = await resolveEffectiveSettings({ settings, cwd, agentDir });
+	applyUnpausedProviders(effective);
+	const policy = await loadEffectiveAuthAccountPolicyConfig({ settings: effective });
 	return discoverAuthStorageFromConfig(agentDir, {
 		...discoveryOptions,
 		accountPolicies: discoveryOptions.accountPolicies ?? policy.accountPolicies,
@@ -2564,6 +2571,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
 	const resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
+	/** This agent's identity in the session tree's change journal. */
+	const journalAgent = { agent: resolvedAgentId, parent: options.parentAgentId };
+	/** The session tree's change journal; `null` while the session keeps no artifacts. */
+	const changeJournal = (): ChangeJournal | null => {
+		const dir = sessionManager.getArtifactsDir();
+		return dir ? ChangeJournal.at(dir) : null;
+	};
 	const resolvedAgentDisplayName = options.agentDisplayName ?? agentKind;
 	let registeredAgentRef: AgentRef | undefined;
 	/**
@@ -2735,6 +2749,21 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				return next;
 			},
 			getFileMutationVersion: path => fileMutationVersions.get(path) ?? 0,
+			recordFileChange: change => {
+				const journal = changeJournal();
+				// Session artifacts (local:// plans, outputs) are never commit material.
+				if (!journal || change.path.startsWith(`${journal.dir}${path.sep}`)) return;
+				const owner = change.agent ?? journalAgent;
+				journal.recordChange({
+					agent: owner.agent,
+					parent: owner.parent,
+					tool: change.tool,
+					path: change.path,
+					before: change.before,
+					after: change.after,
+					beforeMtimeMs: change.beforeMtimeMs,
+				});
+			},
 			getTodoPhases: () => session.getTodoPhases(),
 			setTodoPhases: phases => session.setTodoPhases(phases),
 			commitTodoPhases: phases => session.commitTodoPhases(phases),
@@ -2798,6 +2827,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		let computerPrelude: EvalPreludeDefinition | undefined;
 		let ratchetPrelude: EvalPreludeDefinition | undefined;
 		let archivePrelude: EvalPreludeDefinition | undefined;
+		let commitPrelude: EvalPreludeDefinition | undefined;
 		const getEvalPreludes = (): readonly EvalPreludeDefinition[] => {
 			if (restrictToolNames || !toolRegistry.has("eval") || !activeToolNames.has("eval")) return [];
 			const builtins: EvalPreludeDefinition[] = [];
@@ -2816,6 +2846,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			if (cfgArchiveEnabled.get(settings)) {
 				archivePrelude ??= createArchivePrelude(toolSession);
 				builtins.push(archivePrelude);
+			}
+			if (cfgCommitEnabled.get(settings)) {
+				commitPrelude ??= createCommitPrelude(toolSession);
+				builtins.push(commitPrelude);
 			}
 			return getEnabledEvalPreludes(builtins);
 		};
@@ -5060,6 +5094,20 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				mainRequestProvider = undefined;
 			}
 		});
+		// Shell-like calls bound the windows in which scripts, formatters, and codegen changed
+		// files on this agent's behalf; selective commits match file mtimes against them.
+		const shellCalls = new Map<string, Omit<CallRecord, "type" | "agent" | "parent" | "end">>();
+		agent.subscribe(event => {
+			if (event.type === "tool_execution_start") {
+				if (event.toolName !== "bash" && event.toolName !== "eval") return;
+				shellCalls.set(event.toolCallId, { tool: event.toolName, start: Date.now(), label: callLabel(event.args) });
+			} else if (event.type === "tool_execution_end") {
+				const call = shellCalls.get(event.toolCallId);
+				if (!call) return;
+				shellCalls.delete(event.toolCallId);
+				changeJournal()?.recordCall({ ...journalAgent, ...call, end: Date.now() });
+			}
+		});
 		// Catalog rows carry the registry settings' extended-window opt-ins; this
 		// session adopts every model with the window its own settings select (a
 		// subagent with a compaction override must not inherit the parent's).
@@ -5400,7 +5448,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			);
 		}
 		// A caller-supplied store belongs to the caller (the CLI keeps it in sync itself).
-		if (ownsAuthStorage) createAuthStorageSettingsSync(session, authStorage);
+		if (ownsAuthStorage) createAuthStorageSettingsSync(session, authStorage, modelRegistry);
 		// One coalesced prompt rebuild for every prompt input (rule bucketing, the
 		// `tools.format` catalog dialect, personality, …), so a bulk change rebuilds once.
 		// Hide Secrets first switches outbound obfuscation on the live obfuscator (earlier
