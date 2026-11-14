@@ -859,6 +859,11 @@ type ScheduledAgentContinueOptions = {
 	onError?: (error: unknown) => void;
 	/** Messages the continued turn answers, handed to the turn observer (see `#startTurnObservation`). */
 	turnRecords?: AgentMessage[];
+	/**
+	 * Owner of the run this continue retries. 0 is a background run.
+	 * Omitted at the call site means the run that just ended.
+	 */
+	runOwnerId?: number;
 };
 
 type ScheduledAgentContinueRequest = {
@@ -1394,6 +1399,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	#clientRecoveryOwnerId = 0;
 	#clientRecoveryGeneration = 0;
+	/** Owner of the run that currently holds the agent stream. 0 if that run is not the client prompt. */
+	#streamingRunOwnerId = 0;
+	/** Owner snapshotted when that run ended, so a retry scheduled from the end carries this run. */
+	#endedRunOwnerId = 0;
 	/** Dialogs open and waiting for the user's answer; while any is, the computer turn is ended. */
 	#userWaitCount = 0;
 	/** Whether the open dialogs ended a prompt's computer turn, which goes on once they settle. */
@@ -2073,6 +2082,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#clientPromptInFlightCount = 0;
 		this.#clientOwnedRunId = 0;
 		this.#clientRecoveryOwnerId = 0;
+		this.#streamingRunOwnerId = 0;
+		this.#endedRunOwnerId = 0;
 		this.yieldQueue.requestIdleFlush();
 		this.#releasePowerAssertion();
 		this.#endComputerTurn();
@@ -2428,6 +2439,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			sessionId: () => this.sessionId,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
+			endedRunOwnerId: () => this.#endedRunOwnerId,
 			waitForSessionMessagePersistence: message => this.#waitForSessionMessagePersistence(message),
 			appendSessionMessage: message => this.#appendSessionMessage(message),
 			persistedAssistantEntryId: message => (message as PersistedAssistantMessage)[kPersistedSessionEntryId],
@@ -4229,11 +4241,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 		if (event.type === "agent_end") {
 			// The stream that just ended is no longer a client-owned run.
-			// Clear before this handler yields, so a successor started from
-			// the same event cannot inherit the identity and collect a steer
-			// meant for the ended turn. A synthetic `agent_end` emitted while
-			// the agent is still streaming is not that end.
-			if (!this.agent.state.isStreaming) this.#clientOwnedRunId = 0;
+			// Snapshot its owner before clearing, so a retry of this run
+			// carries that owner and a later background run cannot inherit
+			// it. A synthetic `agent_end` emitted while the agent is still
+			// streaming is not that end.
+			if (!this.agent.state.isStreaming) {
+				this.#endedRunOwnerId = this.#streamingRunOwnerId;
+				this.#streamingRunOwnerId = 0;
+				this.#clientOwnedRunId = 0;
+			}
 			this.#agentEndRunEpochs.set(event, this.#runEpoch);
 		}
 		if (event.type !== "agent_end") {
@@ -5621,7 +5637,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#scheduleAgentContinue(options: ScheduledAgentContinueOptions): void {
 		const request: ScheduledAgentContinueRequest = {
 			schedulerToken: ++this.#agentContinueSchedulerToken,
-			options,
+			options: {
+				...options,
+				// Freeze the retried run's owner now. A later run's end must
+				// not rewrite a continue that was already scheduled.
+				runOwnerId: options.runOwnerId ?? this.#endedRunOwnerId,
+			},
 		};
 		logger.debug("agent.continue scheduled", {
 			source: options.source,
@@ -9839,9 +9860,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					// `agent.prompt` claims streaming synchronously before its
 					// first await: this callback fires exactly when THIS run
 					// goes live (never on a busy-retry that waits behind
-					// another run). Only the client prompt stamps ownership
-					// and wakes parked steers; a background caller must not
-					// collect them.
+					// another run). Record this run's owner (0 for a background
+					// caller) so its retry carries that owner, not a client
+					// prompt that is still unwinding. Only the client prompt
+					// wakes parked steers.
+					this.#streamingRunOwnerId = clientOwnedRunId;
 					if (clientOwnedRunId !== 0) {
 						this.#clientOwnedRunId = clientOwnedRunId;
 						this.#clientRecoveryOwnerId = clientOwnedRunId;
@@ -10505,17 +10528,19 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
-	 * Re-stamp the client prompt's ownership onto a recovery continue that
-	 * just claimed the stream, and wake steers parked on that prompt.
-	 * Unscoped continues (no generation) are not that prompt's recovery.
+	 * The continue just claimed the stream. Record the owner of the run it
+	 * retries. Only that owner — not whichever client prompt is still in
+	 * flight — may collect parked steers.
 	 */
 	#restoreClientRecoveryOwnership(request: ScheduledAgentContinueRequest): void {
 		if (!this.agent.state.isStreaming || this.#abortInProgress) return;
-		if (this.#clientRecoveryOwnerId === 0 || this.#clientPromptInFlightCount === 0) return;
+		const owner = request.options.runOwnerId ?? 0;
+		this.#streamingRunOwnerId = owner;
+		if (owner === 0 || owner !== this.#clientRecoveryOwnerId || this.#clientPromptInFlightCount === 0) return;
 		if (request.options.generation === undefined || request.options.generation !== this.#clientRecoveryGeneration) {
 			return;
 		}
-		this.#clientOwnedRunId = this.#clientRecoveryOwnerId;
+		this.#clientOwnedRunId = owner;
 		this.#wakeDispatchLiveWaiters();
 	}
 

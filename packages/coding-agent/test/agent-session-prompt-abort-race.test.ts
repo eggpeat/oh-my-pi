@@ -960,4 +960,77 @@ describe("AgentSession prompt admission racing abort", () => {
 		await prompting;
 		await session.waitForIdle();
 	});
+
+	it("does not inject a steer into a background run's retry while the client prompt is still unwinding", async () => {
+		const backgroundRetryStreaming = Promise.withResolvers<void>();
+		const releaseBackgroundRetry = Promise.withResolvers<void>();
+		const clientRetryStarted = Promise.withResolvers<void>();
+		const clientBackoffEntered = Promise.withResolvers<void>();
+		const releaseClientBackoff = Promise.withResolvers<void>();
+		let holdClientBackoff = false;
+		let heldClientBackoff = false;
+		const waitSpy = spyOn(scheduler, "wait").mockImplementation(async (_delayMs, options) => {
+			options?.signal?.throwIfAborted();
+			if (holdClientBackoff && !heldClientBackoff) {
+				heldClientBackoff = true;
+				clientBackoffEntered.resolve();
+				await releaseClientBackoff.promise;
+			}
+			options?.signal?.throwIfAborted();
+		});
+		restores.push(() => waitSpy.mockRestore());
+
+		const { session } = await createSession([
+			() => ({ throw: "503 service unavailable: overloaded_error" }),
+			() => ({ throw: "503 service unavailable: overloaded_error" }),
+			async () => {
+				backgroundRetryStreaming.resolve();
+				await releaseBackgroundRetry.promise;
+				return { content: ["background retry"] };
+			},
+		]);
+		cfgRetryEnabled.set(session.settings, true);
+		cfgRetryBaseDelayMs.set(session.settings, 1_000);
+		// The session has one retry budget. The client failure is attempt 1;
+		// the background failure must still be inside the budget so it retries.
+		cfgRetryMaxRetries.set(session.settings, 2);
+		cfgRetryModelFallback.set(session.settings, false);
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start" && !holdClientBackoff) {
+				holdClientBackoff = true;
+				clientRetryStarted.resolve();
+			}
+		});
+
+		const prompting = session.prompt("fail then retry");
+		void prompting.catch(() => undefined);
+		await withTimeout(clientRetryStarted.promise, 2_000, "Client retry never started");
+		await withTimeout(clientBackoffEntered.promise, 2_000, "Client retry backoff never started");
+
+		session.queueDeferredMessage({
+			role: "custom",
+			customType: "test-hidden-message",
+			content: "HIDDEN_NEXT_TURN",
+			display: false,
+			timestamp: Date.now(),
+		});
+		await withTimeout(backgroundRetryStreaming.promise, 2_000, "Background retry never started");
+		expect(session.agent.state.isStreaming).toBe(true);
+
+		let settled = false;
+		const steer = session.joinActiveTurn("steer the client retry").then(admitted => {
+			settled = true;
+			return admitted;
+		});
+		await drainAdmissionMicrotasks();
+		// The background successor's retry must not inherit the client prompt.
+		expect(settled).toBe(false);
+		expect(session.getQueuedMessages().steering).toEqual([]);
+
+		releaseBackgroundRetry.resolve();
+		releaseClientBackoff.resolve();
+		await withTimeout(prompting, 2_000, "Client prompt never settled");
+		await session.waitForIdle();
+		await steer;
+	});
 });

@@ -302,7 +302,11 @@ export interface TurnRecoveryHost {
 		generation?: number;
 		shouldContinue?: () => boolean;
 		onError?: (error: unknown) => void;
+		/** Owner of the run being retried. 0 means that run was not a client prompt. */
+		runOwnerId?: number;
 	}): void;
+	/** Owner snapshotted when the run whose end is being handled finished. */
+	endedRunOwnerId?(): number;
 	waitForSessionMessagePersistence(message: AssistantMessage): Promise<void>;
 	appendSessionMessage(message: AssistantMessage): void;
 	persistedAssistantEntryId(message: AssistantMessage): string | undefined;
@@ -2713,6 +2717,9 @@ export class TurnRecovery {
 		const classifierRefusal = this.isClassifierRefusal(message);
 
 		const generation = this.#host.promptGeneration();
+		// Captured before any await: a successor can end during the backoff
+		// sleep and must not replace the owner of the run being retried.
+		const runOwnerId = this.#host.endedRunOwnerId?.() ?? 0;
 		if (this.#retryAttempt === 0) this.#genericAbortStreak = 0;
 		this.#retryAttempt++;
 		this.#genericAbortStreak =
@@ -3267,6 +3274,7 @@ export class TurnRecovery {
 			source: "automatic-retry",
 			delayMs: 1,
 			generation,
+			runOwnerId,
 			shouldContinue: () => this.#retryAttempt > 0,
 			onError: error =>
 				void this.#failRetryAfterLocalContinueError(message, error).catch(failure =>
