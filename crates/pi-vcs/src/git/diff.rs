@@ -889,10 +889,12 @@ fn render_change(
 /// onto non-UTF-8 snapshots. Identical content emits mode lines only.
 fn render_byte_patch(repo: &gix::Repository, change: &FileChange) -> Result<String> {
 	let mut text = String::new();
-	text.push_str("diff --git a/");
-	text.push_str(&change.old_path);
-	text.push_str(" b/");
-	text.push_str(&change.new_path);
+	text.push_str("diff --git ");
+	// A space in an unquoted `diff --git a/… b/…` header is the field split.
+	// Quote any path that is not a single token so the name survives apply.
+	push_diff_side(&mut text, 'a', &change.old_path);
+	text.push(' ');
+	push_diff_side(&mut text, 'b', &change.new_path);
 	text.push('\n');
 	append_metadata(&mut text, change, None, true);
 	if change.old_id != change.new_id {
@@ -903,6 +905,36 @@ fn render_byte_patch(repo: &gix::Repository, change: &FileChange) -> Result<Stri
 		append_binary_body(&mut text, &new, &old, None)?;
 	}
 	Ok(text)
+}
+
+fn push_diff_side(out: &mut String, side: char, path: &str) {
+	let needs_quote = path
+		.bytes()
+		.any(|byte| byte <= b' ' || byte >= 0x7f || byte == b'"' || byte == b'\\');
+	if !needs_quote {
+		out.push(side);
+		out.push('/');
+		out.push_str(path);
+		return;
+	}
+	out.push('"');
+	out.push(side);
+	out.push('/');
+	for byte in path.bytes() {
+		match byte {
+			b'\\' => out.push_str("\\\\"),
+			b'"' => out.push_str("\\\""),
+			b'\n' => out.push_str("\\n"),
+			b'\t' => out.push_str("\\t"),
+			b'\r' => out.push_str("\\r"),
+			0x20..=0x7e => out.push(char::from(byte)),
+			_ => {
+				use std::fmt::Write as _;
+				let _ = write!(out, "\\{byte:03o}");
+			},
+		}
+	}
+	out.push('"');
 }
 
 fn render_gitlink(change: &FileChange) -> Rendered {

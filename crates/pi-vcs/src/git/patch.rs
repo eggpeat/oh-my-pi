@@ -570,8 +570,8 @@ fn parse_file_patch(raw: &str) -> std::result::Result<FilePatch, ApplyFailure> {
 		.ok_or_else(|| ApplyFailure::Invalid("invalid diff header".into()))?;
 	let (old_token, new_token) = split_diff_paths(paths)?;
 	let mut patch = FilePatch {
-		old_path: Some(strip_side_path(old_token, 'a')),
-		new_path: Some(strip_side_path(new_token, 'b')),
+		old_path: Some(strip_side_path(&old_token, 'a')),
+		new_path: Some(strip_side_path(&new_token, 'b')),
 		old_mode: None,
 		new_mode: None,
 		old_oid:  None,
@@ -653,13 +653,98 @@ fn parse_file_patch(raw: &str) -> std::result::Result<FilePatch, ApplyFailure> {
 	Ok(patch)
 }
 
-fn split_diff_paths(paths: &str) -> std::result::Result<(&str, &str), ApplyFailure> {
+fn split_diff_paths(paths: &str) -> std::result::Result<(String, String), ApplyFailure> {
 	if paths.starts_with('"') {
-		return Err(ApplyFailure::Invalid("quoted paths in diff headers are unsupported".into()));
+		let (first, rest) = unquote_c_token(paths)?;
+		let rest = rest.trim_start();
+		if !rest.starts_with('"') {
+			return Err(ApplyFailure::Invalid("quoted diff header lacks a second path".into()));
+		}
+		let (second, _) = unquote_c_token(rest)?;
+		return Ok((first, second));
+	}
+	// `git diff` leaves spaces unquoted. The two sides of a non-rename are the
+	// same path, so the split is the space where `a/<path>` meets `b/<path>`.
+	if let Some(split) = split_same_path_header(paths) {
+		return Ok(split);
 	}
 	paths
 		.split_once(' ')
+		.map(|(old, new)| (old.to_owned(), new.to_owned()))
 		.ok_or_else(|| ApplyFailure::Invalid("invalid diff paths".into()))
+}
+
+fn split_same_path_header(paths: &str) -> Option<(String, String)> {
+	let bytes = paths.as_bytes();
+	let mut index = 0;
+	while index < bytes.len() {
+		if bytes[index] == b' ' || bytes[index] == b'\t' {
+			let first = &paths[..index];
+			let second = &paths[index + 1..];
+			if let (Some(old), Some(new)) = (first.strip_prefix("a/"), second.strip_prefix("b/"))
+				&& old == new
+			{
+				return Some((first.to_owned(), second.to_owned()));
+			}
+		}
+		index += 1;
+	}
+	None
+}
+
+/// One C-quoted token, as `git diff` writes a path that is not a single field.
+fn unquote_c_token(input: &str) -> std::result::Result<(String, &str), ApplyFailure> {
+	let bytes = input.as_bytes();
+	if bytes.first() != Some(&b'"') {
+		return Err(ApplyFailure::Invalid("expected a quoted path".into()));
+	}
+	let mut out = Vec::new();
+	let mut index = 1;
+	while index < bytes.len() {
+		match bytes[index] {
+			b'"' => {
+				let path = String::from_utf8(out)
+					.map_err(|_| ApplyFailure::Invalid("quoted path is not UTF-8".into()))?;
+				return Ok((path, &input[index + 1..]));
+			},
+			b'\\' => {
+				index += 1;
+				let escape = *bytes
+					.get(index)
+					.ok_or_else(|| ApplyFailure::Invalid("truncated quoted path".into()))?;
+				match escape {
+					b'\\' => out.push(b'\\'),
+					b'"' => out.push(b'"'),
+					b'n' => out.push(b'\n'),
+					b't' => out.push(b'\t'),
+					b'r' => out.push(b'\r'),
+					b'0'..=b'7' => {
+						let mut value = escape - b'0';
+						let mut digits = 1;
+						while digits < 3 {
+							let Some(&next) = bytes.get(index + 1) else {
+								break;
+							};
+							if !(b'0'..=b'7').contains(&next) {
+								break;
+							}
+							index += 1;
+							digits += 1;
+							value = value * 8 + (next - b'0');
+						}
+						out.push(value);
+					},
+					other => out.push(other),
+				}
+				index += 1;
+			},
+			byte => {
+				out.push(byte);
+				index += 1;
+			},
+		}
+	}
+	Err(ApplyFailure::Invalid("unterminated quoted path".into()))
 }
 
 fn unquote_path(path: &str) -> String {
@@ -858,27 +943,33 @@ fn apply_patches_to_map(
 		// A literal binary block is the result itself, so unlike a text hunk it
 		// never notices that the current blob is someone else's. Git refuses
 		// unless the index line's preimage hash is the blob being patched.
-		if !patch.binary.is_empty()
+		// A 3-way apply is the exception: the recorded base can still merge,
+		// including when the result is already present.
+		let bytes = if !patch.binary.is_empty()
 			&& !binary_preimage_matches(source.as_ref(), binary_preimage_oid(patch, options.reverse))
 		{
-			return Err(Error::PatchFailed {
-				message: format!(
-					"binary patch does not match {}",
-					source_path.or(target_path).unwrap_or_default()
-				),
-			});
-		}
-		let source_bytes = match source.as_ref() {
-			Some(entry) => blob_bytes(repo, entry.id)?,
-			None => Vec::new(),
-		};
-		let direct = apply_file_bytes(patch, &source_bytes, options.reverse);
-		let bytes = match direct {
-			Ok(bytes) => bytes,
-			Err(ApplyFailure::Context(_)) if options.three_way => {
+			if options.three_way {
 				merge_patch_bytes(repo, patch, source.as_ref(), options.reverse)?
-			},
-			Err(err) => return Err(err.into_error()),
+			} else {
+				return Err(Error::PatchFailed {
+					message: format!(
+						"binary patch does not match {}",
+						source_path.or(target_path).unwrap_or_default()
+					),
+				});
+			}
+		} else {
+			let source_bytes = match source.as_ref() {
+				Some(entry) => blob_bytes(repo, entry.id)?,
+				None => Vec::new(),
+			};
+			match apply_file_bytes(patch, &source_bytes, options.reverse) {
+				Ok(bytes) => bytes,
+				Err(ApplyFailure::Context(_)) if options.three_way => {
+					merge_patch_bytes(repo, patch, source.as_ref(), options.reverse)?
+				},
+				Err(err) => return Err(err.into_error()),
+			}
 		};
 		if let Some(path) = source_path
 			&& target_path != Some(path)

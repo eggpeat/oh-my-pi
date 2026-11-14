@@ -6,6 +6,7 @@ import { commitSelection } from "@oh-my-pi/pi-coding-agent/commit/selective/appl
 import { createDraft } from "@oh-my-pi/pi-coding-agent/commit/selective/draft";
 import { ChangeJournal } from "@oh-my-pi/pi-coding-agent/commit/selective/journal";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
 
 const tempDirs: string[] = [];
 
@@ -373,5 +374,74 @@ describe("selective commit flow", () => {
 		await expect(
 			commitSelection(draft, { subject: "fix: a" }, { journal, agent: { agent: "Main" } }),
 		).rejects.toThrow(/HEAD moved .* changed a\.ts/);
+	});
+
+	it("commits a new whole file whose name contains a space under that name", async () => {
+		const { root, journal } = await trackedRepo();
+		const name = "my file.bin";
+		const bytes = new Uint8Array([0, 1, 2, 3, 4]);
+		await Bun.write(path.join(root, name), bytes);
+		journal.recordChange({
+			agent: "Main",
+			parent: undefined,
+			tool: "edit",
+			path: path.join(root, name),
+			before: null,
+			after: "new",
+		});
+		await journal.flush();
+		const draft = await createDraft({ cwd: root, journal, caller: "Main", agents: "self" });
+		draft.take({ path: name });
+		const outcome = await commitSelection(draft, { subject: "chore: spaced" }, { journal, agent: { agent: "Main" } });
+		expect(outcome.paths).toEqual([name]);
+		expect(await gitBytes(root, ["cat-file", "blob", `HEAD:${name}`])).toEqual(bytes);
+		expect(await git(root, ["ls-tree", "-r", "--name-only", "HEAD"])).toContain(`${name}\n`);
+	});
+
+	it("commits an existing whole file whose name contains a space", async () => {
+		const { root, journal } = await trackedRepo();
+		const name = "my file.bin";
+		const seed = new Uint8Array([0, 1, 2, 3]);
+		const agent = new Uint8Array([0, 1, 2, 9]);
+		await Bun.write(path.join(root, name), seed);
+		await git(root, ["add", name]);
+		await git(root, ["commit", "-qm", "add spaced"]);
+		await Bun.write(path.join(root, name), agent);
+		journal.recordChange({
+			agent: "Main",
+			parent: undefined,
+			tool: "edit",
+			path: path.join(root, name),
+			before: "old",
+			after: "new",
+		});
+		await journal.flush();
+		const draft = await createDraft({ cwd: root, journal, caller: "Main", agents: "self" });
+		draft.take({ path: name });
+		await commitSelection(draft, { subject: "chore: spaced" }, { journal, agent: { agent: "Main" } });
+		expect(await gitBytes(root, ["cat-file", "blob", `HEAD:${name}`])).toEqual(agent);
+	});
+
+	it("reapplies an already-present binary edit when three-way is on, and rejects a conflicting one", async () => {
+		const { root } = await trackedRepo();
+		const seed = new Uint8Array([0, 1, 2, 3]);
+		const edited = new Uint8Array([0, 1, 2, 9]);
+		const other = new Uint8Array([0, 7, 7, 7]);
+		await Bun.write(path.join(root, "data.bin"), seed);
+		await git(root, ["add", "data.bin"]);
+		await git(root, ["commit", "-qm", "seed bin"]);
+		await Bun.write(path.join(root, "data.bin"), edited);
+		const patch = await git(root, ["diff", "--binary", "--no-ext-diff"]);
+		await git(root, ["checkout", "-q", "--", "data.bin"]);
+		const repo = vcs.requireGit(root);
+		await repo.applyPatch(patch, { threeWay: true });
+		expect(new Uint8Array(await Bun.file(path.join(root, "data.bin")).arrayBuffer())).toEqual(edited);
+		// Already present: a plain apply refuses, a three-way apply keeps the result.
+		await expect(repo.applyPatch(patch, {})).rejects.toThrow();
+		await repo.applyPatch(patch, { threeWay: true });
+		expect(new Uint8Array(await Bun.file(path.join(root, "data.bin")).arrayBuffer())).toEqual(edited);
+		await Bun.write(path.join(root, "data.bin"), other);
+		await expect(repo.applyPatch(patch, { threeWay: true })).rejects.toThrow();
+		expect(new Uint8Array(await Bun.file(path.join(root, "data.bin")).arrayBuffer())).toEqual(other);
 	});
 });
