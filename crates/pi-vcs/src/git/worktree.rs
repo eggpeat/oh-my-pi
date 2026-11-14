@@ -8,12 +8,13 @@ use super::filter::WorktreeFilter;
 use crate::error::{Error, Result};
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct MaterializeOptions {
+pub(crate) struct WorktreeOptions {
 	pub(crate) symlinks:       bool,
+	/// `core.fileMode`: governs worktree change detection, not checkout modes.
 	pub(crate) executable_bit: bool,
 }
 
-impl MaterializeOptions {
+impl WorktreeOptions {
 	pub(crate) fn for_repo(repo: &gix::Repository, op: &'static str) -> Result<Self> {
 		let caps = repo
 			.filesystem_options()
@@ -34,7 +35,7 @@ pub(crate) fn materialize(
 	mode: Mode,
 	bytes: Vec<u8>,
 	filter: &mut WorktreeFilter<'_>,
-	options: MaterializeOptions,
+	options: WorktreeOptions,
 ) -> Result<()> {
 	let absolute = root.join(path);
 	if let Some(parent) = absolute.parent() {
@@ -45,22 +46,17 @@ pub(crate) fn materialize(
 		if options.symlinks {
 			return write_symlink(&absolute, &bytes);
 		}
-		return write_regular_file(&absolute, &bytes, false, options.executable_bit);
+		#[cfg(not(unix))]
+		let _ = options;
+		return write_regular_file(&absolute, &bytes, false);
 	}
 
 	let bytes = filter.git_to_worktree(path, bytes)?;
-	let executable = mode == Mode::FILE_EXECUTABLE;
-	write_regular_file(&absolute, &bytes, executable, options.executable_bit)
+	write_regular_file(&absolute, &bytes, mode == Mode::FILE_EXECUTABLE)
 }
 
-fn write_regular_file(
-	path: &Path,
-	bytes: &[u8],
-	executable: bool,
-	honor_executable_bit: bool,
-) -> Result<()> {
-	let want_executable = executable && honor_executable_bit;
-	match open_new_regular_file(path, want_executable) {
+fn write_regular_file(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
+	match open_new_regular_file(path, executable) {
 		Ok(mut file) => {
 			file.write_all(bytes)?;
 			return Ok(());
@@ -72,7 +68,7 @@ fn write_regular_file(
 	let metadata = fs::symlink_metadata(path)?;
 	if !metadata.is_file() && !metadata.is_dir() {
 		fs::remove_file(path)?;
-		let mut file = open_new_regular_file(path, want_executable)?;
+		let mut file = open_new_regular_file(path, executable)?;
 		file.write_all(bytes)?;
 		return Ok(());
 	}
@@ -80,9 +76,7 @@ fn write_regular_file(
 	let mut file = open_existing_regular_file(path)?;
 	file.write_all(bytes)?;
 	#[cfg(unix)]
-	if honor_executable_bit {
-		sync_executable_bit(&file, executable)?;
-	}
+	sync_executable_bit(&file, executable)?;
 	Ok(())
 }
 

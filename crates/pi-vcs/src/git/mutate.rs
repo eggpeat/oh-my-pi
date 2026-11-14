@@ -17,7 +17,7 @@ use super::{
 	normalize_path,
 	open::{load_index_or_empty, load_index_or_head, status_with_fresh_index, status_with_index},
 	read::literal_pathspec,
-	worktree::{MaterializeOptions, materialize},
+	worktree::{WorktreeOptions, materialize},
 };
 use crate::{
 	error::{Error, Result},
@@ -1731,7 +1731,7 @@ fn restore_index_paths(
 	files: &[String],
 ) -> Result<()> {
 	let mut filter = WorktreeFilter::staging(repo, "git restore")?;
-	let options = MaterializeOptions::for_repo(repo, "git restore")?;
+	let options = WorktreeOptions::for_repo(repo, "git restore")?;
 	for entry in index.entries() {
 		let path = entry.path(index).to_str_lossy();
 		if files.is_empty() || files.iter().any(|wanted| path_matches(&path, wanted)) {

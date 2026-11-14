@@ -237,6 +237,36 @@ describe("in-process VCS bindings", () => {
 	);
 
 	test.skipIf(process.platform === "win32")(
+		"restore preserves executable bits under core.filemode=false without widening private access",
+		async () => {
+			const root = await repository();
+			const deletedSh = join(root, "deleted.sh");
+			const privateSh = join(root, "private.sh");
+			await writeFile(deletedSh, "#!/bin/sh\necho deleted\n");
+			await writeFile(privateSh, "#!/bin/sh\necho private\n");
+			await chmod(deletedSh, 0o755);
+			await chmod(privateSh, 0o700);
+			await git(root, "add", "deleted.sh", "private.sh");
+			await git(root, "commit", "-m", "add executable scripts");
+
+			const repo = vcsGitDiscover(root)!;
+			expect(await repo.isDirty()).toBe(false);
+			await git(root, "config", "core.filemode", "false");
+
+			await rm(deletedSh);
+			await writeFile(privateSh, "#!/bin/sh\ndirty\n");
+			await chmod(privateSh, 0o600);
+
+			await repo.restore({ files: ["deleted.sh", "private.sh"], worktree: true });
+
+			expect(await Bun.file(deletedSh).text()).toBe("#!/bin/sh\necho deleted\n");
+			expect((await lstat(deletedSh)).mode & 0o111).not.toBe(0);
+			expect(await Bun.file(privateSh).text()).toBe("#!/bin/sh\necho private\n");
+			expect((await lstat(privateSh)).mode & 0o777).toBe(0o700);
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
 		"restore honors core.symlinks=false and keeps existing files when link creation fails",
 		async () => {
 			const root = await repository();

@@ -27,7 +27,7 @@ use super::{
 	filter::WorktreeFilter,
 	mutate::update_reference,
 	open::{load_index_or_head, status_with_index},
-	worktree::{MaterializeOptions, materialize},
+	worktree::{WorktreeOptions, materialize},
 };
 use crate::{
 	error::{Error, Result},
@@ -1572,7 +1572,7 @@ fn read_worktree_entry(
 	if !metadata.is_file() {
 		return Ok(None);
 	}
-	let options = MaterializeOptions::for_repo(gix_repo, "git worktree read")?;
+	let options = WorktreeOptions::for_repo(gix_repo, "git worktree read")?;
 	if !options.symlinks && index_mode == Mode::SYMLINK {
 		return Ok(Some((fs::read(path)?, Mode::SYMLINK)));
 	}
@@ -1894,7 +1894,7 @@ fn write_worktree_entry(
 	entry: &FileEntry,
 ) -> Result<()> {
 	validate_repo_path(path).map_err(ApplyFailure::into_error)?;
-	let options = MaterializeOptions::for_repo(gix_repo, "git checkout")?;
+	let options = WorktreeOptions::for_repo(gix_repo, "git checkout")?;
 	let bytes = blob_bytes(gix_repo, entry.id)?;
 	materialize(repo.root(), path, entry.mode, bytes, filter, options)
 }
