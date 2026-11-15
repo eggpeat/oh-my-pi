@@ -245,10 +245,22 @@ async function loadEdits(
 		const before = record.before === null ? null : await journal.blob(record.before);
 		const after = record.after === null ? null : await journal.blob(record.after);
 		if (before === undefined || after === undefined) return undefined;
+		// A required clean filter can reject an old snapshot (invalid JSON the agent later
+		// fixed). That history is unusable and the file needs review; it must not abort the
+		// draft. The current file is read separately and still fails the draft if it cannot
+		// be converted.
+		let storedBefore: string | null;
+		let storedAfter: string | null;
+		try {
+			storedBefore = await storedText(repo, file, before);
+			storedAfter = await storedText(repo, file, after);
+		} catch {
+			return undefined;
+		}
 		edits.push({
 			actor: record.agent,
-			before: toLines(await storedText(repo, file, before)),
-			after: toLines(await storedText(repo, file, after)),
+			before: toLines(storedBefore),
+			after: toLines(storedAfter),
 			gapHint: edits.length > 0 ? windowAgent(record.beforeMtimeMs) : undefined,
 		});
 	}
@@ -259,6 +271,7 @@ async function loadEdits(
  * Journal snapshots are the raw worktree text the agent wrote. Head and work are already the
  * blob Git would store, so a CRLF write under `core.autocrlf` (or any other clean filter) would
  * otherwise look like a later rewrite by someone else and leave the agent's lines unselected.
+ * Throws when the filter rejects `text`; callers of saved history treat that as unusable.
  */
 async function storedText(repo: VcsGitRepo, file: string, text: string | null): Promise<string | null> {
 	if (text === null) return null;

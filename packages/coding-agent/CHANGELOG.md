@@ -6,6 +6,7 @@
 
 - `/commit` now commits binary, oversized, non-UTF-8, and symlink files exactly as they were when the commit was drafted; edits made between drafting and committing can no longer leak into the commit ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat)).
 - `/commit` selects an agent's own edits when Git converts the file on the way in (CRLF under autocrlf, or a clean filter), instead of treating that conversion as a later edit by someone else ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat)).
+- `/commit` no longer fails to draft when a Git filter rejects an old saved edit of a file that has since been fixed; that file is left for review instead ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat)).
 
 ## [18.20.2] - 2026-11-14
 

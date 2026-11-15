@@ -340,4 +340,52 @@ describe("selective commit flow", () => {
 		await commitSelection(draft, { subject: "docs: notes" }, { journal, agent: { agent: "Main" } });
 		expect(await git(root, ["show", "HEAD:notes.txt"])).toBe("HELLO\n");
 	});
+
+	it("still drafts other files when a required filter rejects an old saved edit", async () => {
+		if (process.platform === "win32") return; // the filter command is python3
+		const { root, journal, write } = await emptyRepo();
+		await Bun.write(path.join(root, ".gitattributes"), "*.json filter=jsoncheck\n");
+		await git(root, ["add", ".gitattributes"]);
+		await git(root, ["commit", "-q", "-m", "attrs"]);
+		await git(root, [
+			"config",
+			"filter.jsoncheck.clean",
+			'python3 -c "import json,sys; d=sys.stdin.read(); json.loads(d); sys.stdout.write(d)"',
+		]);
+		await git(root, ["config", "filter.jsoncheck.required", "true"]);
+		const start = Date.now() - 5_000;
+		// The journal still holds the invalid write. The file on disk is already fixed.
+		await write("Main", undefined, "broken.json", "{");
+		await Bun.write(path.join(root, "broken.json"), '{"ok":true}\n');
+		await write("Main", undefined, "ok.ts", "export const ok = 1;\n");
+		journal.recordCall({ agent: "Main", tool: "bash", start, end: Date.now() + 5_000, label: "fix json" });
+		await journal.flush();
+
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		const summary = draft.summary();
+		expect(summary).toContain("✓ ok.ts");
+		expect(summary).not.toContain("✓ broken.json");
+		expect(summary).toContain("? broken.json");
+		expect(summary).toContain("no edit record");
+		const outcome = await commitSelection(draft, { subject: "feat: ok" }, { journal, agent: { agent: "Main" } });
+		expect(outcome.paths).toEqual(["ok.ts"]);
+	});
+
+	it("still fails the draft when the current file is rejected by a required filter", async () => {
+		if (process.platform === "win32") return; // the filter command is python3
+		const { root, journal, write } = await emptyRepo();
+		await Bun.write(path.join(root, ".gitattributes"), "*.json filter=jsoncheck\n");
+		await git(root, ["add", ".gitattributes"]);
+		await git(root, ["commit", "-q", "-m", "attrs"]);
+		await git(root, [
+			"config",
+			"filter.jsoncheck.clean",
+			'python3 -c "import json,sys; d=sys.stdin.read(); json.loads(d); sys.stdout.write(d)"',
+		]);
+		await git(root, ["config", "filter.jsoncheck.required", "true"]);
+		await write("Main", undefined, "broken.json", "{");
+		await journal.flush();
+
+		await expect(createDraft({ cwd: root, journal, caller: "Main" })).rejects.toThrow(/filter|failed/i);
+	});
 });
