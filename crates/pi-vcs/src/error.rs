@@ -20,15 +20,10 @@ pub enum Error {
 	},
 
 	/// HEAD no longer points at the commit the caller expected.
-	#[error(
-		"HEAD moved: expected {}, found {}",
-		expected.as_deref().unwrap_or("unborn HEAD"),
-		actual.as_deref().unwrap_or("unborn HEAD")
-	)]
+	#[error("HEAD moved: expected {expected}, found {}", actual.as_deref().unwrap_or("unborn HEAD"))]
 	HeadMoved {
-		/// The expected HEAD commit id as resolved from the caller's revision;
-		/// `None` when the update required an unborn HEAD.
-		expected: Option<String>,
+		/// The expected HEAD commit id as resolved from the caller's revision.
+		expected: String,
 		/// The current HEAD commit id; `None` for an unborn HEAD.
 		actual:   Option<String>,
 	},

@@ -82,26 +82,16 @@ pub(crate) fn update_reference(
 	Ok(())
 }
 
-/// Current HEAD commit id, or `None` for an unborn HEAD (or a HEAD that cannot
-/// be peeled while another writer holds the reference).
-fn head_commit_hex(repo: &gix::Repository) -> Option<String> {
-	let mut head = repo.head().ok()?;
-	let id = head.try_peel_to_id().ok().flatten()?.detach();
-	Some(id.to_hex().to_string())
-}
-
 /// Translate a lost compare-and-swap on HEAD into [`Error::HeadMoved`], the
 /// failure [`CommitOptions::expected_head`] documents. Returns `None` for
 /// reference errors that are not precondition failures (locks, IO, name
 /// validation), which stay backend errors.
 ///
-/// `expected` is the commit the update started from, `None` for an unborn HEAD.
-/// The failing edit carries the value that broke the swap; when it does not
-/// name a commit (a symbolic target, or a reference that disappeared), HEAD is
-/// read again for `actual`.
+/// `expected` is the commit the update started from. `actual` is the value that
+/// broke the swap; a reference that disappeared leaves it `None`, the same way
+/// an unborn HEAD is reported.
 fn head_moved_at_commit(
-	repo: &gix::Repository,
-	expected: Option<gix::hash::ObjectId>,
+	expected: gix::hash::ObjectId,
 	err: &gix::reference::edit::Error,
 ) -> Option<Error> {
 	let prepare = match err {
@@ -109,15 +99,15 @@ fn head_moved_at_commit(
 		_ => return None,
 	};
 	let actual = match prepare {
-		gix::refs::file::transaction::prepare::Error::ReferenceOutOfDate { actual, .. }
-		| gix::refs::file::transaction::prepare::Error::MustNotExist { actual, .. } => match actual {
-			gix::refs::Target::Object(id) => Some(id.to_hex().to_string()),
-			gix::refs::Target::Symbolic(_) => head_commit_hex(repo),
-		},
-		gix::refs::file::transaction::prepare::Error::MustExist { .. } => head_commit_hex(repo),
+		gix::refs::file::transaction::prepare::Error::ReferenceOutOfDate {
+			actual: gix::refs::Target::Object(id),
+			..
+		} => Some(id.to_hex().to_string()),
+		gix::refs::file::transaction::prepare::Error::ReferenceOutOfDate { .. }
+		| gix::refs::file::transaction::prepare::Error::MustExist { .. } => None,
 		_ => return None,
 	};
-	Some(Error::HeadMoved { expected: expected.map(|id| id.to_hex().to_string()), actual })
+	Some(Error::HeadMoved { expected: expected.to_hex().to_string(), actual })
 }
 
 impl GitRepo {
@@ -277,7 +267,7 @@ impl GitRepo {
 				.detach();
 			if old_commit != Some(expected) {
 				return Err(Error::HeadMoved {
-					expected: Some(expected.to_hex().to_string()),
+					expected: expected.to_hex().to_string(),
 					actual:   old_commit.map(|id| id.to_hex().to_string()),
 				});
 			}
@@ -382,7 +372,7 @@ impl GitRepo {
 			// HEAD moved after the check above, inside the hook/signing window:
 			// the swap lost, which is the `HeadMoved` this option documents, not
 			// a backend failure. Everything else keeps its backend error.
-			if let Some(moved) = head_moved_at_commit(&repo, old_commit, &err) {
+			if let Some(moved) = old_commit.and_then(|old| head_moved_at_commit(old, &err)) {
 				return Err(moved);
 			}
 			return Err(Error::backend("git commit", err));
@@ -2485,69 +2475,9 @@ mod tests {
 				.unwrap_err();
 			assert_eq!(err.kind(), "HeadMoved");
 			assert!(matches!(&err, Error::HeadMoved { expected, actual }
-				if expected.as_deref() == Some(base.as_str()) && actual.as_deref() == Some(moved.as_str())));
+				if *expected == base && actual.as_deref() == Some(moved.as_str())));
 			assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), moved);
 		}
-	}
-
-	#[cfg(unix)]
-	#[test]
-	fn commit_msg_hook_moving_head_is_head_moved() {
-		use std::os::unix::fs::PermissionsExt;
-		let (temp, repo) = fixture();
-		let base = git(temp.path(), &["rev-parse", "HEAD"]);
-		git(temp.path(), &["commit", "-q", "--allow-empty", "-m", "moved"]);
-		let moved = git(temp.path(), &["rev-parse", "HEAD"]);
-		git(temp.path(), &["reset", "-q", "--hard", &base]);
-		// commit-msg runs after the expected-HEAD check and before the swap,
-		// so a move here loses the compare-and-swap instead of the check.
-		let hook = temp.path().join(".git").join("hooks").join("commit-msg");
-		fs::create_dir_all(hook.parent().unwrap()).unwrap();
-		fs::write(&hook, format!("#!/bin/sh\ngit update-ref refs/heads/main {moved}\n")).unwrap();
-		fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
-		let alt = alternate_index(&temp);
-		let err = repo
-			.commit_create("raced", &CommitOptions {
-				index_path: Some(alt),
-				expected_head: Some(base.clone()),
-				..Default::default()
-			})
-			.unwrap_err();
-		assert_eq!(err.kind(), "HeadMoved");
-		assert!(matches!(&err, Error::HeadMoved { expected, actual }
-			if expected.as_deref() == Some(base.as_str()) && actual.as_deref() == Some(moved.as_str())));
-		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), moved);
-	}
-
-	#[cfg(unix)]
-	#[test]
-	fn commit_msg_hook_birthing_head_is_head_moved() {
-		use std::os::unix::fs::PermissionsExt;
-		let temp = tempfile::tempdir().unwrap();
-		git(temp.path(), &["init", "-q", "-b", "main"]);
-		git(temp.path(), &["config", "user.name", "Test"]);
-		git(temp.path(), &["config", "user.email", "test@example.com"]);
-		git(temp.path(), &["config", "core.hooksPath", ".git/hooks"]);
-		git(temp.path(), &["config", "core.autocrlf", "false"]);
-		let repo = GitRepo::require(temp.path()).unwrap();
-		fs::write(temp.path().join("a"), "one\n").unwrap();
-		git(temp.path(), &["add", "a"]);
-		let tree = repo.write_tree(None).unwrap();
-		// A concurrent writer's commit, made without touching HEAD.
-		let concurrent = repo.commit_tree(&tree, &[], "concurrent", None).unwrap();
-		let hook = temp.path().join(".git").join("hooks").join("commit-msg");
-		fs::create_dir_all(hook.parent().unwrap()).unwrap();
-		fs::write(&hook, format!("#!/bin/sh\ngit update-ref refs/heads/main {concurrent}\n"))
-			.unwrap();
-		fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
-		let err = repo
-			.commit_create("first", &CommitOptions::default())
-			.unwrap_err();
-		assert_eq!(err.kind(), "HeadMoved");
-		assert!(matches!(&err, Error::HeadMoved { expected, actual }
-			if expected.is_none() && actual.as_deref() == Some(concurrent.as_str())));
-		assert!(err.to_string().contains("expected unborn HEAD"));
-		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), concurrent);
 	}
 
 	#[cfg(unix)]

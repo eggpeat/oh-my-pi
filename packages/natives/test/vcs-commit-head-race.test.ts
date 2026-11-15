@@ -20,7 +20,7 @@ async function run(cwd: string, ...args: string[]): Promise<string> {
 	return stdout.trimEnd();
 }
 
-async function repository(commit: boolean): Promise<string> {
+async function repository(): Promise<string> {
 	const root = await mkdtemp(join(tmpdir(), "pi-natives-head-race-"));
 	roots.push(root);
 	await run(root, "init", "-q", "-b", "main");
@@ -30,32 +30,35 @@ async function repository(commit: boolean): Promise<string> {
 	await run(root, "config", "core.hooksPath", ".git/hooks");
 	await run(root, "config", "commit.gpgSign", "false");
 	await writeFile(join(root, "tracked.txt"), "one\n");
-	if (commit) {
-		await run(root, "add", "tracked.txt");
-		await run(root, "commit", "-q", "-m", "base");
-	}
+	await run(root, "add", "tracked.txt");
+	await run(root, "commit", "-q", "-m", "base");
 	return root;
 }
 
 /** `commit-msg` runs after the expected-HEAD check and before the swap that updates HEAD. */
-async function moveHeadOnCommitMsg(root: string, target: string): Promise<void> {
+async function commitMsgHook(root: string, command: string): Promise<void> {
 	const dir = join(root, ".git", "hooks");
 	await mkdir(dir, { recursive: true });
 	const hook = join(dir, "commit-msg");
-	await writeFile(hook, `#!/bin/sh\ngit update-ref refs/heads/main ${target}\n`);
+	await writeFile(hook, `#!/bin/sh\n${command}\n`);
 	await chmod(hook, 0o755);
+}
+
+/** Stage a change so the commit has a tree to write before the hook moves HEAD. */
+async function stageChange(root: string, repo: NonNullable<ReturnType<typeof git>>): Promise<void> {
+	await writeFile(join(root, "tracked.txt"), "one\ntwo\n");
+	await repo.stageFiles(["tracked.txt"]);
 }
 
 describe("commit compare-and-swap", () => {
 	test.skipIf(process.platform === "win32")("reports a HEAD move inside the hook window as HeadMoved", async () => {
-		const root = await repository(true);
+		const root = await repository();
 		const repo = git(root)!;
 		const base = await run(root, "rev-parse", "HEAD");
 		// A concurrent commit with the same tree: no worktree or index change.
 		const moved = await run(root, "commit-tree", `${base}^{tree}`, "-p", base, "-m", "concurrent");
-		await moveHeadOnCommitMsg(root, moved);
-		await writeFile(join(root, "tracked.txt"), "one\ntwo\n");
-		await repo.stageFiles(["tracked.txt"]);
+		await commitMsgHook(root, `git update-ref refs/heads/main ${moved}`);
+		await stageChange(root, repo);
 
 		const error = await repo.commitCreate("raced", { expectedHead: base }).catch((err: unknown) => err);
 
@@ -68,23 +71,22 @@ describe("commit compare-and-swap", () => {
 	});
 
 	test.skipIf(process.platform === "win32")(
-		"reports a concurrent first commit as HeadMoved for an unborn HEAD",
+		"reports a branch deleted inside the hook window as HeadMoved",
 		async () => {
-			const root = await repository(false);
+			const root = await repository();
 			const repo = git(root)!;
-			await run(root, "add", "tracked.txt");
-			const tree = await run(root, "write-tree");
-			const concurrent = await run(root, "commit-tree", tree, "-m", "concurrent");
-			await moveHeadOnCommitMsg(root, concurrent);
+			const base = await run(root, "rev-parse", "HEAD");
+			await commitMsgHook(root, "git update-ref -d refs/heads/main");
+			await stageChange(root, repo);
 
-			const error = await repo.commitCreate("first", {}).catch((err: unknown) => err);
+			const error = await repo.commitCreate("raced", { expectedHead: base }).catch((err: unknown) => err);
 
 			expect(isVcsError(error)).toBe(true);
 			if (!isVcsError(error)) throw error;
 			expect(error.code).toBe("HeadMoved");
-			expect(error.message).toContain("expected unborn HEAD");
-			expect(error.message).toContain(concurrent);
-			expect(await run(root, "rev-parse", "HEAD")).toBe(concurrent);
+			expect(error.message).toContain(base);
+			expect(error.message).toContain("found unborn HEAD");
+			expect((await repo.headSha()) ?? null).toBeNull();
 		},
 	);
 });
