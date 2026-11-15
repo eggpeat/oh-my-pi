@@ -361,4 +361,77 @@ describe("selective commit flow", () => {
 		expect(outcome.paths).toEqual(["added.bin"]);
 		expect([...(await gitBlob(root, "HEAD:added.bin"))]).toEqual([0, 1, 2]);
 	});
+
+	it("refuses a whole-file commit when a newer commit changed that file", async () => {
+		const { root, journal } = await emptyRepo();
+		await Bun.write(path.join(root, "logo.bin"), Buffer.from([0xff, 1]));
+		await git(root, ["add", "."]);
+		await git(root, ["commit", "-q", "-m", "seed"]);
+
+		await Bun.write(path.join(root, "logo.bin"), Buffer.from([0xff, 2, 2]));
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		draft.take({ path: "logo.bin" });
+
+		// Another agent commits different bytes of the same file before this draft does.
+		await Bun.write(path.join(root, "logo.bin"), Buffer.from([0xff, 3, 3, 3]));
+		await git(root, ["add", "logo.bin"]);
+		await git(root, ["commit", "-q", "-m", "other"]);
+		const other = (await git(root, ["rev-parse", "HEAD"])).trim();
+
+		await expect(
+			commitSelection(draft, { subject: "chore: logo" }, { journal, agent: { agent: "Main" } }),
+		).rejects.toThrow(/HEAD moved .* changed logo\.bin/);
+		expect((await git(root, ["rev-parse", "HEAD"])).trim()).toBe(other);
+		expect([...(await gitBlob(root, "HEAD:logo.bin"))]).toEqual([0xff, 3, 3, 3]);
+	});
+
+	it("leaves a newer staged whole file in place when committing the drafted bytes", async () => {
+		const { root, journal } = await emptyRepo();
+		await Bun.write(path.join(root, "logo.bin"), Buffer.from([0xff, 1]));
+		await git(root, ["add", "."]);
+		await git(root, ["commit", "-q", "-m", "seed"]);
+
+		await Bun.write(path.join(root, "logo.bin"), Buffer.from([0xff, 2, 2]));
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		draft.take({ path: "logo.bin" });
+
+		await Bun.write(path.join(root, "logo.bin"), Buffer.from([0xff, 3, 3, 3]));
+		await git(root, ["add", "logo.bin"]);
+
+		const outcome = await commitSelection(
+			draft,
+			{ subject: "chore: logo" },
+			{ journal, agent: { agent: "Main" } },
+		);
+
+		expect(outcome.paths).toEqual(["logo.bin"]);
+		expect([...(await gitBlob(root, "HEAD:logo.bin"))]).toEqual([0xff, 2, 2]);
+		expect([...(await gitBlob(root, ":logo.bin"))]).toEqual([0xff, 3, 3, 3]);
+		expect(outcome.indexNotes.join("\n")).toContain("logo.bin");
+	});
+
+	it("still commits a drafted whole file when a newer commit left that file unchanged", async () => {
+		const { root, journal } = await emptyRepo();
+		await Bun.write(path.join(root, "logo.bin"), Buffer.from([0xff, 1]));
+		await git(root, ["add", "."]);
+		await git(root, ["commit", "-q", "-m", "seed"]);
+
+		await Bun.write(path.join(root, "logo.bin"), Buffer.from([0xff, 2, 2]));
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		draft.take({ path: "logo.bin" });
+
+		await Bun.write(path.join(root, "notes.txt"), "unrelated\n");
+		await git(root, ["add", "notes.txt"]);
+		await git(root, ["commit", "-q", "-m", "other"]);
+
+		const outcome = await commitSelection(
+			draft,
+			{ subject: "chore: logo" },
+			{ journal, agent: { agent: "Main" } },
+		);
+
+		expect(outcome.paths).toEqual(["logo.bin"]);
+		expect([...(await gitBlob(root, "HEAD:logo.bin"))]).toEqual([0xff, 2, 2]);
+		expect(await git(root, ["show", "HEAD:notes.txt"])).toBe("unrelated\n");
+	});
 });
