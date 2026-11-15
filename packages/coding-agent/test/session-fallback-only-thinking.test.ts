@@ -177,4 +177,29 @@ describe("fallback-only thinking entries", () => {
 			await session.dispose();
 		}
 	});
+
+	test("keeps the effort a model switch left in place when a later fallback follows", async () => {
+		freshDir();
+		const sessionManager = SessionManager.inMemory(tempDir);
+		sessionManager.appendModelChange(PRIMARY);
+		sessionManager.appendThinkingLevelChange(Effort.Low, Effort.Low);
+		sessionManager.appendModelChange("openai-codex/gpt-5.6-sol", EPHEMERAL_MODEL_CHANGE_ROLE, true);
+		sessionManager.appendThinkingLevelChange(Effort.High, Effort.High);
+		// The switch keeps high. The level did not change, so no thinking entry is written.
+		sessionManager.appendModelChange(PRIMARY);
+		sessionManager.appendModelChange("openai/gpt-4o-mini", EPHEMERAL_MODEL_CHANGE_ROLE, true);
+		sessionManager.appendThinkingLevelChange(Effort.XHigh, Effort.XHigh);
+		sessionManager.appendMessage({ role: "user", content: "continue", timestamp: Date.now() });
+		const context = sessionManager.buildSessionContext();
+		expect(context.thinkingLevel).toBe(Effort.High);
+		expect(context.configuredThinkingLevel).toBe(Effort.High);
+
+		const { session } = await createAgentSession(sessionOptions(sessionManager));
+		try {
+			expect(session.model?.id).toBe("claude-sonnet-4-5");
+			expect(session.configuredThinkingLevel()).toBe(Effort.High);
+		} finally {
+			await session.dispose();
+		}
+	});
 });
