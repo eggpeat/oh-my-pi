@@ -608,9 +608,9 @@ fn parse_file_patch(raw: &str) -> std::result::Result<FilePatch, ApplyFailure> {
 				patch.new_mode.get_or_insert(mode);
 			}
 		} else if let Some(value) = line.strip_prefix("--- ") {
-			patch.old_path = parse_marker_path(value);
+			patch.old_path = parse_marker_path(value, "a");
 		} else if let Some(value) = line.strip_prefix("+++ ") {
-			patch.new_path = parse_marker_path(value);
+			patch.new_path = parse_marker_path(value, "b");
 		} else if line.starts_with("@@") {
 			let (hunk, next) = parse_hunk(&lines, index)?;
 			patch.hunks.push(hunk);
@@ -656,10 +656,10 @@ fn parse_file_patch(raw: &str) -> std::result::Result<FilePatch, ApplyFailure> {
 fn split_diff_paths(paths: &str) -> std::result::Result<(String, String), ApplyFailure> {
 	let (old_token, new_token) = split_header_tokens(paths)
 		.ok_or_else(|| ApplyFailure::Invalid("invalid diff paths".into()))?;
-	let old =
-		side_path(old_token).ok_or_else(|| ApplyFailure::Invalid("invalid diff paths".into()))?;
-	let new =
-		side_path(new_token).ok_or_else(|| ApplyFailure::Invalid("invalid diff paths".into()))?;
+	let old = side_path(old_token, "a")
+		.ok_or_else(|| ApplyFailure::Invalid("invalid diff paths".into()))?;
+	let new = side_path(new_token, "b")
+		.ok_or_else(|| ApplyFailure::Invalid("invalid diff paths".into()))?;
 	Ok((old, new))
 }
 
@@ -804,19 +804,23 @@ fn decode_git_path(token: &str) -> String {
 	String::from_utf8_lossy(&bytes).into_owned()
 }
 
-fn side_path(token: &str) -> Option<String> {
+fn side_path(token: &str, side: &str) -> Option<String> {
 	let decoded = decode_git_path(token);
 	if decoded.is_empty() || decoded == "/dev/null" {
 		return None;
 	}
-	Some(strip_side_prefix(&decoded))
+	Some(strip_side_marker(&decoded, side))
 }
 
-fn strip_side_prefix(path: &str) -> String {
-	match path.split_once('/') {
-		Some((_, rest)) if !rest.is_empty() => rest.to_owned(),
-		_ => path.to_owned(),
-	}
+/// Drop only the `a/` or `b/` marker. A `--no-prefix` path such as
+/// `src/notes.txt` stays intact.
+fn strip_side_marker(path: &str, side: &str) -> String {
+	let prefix = format!("{side}/");
+	path
+		.strip_prefix(prefix.as_str())
+		.filter(|rest| !rest.is_empty())
+		.unwrap_or(path)
+		.to_owned()
 }
 
 fn strip_diff_timestamp(path: &str) -> &str {
@@ -836,12 +840,12 @@ fn strip_diff_timestamp(path: &str) -> &str {
 	}
 }
 
-fn parse_marker_path(value: &str) -> Option<String> {
+fn parse_marker_path(value: &str, side: &str) -> Option<String> {
 	if value.starts_with('"') {
 		let (token, _) = read_quoted_token(value, 0)?;
-		return side_path(token);
+		return side_path(token, side);
 	}
-	side_path(strip_diff_timestamp(value))
+	side_path(strip_diff_timestamp(value), side)
 }
 
 fn parse_mode(value: &str) -> Option<Mode> {
@@ -1020,8 +1024,8 @@ fn apply_patches_to_map(
 			continue;
 		}
 		let source_bytes = match source.as_ref() {
-			Some(entry) => blob_bytes(repo, entry.id)?,
-			None => Vec::new(),
+			Some(entry) => Some(blob_bytes(repo, entry.id)?),
+			None => None,
 		};
 		if !patch.binary.is_empty()
 			&& let Some(oid) = if options.reverse {
@@ -1029,7 +1033,7 @@ fn apply_patches_to_map(
 			} else {
 				patch.old_oid.as_deref()
 			}
-			&& !binary_base_matches(repo, &source_bytes, oid)
+			&& !binary_base_matches(repo, source_bytes.as_deref(), oid)
 		{
 			return Err(Error::PatchFailed {
 				message: format!(
@@ -1038,7 +1042,7 @@ fn apply_patches_to_map(
 				),
 			});
 		}
-		let direct = apply_file_bytes(patch, &source_bytes, options.reverse);
+		let direct = apply_file_bytes(patch, source_bytes.as_deref().unwrap_or(b""), options.reverse);
 		let bytes = match direct {
 			Ok(bytes) => bytes,
 			Err(ApplyFailure::Context(_)) if options.three_way => {
@@ -1089,7 +1093,14 @@ fn patch_sides(
 		(patch.old_path.as_deref(), patch.new_path.as_deref(), patch.old_mode, patch.new_mode)
 	}
 }
-fn binary_base_matches(repo: &gix::Repository, bytes: &[u8], oid: &str) -> bool {
+fn binary_base_matches(repo: &gix::Repository, bytes: Option<&[u8]>, oid: &str) -> bool {
+	// A full zero id means the file was absent, not that it was an empty blob.
+	if (oid.len() == 40 || oid.len() == 64) && oid.bytes().all(|byte| byte == b'0') {
+		return bytes.is_none();
+	}
+	let Some(bytes) = bytes else {
+		return false;
+	};
 	let full = oid.len() == 40 || oid.len() == 64;
 	if !full || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
 		return true;

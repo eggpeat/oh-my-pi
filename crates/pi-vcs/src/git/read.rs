@@ -966,6 +966,14 @@ impl GitRepo {
 		))
 	}
 
+	/// Bytes git would store for worktree `bytes` at `path` (`git add` clean
+	/// filters).
+	pub fn clean_worktree_bytes(&self, path: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+		let repo = self.gix()?;
+		let mut filter = super::filter::WorktreeFilter::staging(&repo, "git clean bytes")?;
+		filter.worktree_to_git(path, bytes.to_vec())
+	}
+
 	/// Resolve Git LFS's local object directory.
 	pub fn lfs_media_dir(&self) -> Result<Option<PathBuf>> {
 		let base = self.info().common_dir.clone();

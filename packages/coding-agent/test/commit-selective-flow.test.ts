@@ -237,6 +237,20 @@ async function blobId(bytes: Uint8Array): Promise<string> {
 	return out.trim();
 }
 
+async function gitBlob(cwd: string, spec: string): Promise<Uint8Array> {
+	const proc = Bun.spawn(["git", "-C", cwd, "cat-file", "blob", spec], {
+		stdout: "pipe",
+		stderr: "pipe",
+		env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+	});
+	const [out, err, code] = await Promise.all([
+		new Response(proc.stdout).arrayBuffer(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	if (code !== 0) throw new Error(`git cat-file failed (${code}): ${err}`);
+	return new Uint8Array(out);
+}
 /** Incompressible bytes so a binary patch spans more than one base85 line. */
 function pattern(length: number, seed: number): Uint8Array {
 	const out = new Uint8Array(length);
@@ -528,15 +542,16 @@ describe("selective commit of whole files", () => {
 		const root = await initRepo();
 		const name = "race.bin";
 		const file = path.join(root, name);
-		await fs.writeFile(file, Uint8Array.of(1, 1, 1));
+		await fs.writeFile(file, Uint8Array.of(0, 1, 1));
 		await git(root, ["add", "--", name]);
 		await git(root, ["commit", "-q", "-m", "binary"]);
-		const edited = Uint8Array.of(1, 1, 2);
+		const edited = Uint8Array.of(0, 1, 2);
 		await fs.writeFile(file, edited);
 
 		const draft = await createDraft({ cwd: root, journal: null, caller: "Main" });
 		draft.take({ path: name });
-		const other = Uint8Array.of(7, 7, 7);
+		expect(wholeChange(draft, name).kind).toBe("whole");
+		const other = Uint8Array.of(0, 7, 7);
 		await fs.writeFile(file, other);
 		await git(root, ["add", "--", name]);
 		await git(root, ["commit", "-q", "-m", "other"]);
@@ -553,7 +568,7 @@ describe("selective commit of whole files", () => {
 		const root = await initRepo();
 		const name = "mode.bin";
 		const file = path.join(root, name);
-		const original = Uint8Array.of(2, 2, 2);
+		const original = Uint8Array.of(0, 2, 2);
 		await fs.writeFile(file, original);
 		await git(root, ["add", "--", name]);
 		await git(root, ["commit", "-q", "-m", "binary"]);
@@ -561,7 +576,8 @@ describe("selective commit of whole files", () => {
 
 		const draft = await createDraft({ cwd: root, journal: null, caller: "Main" });
 		draft.take({ path: name });
-		const other = Uint8Array.of(3, 3, 3);
+		expect(wholeChange(draft, name).kind).toBe("whole");
+		const other = Uint8Array.of(0, 3, 3);
 		await fs.writeFile(file, other);
 		await fs.chmod(file, 0o644);
 		await git(root, ["add", "--", name]);
@@ -580,15 +596,16 @@ describe("selective commit of whole files", () => {
 		const root = await initRepo();
 		const name = "staged.bin";
 		const file = path.join(root, name);
-		await fs.writeFile(file, Uint8Array.of(4, 4, 4));
+		await fs.writeFile(file, Uint8Array.of(0, 4, 4));
 		await git(root, ["add", "--", name]);
 		await git(root, ["commit", "-q", "-m", "binary"]);
-		const edited = Uint8Array.of(4, 4, 5);
+		const edited = Uint8Array.of(0, 4, 5);
 		await fs.writeFile(file, edited);
 
 		const draft = await createDraft({ cwd: root, journal: null, caller: "Main" });
 		draft.take({ path: name });
-		const staged = Uint8Array.of(9, 9, 9);
+		expect(wholeChange(draft, name).kind).toBe("whole");
+		const staged = Uint8Array.of(0, 9, 9);
 		await fs.writeFile(file, staged);
 		await git(root, ["add", "--", name]);
 
@@ -601,5 +618,102 @@ describe("selective commit of whole files", () => {
 		expect((await git(root, ["rev-parse", `HEAD:${name}`])).trim()).toBe(await blobId(edited));
 		expect((await git(root, ["rev-parse", `:${name}`])).trim()).toBe(await blobId(staged));
 		expect(outcome.indexNotes.some(note => note.includes(name))).toBe(true);
+	});
+
+	it("applies a binary addition and the reverse of a binary deletion when the file is absent", async () => {
+		const root = await initRepo();
+		const name = "new.bin";
+		const file = path.join(root, name);
+		const bytes = Uint8Array.of(0, 1, 255);
+		await fs.writeFile(file, bytes);
+		await git(root, ["add", "--", name]);
+		const addition = await git(root, ["diff", "--cached", "--binary", "--", name]);
+		await git(root, ["reset", "-q", "--", name]);
+		await fs.rm(file);
+		const repo = vcs.requireGit(root);
+		await repo.applyPatch(addition, { cached: true });
+		expect((await git(root, ["rev-parse", `:${name}`])).trim()).toBe(await blobId(bytes));
+
+		await git(root, ["commit", "-q", "-m", "add"]);
+		await fs.rm(file, { force: true });
+		const deletion = await git(root, ["diff", "--binary", "--", name]);
+		await repo.applyPatch(deletion, { reverse: true });
+		expect(Buffer.from(await fs.readFile(file)).equals(bytes)).toBe(true);
+
+		await fs.writeFile(file, new Uint8Array());
+		await git(root, ["add", "--", name]);
+		await git(root, ["commit", "-q", "-m", "empty"]);
+		const zero = "0".repeat(40);
+		const emptyPatch = `diff --git a/${name} b/${name}\nindex ${zero}..${zero}\nGIT binary patch\nliteral 0\nHcmV?d00001\n\nliteral 0\nHcmV?d00001\n\n`;
+		await expect(repo.applyPatch(emptyPatch, { cached: true })).rejects.toThrow(/does not match/);
+	});
+
+	it("applies a patch without a/ and b/ markers to a nested path", async () => {
+		const root = await initRepo();
+		const name = "src/notes.txt";
+		const file = path.join(root, name);
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		await Bun.write(file, "one\n");
+		await git(root, ["add", "--", name]);
+		await git(root, ["commit", "-q", "-m", "notes"]);
+		await Bun.write(file, "two\n");
+		const patch = await git(root, ["diff", "--no-prefix", "--", name]);
+		await git(root, ["checkout", "-q", "--", name]);
+		await vcs.requireGit(root).applyPatch(patch, { cached: false });
+		expect(await Bun.file(file).text()).toBe("two\n");
+		expect(await Bun.file(path.join(root, "notes.txt")).exists()).toBe(false);
+	});
+
+	it("commits a symlink whose target is not valid text", async () => {
+		const root = await initRepo();
+		const name = "link";
+		const file = path.join(root, name);
+		const target = Uint8Array.of(0x63, 0x61, 0x66, 0xff);
+		const proc = Bun.spawn(
+			[
+				"python3",
+				"-c",
+				"import ctypes,sys; ctypes.CDLL('libc.so.6').symlink(sys.argv[1].encode('latin1'), sys.argv[2].encode())",
+				"caf\xff",
+				file,
+			],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		const code = await proc.exited;
+		if (code !== 0) throw new Error(`symlink failed (${code})`);
+
+		const draft = await createDraft({ cwd: root, journal: null, caller: "Main" });
+		draft.take({ path: name });
+		const change = wholeChange(draft, name);
+		expect(change.content !== null && Buffer.from(change.content).equals(target)).toBe(true);
+		await fs.rm(file);
+		await fs.symlink("later", file);
+		await commitSelection(draft, { subject: "fix: freeze link" }, { journal: null, agent: { agent: "Main" } });
+
+		expect(Buffer.from(await gitBlob(root, `HEAD:${name}`)).equals(target)).toBe(true);
+		expect(Buffer.from(await fs.readlink(file, { encoding: "buffer" })).equals(Buffer.from("later"))).toBe(true);
+	});
+
+	it("commits a filtered binary file as the bytes git would store", async () => {
+		const root = await initRepo();
+		await git(root, [
+			"config",
+			"filter.pointer.clean",
+			"python3 -c \"import sys; sys.stdin.buffer.read(); sys.stdout.buffer.write(b'pointer\\n')\"",
+		]);
+		await Bun.write(path.join(root, ".gitattributes"), "data.bin filter=pointer\n");
+		await git(root, ["add", ".gitattributes"]);
+		await git(root, ["commit", "-q", "-m", "attrs"]);
+		const raw = Uint8Array.of(0, 1, 2, 255);
+		await fs.writeFile(path.join(root, "data.bin"), raw);
+
+		const draft = await createDraft({ cwd: root, journal: null, caller: "Main" });
+		draft.take({ path: "data.bin" });
+		const change = wholeChange(draft, "data.bin");
+		expect(Buffer.from(change.content ?? new Uint8Array()).toString()).toBe("pointer\n");
+		await fs.writeFile(path.join(root, "data.bin"), Uint8Array.of(9, 9, 9, 0));
+		await commitSelection(draft, { subject: "fix: freeze filter" }, { journal: null, agent: { agent: "Main" } });
+
+		expect(await git(root, ["show", "HEAD:data.bin"])).toBe("pointer\n");
 	});
 });

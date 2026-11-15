@@ -45,6 +45,26 @@ const SYMLINK_MODE = "120000";
 function isGitFalse(value: string | null | undefined): boolean {
 	return value != null && /^(?:false|no|off|0)$/i.test(value.trim());
 }
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+	if (left.byteLength !== right.byteLength) return false;
+	for (let index = 0; index < left.byteLength; index++) {
+		if (left[index] !== right[index]) return false;
+	}
+	return true;
+}
+
+/** Blob bytes git would store. Symlink targets are already the blob. */
+async function gitBytes(
+	repo: VcsGitRepo,
+	file: string,
+	mode: string | null,
+	bytes: Uint8Array | null,
+): Promise<Uint8Array | null> {
+	if (bytes === null || mode === SYMLINK_MODE) return bytes;
+	return new Uint8Array(await repo.cleanWorktreeBytes(file, bytes));
+}
+
 /** Tolerance when matching a file's mtime to a tool call window (event and fs clock skew). */
 const WINDOW_SLACK_MS = 1500;
 /** Concurrent file reads while building a draft. */
@@ -391,7 +411,7 @@ async function loadFile(
 		mtimeMs = stat.mtimeMs;
 		if (stat.isSymbolicLink()) {
 			mode = SYMLINK_MODE;
-			workBytes = new TextEncoder().encode(await fs.readlink(absolute));
+			workBytes = await fs.readlink(absolute, { encoding: "buffer" });
 		} else if (!stat.isFile()) return "skip";
 		else {
 			// Git ignores the executable bit when core.filemode is false, so a tracked
@@ -431,8 +451,11 @@ async function loadFile(
 	if (head.mode === SYMLINK_MODE || mode === SYMLINK_MODE) return whole("symlink");
 	const headText = headBytes === null ? null : decodeText(headBytes);
 	const workText = workBytes === null ? null : decodeText(workBytes);
-	if (headText === undefined || workText === undefined) return whole("content");
-	if (headText === workText) return head.mode === mode ? undefined : whole("mode");
+	if (headText === undefined || workText === undefined || (headText === workText && head.mode !== mode)) {
+		const stored = await gitBytes(repo, file, mode, workBytes);
+		if (stored !== null && headBytes !== null && sameBytes(stored, headBytes) && head.mode === mode) return undefined;
+		return { ...whole(headText === undefined || workText === undefined ? "content" : "mode"), bytes: stored };
+	}
 	const headLines = toLines(headText);
 	const workLines = toLines(workText);
 	const windowAgent = (ms: number | undefined) => windowCall(ms)?.agent;

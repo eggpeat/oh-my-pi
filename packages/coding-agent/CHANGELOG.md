@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- A selective commit of a binary, non-text, or very large file now uses the copy saved with the draft, including a name with spaces and the executable mark git recorded, and refuses when someone else has since changed that file ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+- A selective commit of a binary, non-text, or very large file now keeps the copy saved with the draft, including a name with spaces, the executable mark git recorded, and the bytes git would store, and refuses when someone else has since changed that file ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 
 ## [18.20.1] - 2026-11-14
 
@@ -41,12 +41,6 @@
 - Language servers now recognize edits made shortly after a file is created, including on macOS.
 - Bash commands displayed in the Pseudo shell view now remain accurate while streaming through heredocs, substitutions, loops, continuations, arithmetic expressions, and background execution.
 - Resuming a session or reviving a subagent after a retry fallback with a thinking suffix (e.g. `:xhigh`) now restores the primary model's own thinking level instead of keeping the fallback's ([#19273](https://github.com/can1357/oh-my-pi/issues/19273)).
-- Fixed `^` model mentions and `/switch` argument completions missing discovered models for the rest of a session after provider discovery failed at startup; using those lists now retries the failed discovery, and an open `^` list updates once it recovers models.
-- A background job result that arrives after an ACP prompt ends no longer starts a turn the client cannot see; it is folded into the next prompt
-- A failed OpenAI server compaction now falls back to the next compaction method instead of first retrying server compaction on another model
-- Language servers are now told when a newly created file is edited again soon after; on macOS such edits were previously dropped as repeats of the creation
-- A `bash` command streaming into the Pseudo shell view keeps its rows through heredocs and loops inside `$(`, nested `$(`, unfinished arithmetic, line continuations and a trailing `&`, and is drawn as it will continue only while its arguments still stream: once complete, waiting to run, or running, an unfinished end is shown as written
-- Fixed selective commit recording a binary, non-UTF-8, or oversized file as whatever is in the worktree at commit time; the commit now keeps the bytes captured when the draft was built ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 
 ## [18.20.0] - 2026-11-12
 

@@ -1053,6 +1053,20 @@ impl VcsGitRepo {
 		})
 	}
 
+	/// Convert worktree bytes to the blob git would store for `path`.
+	#[napi]
+	pub fn clean_worktree_bytes(
+		&self,
+		path: String,
+		bytes: Uint8Array,
+		signal: Option<Unknown>,
+	) -> Promise<Buffer> {
+		let owned = bytes.to_vec();
+		blocking("vcs.cleanWorktreeBytes", self.inner.clone(), signal, move |r| {
+			r.clean_worktree_bytes(&path, &owned).map(Buffer::from)
+		})
+	}
+
 	/// Read commit and patch bytes.
 	#[napi]
 	pub fn show_commit(
