@@ -1863,10 +1863,14 @@ fn write_worktree_entry(
 	validate_repo_path(path).map_err(ApplyFailure::into_error)?;
 	let bytes = blob_bytes(gix_repo, entry.id)?;
 	if entry.mode == Mode::SYMLINK {
+		let enabled = gix_repo
+			.filesystem_options()
+			.map_err(|err| Error::backend("git checkout", err))?
+			.symlink;
 		return super::worktree::materialize_worktree_entry(
 			repo.root(),
 			path,
-			super::worktree::MaterializedEntry::Symlink { target: &bytes },
+			super::worktree::MaterializedEntry::Symlink { target: &bytes, enabled },
 		);
 	}
 	let converted = filter.git_to_worktree(path, bytes)?;
@@ -1882,9 +1886,9 @@ fn write_worktree_entry(
 
 /// Remove `path` and the parent directories it leaves empty. A directory at
 /// `path` is a gitlink: like git, only an empty (uninitialized) one is
-/// removed, a checked-out submodule stays. A symlink parent is replaced with a
-/// real directory first so the removal cannot follow the link out of the
-/// repository.
+/// removed, a checked-out submodule stays. A symlink parent is unlinked rather
+/// than followed, and a missing or non-directory parent means there is no
+/// in-repository leaf to remove.
 fn remove_worktree_path(repo: &GitRepo, path: &str) -> Result<()> {
 	validate_repo_path(path).map_err(ApplyFailure::into_error)?;
 	let absolute = repo.root().join(path);

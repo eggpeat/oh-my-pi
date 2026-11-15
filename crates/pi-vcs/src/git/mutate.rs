@@ -1771,6 +1771,10 @@ fn restore_index_paths(
 	files: &[String],
 ) -> Result<()> {
 	let mut filter = WorktreeFilter::staging(repo, "git restore")?;
+	let symlinks = repo
+		.filesystem_options()
+		.map_err(|err| Error::backend("git restore", err))?
+		.symlink;
 	for entry in index.entries() {
 		let path = entry.path(index).to_str_lossy();
 		if files.is_empty() || files.iter().any(|wanted| path_matches(&path, wanted)) {
@@ -1787,7 +1791,7 @@ fn restore_index_paths(
 				super::worktree::materialize_worktree_entry(
 					root,
 					&path,
-					super::worktree::MaterializedEntry::Symlink { target: &data },
+					super::worktree::MaterializedEntry::Symlink { target: &data, enabled: symlinks },
 				)?;
 			} else {
 				let converted = filter.git_to_worktree(&path, data)?;

@@ -14,7 +14,7 @@ use crate::Result;
 /// a smudge-filter conversion.
 pub(super) enum MaterializedEntry<'a> {
 	File { bytes: &'a [u8], executable: bool },
-	Symlink { target: &'a [u8] },
+	Symlink { target: &'a [u8], enabled: bool },
 }
 
 /// What [`unlink_worktree_leaf`] did with the final path component.
@@ -133,26 +133,28 @@ mod unix {
 		entry: MaterializedEntry<'_>,
 	) -> crate::Result<()> {
 		with_leaf(root, parts, |dir, leaf| match entry {
-			MaterializedEntry::Symlink { target } => create_symlink(dir, leaf, target),
-			MaterializedEntry::File { bytes, executable } => {
-				let mut file = File::from(create_file(dir, leaf)?);
-				file.write_all(bytes)?;
-				let mode = if executable { 0o755 } else { 0o644 };
-				file.set_permissions(fs_permissions(mode))?;
-				Ok(())
+			MaterializedEntry::Symlink { target, enabled: true } => create_symlink(dir, leaf, target),
+			MaterializedEntry::Symlink { target, enabled: false } => {
+				write_file(dir, leaf, target, false)
 			},
+			MaterializedEntry::File { bytes, executable } => write_file(dir, leaf, bytes, executable),
 		})
 	}
 
 	pub(super) fn unlink_leaf(root: &Path, parts: &[&str]) -> crate::Result<super::Leaf> {
-		with_leaf(root, parts, |dir, leaf| match symlink_kind(dir, leaf)? {
+		let (leaf, parents) = parts.split_last().ok_or_else(|| invalid())?;
+		let Some(dir) = removal_parent(root, parents)? else {
+			return Ok(super::Leaf::Missing);
+		};
+		let leaf = c_name(leaf)?;
+		match symlink_kind(&dir, &leaf)? {
 			Kind::Missing => Ok(super::Leaf::Missing),
 			Kind::Directory => Ok(super::Leaf::Directory),
 			Kind::Other => {
-				unlink_at(dir, leaf)?;
+				unlink_at(&dir, &leaf)?;
 				Ok(super::Leaf::Removed)
 			},
-		})
+		}
 	}
 
 	pub(super) fn ensure_parents(root: &Path, parents: &[&str]) -> crate::Result<()> {
@@ -204,6 +206,48 @@ mod unix {
 		}
 	}
 
+	/// Find a leaf's real parent without creating anything. A symlink parent is
+	/// unlinked, since following it could remove a file outside the worktree;
+	/// a missing or non-directory parent means the leaf is already absent.
+	fn removal_parent(root: &Path, parents: &[&str]) -> io::Result<Option<OwnedFd>> {
+		let mut dir = open_root(root)?;
+		for parent in parents {
+			let name = c_name(parent)?;
+			match open_subdir(&dir, &name) {
+				Ok(child) => dir = child,
+				Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+				Err(_) if is_symlink(&dir, &name)? => {
+					unlink_at(&dir, &name)?;
+					return Ok(None);
+				},
+				Err(err) if err.raw_os_error() == Some(libc::ENOTDIR) => return Ok(None),
+				Err(err) => return Err(err),
+			}
+		}
+		Ok(Some(dir))
+	}
+
+	fn write_file(dir: &OwnedFd, leaf: &CStr, bytes: &[u8], executable: bool) -> io::Result<()> {
+		let (fd, existed) = create_file(dir, leaf, executable)?;
+		let mut file = File::from(fd);
+		file.write_all(bytes)?;
+		if existed {
+			// Keep private files private and preserve read/write bits. Only the
+			// executable state follows the index. New files already got their
+			// mode from openat, so the process umask remains in effect.
+			let mode = file.metadata()?.permissions().mode() & 0o7777;
+			let desired = if executable {
+				mode | ((mode & 0o444) >> 2)
+			} else {
+				mode & !0o111
+			};
+			if desired != mode {
+				file.set_permissions(std::fs::Permissions::from_mode(desired))?;
+			}
+		}
+		Ok(())
+	}
+
 	fn is_symlink(parent: &OwnedFd, name: &CStr) -> io::Result<bool> {
 		Ok(matches!(stat_mode(parent, name)?, Some(mode) if (mode & libc::S_IFMT) == libc::S_IFLNK))
 	}
@@ -249,14 +293,17 @@ mod unix {
 		)
 	}
 
-	fn create_file(parent: &OwnedFd, name: &CStr) -> io::Result<OwnedFd> {
+	fn create_file(parent: &OwnedFd, name: &CStr, executable: bool) -> io::Result<(OwnedFd, bool)> {
 		let flags =
 			libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-		match openat(parent, name, flags, 0o666) {
-			Ok(file) => Ok(file),
+		let existed =
+			stat_mode(parent, name)?.is_some_and(|mode| (mode & libc::S_IFMT) == libc::S_IFREG);
+		let mode = if executable { 0o777 } else { 0o666 };
+		match openat(parent, name, flags, mode) {
+			Ok(file) => Ok((file, existed)),
 			Err(err) if nofollow_hit(&err) || is_symlink(parent, name).unwrap_or(false) => {
 				unlink_at(parent, name)?;
-				openat(parent, name, flags, 0o666)
+				openat(parent, name, flags, mode).map(|file| (file, false))
 			},
 			Err(err) => Err(err),
 		}
@@ -302,7 +349,7 @@ mod unix {
 		parent: &OwnedFd,
 		name: &CStr,
 		flags: libc::c_int,
-		mode: libc::mode_t,
+		mode: libc::c_uint,
 	) -> io::Result<OwnedFd> {
 		let fd = retry(|| {
 			// SAFETY: `name` is a NUL-terminated component of `parent`. `mode` is
@@ -330,10 +377,6 @@ mod unix {
 		matches!(err.raw_os_error(), Some(code) if code == libc::ELOOP)
 	}
 
-	fn fs_permissions(mode: u32) -> std::fs::Permissions {
-		std::fs::Permissions::from_mode(mode)
-	}
-
 	enum Kind {
 		Missing,
 		Directory,
@@ -359,7 +402,7 @@ mod portable {
 			fs::remove_file(&path)?;
 		}
 		match entry {
-			MaterializedEntry::Symlink { target } => {
+			MaterializedEntry::Symlink { target, .. } => {
 				if fs::symlink_metadata(&path).is_ok() {
 					fs::remove_file(&path)?;
 				}
@@ -372,7 +415,10 @@ mod portable {
 
 	pub(super) fn unlink_leaf(root: &Path, parts: &[&str]) -> crate::Result<super::Leaf> {
 		let (leaf, parents) = parts.split_last().expect("split rejects an empty path");
-		let path = parents_path(root, parents)?.join(leaf);
+		let Some(dir) = removal_parent_path(root, parents)? else {
+			return Ok(super::Leaf::Missing);
+		};
+		let path = dir.join(leaf);
 		match fs::symlink_metadata(&path) {
 			Ok(meta) if meta.is_dir() => Ok(super::Leaf::Directory),
 			Ok(_) => {
@@ -380,12 +426,31 @@ mod portable {
 				Ok(super::Leaf::Removed)
 			},
 			Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(super::Leaf::Missing),
-			Err(err) => Err(err.into()),
+			Err(err) => Err(crate::Error::Io(err)),
 		}
 	}
 
 	pub(super) fn ensure_parents(root: &Path, parents: &[&str]) -> crate::Result<()> {
-		parents_path(root, parents).map(|_| ())
+		parents_path(root, parents)?;
+		Ok(())
+	}
+
+	fn removal_parent_path(root: &Path, parents: &[&str]) -> io::Result<Option<std::path::PathBuf>> {
+		let mut dir = root.to_path_buf();
+		for parent in parents {
+			dir.push(parent);
+			match fs::symlink_metadata(&dir) {
+				Ok(meta) if meta.file_type().is_symlink() => {
+					fs::remove_file(&dir)?;
+					return Ok(None);
+				},
+				Ok(meta) if meta.is_dir() => {},
+				Ok(_) => return Ok(None),
+				Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+				Err(err) => return Err(err),
+			}
+		}
+		Ok(Some(dir))
 	}
 
 	fn parents_path(root: &Path, parents: &[&str]) -> io::Result<std::path::PathBuf> {
