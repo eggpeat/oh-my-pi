@@ -1,14 +1,16 @@
 /**
  * Steer admission must follow run ownership: a `joinActiveTurn` steer may only
  * inject into a run claimed by a client prompt dispatch (`session.prompt`) or a
- * continuation of that turn (recovery retry, compaction length-stop retry, rule
- * interrupt retry). An autonomous run — a queued-hidden drain, a background
- * turn's retry — streaming while a client prompt is still dispatching must
- * never swallow the steer: it parks until the client's own run goes live, and
- * refuses when the dispatch settles first.
+ * continuation of that turn (recovery retry, compaction length-stop retry, text
+ * rule retry, or a code-rule retry checked before a tool runs). An autonomous
+ * run — a queued-hidden drain, a background turn's retry — streaming while a
+ * client prompt is still dispatching must never swallow the steer: it parks
+ * until the client's own run goes live, and refuses when the dispatch settles
+ * first.
  */
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
-import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { type } from "@oh-my-pi/omptype";
+import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { CustomMessage } from "@oh-my-pi/pi-agent-core";
 import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
@@ -69,6 +71,7 @@ describe("AgentSession steer run ownership", () => {
 			ttsrManager?: TtsrManager;
 			/** Identity stamped on mock responses; compaction recovery requires it to match the session model. */
 			mockIdentity?: { provider: string; id: string };
+			tools?: AgentTool[];
 		} = {},
 	) {
 		authStorage = await AuthStorage.create(":memory:");
@@ -78,7 +81,7 @@ describe("AgentSession steer run ownership", () => {
 		const mock = createMockModel({ responses, ...options.mockIdentity });
 		const agent = new Agent({
 			getApiKey: () => "test-key",
-			initialState: { model: bundled, systemPrompt: ["Test"], tools: [] },
+			initialState: { model: bundled, systemPrompt: ["Test"], tools: options.tools ?? [] },
 			streamFn: mock.stream,
 		});
 		const modelRegistry = new ModelRegistry(authStorage);
@@ -409,6 +412,83 @@ describe("AgentSession steer run ownership", () => {
 		expect(userIndexContaining(messages, "steer the rule retry")).toBeGreaterThanOrEqual(0);
 		expect(assistantIndexContaining(messages, "steer answer")).toBeGreaterThan(
 			userIndexContaining(messages, "steer the rule retry"),
+		);
+	});
+
+	it("admits a steer into the client prompt's code-rule retry", async () => {
+		const parameters = type({ path: "string", content: "string" });
+		let writes = 0;
+		const writeTool: AgentTool<typeof parameters> = {
+			name: "write",
+			label: "Write",
+			description: "Write a file",
+			parameters,
+			matcherDigest: args => {
+				if (!args || typeof args !== "object" || !("content" in args)) return undefined;
+				return typeof args.content === "string" ? args.content : undefined;
+			},
+			execute: async () => {
+				writes += 1;
+				return { content: [{ type: "text", text: "written" }] };
+			},
+		};
+		const ttsrManager = new TtsrManager({ enabled: true, interruptMode: "always" });
+		const rule: Rule = {
+			name: "no-console",
+			path: "/tmp/no-console.md",
+			content: "Do not add console.log calls.",
+			astCondition: ["console.log($$$)"],
+			scope: ["tool:write(*.ts)"],
+			interruptMode: "always",
+			_source: { provider: "test", providerName: "test", path: "/tmp/no-console.md", level: "project" },
+		};
+		ttsrManager.addRule(rule);
+		const retryStarted = Promise.withResolvers<void>();
+		const releaseRetry = Promise.withResolvers<void>();
+		const { session } = await createSession(
+			[
+				() => ({
+					content: [
+						{
+							type: "toolCall",
+							name: "write",
+							arguments: { path: "probe.ts", content: "console.log('blocked');" },
+						},
+					],
+				}),
+				async () => {
+					retryStarted.resolve();
+					await releaseRetry.promise;
+					return { content: ["rewrote without console.log"] };
+				},
+				() => ({ content: ["steer answer"] }),
+			],
+			{ ttsrManager, tools: [writeTool] },
+		);
+
+		const promptDone = session.prompt("write the file");
+		await withTimeout(retryStarted.promise, 4_000, "Code-rule retry never streamed");
+		expect(session.agent.state.isStreaming).toBe(true);
+		// The rule blocked the write and retried from the tool check, not from
+		// the text stream. A steer joins that retry only when the check kept
+		// the client run's owner.
+		expect(writes).toBe(0);
+		expect(
+			session.agent.state.messages.some(
+				message => message.role === "custom" && message.customType === "ttsr-injection",
+			),
+		).toBe(true);
+
+		expect(await withTimeout(session.joinActiveTurn("steer the code-rule retry"), 1_000, "steer parked")).toBe(true);
+
+		releaseRetry.resolve();
+		await promptDone;
+		await session.waitForIdle();
+		const messages = session.agent.state.messages;
+		expect(assistantIndexContaining(messages, "rewrote without console.log")).toBeGreaterThanOrEqual(0);
+		expect(userIndexContaining(messages, "steer the code-rule retry")).toBeGreaterThanOrEqual(0);
+		expect(assistantIndexContaining(messages, "steer answer")).toBeGreaterThan(
+			userIndexContaining(messages, "steer the code-rule retry"),
 		);
 	});
 });

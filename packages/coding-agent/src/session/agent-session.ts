@@ -5912,7 +5912,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	async #beforeToolCall(ctx: BeforeToolCallContext, signal?: AbortSignal): Promise<BeforeToolCallResult | undefined> {
 		const runner = this.#extensionRunner;
 		runner?.markLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
-		const ttsrResult = await this.#ttsr.beforeToolCall(ctx);
+		// Code rules run in the agent loop, outside the event dispatch that owns
+		// continuationOwnerScope. Bind the live run before the check: the
+		// interrupt retry is scheduled from here, after awaits, and must keep
+		// that owner or a steer into the retry waits until it ends and is refused.
+		const owner = this.agent.state.runOwner;
+		const ttsrResult = await continuationOwnerScope.run(owner, () => this.#ttsr.beforeToolCall(ctx));
 		if (ttsrResult) {
 			runner?.clearLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
 			return ttsrResult;
