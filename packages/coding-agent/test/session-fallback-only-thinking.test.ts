@@ -202,4 +202,57 @@ describe("fallback-only thinking entries", () => {
 			await session.dispose();
 		}
 	});
+
+	test("switching to a fallback-only session with a different model uses the configured default", async () => {
+		freshDir();
+		const target = await writeTranscript(fallbackOnlyTranscript());
+		const { session } = await createAgentSession(
+			sessionOptions(SessionManager.create(tempDir, path.join(tempDir, "active"))),
+		);
+		try {
+			const other = session.modelRegistry.find("anthropic", "claude-sonnet-4-6");
+			if (!other) throw new Error("Expected bundled claude-sonnet-4-6");
+			session.setThinkingLevel(Effort.Medium);
+			await expect(session.switchSession(target, { model: other })).resolves.toBe(true);
+			expect(session.model?.id).toBe("claude-sonnet-4-6");
+			expect(session.configuredThinkingLevel()).toBe(AUTO_THINKING);
+			expect(session.sessionManager.buildSessionContext().configuredThinkingLevel).toBe(AUTO_THINKING);
+			await session.sessionManager.flush();
+		} finally {
+			await session.dispose();
+		}
+
+		const reopenedManager = await SessionManager.open(target, path.join(tempDir, "reopen"));
+		const { session: reopened } = await createAgentSession(sessionOptions(reopenedManager));
+		try {
+			expect(reopened.model?.id).toBe("claude-sonnet-4-6");
+			expect(reopened.configuredThinkingLevel()).toBe(AUTO_THINKING);
+		} finally {
+			await reopened.dispose();
+		}
+	});
+
+	test("switching to a session with a different model keeps the effort from before the fallback", async () => {
+		freshDir();
+		const sessionManager = SessionManager.inMemory(tempDir);
+		sessionManager.appendModelChange(PRIMARY);
+		sessionManager.appendThinkingLevelChange(Effort.High, Effort.High);
+		sessionManager.appendModelChange("openai-codex/gpt-5.6-sol", EPHEMERAL_MODEL_CHANGE_ROLE, true);
+		sessionManager.appendThinkingLevelChange(Effort.XHigh, Effort.XHigh);
+		sessionManager.appendMessage({ role: "user", content: "continue", timestamp: Date.now() });
+		const target = await writeTranscript(sessionManager);
+		const { session } = await createAgentSession(
+			sessionOptions(SessionManager.create(tempDir, path.join(tempDir, "active"))),
+		);
+		try {
+			const other = session.modelRegistry.find("anthropic", "claude-sonnet-4-6");
+			if (!other) throw new Error("Expected bundled claude-sonnet-4-6");
+			session.setThinkingLevel(Effort.Medium);
+			await expect(session.switchSession(target, { model: other })).resolves.toBe(true);
+			expect(session.configuredThinkingLevel()).toBe(Effort.High);
+			expect(session.sessionManager.buildSessionContext().configuredThinkingLevel).toBe(Effort.High);
+		} finally {
+			await session.dispose();
+		}
+	});
 });
