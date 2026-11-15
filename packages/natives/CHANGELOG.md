@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed overlapping commitCreate() calls saving each other's subject and body. ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+
 ## [18.20.1] - 2026-11-14
 
 ### Breaking Changes

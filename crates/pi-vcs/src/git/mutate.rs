@@ -5,6 +5,7 @@ use std::{
 	collections::{BTreeMap, BTreeSet, HashSet},
 	ffi::OsStr,
 	fs,
+	io::Write,
 	path::{Path, PathBuf},
 	process::{Command, Stdio},
 };
@@ -290,12 +291,13 @@ impl GitRepo {
 				.ok_or_else(|| Error::backend("git commit", "author identity is not configured"))?
 				.map_err(|err| Error::backend("git commit", err))?
 		};
-		let message_path = self.info().git_dir.join("COMMIT_EDITMSG");
-		fs::write(&message_path, message)?;
+		// Not `.git/COMMIT_EDITMSG`: overlapping calls reread whichever message
+		// landed last, including when `no_verify` skips the hook.
+		let message_file = CommitMessageFile::create(&self.info().git_dir, message)?;
 		if !options.no_verify {
-			run_commit_hook(self, "commit-msg", &[message_path.as_os_str()], index_path)?;
+			run_commit_hook(self, "commit-msg", &[message_file.path.as_os_str()], index_path)?;
 		}
-		let message = fs::read_to_string(&message_path)
+		let message = fs::read_to_string(&message_file.path)
 			.map_err(|err| Error::backend("git commit read commit-msg result", err))?;
 		let id = if sign {
 			sign_commit(self, &message, tree, &parents, author, committer)?
@@ -1029,6 +1031,46 @@ impl GitRepo {
 			}
 		}
 		Ok(())
+	}
+}
+
+/// One call's commit message. Dropped on every exit, including hook, signer,
+/// and ref-update failures.
+///
+/// `commit-msg` edits the path it is given. Sharing `.git/COMMIT_EDITMSG`
+/// lets an overlapping `commit_create` replace that file between the write
+/// and the reread, so both commits record the other call's subject and body.
+#[must_use = "dropping the guard deletes the commit message file"]
+struct CommitMessageFile {
+	path: PathBuf,
+}
+
+impl CommitMessageFile {
+	fn create(git_dir: &Path, message: &str) -> Result<Self> {
+		use std::sync::atomic::{AtomicU64, Ordering};
+		static NEXT: AtomicU64 = AtomicU64::new(0);
+		let n = NEXT.fetch_add(1, Ordering::Relaxed);
+		let tick = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map_or(0, |elapsed| elapsed.as_nanos());
+		let path = git_dir.join(format!(".omp-commit-msg-{}-{tick}-{n}", std::process::id()));
+		// Close before the guard exists so a failed write can unlink the
+		// partial file on Windows, where an open handle blocks removal.
+		let mut file = fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&path)?;
+		let written = file.write_all(message.as_bytes());
+		drop(file);
+		let message_file = Self { path };
+		written?;
+		Ok(message_file)
+	}
+}
+
+impl Drop for CommitMessageFile {
+	fn drop(&mut self) {
+		let _ = fs::remove_file(&self.path);
 	}
 }
 
@@ -2454,6 +2496,119 @@ mod tests {
 			.commit_create("unverified", &CommitOptions { no_verify: true, ..options })
 			.unwrap();
 		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), id);
+	}
+
+	/// A `commit-msg` hook is the race window: it runs after the message file
+	/// is written and before that file is read back. Overwriting the shared
+	/// `COMMIT_EDITMSG` there is another call's write landing in between.
+	#[cfg(unix)]
+	#[test]
+	fn commit_keeps_its_message_when_shared_editmsg_is_replaced() {
+		use std::os::unix::fs::PermissionsExt;
+		let (temp, repo) = fixture();
+		let hook = temp.path().join(".git/hooks/commit-msg");
+		fs::write(
+			&hook,
+			r#"#!/bin/sh
+printf '%s' "$1" > "$GIT_DIR/seen-msg-path"
+printf '\nHook-Trailer: kept\n' >> "$1"
+printf '%s\n\n%s\n' 'stolen subject' 'stolen body' > "$GIT_DIR/COMMIT_EDITMSG"
+"#,
+		)
+		.unwrap();
+		fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+		let shared = temp.path().join(".git/COMMIT_EDITMSG");
+		fs::write(&shared, "preexisting\n").unwrap();
+
+		let id = repo
+			.commit_create("mine subject\n\nmine body\n", &CommitOptions {
+				allow_empty: true,
+				..Default::default()
+			})
+			.unwrap();
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), id);
+		let committed = git(temp.path(), &["log", "-1", "--format=%B"]);
+		assert!(
+			committed.contains("mine subject") && committed.contains("mine body"),
+			"commit recorded another call's message: {committed}"
+		);
+		assert!(
+			committed.contains("Hook-Trailer: kept"),
+			"commit-msg edit of its own file was dropped: {committed}"
+		);
+		assert!(
+			!committed.contains("stolen subject"),
+			"commit recorded the shared COMMIT_EDITMSG: {committed}"
+		);
+		let seen = fs::read_to_string(temp.path().join(".git/seen-msg-path")).unwrap();
+		assert!(
+			!seen.ends_with("COMMIT_EDITMSG"),
+			"commit-msg was given the shared message file: {seen}"
+		);
+		assert!(!Path::new(&seen).exists(), "message file was left behind: {seen}");
+		assert_eq!(
+			fs::read_to_string(&shared).unwrap(),
+			"stolen subject\n\nstolen body\n",
+			"commit published its message through the shared file"
+		);
+	}
+
+	#[test]
+	fn commit_no_verify_does_not_publish_through_shared_editmsg() {
+		let (temp, repo) = fixture();
+		let shared = temp.path().join(".git/COMMIT_EDITMSG");
+		fs::write(&shared, "preexisting\n").unwrap();
+		let before: BTreeSet<_> = fs::read_dir(temp.path().join(".git"))
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name())
+			.collect();
+
+		let id = repo
+			.commit_create("private message\n", &CommitOptions {
+				allow_empty: true,
+				no_verify: true,
+				..Default::default()
+			})
+			.unwrap();
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), id);
+		assert_eq!(git(temp.path(), &["log", "-1", "--format=%B"]), "private message");
+		assert_eq!(fs::read_to_string(&shared).unwrap(), "preexisting\n");
+		let added: Vec<_> = fs::read_dir(temp.path().join(".git"))
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name())
+			.filter(|name| !before.contains(name))
+			.collect();
+		assert!(added.is_empty(), "commit left a message file behind: {added:?}");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn rejected_commit_msg_hook_removes_its_message_file() {
+		use std::os::unix::fs::PermissionsExt;
+		let (temp, repo) = fixture();
+		let hook = temp.path().join(".git/hooks/commit-msg");
+		fs::write(&hook, "#!/bin/sh\nprintf '%s' \"$1\" > \"$GIT_DIR/seen-msg-path\"\nexit 1\n")
+			.unwrap();
+		fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+		let shared = temp.path().join(".git/COMMIT_EDITMSG");
+		fs::write(&shared, "preexisting\n").unwrap();
+		let head = git(temp.path(), &["rev-parse", "HEAD"]);
+
+		let err = repo
+			.commit_create("will not land\n", &CommitOptions {
+				allow_empty: true,
+				..Default::default()
+			})
+			.unwrap_err();
+		assert!(matches!(err, Error::Cli { .. }), "{err:?}");
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), head);
+		let seen = fs::read_to_string(temp.path().join(".git/seen-msg-path")).unwrap();
+		assert!(
+			!seen.ends_with("COMMIT_EDITMSG"),
+			"commit-msg was given the shared message file: {seen}"
+		);
+		assert!(!Path::new(&seen).exists(), "message file was left behind: {seen}");
+		assert_eq!(fs::read_to_string(&shared).unwrap(), "preexisting\n");
 	}
 
 	#[cfg(unix)]
