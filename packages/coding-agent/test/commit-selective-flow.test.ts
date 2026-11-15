@@ -25,6 +25,19 @@ async function git(cwd: string, args: string[]): Promise<string> {
 	return out;
 }
 
+/** Raw bytes of one committed blob, so binary content can be compared exactly. */
+async function gitBlob(cwd: string, spec: string): Promise<Buffer> {
+	const env = { ...process.env, HOME: cwd, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+	const proc = Bun.spawn(["git", "-C", cwd, "cat-file", "blob", spec], { env, stdout: "pipe", stderr: "pipe" });
+	const [out, err, code] = await Promise.all([
+		new Response(proc.stdout).arrayBuffer(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	if (code !== 0) throw new Error(`git cat-file blob ${spec} failed (${code}): ${err}`);
+	return Buffer.from(out);
+}
+
 const CHANGELOG = "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- Fixed an old bug\n";
 
 /** Repository without commits, and a writer that edits files the way agent edit tools do: journaled. */
@@ -284,5 +297,68 @@ describe("selective commit flow", () => {
 
 		expect(outcome.paths).toEqual([filename]);
 		expect(await git(root, ["show", `HEAD:${filename}`])).toBe("after\n");
+	});
+
+	it("commits whole-file changes as captured at draft time, not as later worktree edits", async () => {
+		const { root, journal } = await emptyRepo();
+		const binary = (bytes: number[]) => Buffer.from(bytes);
+		// NUL bytes make the .bin files non-text; big.txt is over the 4 MiB attribution limit,
+		// so all three select whole instead of per line.
+		await Bun.write(path.join(root, "logo.bin"), binary([0, 1, 2]));
+		await Bun.write(path.join(root, "gone.bin"), binary([0, 9]));
+		await Bun.write(path.join(root, "big.txt"), `${"a".repeat(4 * 1024 * 1024)}\n`);
+		await git(root, ["add", "."]);
+		await git(root, ["commit", "-q", "-m", "seed"]);
+
+		const draftedLogo = binary([0, 3, 3, 3]);
+		const draftedBig = `${"b".repeat(4 * 1024 * 1024)}\n`;
+		await Bun.write(path.join(root, "logo.bin"), draftedLogo);
+		await Bun.write(path.join(root, "big.txt"), draftedBig);
+		await fs.rm(path.join(root, "gone.bin"));
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		draft.take({ path: "**" });
+
+		// Another process edits the whole-file paths after the draft captured them.
+		await Bun.write(path.join(root, "logo.bin"), binary([0, 7, 7, 7, 7, 7]));
+		await Bun.write(path.join(root, "big.txt"), `${"c".repeat(4 * 1024 * 1024)}\n`);
+		await Bun.write(path.join(root, "gone.bin"), binary([0, 5, 5]));
+
+		const outcome = await commitSelection(
+			draft,
+			{ subject: "chore: assets" },
+			{ journal, agent: { agent: "Main" } },
+		);
+
+		expect(outcome.paths).toEqual(["big.txt", "gone.bin", "logo.bin"]);
+		expect([...(await gitBlob(root, "HEAD:logo.bin"))]).toEqual([...draftedLogo]);
+		expect((await gitBlob(root, "HEAD:big.txt")).toString()).toBe(draftedBig);
+		// The deletion the draft saw stays a deletion; the file recreated afterwards is not committed.
+		expect((await git(root, ["ls-tree", "--name-only", "HEAD"])).trim().split("\n").sort()).toEqual([
+			"big.txt",
+			"logo.bin",
+		]);
+	});
+
+	it("commits an added whole file as captured at draft time", async () => {
+		const { root, journal } = await emptyRepo();
+		await Bun.write(path.join(root, "seed.txt"), "seed\n");
+		await git(root, ["add", "."]);
+		await git(root, ["commit", "-q", "-m", "seed"]);
+
+		await Bun.write(path.join(root, "added.bin"), Buffer.from([0, 1, 2]));
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		draft.take({ path: "added.bin" });
+
+		// The file keeps being edited after the draft captured it.
+		await Bun.write(path.join(root, "added.bin"), Buffer.from([0, 8, 8, 8]));
+
+		const outcome = await commitSelection(
+			draft,
+			{ subject: "feat: asset" },
+			{ journal, agent: { agent: "Main" } },
+		);
+
+		expect(outcome.paths).toEqual(["added.bin"]);
+		expect([...(await gitBlob(root, "HEAD:added.bin"))]).toEqual([0, 1, 2]);
 	});
 });
