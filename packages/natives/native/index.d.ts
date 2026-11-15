@@ -865,6 +865,19 @@ export declare class VcsGitRepo {
   diffText(options: VcsDiffOptions, signal?: unknown | undefined | null): Promise<string>
   /** Render a no-index patch between two filesystem paths. */
   diffNoIndex(left: string, right: string, binary: boolean, signal?: unknown | undefined | null): Promise<string>
+  /**
+   * Render an appliable patch between two content snapshots at
+   * repo-relative `path` (`null` side: path absent). Unlike `diffText`, the
+   * sides are bytes the caller captured — never the live worktree — so a
+   * draft reviewed earlier commits exactly what it showed.
+   */
+  diffSnapshots(path: string, before?: VcsFileSnapshot | undefined | null, after?: VcsFileSnapshot | undefined | null, signal?: unknown | undefined | null): Promise<string>
+  /**
+   * Read a worktree file as it would be committed: clean filters applied
+   * for regular files, raw link target for symlinks. `null` when the path
+   * holds no file or link.
+   */
+  readWorktreeFile(path: string, signal?: unknown | undefined | null): Promise<VcsFileSnapshot | undefined | null>
   /** Changed paths. */
   changedFiles(options: VcsDiffOptions, signal?: unknown | undefined | null): Promise<Array<string>>
   /** Per-file line counts. */
@@ -4285,6 +4298,18 @@ export declare function vcsDiscover(dir: string): VcsRepo | null
  */
 export declare function vcsDiscoverForDisplay(dir: string): VcsRepo | null
 
+/**
+ * A file's contents at a point in time, outside any repository reference.
+ *
+ * The bytes are in their blob form — clean-filtered (`git add` semantics)
+ * for regular files, the raw link target for symlinks — plus the octal git
+ * mode (`100644`, `100755`, `120000`).
+ */
+export interface VcsFileSnapshot {
+  data: Buffer
+  mode: string
+}
+
 /** Clone a Git repository. */
 export declare function vcsGitClone(url: string, target: string, options: VcsCloneOptions, signal?: unknown | undefined | null): Promise<void>
 
@@ -4387,7 +4412,10 @@ export interface VcsStatusSummary {
 /** One blob or symlink of a tree listing. */
 export interface VcsTreeEntry {
   path: string
-  /** Octal git mode as `git ls-tree` prints it: `100644`, `100755`, or `120000`. */
+  /**
+   * Octal git mode as `git ls-tree` prints it: `100644`, `100755`, or
+   * `120000`.
+   */
   mode: string
 }
 

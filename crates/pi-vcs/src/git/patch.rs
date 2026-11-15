@@ -570,8 +570,8 @@ fn parse_file_patch(raw: &str) -> std::result::Result<FilePatch, ApplyFailure> {
 		.ok_or_else(|| ApplyFailure::Invalid("invalid diff header".into()))?;
 	let (old_token, new_token) = split_diff_paths(paths)?;
 	let mut patch = FilePatch {
-		old_path: Some(strip_side_path(old_token, 'a')),
-		new_path: Some(strip_side_path(new_token, 'b')),
+		old_path: Some(strip_side_path(&old_token, 'a')),
+		new_path: Some(strip_side_path(&new_token, 'b')),
 		old_mode: None,
 		new_mode: None,
 		old_oid:  None,
@@ -653,22 +653,108 @@ fn parse_file_patch(raw: &str) -> std::result::Result<FilePatch, ApplyFailure> {
 	Ok(patch)
 }
 
-fn split_diff_paths(paths: &str) -> std::result::Result<(&str, &str), ApplyFailure> {
+fn split_diff_paths(paths: &str) -> std::result::Result<(String, String), ApplyFailure> {
 	if paths.starts_with('"') {
-		return Err(ApplyFailure::Invalid("quoted paths in diff headers are unsupported".into()));
+		// Git C-quotes both paths when either needs it: `"a/na\tme" "b/na\tme"`.
+		return parse_quoted_pair(paths)
+			.ok_or_else(|| ApplyFailure::Invalid("invalid diff paths".into()));
 	}
-	paths
+	// Unquoted names can still contain spaces: `diff --git a/sp ace b/sp ace`
+	// splits at the ` b/` boundary (marker lines then carry a trailing TAB so
+	// the real name survives elsewhere in the patch).
+	for (index, _) in paths.match_indices(" b/") {
+		let old = &paths[..index];
+		if old.strip_prefix("a/") == Some(&paths[index + 3..]) {
+			return Ok((old.to_owned(), paths[index + 3..].to_owned()));
+		}
+	}
+	if let Some(index) = paths.find(" b/") {
+		return Ok((paths[..index].to_owned(), paths[index + 3..].to_owned()));
+	}
+	let (old, new) = paths
 		.split_once(' ')
-		.ok_or_else(|| ApplyFailure::Invalid("invalid diff paths".into()))
+		.ok_or_else(|| ApplyFailure::Invalid("invalid diff paths".into()))?;
+	Ok((old.to_owned(), new.to_owned()))
 }
 
+/// A C-style quoted string at the start of `text` without its quotes: the
+/// decoded bytes lossily converted (git paths are byte strings) and the
+/// index of the character following the closing quote.
+fn unquote_prefix(text: &str) -> Option<(String, usize)> {
+	debug_assert!(text.starts_with('"'));
+	let mut bytes: Vec<u8> = Vec::with_capacity(text.len());
+	let mut chars = text.char_indices();
+	chars.next();
+	while let Some((index, ch)) = chars.next() {
+		match ch {
+			'"' => return Some((String::from_utf8_lossy(&bytes).into_owned(), index + 1)),
+			'\\' => {
+				let (offset, escaped) = chars.next()?;
+				match escaped {
+					'\\' | '"' | 'a' | 'b' | 'f' | 'n' | 'r' | 't' | 'v' => bytes.push(match escaped {
+						'\\' => b'\\',
+						'"' => b'"',
+						'a' => 0x07,
+						'b' => 0x08,
+						'f' => 0x0c,
+						'n' => b'\n',
+						'r' => b'\r',
+						't' => b'\t',
+						_ => 0x0b,
+					}),
+					'0'..='7' => {
+						let mut value = escaped.to_digit(8).unwrap_or_default();
+						for _ in 0..2 {
+							match chars.clone().next() {
+								Some((_, digit @ '0'..='7')) => {
+									chars.next();
+									value = value * 8 + digit.to_digit(8).unwrap_or_default();
+								},
+								_ => break,
+							}
+						}
+						bytes.push(value as u8);
+					},
+					_ => bytes.extend_from_slice(&text.as_bytes()[index..=offset]),
+				}
+			},
+			_ => {
+				let mut encoded = [0_u8; 4];
+				bytes.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
+			},
+		}
+	}
+	None
+}
+
+/// Both members of a `"a/name" "b/name"` quoted pair.
+fn parse_quoted_pair(text: &str) -> Option<(String, String)> {
+	let (old, used) = unquote_prefix(text)?;
+	let rest = &text[used..];
+	let new = rest
+		.strip_prefix(' ')
+		.and_then(unquote_prefix)
+		.map(|(name, _)| name)?;
+	Some((old, new))
+}
+
+/// Decode git's C-style path quoting when present (`"a/caf\303\251.txt"` →
+/// `a/café.txt`); the bytes are lossily decoded because git paths need not be
+/// UTF-8.
 fn unquote_path(path: &str) -> String {
+	if path.starts_with('"')
+		&& let Some((decoded, used)) = unquote_prefix(path)
+		&& used == path.len()
+	{
+		return decoded;
+	}
 	path.trim_matches('"').to_owned()
 }
 
 fn strip_side_path(token: &str, side: char) -> String {
 	let prefix = format!("{side}/");
-	unquote_path(token.strip_prefix(&prefix).unwrap_or(token))
+	let token = unquote_path(token);
+	token.strip_prefix(&prefix).unwrap_or(&token).to_owned()
 }
 
 fn parse_marker_path(value: &str, side: char) -> Option<String> {
@@ -1521,7 +1607,7 @@ fn untracked_worktree_map(
 
 /// Read the worktree entry at repo-relative `rela_path` in its blob form:
 /// symlink targets as-is, regular files through the clean filters.
-fn read_worktree_entry(
+pub(crate) fn read_worktree_entry(
 	repo: &GitRepo,
 	filter: &mut WorktreeFilter<'_>,
 	rela_path: &str,
@@ -2665,6 +2751,38 @@ mod tests {
 		assert!(repository.stash_try_pop(false).expect("pop second"));
 		assert_eq!(git(temp.path(), &["rev-parse", "refs/stash"]), first);
 		assert_eq!(fs::read(temp.path().join("file.txt")).expect("second restored"), b"second\n");
+	}
+
+	/// A name needing git's C-quoting (`café` → `"a/caf\303\251.*"`) appears
+	/// quoted on the `diff --git` and marker lines of every real diff; the
+	/// header reader must hand back the decoded name or the patch lands on
+	/// `caf\303\251.*` literally.
+	#[test]
+	fn patch_applies_to_quoted_paths() {
+		let text = init(&[("café.txt", b"old\n")]);
+		fs::write(text.path().join("café.txt"), b"new\n").expect("edit text");
+		let repository = repo(text.path());
+		let text_patch = repository
+			.diff_text(&DiffOptions::default())
+			.expect("text diff");
+		assert!(text_patch.contains("\"a/caf\\303\\251.txt\""), "{text_patch}");
+		repository
+			.apply_patch(&text_patch, &ApplyOptions { reverse: true, ..ApplyOptions::default() })
+			.expect("reverse text patch");
+		assert_eq!(fs::read(text.path().join("café.txt")).expect("text file"), b"old\n");
+
+		let binary = init(&[("café.bin", b"\x00\x01")]);
+		fs::write(binary.path().join("café.bin"), b"\x02\x03").expect("edit binary");
+		let binary_patch = repo(binary.path())
+			.diff_text(&DiffOptions { binary: true, ..DiffOptions::default() })
+			.expect("binary diff");
+		reset(binary.path());
+		repo(binary.path())
+			.apply_patch(&binary_patch, &ApplyOptions::default())
+			.expect("apply binary patch");
+		assert_eq!(fs::read(binary.path().join("café.bin")).expect("binary file"), b"\x02\x03");
+		// Porcelain quotes the same name git quoted in the patch.
+		assert_eq!(git(binary.path(), &["status", "--porcelain"]), " M \"caf\\303\\251.bin\"\n");
 	}
 
 	/// Superproject tracking gitlink `module` at the first of two module

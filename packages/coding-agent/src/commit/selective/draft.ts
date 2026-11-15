@@ -12,7 +12,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { VcsGitRepo } from "@oh-my-pi/pi-natives";
+import type { VcsFileSnapshot, VcsGitRepo } from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { BINARY_SNIFF_BYTES, isEnoent, isProbablyBinaryHeader } from "@oh-my-pi/pi-utils";
 import { parseDirtyPathsWithStatus } from "../../autoresearch/git";
@@ -41,6 +41,8 @@ import { formatTextPatch } from "./patch";
 const MAX_TEXT_BYTES = 4 * 1024 * 1024;
 /** Git mode of a symlink. */
 const SYMLINK_MODE = "120000";
+/** Git mode of a submodule (gitlink); never a file's content. */
+const GITLINK_MODE = "160000";
 /** Tolerance when matching a file's mtime to a tool call window (event and fs clock skew). */
 const WINDOW_SLACK_MS = 1500;
 /** Concurrent file reads while building a draft. */
@@ -74,8 +76,11 @@ export interface FileState {
 export type SelectedChange =
 	/** HEAD's state (`null`: absent) → the selected state (`null`: deleted). */
 	| { kind: "text"; path: string; before: FileState | null; after: FileState | null }
-	/** Committed as its current worktree state; `added` when HEAD lacks the path. */
-	| { kind: "whole"; path: string; added: boolean };
+	/**
+	 * Committed as the content the draft froze: blob bytes and mode on each side (`null`: absent
+	 * or not a file). Frozen at draft time so edits after the draft cannot leak into the commit.
+	 */
+	| { kind: "whole"; path: string; before: VcsFileSnapshot | null; after: VcsFileSnapshot | null };
 
 /**
  * Why a file has no line attribution and is committed whole: binary, non-UTF-8, or oversized
@@ -101,6 +106,10 @@ interface FileChange {
 	mode: string | null;
 	/** Set exactly when `attribution` is absent: the file selects whole. */
 	whole?: WholeReason;
+	/** HEAD's blob bytes and mode (`null`: absent or not a file), when `whole` is set. */
+	wholeBefore?: VcsFileSnapshot | null;
+	/** The worktree's blob bytes and mode (`null`: deleted), frozen at draft time. */
+	wholeAfter?: VcsFileSnapshot | null;
 	/** Line attribution of the content change. */
 	attribution?: Attribution;
 	classification?: Classification;
@@ -122,6 +131,13 @@ function decodeText(bytes: Uint8Array): string | undefined {
 	} catch {
 		return undefined;
 	}
+}
+
+/** Byte equality of two possibly-absent contents (`null` ↔ `null` is equal). */
+function equalBytes(a: Uint8Array | null, b: Uint8Array | null): boolean {
+	if (a === null || b === null) return a === b;
+	if (a.byteLength !== b.byteLength) return false;
+	return Buffer.isBuffer(a) && Buffer.isBuffer(b) ? a.equals(b) : a.every((byte, index) => byte === b[index]);
 }
 
 function actorName(actor: string): string {
@@ -361,17 +377,21 @@ async function loadFile(
 	windowCall: (ms: number | undefined) => CallRecord | undefined,
 ): Promise<FileChange | "skip" | undefined> {
 	const absolute = path.join(root, file);
-	let workBytes: Uint8Array | null = null;
 	let mtimeMs: number | undefined;
 	let mode: string | null = null;
+	let work: VcsFileSnapshot | null = null;
 	try {
 		const stat = await fs.lstat(absolute);
 		mtimeMs = stat.mtimeMs;
-		if (stat.isSymbolicLink()) mode = SYMLINK_MODE;
-		else if (!stat.isFile()) return "skip";
-		else {
-			mode = stat.mode & 0o111 ? "100755" : "100644";
-			workBytes = await fs.readFile(absolute);
+		if (stat.isFile() || stat.isSymbolicLink()) {
+			// Blob bytes and mode in one read, frozen now: regular files come back
+			// clean-filtered (`git add` semantics, e.g. LFS pointers), symlinks as
+			// their raw link target. The commit later renders these bytes, so
+			// another agent's rewrite cannot leak in.
+			work = (await repo.readWorktreeFile(file)) ?? null;
+			mode = work?.mode ?? null;
+		} else {
+			return "skip";
 		}
 	} catch (error) {
 		if (!isEnoent(error)) throw error;
@@ -385,20 +405,26 @@ async function loadFile(
 		wholeSelected: false,
 		editors: [...new Set(records.map(record => record.agent))],
 	};
+	const headBytes =
+		head.sha && head.mode && head.mode !== GITLINK_MODE ? (await repo.showBlob(`${head.sha}:${file}`)).data : null;
+	const before = headBytes && head.mode ? { data: headBytes, mode: head.mode } : null;
 	const whole = (reason: WholeReason): FileChange => ({
 		...base,
 		head: null,
 		work: null,
 		whole: reason,
+		wholeBefore: before,
+		wholeAfter: work && mode ? { data: work.data, mode } : null,
 		hint: records.length === 0 ? windowCall(mtimeMs) : undefined,
 	});
 	// Symlinks commit as their link target, whole; this also covers a file replaced by a link and back.
 	if (head.mode === SYMLINK_MODE || mode === SYMLINK_MODE) return whole("symlink");
-	const headBytes = head.sha && head.mode ? (await repo.showBlob(`${head.sha}:${file}`)).data : null;
 	const headText = headBytes === null ? null : decodeText(headBytes);
-	const workText = workBytes === null ? null : decodeText(workBytes);
+	const workText = work === null ? null : decodeText(work.data);
+	// Identical content (text or binary) carries no change; only a mode change does.
+	const sameContent = headText === workText && (headText !== undefined || equalBytes(headBytes, work?.data ?? null));
+	if (sameContent) return head.mode === mode ? undefined : whole("mode");
 	if (headText === undefined || workText === undefined) return whole("content");
-	if (headText === workText) return head.mode === mode ? undefined : whole("mode");
 	const headLines = toLines(headText);
 	const workLines = toLines(workText);
 	const windowAgent = (ms: number | undefined) => windowCall(ms)?.agent;
@@ -509,7 +535,12 @@ export class Draft {
 		const changes: SelectedChange[] = [];
 		for (const file of this.#files) {
 			if (!file.attribution) {
-				if (file.wholeSelected) changes.push({ kind: "whole", path: file.path, added: file.headMode === null });
+				const before = file.wholeBefore ?? null;
+				const after = file.wholeAfter ?? null;
+				const unchanged = equalBytes(before?.data ?? null, after?.data ?? null) && before?.mode === after?.mode;
+				if (file.wholeSelected && !unchanged) {
+					changes.push({ kind: "whole", path: file.path, before, after });
+				}
 				continue;
 			}
 			if (file.selected.size === 0) continue;
@@ -775,7 +806,7 @@ export class Draft {
 		const parts = this.selection().map(change =>
 			change.kind === "text"
 				? formatTextPatch(change.path, change.before, change.after)
-				: `diff --git a/${change.path} b/${change.path}\n(whole-file change committed as in the worktree)\n`,
+				: `diff --git a/${change.path} b/${change.path}\n(whole-file change; the bytes captured at draft time are committed)\n`,
 		);
 		return parts.join("") || "Nothing selected.";
 	}

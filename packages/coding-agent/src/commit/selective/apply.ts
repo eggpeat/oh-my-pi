@@ -64,11 +64,9 @@ function shortSha(sha: string | null): string {
 	return sha?.slice(0, 10) ?? "(no commits yet)";
 }
 
-async function patchFor(repo: VcsGitRepo, head: string | null, change: SelectedChange): Promise<string> {
+async function patchFor(repo: VcsGitRepo, change: SelectedChange): Promise<string> {
 	if (change.kind === "text") return formatTextPatch(change.path, change.before, change.after);
-	return change.added || head === null
-		? repo.diffNoIndex("/dev/null", change.path, true)
-		: repo.diffText({ base: head, files: [change.path], binary: true });
+	return repo.diffSnapshots(change.path, change.before, change.after);
 }
 
 /**
@@ -87,7 +85,7 @@ export async function commitSelection(
 	const repo = vcs.requireGit(draft.root);
 	const patches: Array<{ path: string; patch: string }> = [];
 	for (const change of changes) {
-		const patch = await patchFor(repo, draft.head, change);
+		const patch = await patchFor(repo, change);
 		if (patch) patches.push({ path: change.path, patch });
 	}
 	if (patches.length === 0) throw new Error("The selection matches HEAD; nothing to commit.");

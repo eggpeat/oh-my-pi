@@ -386,3 +386,16 @@ pub struct ShowResult {
 	/// True when the object was larger than the cap and `bytes` is incomplete.
 	pub truncated: bool,
 }
+
+/// Content and mode of a file at a point in time.
+///
+/// The bytes are in their blob form — clean filters applied for regular
+/// files, the raw link target for symlinks — plus the octal git mode
+/// (`100644`, `100755`, `120000`), outside any repository reference.
+#[derive(Debug, Clone)]
+pub struct FileSnapshot {
+	/// Blob bytes for the path.
+	pub data: Vec<u8>,
+	/// Octal git mode as `git ls-tree` prints it.
+	pub mode: String,
+}

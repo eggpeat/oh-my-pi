@@ -17,7 +17,7 @@ use super::{
 };
 use crate::{
 	error::{Error, Result},
-	types::{DiffOptions, NumstatEntry, ShowResult},
+	types::{DiffOptions, FileSnapshot, NumstatEntry, ShowResult},
 };
 
 #[derive(Clone)]
@@ -136,6 +136,50 @@ impl GitRepo {
 			.diff_resource_cache_for_tree_diff()
 			.map_err(|err| Error::backend("git diff --no-index", err))?;
 		render_change(&repo, &mut cache, &change, 3, binary, None).map(|rendered| rendered.text)
+	}
+
+	/// Render an appliable patch turning `before` into `after` at
+	/// repo-relative `path`. Both sides are content snapshots the caller
+	/// captured earlier — blob bytes, never the live worktree — so the patch
+	/// commits exactly what the caller reviewed, not what the file became
+	/// since. `None` means the path is absent on that side.
+	pub fn diff_snapshots(
+		&self,
+		path: &str,
+		before: Option<&FileSnapshot>,
+		after: Option<&FileSnapshot>,
+	) -> Result<String> {
+		let repo = self.gix()?;
+		let (old, new) = (before.and_then(snapshot_mode), after.and_then(snapshot_mode));
+		let write = |snapshot: Option<&FileSnapshot>| {
+			snapshot
+				.map(|side| {
+					repo
+						.write_blob(&side.data)
+						.map(gix::Id::detach)
+						.map_err(|err| Error::backend("git diff snapshots", err))
+				})
+				.transpose()
+		};
+		let (old_id, new_id) = (write(before)?, write(after)?);
+		if old_id == new_id && old == new {
+			return Ok(String::new());
+		}
+		let null = repo.object_hash().null();
+		let change = FileChange {
+			old_path:     path.to_owned(),
+			new_path:     path.to_owned(),
+			old_id:       old_id.unwrap_or(null),
+			new_id:       new_id.unwrap_or(null),
+			old_mode:     old,
+			new_mode:     new,
+			similarity:   None,
+			worktree_new: false,
+		};
+		let mut cache = repo
+			.diff_resource_cache_for_tree_diff()
+			.map_err(|err| Error::backend("git diff snapshots", err))?;
+		render_change(&repo, &mut cache, &change, 3, true, None).map(|rendered| rendered.text)
 	}
 
 	/// Render a commit header and its patch against its first parent.
@@ -740,11 +784,7 @@ fn render_change(
 		.map_err(|err| Error::backend("git diff", err))?;
 
 	let mut text = String::new();
-	text.push_str("diff --git a/");
-	text.push_str(&change.old_path);
-	text.push_str(" b/");
-	text.push_str(&change.new_path);
-	text.push('\n');
+	push_diff_header(&mut text, change);
 	// Callers receive the patch as a `String`, which cannot hold a text hunk of
 	// bytes that are not UTF-8. An appliable (`binary_patch`) render carries
 	// such content as a binary block instead; `git apply` takes either form.
@@ -823,7 +863,8 @@ fn render_change(
 }
 
 fn render_gitlink(change: &FileChange) -> Rendered {
-	let mut text = format!("diff --git a/{} b/{}\n", change.old_path, change.new_path);
+	let mut text = String::new();
+	push_diff_header(&mut text, change);
 	// Gitlinks have no content to score, so only an exact-id rename carries a
 	// meaningful similarity; the "compute later" sentinel has nothing to
 	// compute.
@@ -859,10 +900,10 @@ fn append_metadata(out: &mut String, change: &FileChange, similarity: Option<u8>
 	if let Some(similarity) = similarity {
 		let _ = writeln!(out, "similarity index {similarity}%");
 		out.push_str("rename from ");
-		out.push_str(&change.old_path);
+		push_path_token(out, &change.old_path);
 		out.push('\n');
 		out.push_str("rename to ");
-		out.push_str(&change.new_path);
+		push_path_token(out, &change.new_path);
 		out.push('\n');
 	}
 	match (change.old_mode, change.new_mode) {
@@ -1570,6 +1611,86 @@ fn push_range(out: &mut String, start: u32, len: u32) {
 	}
 }
 
+/// The `diff --git a/old b/new` line: git quotes both names, C-style, as soon
+/// as either needs it (`"a/caf\303\251.bin" "b/caf\303\251.bin"`).
+fn push_diff_header(out: &mut String, change: &FileChange) {
+	out.push_str("diff --git ");
+	let quoted = needs_quote(&change.old_path) || needs_quote(&change.new_path);
+	if quoted {
+		push_quoted_prefixed(out, 'a', &change.old_path);
+		out.push(' ');
+		push_quoted_prefixed(out, 'b', &change.new_path);
+	} else {
+		out.push_str("a/");
+		out.push_str(&change.old_path);
+		out.push_str(" b/");
+		out.push_str(&change.new_path);
+	}
+	out.push('\n');
+}
+
+fn push_quoted_prefixed(out: &mut String, side: char, path: &str) {
+	out.push('"');
+	out.push(side);
+	out.push('/');
+	push_c_escaped(out, path);
+	out.push('"');
+}
+
+/// A `--- ` / `+++ ` path or `rename from`/`rename to` value: quoted when it
+/// needs it, with a trailing TAB on unquoted names containing a space, as
+/// git's `quote_path` emits.
+fn push_path_token(out: &mut String, path: &str) {
+	if needs_quote(path) {
+		out.push('"');
+		push_c_escaped(out, path);
+		out.push('"');
+	} else {
+		out.push_str(path);
+		if path.contains(' ') {
+			out.push('\t');
+		}
+	}
+}
+
+/// True when git would C-quote `path` in a diff header: anything outside
+/// printable ASCII, plus `"` and `\`.
+fn needs_quote(path: &str) -> bool {
+	path
+		.bytes()
+		.any(|byte| !(0x20..0x7f).contains(&byte) || byte == b'"' || byte == b'\\')
+}
+
+fn push_c_escaped(out: &mut String, path: &str) {
+	for byte in path.bytes() {
+		match byte {
+			b'\\' => out.push_str("\\\\"),
+			b'"' => out.push_str("\\\""),
+			0x07 => out.push_str("\\a"),
+			0x08 => out.push_str("\\b"),
+			0x0c => out.push_str("\\f"),
+			b'\n' => out.push_str("\\n"),
+			b'\r' => out.push_str("\\r"),
+			b'\t' => out.push_str("\\t"),
+			0x0b => out.push_str("\\v"),
+			0x20..=0x7e => out.push(char::from(byte)),
+			_ => {
+				let _ = write!(out, "\\{byte:03o}");
+			},
+		}
+	}
+}
+
+/// The tree-entry mode of a snapshot side, or `None` when its mode string
+/// does not name a blob or symlink (callers pre-validate, so a bad mode only
+/// renders the change as absent).
+fn snapshot_mode(snapshot: &FileSnapshot) -> Option<gix::objs::tree::EntryMode> {
+	let bits = u32::from_str_radix(snapshot.mode.trim(), 8).ok()?;
+	gix::objs::tree::EntryMode::try_from(bits)
+		.ok()
+		.filter(gix::objs::tree::EntryMode::is_blob_or_symlink)
+}
+
 fn push_old_path(out: &mut String, change: &FileChange) {
 	if change.old_mode.is_some() {
 		out.push_str("a/");
@@ -2232,5 +2353,94 @@ mod tests {
 			repo.diff_text(&DiffOptions::default()).expect("diff"),
 			git(dir.path(), &["diff", "--no-ext-diff"])
 		);
+	}
+
+	/// The snapshot diff must commit the bytes it was handed — the draft-time
+	/// contents, never the live worktree — for adds, edits, deletes, modes and
+	/// C-quoted names alike. git's own staging of the same end state is the
+	/// oracle for the tree the patch builds in a private index.
+	#[test]
+	fn diff_snapshots_commits_frozen_bytes() {
+		let dir = fixture();
+		let repo = GitRepo::discover(dir.path())
+			.expect("discover")
+			.expect("repository");
+		// The frozen sides are bytes the caller captured earlier; what the
+		// worktree holds now must not matter.
+		fs::write(dir.path().join("file.txt"), b"later bytes").expect("post-draft edit");
+		fs::write(dir.path().join("café.dat"), b"later bytes").expect("post-draft add");
+		let patch = [
+			repo
+				.diff_snapshots(
+					"file.txt",
+					Some(&FileSnapshot {
+						data: b"one\ntwo\nthree\nfour\nfive\nsix\nseven\n".to_vec(),
+						mode: "100644".to_owned(),
+					}),
+					Some(&FileSnapshot { data: b"one\nfrozen\n".to_vec(), mode: "100755".to_owned() }),
+				)
+				.expect("edit patch"),
+			repo
+				.diff_snapshots(
+					"café.dat",
+					None,
+					Some(&FileSnapshot {
+						data: b"\x00frozen\xff\x01".to_vec(),
+						mode: "100644".to_owned(),
+					}),
+				)
+				.expect("add patch"),
+			repo
+				.diff_snapshots(
+					"delete.txt",
+					Some(&FileSnapshot { data: b"delete\n".to_vec(), mode: "100644".to_owned() }),
+					None,
+				)
+				.expect("delete patch"),
+		]
+		.join("");
+		assert!(patch.contains("\"a/caf\\303\\251.dat\""), "{patch}");
+
+		let index = dir.path().join("private.index");
+		repo
+			.read_tree("HEAD", Some(&index))
+			.expect("seed private index");
+		repo
+			.apply_patch(&patch, &ApplyOptions {
+				cached: true,
+				index_path: Some(index.clone()),
+				..ApplyOptions::default()
+			})
+			.expect("apply snapshot patch");
+		// git stages the same end state as the oracle for the tree the patch
+		// built in the private index.
+		fs::write(dir.path().join("file.txt"), b"one\nfrozen\n").expect("oracle bytes");
+		fs::write(dir.path().join("café.dat"), b"\x00frozen\xff\x01").expect("oracle bytes");
+		git(dir.path(), &["add", "-A", "--", "file.txt", "café.dat"]);
+		git(dir.path(), &["update-index", "--chmod=+x", "file.txt"]);
+		git(dir.path(), &["rm", "-q", "--cached", "delete.txt"]);
+		assert_eq!(
+			repo.write_tree(Some(&index)).expect("write private tree"),
+			git(dir.path(), &["write-tree"]).trim()
+		);
+	}
+
+	/// An unchanged snapshot pair renders no patch at all, so joining it into
+	/// a multi-file patch cannot produce a header-only hunk that fails to
+	/// parse or a commit that recreates a file equal to HEAD.
+	#[test]
+	fn diff_snapshots_empty_when_unchanged() {
+		let dir = fixture();
+		let repo = GitRepo::discover(dir.path())
+			.expect("discover")
+			.expect("repository");
+		let side = FileSnapshot { data: b"same\n".to_vec(), mode: "100644".to_owned() };
+		assert_eq!(
+			repo
+				.diff_snapshots("file.txt", Some(&side), Some(&side))
+				.expect("same"),
+			""
+		);
+		assert_eq!(repo.diff_snapshots("file.txt", None, None).expect("absent"), "");
 	}
 }

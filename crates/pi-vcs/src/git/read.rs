@@ -9,13 +9,15 @@ use gix::bstr::ByteSlice;
 
 use super::{
 	GitRepo,
+	filter::WorktreeFilter,
 	open::{load_index_or_empty, status_with_fresh_index},
+	patch::read_worktree_entry,
 };
 use crate::{
 	error::{Error, Result},
 	types::{
-		CommitAuthor, CommitDetails, HeadState, ShowResult, StatusOptions, StatusSummary, TreeEntry,
-		UntrackedMode, WorktreeEntry,
+		CommitAuthor, CommitDetails, FileSnapshot, HeadState, ShowResult, StatusOptions,
+		StatusSummary, TreeEntry, UntrackedMode, WorktreeEntry,
 	},
 };
 
@@ -966,6 +968,22 @@ impl GitRepo {
 		))
 	}
 
+	/// Read the worktree file at repo-relative `rela_path` as it would be
+	/// committed: regular files pass through the clean filters (`git add`
+	/// semantics, so LFS payloads arrive as pointers), symlinks arrive as
+	/// their raw link target. `None` when the path holds no file or link —
+	/// absent, or a directory/gitlink.
+	pub fn read_worktree_file(&self, rela_path: &str) -> Result<Option<FileSnapshot>> {
+		let repo = self.gix()?;
+		let mut filter = WorktreeFilter::staging(&repo, "git read worktree file")?;
+		let Some((data, mode)) =
+			read_worktree_entry(self, &mut filter, rela_path, gix::index::entry::Mode::FILE)?
+		else {
+			return Ok(None);
+		};
+		Ok(Some(FileSnapshot { data, mode: format!("{:o}", mode.bits()) }))
+	}
+
 	/// Resolve Git LFS's local object directory.
 	pub fn lfs_media_dir(&self) -> Result<Option<PathBuf>> {
 		let base = self.info().common_dir.clone();
@@ -1785,6 +1803,43 @@ mod tests {
 		// resolved locations rather than spellings.
 		assert_eq!(worktrees[1].path.canonicalize()?, linked.canonicalize()?);
 		assert_eq!(worktrees[1].branch.as_deref(), Some("refs/heads/linked-branch"));
+		Ok(())
+	}
+
+	/// A `filter=` driver's clean command must run for the stored snapshot:
+	/// staging raw worktree bytes would commit the payload Git never stores
+	/// (the equivalent of LFS data instead of its pointer). `tr` is a stable,
+	/// dependency-free clean command on Unix.
+	#[cfg(unix)]
+	#[test]
+	fn read_worktree_file_returns_clean_filtered_blob() -> TestResult {
+		let (dir, repo) = repo()?;
+		fs::write(dir.path().join(".gitattributes"), "*.bin filter=upcase\n")?;
+		git(dir.path(), &["config", "filter.upcase.clean", "tr a-z A-Z"])?;
+		fs::write(dir.path().join("blob.bin"), b"\x00payload")?;
+		let file = repo
+			.read_worktree_file("blob.bin")?
+			.ok_or("blob.bin is a file")?;
+		assert_eq!(file.data, b"\x00PAYLOAD");
+		assert_eq!(file.mode, "100644");
+		// Missing and directory paths report no file instead of erroring.
+		assert!(repo.read_worktree_file("missing.bin")?.is_none());
+		fs::create_dir(dir.path().join("dir.bin"))?;
+		assert!(repo.read_worktree_file("dir.bin")?.is_none());
+		Ok(())
+	}
+
+	/// Symlinks read as their link target bytes with mode `120000`.
+	#[cfg(unix)]
+	#[test]
+	fn read_worktree_file_reads_symlink_target() -> TestResult {
+		let (dir, repo) = repo()?;
+		std::os::unix::fs::symlink("else/where.txt", dir.path().join("link"))?;
+		let file = repo
+			.read_worktree_file("link")?
+			.ok_or("link is a symlink")?;
+		assert_eq!(file.data, b"else/where.txt");
+		assert_eq!(file.mode, "120000");
 		Ok(())
 	}
 }

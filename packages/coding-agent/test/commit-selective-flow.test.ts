@@ -25,6 +25,18 @@ async function git(cwd: string, args: string[]): Promise<string> {
 	return out;
 }
 
+async function gitBytes(cwd: string, args: string[]): Promise<Buffer> {
+	const env = { ...process.env, HOME: cwd, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+	const proc = Bun.spawn(["git", "-C", cwd, ...args], { env, stdout: "pipe", stderr: "pipe" });
+	const [out, err, code] = await Promise.all([
+		new Response(proc.stdout).arrayBuffer(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	if (code !== 0) throw new Error(`git ${args.join(" ")} failed (${code}): ${err}`);
+	return Buffer.from(out);
+}
+
 const CHANGELOG = "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- Fixed an old bug\n";
 
 /** Repository without commits, and a writer that edits files the way agent edit tools do: journaled. */
@@ -202,5 +214,65 @@ describe("selective commit flow", () => {
 		await expect(
 			commitSelection(draft, { subject: "fix: a" }, { journal, agent: { agent: "Main" } }),
 		).rejects.toThrow(/HEAD moved .* changed a\.ts/);
+	});
+
+	it("commits whole files as the draft captured them, not as edited afterwards", async () => {
+		const { root, journal } = await emptyRepo();
+		const bigBefore = Buffer.concat([Buffer.alloc(4 * 1024 * 1024 + 1, "x"), Buffer.from("\n")]);
+		await Bun.write(path.join(root, "big.txt"), bigBefore);
+		await Bun.write(path.join(root, "café.bin"), Buffer.from([0x00, 0x01]));
+		await git(root, ["add", "."]);
+		await git(root, ["commit", "-q", "-m", "seed"]);
+
+		const newBefore = Buffer.from([0x02, 0x00, 0xff]);
+		await Bun.write(path.join(root, "café.bin"), Buffer.from([0x00, 0x02]));
+		await Bun.write(path.join(root, "new.bin"), newBefore);
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		draft.take({ path: "**" });
+
+		// Another agent or process rewrites every selected path before commit.
+		await Bun.write(path.join(root, "big.txt"), "later\n");
+		await Bun.write(path.join(root, "café.bin"), Buffer.from([0x00, 0x03]));
+		await Bun.write(path.join(root, "new.bin"), Buffer.from([0x99]));
+		await commitSelection(draft, { subject: "chore: freeze" }, { journal, agent: { agent: "Main" } });
+
+		expect(await gitBytes(root, ["show", "HEAD:big.txt"])).toEqual(bigBefore);
+		expect(await gitBytes(root, ["show", "HEAD:café.bin"])).toEqual(Buffer.from([0x00, 0x02]));
+		expect(await gitBytes(root, ["show", "HEAD:new.bin"])).toEqual(newBefore);
+	});
+
+	it("commits a whole file's clean-filtered bytes, like git add does", async () => {
+		if (process.platform === "win32") return; // needs `tr` as a clean command
+		const { root, journal } = await emptyRepo();
+		await Bun.write(path.join(root, ".gitattributes"), "*.bin filter=upcase\n");
+		await git(root, ["config", "filter.upcase.clean", "tr a-z A-Z"]);
+		await Bun.write(path.join(root, "payload.bin"), Buffer.from("\x00tracked"));
+		await git(root, ["add", "."]);
+		await git(root, ["commit", "-q", "-m", "seed"]);
+
+		await Bun.write(path.join(root, "payload.bin"), Buffer.from("\x00changed"));
+		await Bun.write(path.join(root, "fresh.bin"), Buffer.from("\x00fresh"));
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		draft.take({ path: "**" });
+		await commitSelection(draft, { subject: "chore: filtered" }, { journal, agent: { agent: "Main" } });
+
+		// Staging raw bytes would commit the payload, not the filter's output.
+		expect(await gitBytes(root, ["show", "HEAD:payload.bin"])).toEqual(Buffer.from("\x00CHANGED"));
+		expect(await gitBytes(root, ["show", "HEAD:fresh.bin"])).toEqual(Buffer.from("\x00FRESH"));
+	});
+
+	it("commits a symlink's draft-time target", async () => {
+		if (process.platform === "win32") return; // symlinks need privileges git for windows may not grant
+		const { root, journal } = await emptyRepo();
+		await fs.symlink("first.txt", path.join(root, "link"));
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		draft.take({ path: "**" });
+
+		await fs.rm(path.join(root, "link"));
+		await fs.symlink("second.txt", path.join(root, "link"));
+		await commitSelection(draft, { subject: "chore: link" }, { journal, agent: { agent: "Main" } });
+
+		expect(await git(root, ["show", "HEAD:link"])).toBe("first.txt");
+		expect((await git(root, ["ls-tree", "HEAD", "link"])).trim().split(" ")[0]).toBe("120000");
 	});
 });

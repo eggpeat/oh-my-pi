@@ -175,6 +175,28 @@ pub struct VcsShowResult {
 	pub data:      Buffer,
 	pub truncated: bool,
 }
+
+/// A file's contents at a point in time, outside any repository reference.
+///
+/// The bytes are in their blob form — clean-filtered (`git add` semantics)
+/// for regular files, the raw link target for symlinks — plus the octal git
+/// mode (`100644`, `100755`, `120000`).
+#[napi(object)]
+pub struct VcsFileSnapshot {
+	pub data: Buffer,
+	pub mode: String,
+}
+impl From<VcsFileSnapshot> for core::FileSnapshot {
+	fn from(v: VcsFileSnapshot) -> Self {
+		Self { data: v.data.to_vec(), mode: v.mode }
+	}
+}
+impl From<core::FileSnapshot> for VcsFileSnapshot {
+	fn from(v: core::FileSnapshot) -> Self {
+		Self { data: v.data.into(), mode: v.mode }
+	}
+}
+
 /// Diff generation options.
 #[napi(object)]
 #[derive(Default)]
@@ -1093,6 +1115,39 @@ impl VcsGitRepo {
 	) -> Promise<String> {
 		blocking("vcs.diffNoIndex", self.inner.clone(), signal, move |repo| {
 			repo.diff_no_index(Path::new(&left), Path::new(&right), binary)
+		})
+	}
+
+	/// Render an appliable patch between two content snapshots at
+	/// repo-relative `path` (`null` side: path absent). Unlike `diffText`, the
+	/// sides are bytes the caller captured — never the live worktree — so a
+	/// draft reviewed earlier commits exactly what it showed.
+	#[napi]
+	pub fn diff_snapshots(
+		&self,
+		path: String,
+		before: Option<VcsFileSnapshot>,
+		after: Option<VcsFileSnapshot>,
+		signal: Option<Unknown>,
+	) -> Promise<String> {
+		let before = before.map(Into::into);
+		let after = after.map(Into::into);
+		blocking("vcs.diffSnapshots", self.inner.clone(), signal, move |r| {
+			r.diff_snapshots(&path, before.as_ref(), after.as_ref())
+		})
+	}
+
+	/// Read a worktree file as it would be committed: clean filters applied
+	/// for regular files, raw link target for symlinks. `null` when the path
+	/// holds no file or link.
+	#[napi]
+	pub fn read_worktree_file(
+		&self,
+		path: String,
+		signal: Option<Unknown>,
+	) -> Promise<Option<VcsFileSnapshot>> {
+		blocking("vcs.readWorktreeFile", self.inner.clone(), signal, move |r| {
+			r.read_worktree_file(&path).map(|v| v.map(Into::into))
 		})
 	}
 
