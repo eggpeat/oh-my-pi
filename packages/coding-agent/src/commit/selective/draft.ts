@@ -555,10 +555,10 @@ export class Draft {
 		if (target.units?.length && target.path === undefined) throw new Error("Units need a path.");
 		const files = target.path === undefined ? this.#files : this.#match(target.path);
 		const pattern = target.grep === undefined ? undefined : new RegExp(target.grep);
-		// Validate every file before mutating, so an unknown unit rejects the whole call.
-		const planned = files.map(file => ({ file, ops: this.#targetOps(file, target.units, pattern) }));
+		for (const file of files) this.#targetOps(file, target.units, pattern);
 		let touched = 0;
-		for (const { file, ops } of planned) {
+		for (const file of files) {
+			const ops = this.#targetOps(file, target.units, pattern);
 			if (ops === "whole") {
 				if (file.wholeSelected !== take) touched++;
 				file.wholeSelected = take;
@@ -571,7 +571,7 @@ export class Draft {
 				touched++;
 			}
 		}
-		if (pattern && touched === 0 && planned.every(({ ops }) => ops === "whole")) {
+		if (pattern && touched === 0 && !files.some(file => this.#targetOps(file, target.units, pattern) !== "whole")) {
 			throw new Error(`No change line matches /${target.grep}/.`);
 		}
 		return `${take ? "Selected" : "Deselected"} ${touched} change line(s).`;
@@ -594,15 +594,15 @@ export class Draft {
 		const wanted = units?.length ? units : undefined;
 		const known = new Set<string>();
 		hunks.forEach((hunk, hunkIndex) => {
-			const hunkId = String(hunkIndex + 1);
-			known.add(hunkId);
-			for (const [unitIndex, unitOps] of [...hunkUnits(hunk).values()].entries()) {
-				const id = `${hunkId}${unitLetter(unitIndex)}`;
+			known.add(String(hunkIndex + 1));
+			const units = [...hunkUnits(hunk).values()];
+			units.forEach((unitOps, unitIndex) => {
+				const id = `${hunkIndex + 1}${unitLetter(unitIndex)}`;
 				known.add(id);
-				if (wanted && !wanted.includes(hunkId) && !wanted.includes(id)) continue;
-				if (pattern && !unitOps.some(op => pattern.test(op.text))) continue;
+				if (wanted && !wanted.includes(String(hunkIndex + 1)) && !wanted.includes(id)) return;
+				if (pattern && !unitOps.some(op => pattern.test(op.text))) return;
 				ops.push(...unitOps);
-			}
+			});
 		});
 		if (wanted) {
 			for (const unit of wanted) {
