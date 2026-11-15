@@ -463,7 +463,12 @@ import {
 	type SessionAdvisorsHost,
 } from "./session-advisors";
 import type { SessionContext, TranscriptSessionContextOptions } from "./session-context";
-import { buildSessionContext, getRestorableSessionModels, isTranscriptEntry } from "./session-context";
+import {
+	buildSessionContext,
+	getRestorableSessionModels,
+	isTranscriptEntry,
+	sessionBranchHasSavedThinkingEntry,
+} from "./session-context";
 import {
 	type CacheRefreshOutcome,
 	type CacheWarmer,
@@ -14322,7 +14327,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				}
 			}
 
-			const hasThinkingEntry = this.sessionManager.getBranch().some(entry => entry.type === "thinking_level_change");
+			// A retry-fallback hop's own entry is not a saved selector when nothing
+			// was recorded before that hop; the configured default applies instead.
+			const hasThinkingEntry = sessionBranchHasSavedThinkingEntry(this.sessionManager.getBranch());
 			const hasServiceTierEntry = this.sessionManager
 				.getBranch()
 				.some(entry => entry.type === "service_tier_change");
