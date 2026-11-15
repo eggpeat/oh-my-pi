@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Antigravity CLI requests failing with a credential staging error when two sessions for the same account prepare sign-in at the same time ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat)).
+
 ## [18.20.2] - 2026-11-14
 
 ### Added
