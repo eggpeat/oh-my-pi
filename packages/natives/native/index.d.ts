@@ -878,6 +878,12 @@ export declare class VcsGitRepo {
    * holds no file or link.
    */
   readWorktreeFile(path: string, signal?: unknown | undefined | null): Promise<VcsFileSnapshot | undefined | null>
+  /**
+   * Convert worktree bytes at repo-relative `path` to the blob Git would
+   * store. Clean filters, `core.autocrlf`, and `text`/`eol` attributes run
+   * as they do for `git add`.
+   */
+  cleanWorktreeBytes(path: string, bytes: Buffer, signal?: unknown | undefined | null): Promise<Buffer>
   /** Changed paths. */
   changedFiles(options: VcsDiffOptions, signal?: unknown | undefined | null): Promise<Array<string>>
   /** Per-file line counts. */

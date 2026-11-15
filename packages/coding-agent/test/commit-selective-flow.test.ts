@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { commitSelection } from "@oh-my-pi/pi-coding-agent/commit/selective/apply";
 import { createDraft } from "@oh-my-pi/pi-coding-agent/commit/selective/draft";
 import { ChangeJournal } from "@oh-my-pi/pi-coding-agent/commit/selective/journal";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 const tempDirs: string[] = [];
@@ -274,5 +275,69 @@ describe("selective commit flow", () => {
 
 		expect(await git(root, ["show", "HEAD:link"])).toBe("first.txt");
 		expect((await git(root, ["ls-tree", "HEAD", "link"])).trim().split(" ")[0]).toBe("120000");
+	});
+
+	it("commits a binary edit inside a directory named b without moving the file", async () => {
+		const { root, journal } = await emptyRepo();
+		await fs.mkdir(path.join(root, "b"));
+		await Bun.write(path.join(root, "b/photo.bin"), Buffer.from([0x00, 0x01]));
+		await Bun.write(path.join(root, "photo.bin"), Buffer.from("keep"));
+		await git(root, ["add", "."]);
+		await git(root, ["commit", "-q", "-m", "seed"]);
+		await Bun.write(path.join(root, "b/photo.bin"), Buffer.from([0x00, 0x02]));
+
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		draft.take({ path: "**" });
+		await commitSelection(draft, { subject: "chore: b" }, { journal, agent: { agent: "Main" } });
+
+		expect(await gitBytes(root, ["show", "HEAD:b/photo.bin"])).toEqual(Buffer.from([0x00, 0x02]));
+		expect(await gitBytes(root, ["show", "HEAD:photo.bin"])).toEqual(Buffer.from("keep"));
+	});
+
+	it("applies a rename whose name contains a space to that name", async () => {
+		const { root } = await emptyRepo();
+		await Bun.write(path.join(root, "old name.txt"), "kept\n");
+		await git(root, ["add", "."]);
+		await git(root, ["commit", "-q", "-m", "seed"]);
+		await git(root, ["mv", "old name.txt", "new name.txt"]);
+		const repo = vcs.requireGit(root);
+		const patch = await repo.diffText({ cached: true });
+		expect(patch).toBe(await git(root, ["diff", "--no-ext-diff", "--cached", "--find-renames"]));
+		expect(patch).toContain("rename from old name.txt\n");
+		await git(root, ["reset", "--hard", "-q"]);
+		const tabbed = patch
+			.replace("rename from old name.txt\n", "rename from old name.txt\t\n")
+			.replace("rename to new name.txt\n", "rename to new name.txt\t\n");
+		await repo.applyPatch(tabbed, { cached: true });
+		expect(await git(root, ["ls-files"])).toBe("new name.txt\n");
+	});
+
+	it("selects an agent's CRLF write as their own lines", async () => {
+		const { root, journal, write } = await emptyRepo();
+		await git(root, ["config", "core.autocrlf", "true"]);
+		await write("Main", undefined, "a.ts", "export const a = 1;\r\n");
+		await journal.flush();
+
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		expect(draft.summary()).toContain("✓ a.ts  +1  [Main]");
+		const outcome = await commitSelection(draft, { subject: "feat: a" }, { journal, agent: { agent: "Main" } });
+		expect(outcome.paths).toEqual(["a.ts"]);
+		expect(await gitBytes(root, ["show", "HEAD:a.ts"])).toEqual(Buffer.from("export const a = 1;\n"));
+	});
+
+	it("selects an agent's text edit after a clean filter rewrites it", async () => {
+		if (process.platform === "win32") return; // needs `tr` as a clean command
+		const { root, journal, write } = await emptyRepo();
+		await Bun.write(path.join(root, ".gitattributes"), "notes.txt filter=upcase\n");
+		await git(root, ["add", ".gitattributes"]);
+		await git(root, ["commit", "-q", "-m", "attrs"]);
+		await git(root, ["config", "filter.upcase.clean", "tr a-z A-Z"]);
+		await write("Main", undefined, "notes.txt", "hello\n");
+		await journal.flush();
+
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		expect(draft.summary()).toContain("✓ notes.txt  +1  [Main]");
+		await commitSelection(draft, { subject: "docs: notes" }, { journal, agent: { agent: "Main" } });
+		expect(await git(root, ["show", "HEAD:notes.txt"])).toBe("HELLO\n");
 	});
 });

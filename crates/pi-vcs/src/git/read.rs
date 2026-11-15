@@ -984,6 +984,16 @@ impl GitRepo {
 		Ok(Some(FileSnapshot { data, mode: format!("{:o}", mode.bits()) }))
 	}
 
+	/// Convert worktree `bytes` for repo-relative `rela_path` to the blob Git
+	/// would store (`git add` semantics: clean filters, `core.autocrlf`,
+	/// `text`/`eol`). Callers use this to compare a saved edit, which is raw
+	/// worktree text, with a snapshot already in stored form.
+	pub fn clean_worktree_bytes(&self, rela_path: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+		let repo = self.gix()?;
+		let mut filter = WorktreeFilter::staging(&repo, "git clean worktree bytes")?;
+		filter.worktree_to_git(rela_path, bytes.to_vec())
+	}
+
 	/// Resolve Git LFS's local object directory.
 	pub fn lfs_media_dir(&self) -> Result<Option<PathBuf>> {
 		let base = self.info().common_dir.clone();

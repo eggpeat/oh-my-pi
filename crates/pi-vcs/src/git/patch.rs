@@ -594,9 +594,9 @@ fn parse_file_patch(raw: &str) -> std::result::Result<FilePatch, ApplyFailure> {
 			patch.new_path = None;
 			patch.old_mode = parse_mode(value);
 		} else if let Some(value) = line.strip_prefix("rename from ") {
-			patch.old_path = Some(unquote_path(value));
+			patch.old_path = Some(parse_rename_path(value));
 		} else if let Some(value) = line.strip_prefix("rename to ") {
-			patch.new_path = Some(unquote_path(value));
+			patch.new_path = Some(parse_rename_path(value));
 		} else if let Some(value) = line.strip_prefix("index ") {
 			let ids = value.split_whitespace().next().unwrap_or_default();
 			if let Some((old, new)) = ids.split_once("..") {
@@ -659,17 +659,18 @@ fn split_diff_paths(paths: &str) -> std::result::Result<(String, String), ApplyF
 		return parse_quoted_pair(paths)
 			.ok_or_else(|| ApplyFailure::Invalid("invalid diff paths".into()));
 	}
-	// Unquoted names can still contain spaces: `diff --git a/sp ace b/sp ace`
-	// splits at the ` b/` boundary (marker lines then carry a trailing TAB so
-	// the real name survives elsewhere in the patch).
+	// Unquoted names can contain spaces: `diff --git a/sp ace b/sp ace`.
+	// Split at the ` b/` marker, but keep both side prefixes. `strip_side_path`
+	// removes `a/` and `b/` once; stripping `b/` here too would turn a file
+	// inside a directory named `b` (`b/photo.bin`) into `photo.bin`.
 	for (index, _) in paths.match_indices(" b/") {
 		let old = &paths[..index];
 		if old.strip_prefix("a/") == Some(&paths[index + 3..]) {
-			return Ok((old.to_owned(), paths[index + 3..].to_owned()));
+			return Ok((old.to_owned(), paths[index + 1..].to_owned()));
 		}
 	}
 	if let Some(index) = paths.find(" b/") {
-		return Ok((paths[..index].to_owned(), paths[index + 3..].to_owned()));
+		return Ok((paths[..index].to_owned(), paths[index + 1..].to_owned()));
 	}
 	let (old, new) = paths
 		.split_once(' ')
@@ -755,6 +756,12 @@ fn strip_side_path(token: &str, side: char) -> String {
 	let prefix = format!("{side}/");
 	let token = unquote_path(token);
 	token.strip_prefix(&prefix).unwrap_or(&token).to_owned()
+}
+
+/// A `rename from` / `rename to` value. Drop a trailing TAB (the separator
+/// `---` lines use, never part of the name) and decode C-quoting.
+fn parse_rename_path(value: &str) -> String {
+	unquote_path(value.split('\t').next().unwrap_or(value))
 }
 
 fn parse_marker_path(value: &str, side: char) -> Option<String> {
@@ -2783,6 +2790,63 @@ mod tests {
 		assert_eq!(fs::read(binary.path().join("café.bin")).expect("binary file"), b"\x02\x03");
 		// Porcelain quotes the same name git quoted in the patch.
 		assert_eq!(git(binary.path(), &["status", "--porcelain"]), " M \"caf\\303\\251.bin\"\n");
+	}
+
+	/// A directory named `b` shares the header's new-side marker. Stripping
+	/// that marker twice turns a binary edit or a mode change of `b/photo.bin`
+	/// into a move onto `photo.bin`.
+	#[test]
+	fn patch_keeps_files_inside_directory_named_b() {
+		let binary = init(&[("b/photo.bin", b"\x00\x01"), ("photo.bin", b"keep\n")]);
+		fs::write(binary.path().join("b/photo.bin"), b"\x00\x02").expect("edit binary");
+		let patch = repo(binary.path())
+			.diff_text(&DiffOptions { binary: true, ..DiffOptions::default() })
+			.expect("binary diff");
+		assert!(patch.contains("b/b/photo.bin"), "{patch}");
+		reset(binary.path());
+		repo(binary.path())
+			.apply_patch(&patch, &ApplyOptions::default())
+			.expect("apply binary edit");
+		assert_eq!(fs::read(binary.path().join("b/photo.bin")).expect("edited"), b"\x00\x02");
+		assert_eq!(fs::read(binary.path().join("photo.bin")).expect("untouched"), b"keep\n");
+
+		let mode = init(&[("b/photo.bin", b"\x00\x01"), ("photo.bin", b"keep\n")]);
+		git(mode.path(), &["update-index", "--chmod=+x", "--", "b/photo.bin"]);
+		let mode_patch = repo(mode.path())
+			.diff_text(&DiffOptions { cached: true, ..DiffOptions::default() })
+			.expect("mode diff");
+		assert!(mode_patch.contains("old mode "), "{mode_patch}");
+		assert!(!mode_patch.contains("+++ "), "{mode_patch}");
+		git(mode.path(), &["reset", "--hard", "-q"]);
+		repo(mode.path())
+			.apply_patch(&mode_patch, &ApplyOptions { cached: true, ..ApplyOptions::default() })
+			.expect("apply mode change");
+		assert!(git(mode.path(), &["ls-files", "--stage", "b/photo.bin"]).contains("100755"));
+		assert_eq!(fs::read(mode.path().join("photo.bin")).expect("untouched"), b"keep\n");
+	}
+
+	/// Git leaves a space unquoted on `rename from` / `rename to` and does not
+	/// append the TAB that `---` lines use. A reader that keeps that TAB looks
+	/// up `old name.txt\t`, which does not exist.
+	#[test]
+	fn rename_with_spaces_applies_to_the_real_name() {
+		let dir = init(&[("old name.txt", b"kept\n")]);
+		git(dir.path(), &["mv", "old name.txt", "new name.txt"]);
+		let repository = repo(dir.path());
+		let patch = repository
+			.diff_text(&DiffOptions { cached: true, ..DiffOptions::default() })
+			.expect("rename diff");
+		assert_eq!(patch, git(dir.path(), &["diff", "--no-ext-diff", "--cached", "--find-renames"]));
+		assert!(patch.contains("rename from old name.txt\n"), "{patch}");
+		assert!(patch.contains("rename to new name.txt\n"), "{patch}");
+		git(dir.path(), &["reset", "--hard", "-q"]);
+		let tabbed = patch
+			.replace("rename from old name.txt\n", "rename from old name.txt\t\n")
+			.replace("rename to new name.txt\n", "rename to new name.txt\t\n");
+		repository
+			.apply_patch(&tabbed, &ApplyOptions { cached: true, ..ApplyOptions::default() })
+			.expect("apply tabbed rename");
+		assert_eq!(git(dir.path(), &["ls-files"]), "new name.txt\n");
 	}
 
 	/// Superproject tracking gitlink `module` at the first of two module

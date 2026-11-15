@@ -4,11 +4,11 @@
 
 ### Added
 
-- Added `VcsGitRepo.readWorktreeFile()` to read a file in its committed form (clean filters applied, symlink target for links) and `VcsGitRepo.diffSnapshots()` to render an appliable patch between two captured content snapshots ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat)).
+- Added `VcsGitRepo.readWorktreeFile()` to read a file in its committed form (clean filters applied, symlink target for links), `VcsGitRepo.cleanWorktreeBytes()` to convert saved worktree text to that form, and `VcsGitRepo.diffSnapshots()` to render an appliable patch between two captured content snapshots ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat)).
 
 ### Fixed
 
-- Fixed patch application for files whose names need Git's C-style quoting (for example `café.bin`), which previously failed or created a wrongly named file ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat)).
+- Fixed patch application for quoted names (for example `café.bin`), for a file inside a directory named `b`, and for a rename whose name contains a space, which previously failed or landed on the wrong path ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat)).
 
 ## [18.20.1] - 2026-11-14
 

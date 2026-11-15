@@ -1151,6 +1151,22 @@ impl VcsGitRepo {
 		})
 	}
 
+	/// Convert worktree bytes at repo-relative `path` to the blob Git would
+	/// store. Clean filters, `core.autocrlf`, and `text`/`eol` attributes run
+	/// as they do for `git add`.
+	#[napi]
+	pub fn clean_worktree_bytes(
+		&self,
+		path: String,
+		bytes: Buffer,
+		signal: Option<Unknown>,
+	) -> Promise<Buffer> {
+		let bytes = bytes.to_vec();
+		blocking("vcs.cleanWorktreeBytes", self.inner.clone(), signal, move |r| {
+			r.clean_worktree_bytes(&path, &bytes).map(Buffer::from)
+		})
+	}
+
 	/// Changed paths.
 	#[napi]
 	pub fn changed_files(

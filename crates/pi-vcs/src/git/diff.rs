@@ -1637,9 +1637,9 @@ fn push_quoted_prefixed(out: &mut String, side: char, path: &str) {
 	out.push('"');
 }
 
-/// A `--- ` / `+++ ` path or `rename from`/`rename to` value: quoted when it
-/// needs it, with a trailing TAB on unquoted names containing a space, as
-/// git's `quote_path` emits.
+/// A `rename from` / `rename to` value. Quote only when git would. A space
+/// stays literal and gets no trailing TAB: that TAB is a separator on `---` /
+/// `+++` lines, and on a rename line it would be kept as part of the name.
 fn push_path_token(out: &mut String, path: &str) {
 	if needs_quote(path) {
 		out.push('"');
@@ -1647,9 +1647,6 @@ fn push_path_token(out: &mut String, path: &str) {
 		out.push('"');
 	} else {
 		out.push_str(path);
-		if path.contains(' ') {
-			out.push('\t');
-		}
 	}
 }
 

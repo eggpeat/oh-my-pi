@@ -233,6 +233,8 @@ function resolveScope(spec: ScopeSpec, caller: string, parents: Map<string, stri
 
 /** Recorded edit history of one file, as consecutive content snapshots; `undefined` when unusable. */
 async function loadEdits(
+	repo: VcsGitRepo,
+	file: string,
 	journal: ChangeJournal,
 	records: readonly ChangeRecord[],
 	windowAgent: (ms: number | undefined) => string | undefined,
@@ -245,12 +247,23 @@ async function loadEdits(
 		if (before === undefined || after === undefined) return undefined;
 		edits.push({
 			actor: record.agent,
-			before: toLines(before),
-			after: toLines(after),
+			before: toLines(await storedText(repo, file, before)),
+			after: toLines(await storedText(repo, file, after)),
 			gapHint: edits.length > 0 ? windowAgent(record.beforeMtimeMs) : undefined,
 		});
 	}
 	return edits;
+}
+
+/**
+ * Journal snapshots are the raw worktree text the agent wrote. Head and work are already the
+ * blob Git would store, so a CRLF write under `core.autocrlf` (or any other clean filter) would
+ * otherwise look like a later rewrite by someone else and leave the agent's lines unselected.
+ */
+async function storedText(repo: VcsGitRepo, file: string, text: string | null): Promise<string | null> {
+	if (text === null) return null;
+	const cleaned = await repo.cleanWorktreeBytes(file, Buffer.from(text, "utf8"));
+	return decodeText(cleaned) ?? text;
 }
 
 /**
@@ -428,7 +441,7 @@ async function loadFile(
 	const headLines = toLines(headText);
 	const workLines = toLines(workText);
 	const windowAgent = (ms: number | undefined) => windowCall(ms)?.agent;
-	const edits = journal && records.length > 0 ? await loadEdits(journal, records, windowAgent) : undefined;
+	const edits = journal && records.length > 0 ? await loadEdits(repo, file, journal, records, windowAgent) : undefined;
 	const steps = historySteps(headLines, edits ?? [], workLines, windowAgent(mtimeMs));
 	return {
 		...base,
