@@ -36,7 +36,6 @@ export interface CommitRequest {
 /** Result of {@link commitSelection}. */
 export interface CommitOutcome {
 	sha: string;
-	/** First line of the message stored on the commit. A `commit-msg` hook may have rewritten it. */
 	subject: string;
 	/** Repo-relative paths the commit changed. */
 	paths: string[];
