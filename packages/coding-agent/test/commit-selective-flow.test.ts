@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { VcsGitRepo } from "@oh-my-pi/pi-natives";
 import { commitSelection } from "@oh-my-pi/pi-coding-agent/commit/selective/apply";
 import { createDraft } from "@oh-my-pi/pi-coding-agent/commit/selective/draft";
 import { ChangeJournal } from "@oh-my-pi/pi-coding-agent/commit/selective/journal";
@@ -220,6 +221,17 @@ describe("selective commit flow", () => {
 		const lock = path.join(root, ".git", "index.lock");
 		await Bun.write(lock, "");
 		const controller = new AbortController();
+		const realReadTree = VcsGitRepo.prototype.readTree;
+		let seeds = 0;
+		vi.spyOn(VcsGitRepo.prototype, "readTree").mockImplementation(function (
+			this: VcsGitRepo,
+			treeish: string,
+			indexPath?: string | null,
+			readSignal?: unknown,
+		) {
+			seeds++;
+			return realReadTree.call(this, treeish, indexPath, readSignal);
+		});
 		let pauses = 0;
 		vi.spyOn(Bun, "sleep").mockImplementation(async () => {
 			pauses++;
@@ -234,6 +246,50 @@ describe("selective commit flow", () => {
 			),
 		).rejects.toThrow(/aborted/i);
 		expect(pauses).toBe(1);
+		expect(seeds).toBe(1);
+		expect((await git(root, ["rev-parse", "HEAD"])).trim()).toMatch(/^[0-9a-f]{40}$/);
+		expect(await git(root, ["ls-tree", "--name-only", "HEAD"])).toBe("first.txt\n");
+		expect(await Bun.file(index).exists()).toBe(false);
+		expect(await Bun.file(path.join(root, "first.txt")).text()).toBe("first\n");
+	});
+
+	it("does not record a commit note when seeding the root index is aborted", async () => {
+		const { root, journal, write } = await emptyRepo();
+		await write("Main", undefined, "first.txt", "first\n");
+		await journal.flush();
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		const index = path.join(root, ".git", "index");
+		await fs.rm(index, { force: true });
+		const lock = path.join(root, ".git", "index.lock");
+		await Bun.write(lock, "");
+		const controller = new AbortController();
+		const realReadTree = VcsGitRepo.prototype.readTree;
+		let seeds = 0;
+		vi.spyOn(VcsGitRepo.prototype, "readTree").mockImplementation(function (
+			this: VcsGitRepo,
+			treeish: string,
+			indexPath?: string | null,
+			readSignal?: unknown,
+		) {
+			seeds++;
+			controller.abort();
+			return realReadTree.call(this, treeish, indexPath, readSignal);
+		});
+		const pauses: number[] = [];
+		vi.spyOn(Bun, "sleep").mockImplementation(async ms => {
+			if (typeof ms !== "number") throw new Error(`expected milliseconds, got ${String(ms)}`);
+			pauses.push(ms);
+		});
+
+		await expect(
+			commitSelection(
+				draft,
+				{ subject: "feat: first" },
+				{ journal, agent: { agent: "Main" }, signal: controller.signal },
+			),
+		).rejects.toThrow(/aborted/i);
+		expect(seeds).toBe(1);
+		expect(pauses).toEqual([]);
 		expect((await git(root, ["rev-parse", "HEAD"])).trim()).toMatch(/^[0-9a-f]{40}$/);
 		expect(await git(root, ["ls-tree", "--name-only", "HEAD"])).toBe("first.txt\n");
 		expect(await Bun.file(index).exists()).toBe(false);
