@@ -46,7 +46,7 @@ async function applyToSharedIndex(repo: VcsGitRepo, patch: string, signal?: Abor
 
 /**
  * Write `treeish` into the missing shared index, retrying while `index.lock` is held.
- * `wrote` is false with no `failure` when the index appears during a wait: it is left as is.
+ * `wrote` is false with no `failure` when the index already exists: it is left as is.
  */
 async function seedSharedIndex(
 	repo: VcsGitRepo,
@@ -54,19 +54,34 @@ async function seedSharedIndex(
 	indexPath: string,
 	signal?: AbortSignal,
 ): Promise<{ wrote: boolean; failure?: string }> {
+	const lockPath = `${indexPath}.lock`;
+	const stagePath = `${indexPath}.omp-seed-${process.pid}-${Math.floor(Math.random() * 46656).toString(36)}`;
 	let failure = "";
 	for (let attempt = 0; attempt < INDEX_WRITE_ATTEMPTS; attempt++) {
 		if (attempt > 0) await Bun.sleep(INDEX_WRITE_BACKOFF_MS << (attempt - 1));
 		signal?.throwIfAborted();
-		// The lock holder may have created the index while this waited. Replacing it would drop
-		// the entries they staged, so the caller patches this commit's paths into it instead.
-		if (await Bun.file(indexPath).exists()) return { wrote: false };
+		let lock: fs.FileHandle | undefined;
+		let ownsLock = false;
 		try {
-			await repo.readTree(treeish, undefined, signal);
+			lock = await fs.open(lockPath, "wx", 0o666);
+			ownsLock = true;
+			// Check under `index.lock` and keep holding it until `rename` installs the seeded
+			// index, so another Git command cannot create `.git/index` in between and lose work.
+			if (await Bun.file(indexPath).exists()) return { wrote: false };
+			await repo.readTree(treeish, stagePath, signal);
+			await lock.writeFile(await fs.readFile(stagePath));
+			await lock.close();
+			lock = undefined;
+			await fs.rename(lockPath, indexPath);
+			ownsLock = false;
 			return { wrote: true };
 		} catch (error) {
 			if (signal?.aborted) signal.throwIfAborted();
 			failure = error instanceof Error ? error.message : String(error);
+		} finally {
+			await lock?.close().catch(() => undefined);
+			await fs.rm(stagePath, { force: true });
+			if (ownsLock) await fs.rm(lockPath, { force: true });
 		}
 	}
 	return { wrote: false, failure };
@@ -216,15 +231,14 @@ export async function commitSelection(
 	// A new repository may have no index file yet. Git reads that as an empty index, but patch
 	// application reads HEAD in its place, so seed it with the root commit's tree instead.
 	const sharedIndex = path.join(repo.info().gitDir, "index");
-	const seedIndex = parent === null && !(await Bun.file(sharedIndex).exists());
-	const seeded = seedIndex ? await seedSharedIndex(repo, sha, sharedIndex, context.signal) : undefined;
+	const seeded = parent === null ? await seedSharedIndex(repo, sha, sharedIndex, context.signal) : undefined;
 	if (seeded?.failure !== undefined) {
 		for (const entry of patches) indexNotes.push(sharedIndexWriteNote(entry.path, seeded.failure));
 	}
 	// One write for every path: each write takes `index.lock`, which a concurrent git (a prompt's
 	// or an editor's `git status`) may hold. Per-path writes only when a path's entry differs.
-	// Seeding either wrote the whole tree or gave up after its own retries. An index that showed
-	// up during the wait is neither, so this commit's paths still have to be patched in.
+	// Seeding either wrote the whole tree or gave up after its own retries. An index that already
+	// existed was left alone, so this commit's paths still have to be patched into it.
 	const synced =
 		seeded?.wrote === true ||
 		seeded?.failure !== undefined ||

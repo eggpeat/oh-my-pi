@@ -172,6 +172,7 @@ describe("selective commit flow", () => {
 		expect((await git(root, ["rev-parse", "HEAD"])).trim()).toBe(outcome.sha);
 		expect(await git(root, ["status", "--porcelain"])).toBe("");
 		expect(await Bun.file(path.join(root, "first.txt")).text()).toBe("first\n");
+		expect((await fs.readdir(path.join(root, ".git"))).filter(name => name.includes("omp-seed"))).toEqual([]);
 		const records = await journal.read();
 		expect(records).toContainEqual(
 			expect.objectContaining({ type: "commit", sha: outcome.sha, paths: ["first.txt"] }),
@@ -209,6 +210,66 @@ describe("selective commit flow", () => {
 		expect(outcome.paths).toEqual(["ours.txt"]);
 		expect(await git(root, ["ls-files"])).toBe("ours.txt\ntheirs.txt\n");
 		expect(await git(root, ["diff", "--cached", "--name-only"])).toBe("theirs.txt\n");
+	});
+
+	it("holds index.lock from the missing-index check through writing the root index", async () => {
+		const { root, journal, write } = await emptyRepo();
+		await write("Main", undefined, "ours.txt", "ours\n");
+		await journal.flush();
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		const index = path.join(root, ".git", "index");
+		await fs.rm(index, { force: true });
+		await Bun.write(path.join(root, "theirs.txt"), "theirs\n");
+		const env = { ...process.env, HOME: root, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+		let blocked = 0;
+		let stagedDuringSeed = false;
+		const tryStageTheirs = async () => {
+			const proc = Bun.spawn(["git", "-C", root, "add", "--", "theirs.txt"], {
+				env,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [err, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+			if (code === 0) {
+				stagedDuringSeed = true;
+				return;
+			}
+			expect(err).toContain("index.lock");
+			blocked++;
+		};
+		const indexFile = Bun.file(index);
+		const realExists = indexFile.exists.bind(indexFile);
+		vi.spyOn(indexFile, "exists").mockImplementation(async () => {
+			const present = await realExists();
+			if (!present) await tryStageTheirs();
+			return present;
+		});
+		const realFile = Bun.file.bind(Bun);
+		vi.spyOn(Bun, "file").mockImplementation((source, options) => {
+			if (source === index) return indexFile;
+			return realFile(source as string, options);
+		});
+		const realReadTree = VcsGitRepo.prototype.readTree;
+		vi.spyOn(VcsGitRepo.prototype, "readTree").mockImplementation(async function (
+			this: VcsGitRepo,
+			treeish: string,
+			indexPath?: string | null,
+			readSignal?: unknown,
+		) {
+			await tryStageTheirs();
+			return realReadTree.call(this, treeish, indexPath, readSignal);
+		});
+
+		const outcome = await commitSelection(draft, { subject: "feat: ours" }, { journal, agent: { agent: "Main" } });
+		if (!stagedDuringSeed) await git(root, ["add", "--", "theirs.txt"]);
+
+		expect(await git(root, ["ls-files"])).toBe("ours.txt\ntheirs.txt\n");
+		expect(await git(root, ["diff", "--cached", "--name-only"])).toBe("theirs.txt\n");
+		expect(stagedDuringSeed).toBe(false);
+		expect(blocked).toBe(2);
+		expect(outcome.parent).toBeNull();
+		expect(outcome.indexNotes).toEqual([]);
+		expect(outcome.paths).toEqual(["ours.txt"]);
 	});
 
 	it("returns the root commit when the shared index stays locked", async () => {
@@ -249,7 +310,7 @@ describe("selective commit flow", () => {
 		]);
 		expect(outcome.indexNotes).toHaveLength(2);
 		const failure = outcome.indexNotes[0]?.match(/could not be written \((.*)\); /)?.[1];
-		expect(failure).toContain("Could not acquire lock");
+		expect(failure).toContain("index.lock");
 		expect(outcome.indexNotes).toEqual([
 			`first.txt: the shared index could not be written (${failure}); \`git diff --cached\` there shows this commit reverted until \`git --literal-pathspecs reset -q -- 'first.txt'\`.`,
 			`second.txt: the shared index could not be written (${failure}); \`git diff --cached\` there shows this commit reverted until \`git --literal-pathspecs reset -q -- 'second.txt'\`.`,
@@ -319,6 +380,7 @@ describe("selective commit flow", () => {
 		let pauses = 0;
 		vi.spyOn(Bun, "sleep").mockImplementation(async () => {
 			pauses++;
+			await fs.rm(lock, { force: true });
 			controller.abort();
 		});
 
@@ -330,7 +392,7 @@ describe("selective commit flow", () => {
 			),
 		).rejects.toThrow(/aborted/i);
 		expect(pauses).toBe(1);
-		expect(seeds).toBe(1);
+		expect(seeds).toBe(0);
 		expect((await git(root, ["rev-parse", "HEAD"])).trim()).toMatch(/^[0-9a-f]{40}$/);
 		expect(await git(root, ["ls-tree", "--name-only", "HEAD"])).toBe("first.txt\n");
 		expect(await Bun.file(index).exists()).toBe(false);
@@ -345,7 +407,6 @@ describe("selective commit flow", () => {
 		const index = path.join(root, ".git", "index");
 		await fs.rm(index, { force: true });
 		const lock = path.join(root, ".git", "index.lock");
-		await Bun.write(lock, "");
 		const controller = new AbortController();
 		const realReadTree = VcsGitRepo.prototype.readTree;
 		let seeds = 0;
@@ -377,6 +438,7 @@ describe("selective commit flow", () => {
 		expect((await git(root, ["rev-parse", "HEAD"])).trim()).toMatch(/^[0-9a-f]{40}$/);
 		expect(await git(root, ["ls-tree", "--name-only", "HEAD"])).toBe("first.txt\n");
 		expect(await Bun.file(index).exists()).toBe(false);
+		expect(await Bun.file(lock).exists()).toBe(false);
 		expect(await Bun.file(path.join(root, "first.txt")).text()).toBe("first\n");
 	});
 

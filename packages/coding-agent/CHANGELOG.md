@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- The first `/commit` in a repository still reports the new commit when another Git command is using the index, keeps the files that command staged if the index appears during the wait, and the refresh command treats a filename with spaces or wildcards as one file, instead of erroring after the commit was already created ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+- The first `/commit` in a repository still reports the new commit when another Git command is using the index, keeps files another command stages if it creates the index first, and the refresh command treats a filename with spaces or wildcards as one file, instead of erroring after the commit was already created ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 
 ## [18.21.0] - 2026-11-16
 
