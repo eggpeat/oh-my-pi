@@ -204,6 +204,12 @@ async function probe<TApi extends Api>(
 		if (baseline?.accepted) {
 			return { checkedAt: Date.now(), format: "none", efforts: [], observed: baseline.observed, attempts };
 		}
+		// Every dialect already run finished as a rejection. A plain check that
+		// never completed is not a refusal, and resending a rejected dialect fails
+		// the turn. The caller does not save this guess.
+		if (!baseline) {
+			return { checkedAt: Date.now(), format: "none", efforts: [], observed: false, attempts };
+		}
 		const fallback = batches[0]?.[0] ?? "openai";
 		return { ...hypothesis(fallback), attempts };
 	};
