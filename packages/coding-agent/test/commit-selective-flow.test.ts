@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,6 +10,7 @@ import { removeWithRetries } from "@oh-my-pi/pi-utils";
 const tempDirs: string[] = [];
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	await Promise.all(tempDirs.splice(0).map(dir => removeWithRetries(dir)));
 });
 
@@ -122,6 +123,121 @@ describe("selective commit flow", () => {
 
 		expect(outcome.indexNotes).toEqual([]);
 		expect((await git(root, ["diff", "--cached", "--name-only"])).trim()).toBe("b.ts");
+	});
+
+	it("seeds a root commit's shared index once another git process lets go of its lock", async () => {
+		const { root, journal, write } = await emptyRepo();
+		await write("Main", undefined, "first.txt", "first\n");
+		await journal.flush();
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		const index = path.join(root, ".git", "index");
+		await fs.rm(index, { force: true });
+		const lock = path.join(root, ".git", "index.lock");
+		await Bun.write(lock, "");
+		// The retry asks to sleep before the next attempt. Release the lock there so the
+		// next attempt is what writes the index, with no dependence on the clock.
+		const delays: number[] = [];
+		vi.spyOn(Bun, "sleep").mockImplementation(async ms => {
+			if (typeof ms !== "number") throw new Error(`expected milliseconds, got ${String(ms)}`);
+			delays.push(ms);
+			await fs.rm(lock, { force: true });
+		});
+
+		const outcome = await commitSelection(draft, { subject: "feat: first" }, { journal, agent: { agent: "Main" } });
+
+		expect(delays).toEqual([40]);
+		expect(outcome.parent).toBeNull();
+		expect(outcome.indexNotes).toEqual([]);
+		expect(outcome.paths).toEqual(["first.txt"]);
+		expect((await git(root, ["rev-parse", "HEAD"])).trim()).toBe(outcome.sha);
+		expect(await git(root, ["status", "--porcelain"])).toBe("");
+		expect(await Bun.file(path.join(root, "first.txt")).text()).toBe("first\n");
+		const records = await journal.read();
+		expect(records).toContainEqual(
+			expect.objectContaining({ type: "commit", sha: outcome.sha, paths: ["first.txt"] }),
+		);
+	});
+
+	it("returns the root commit when the shared index stays locked", async () => {
+		const { root, journal, write } = await emptyRepo();
+		await write("Main", undefined, "first.txt", "first\n");
+		await write("Main", undefined, "second.txt", "second\n");
+		await journal.flush();
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		const index = path.join(root, ".git", "index");
+		await fs.rm(index, { force: true });
+		const lock = path.join(root, ".git", "index.lock");
+		await Bun.write(lock, "");
+		const delays: number[] = [];
+		vi.spyOn(Bun, "sleep").mockImplementation(async ms => {
+			if (typeof ms !== "number") throw new Error(`expected milliseconds, got ${String(ms)}`);
+			delays.push(ms);
+		});
+
+		const outcome = await commitSelection(draft, { subject: "feat: first" }, { journal, agent: { agent: "Main" } });
+
+		expect(delays).toEqual([40, 80, 160, 320]);
+		expect(outcome.parent).toBeNull();
+		expect(outcome.paths).toEqual(["first.txt", "second.txt"]);
+		expect((await git(root, ["rev-parse", "HEAD"])).trim()).toBe(outcome.sha);
+		expect(await git(root, ["ls-tree", "--name-only", "HEAD"])).toBe("first.txt\nsecond.txt\n");
+		expect(await Bun.file(index).exists()).toBe(false);
+		const records = await journal.read();
+		expect(records).toContainEqual(
+			expect.objectContaining({ type: "commit", sha: outcome.sha, paths: ["first.txt", "second.txt"] }),
+		);
+		await fs.rm(lock);
+		expect(await git(root, ["status", "--porcelain"])).toBe(
+			"D  first.txt\nD  second.txt\n?? first.txt\n?? second.txt\n",
+		);
+		expect((await git(root, ["diff", "--cached", "--name-only"])).trim().split("\n").sort()).toEqual([
+			"first.txt",
+			"second.txt",
+		]);
+		expect(outcome.indexNotes).toHaveLength(2);
+		const failure = outcome.indexNotes[0]?.match(/could not be written \((.*)\); /)?.[1];
+		expect(failure).toContain("Could not acquire lock");
+		expect(outcome.indexNotes).toEqual([
+			`first.txt: the shared index could not be written (${failure}); \`git diff --cached\` there shows this commit reverted until \`git reset -q -- first.txt\`.`,
+			`second.txt: the shared index could not be written (${failure}); \`git diff --cached\` there shows this commit reverted until \`git reset -q -- second.txt\`.`,
+		]);
+		for (const note of outcome.indexNotes) {
+			const command = note.match(/until `([^`]+)`\.$/)?.[1];
+			if (command === undefined) throw new Error(`note has no repair command: ${note}`);
+			await git(root, command.slice("git ".length).split(" "));
+		}
+		expect(await git(root, ["status", "--porcelain"])).toBe("");
+		expect(await git(root, ["diff", "HEAD"])).toBe("");
+	});
+
+	it("stops seeding a root commit's shared index when the caller aborts", async () => {
+		const { root, journal, write } = await emptyRepo();
+		await write("Main", undefined, "first.txt", "first\n");
+		await journal.flush();
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		const index = path.join(root, ".git", "index");
+		await fs.rm(index, { force: true });
+		const lock = path.join(root, ".git", "index.lock");
+		await Bun.write(lock, "");
+		const controller = new AbortController();
+		let pauses = 0;
+		vi.spyOn(Bun, "sleep").mockImplementation(async () => {
+			pauses++;
+			controller.abort();
+		});
+
+		await expect(
+			commitSelection(
+				draft,
+				{ subject: "feat: first" },
+				{ journal, agent: { agent: "Main" }, signal: controller.signal },
+			),
+		).rejects.toThrow(/aborted/i);
+		expect(pauses).toBe(1);
+		expect((await git(root, ["rev-parse", "HEAD"])).trim()).toMatch(/^[0-9a-f]{40}$/);
+		expect(await git(root, ["ls-tree", "--name-only", "HEAD"])).toBe("first.txt\n");
+		expect(await Bun.file(index).exists()).toBe(false);
+		expect(await Bun.file(path.join(root, "first.txt")).text()).toBe("first\n");
 	});
 
 	it("commits only one subagent's changes when scoped to it", async () => {

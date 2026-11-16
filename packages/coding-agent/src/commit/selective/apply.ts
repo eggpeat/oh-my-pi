@@ -43,6 +43,34 @@ async function applyToSharedIndex(repo: VcsGitRepo, patch: string, signal?: Abor
 	return failure;
 }
 
+/**
+ * Seed the shared index from `treeish`, retrying while another git process holds `index.lock`.
+ * The last failure's message, or `undefined` once written. An aborted `signal` stops the retries.
+ */
+async function seedSharedIndex(repo: VcsGitRepo, treeish: string, signal?: AbortSignal): Promise<string | undefined> {
+	let failure = "";
+	for (let attempt = 0; attempt < INDEX_WRITE_ATTEMPTS; attempt++) {
+		if (attempt > 0) await Bun.sleep(INDEX_WRITE_BACKOFF_MS << (attempt - 1));
+		signal?.throwIfAborted();
+		try {
+			await repo.readTree(treeish, undefined, signal);
+			return undefined;
+		} catch (error) {
+			if (signal?.aborted) signal.throwIfAborted();
+			failure = error instanceof Error ? error.message : String(error);
+		}
+	}
+	return failure;
+}
+
+/** What the caller sees when a committed path could not be written into the shared index. */
+function unwritableIndexNote(filePath: string, failure: string): string {
+	return (
+		`${filePath}: the shared index could not be written (${failure}); ` +
+		`\`git diff --cached\` there shows this commit reverted until \`git reset -q -- ${filePath}\`.`
+	);
+}
+
 /** Attempts when HEAD moves between building the private index and committing it. */
 const HEAD_RACE_ATTEMPTS = 3;
 
@@ -68,7 +96,7 @@ export interface CommitOutcome {
 	paths: string[];
 	/** HEAD the commit was placed on (differs from the draft's HEAD when someone committed meanwhile); `null` for a root commit. */
 	parent: string | null;
-	/** Committed paths whose shared-index entry kept someone else's staged content instead of the commit's. */
+	/** Committed paths whose shared-index entry was left unchanged, each with a way to repair it. */
 	indexNotes: string[];
 }
 
@@ -176,9 +204,16 @@ export async function commitSelection(
 
 	const indexNotes: string[] = [];
 	// A new repository may have no index file yet. Git reads that as an empty index, but patch
-	// application reads HEAD in its place, so seed it with the root commit's tree instead.
+	// application reads HEAD in its place, so seed it with the root commit's tree instead,
+	// retrying while `index.lock` is held. The commit already exists, so a lock that never
+	// clears is a note rather than a thrown failure.
 	const seedIndex = parent === null && !(await Bun.file(path.join(repo.info().gitDir, "index")).exists());
-	if (seedIndex) await repo.readTree(sha, undefined, context.signal);
+	if (seedIndex) {
+		const failure = await seedSharedIndex(repo, sha, context.signal);
+		if (failure !== undefined) {
+			for (const entry of patches) indexNotes.push(unwritableIndexNote(entry.path, failure));
+		}
+	}
 	// One write for every path: each write takes `index.lock`, which a concurrent git (a prompt's
 	// or an editor's `git status`) may hold. Per-path writes only when a path's entry differs.
 	const synced = seedIndex || (await applyToSharedIndex(repo, joined, context.signal)) === undefined;
@@ -191,8 +226,7 @@ export async function commitSelection(
 			staged === false
 				? `${entry.path}: its shared-index entry holds someone else's staged changes and was left as is; ` +
 						"`git diff --cached` there shows this commit reverted until they restage."
-				: `${entry.path}: the shared index could not be written (${failure}); ` +
-						`\`git diff --cached\` there shows this commit reverted until \`git reset -q -- ${entry.path}\`.`,
+				: unwritableIndexNote(entry.path, failure),
 		);
 	}
 	const paths = patches.map(entry => entry.path);

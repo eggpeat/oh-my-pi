@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The first `/commit` in a repository still reports the new commit when another Git command is using the index, and explains how to refresh it, instead of erroring after the commit was already created ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+
 ## [18.21.0] - 2026-11-16
 
 ### Breaking Changes
