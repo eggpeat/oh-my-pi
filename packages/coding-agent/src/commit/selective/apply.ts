@@ -36,6 +36,7 @@ export interface CommitRequest {
 /** Result of {@link commitSelection}. */
 export interface CommitOutcome {
 	sha: string;
+	/** First line of the message stored on the commit. A `commit-msg` hook may have rewritten it. */
 	subject: string;
 	/** Repo-relative paths the commit changed. */
 	paths: string[];
@@ -164,6 +165,9 @@ export async function commitSelection(
 		}
 	}
 	const paths = patches.map(entry => entry.path);
+	// A commit-msg hook may rewrite COMMIT_EDITMSG before the object is written.
+	// The summary prints this subject, so it has to be the line that was stored.
+	const subject = (await repo.commitDetails(sha, context.signal)).message.split("\n", 1)[0];
 	await context.journal?.recordCommit({ agent: context.agent.agent, parent: context.agent.parent, sha, paths });
-	return { sha, subject: message.split("\n", 1)[0], paths, parent, indexNotes };
+	return { sha, subject, paths, parent, indexNotes };
 }

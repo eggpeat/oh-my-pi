@@ -285,4 +285,37 @@ describe("selective commit flow", () => {
 		expect(outcome.paths).toEqual([filename]);
 		expect(await git(root, ["show", `HEAD:${filename}`])).toBe("after\n");
 	});
+
+	it("returns the subject a commit-msg hook stored on the commit", async () => {
+		// The commit summary prints outcome.subject. A hook can replace that line;
+		// callers must see the subject on the commit, not the one they submitted.
+		const { root, journal, write } = await emptyRepo();
+		await git(root, ["config", "core.hooksPath", ".git/hooks"]);
+		const hook = path.join(root, ".git", "hooks", "commit-msg");
+		await Bun.write(
+			hook,
+			"#!/bin/sh\n" +
+				"cat > \"$1\" <<'EOF'\n" +
+				"fix(notes): kept the rewritten subject\n" +
+				"\n" +
+				"- Hook rewrote the body.\n" +
+				"EOF\n",
+		);
+		await fs.chmod(hook, 0o755);
+		await write("Main", undefined, "notes.txt", "notes\n");
+		await journal.flush();
+
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		const outcome = await commitSelection(
+			draft,
+			{ subject: "chore: original subject", body: ["- Original body."] },
+			{ journal, agent: { agent: "Main" } },
+		);
+
+		const stored = (await git(root, ["log", "-1", "--format=%s"])).replace(/\n$/, "");
+		expect(stored).toBe("fix(notes): kept the rewritten subject");
+		expect(outcome.subject).toBe(stored);
+		expect(await git(root, ["log", "-1", "--format=%B"])).toContain("- Hook rewrote the body.");
+		expect(await git(root, ["log", "-1", "--format=%B"])).not.toContain("Original body");
+	});
 });
