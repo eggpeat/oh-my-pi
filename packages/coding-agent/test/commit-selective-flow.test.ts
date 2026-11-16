@@ -15,8 +15,14 @@ afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(dir => removeWithRetries(dir)));
 });
 
-async function git(cwd: string, args: string[]): Promise<string> {
-	const env = { ...process.env, HOME: cwd, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+async function git(cwd: string, args: string[], indexFile?: string): Promise<string> {
+	const env = {
+		...process.env,
+		HOME: cwd,
+		GIT_CONFIG_GLOBAL: "/dev/null",
+		GIT_CONFIG_SYSTEM: "/dev/null",
+		...(indexFile === undefined ? {} : { GIT_INDEX_FILE: indexFile }),
+	};
 	const proc = Bun.spawn(["git", "-C", cwd, ...args], { env, stdout: "pipe", stderr: "pipe" });
 	const [out, err, code] = await Promise.all([
 		new Response(proc.stdout).text(),
@@ -24,6 +30,19 @@ async function git(cwd: string, args: string[]): Promise<string> {
 		proc.exited,
 	]);
 	if (code !== 0) throw new Error(`git ${args.join(" ")} failed (${code}): ${err}`);
+	return out;
+}
+
+/** Run a repair command in a shell, so word splitting and globs are real. */
+async function shell(cwd: string, command: string): Promise<string> {
+	const env = { ...process.env, HOME: cwd, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+	const proc = Bun.spawn(["sh", "-c", command], { cwd, env, stdout: "pipe", stderr: "pipe" });
+	const [out, err, code] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	if (code !== 0) throw new Error(`sh -c ${command} failed (${code}): ${err}`);
 	return out;
 }
 
@@ -159,6 +178,39 @@ describe("selective commit flow", () => {
 		);
 	});
 
+	it("keeps files another command staged when that command creates the index during the wait", async () => {
+		const { root, journal, write } = await emptyRepo();
+		await write("Main", undefined, "ours.txt", "ours\n");
+		await journal.flush();
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		const index = path.join(root, ".git", "index");
+		await fs.rm(index, { force: true });
+		const lock = path.join(root, ".git", "index.lock");
+		await Bun.write(lock, "");
+		await Bun.write(path.join(root, "theirs.txt"), "theirs\n");
+		const foreign = path.join(root, ".git", "theirs.index");
+		const delays: number[] = [];
+		let published = false;
+		vi.spyOn(Bun, "sleep").mockImplementation(async ms => {
+			if (typeof ms !== "number") throw new Error(`expected milliseconds, got ${String(ms)}`);
+			delays.push(ms);
+			if (published) return;
+			published = true;
+			await git(root, ["add", "--", "theirs.txt"], foreign);
+			await fs.rename(foreign, index);
+			await fs.rm(lock, { force: true });
+		});
+
+		const outcome = await commitSelection(draft, { subject: "feat: ours" }, { journal, agent: { agent: "Main" } });
+
+		expect(delays).toEqual([40]);
+		expect(outcome.parent).toBeNull();
+		expect(outcome.indexNotes).toEqual([]);
+		expect(outcome.paths).toEqual(["ours.txt"]);
+		expect(await git(root, ["ls-files"])).toBe("ours.txt\ntheirs.txt\n");
+		expect(await git(root, ["diff", "--cached", "--name-only"])).toBe("theirs.txt\n");
+	});
+
 	it("returns the root commit when the shared index stays locked", async () => {
 		const { root, journal, write } = await emptyRepo();
 		await write("Main", undefined, "first.txt", "first\n");
@@ -199,16 +251,48 @@ describe("selective commit flow", () => {
 		const failure = outcome.indexNotes[0]?.match(/could not be written \((.*)\); /)?.[1];
 		expect(failure).toContain("Could not acquire lock");
 		expect(outcome.indexNotes).toEqual([
-			`first.txt: the shared index could not be written (${failure}); \`git diff --cached\` there shows this commit reverted until \`git reset -q -- first.txt\`.`,
-			`second.txt: the shared index could not be written (${failure}); \`git diff --cached\` there shows this commit reverted until \`git reset -q -- second.txt\`.`,
+			`first.txt: the shared index could not be written (${failure}); \`git diff --cached\` there shows this commit reverted until \`git --literal-pathspecs reset -q -- 'first.txt'\`.`,
+			`second.txt: the shared index could not be written (${failure}); \`git diff --cached\` there shows this commit reverted until \`git --literal-pathspecs reset -q -- 'second.txt'\`.`,
 		]);
 		for (const note of outcome.indexNotes) {
 			const command = note.match(/until `([^`]+)`\.$/)?.[1];
 			if (command === undefined) throw new Error(`note has no repair command: ${note}`);
-			await git(root, command.slice("git ".length).split(" "));
+			await shell(root, command);
 		}
 		expect(await git(root, ["status", "--porcelain"])).toBe("");
 		expect(await git(root, ["diff", "HEAD"])).toBe("");
+	});
+
+	it("repairs a spaced wildcard filename through a shell without unstaging another file", async () => {
+		const { root, journal, write } = await emptyRepo();
+		const target = "first file*.txt";
+		const decoy = "first fileY.txt";
+		await write("Main", undefined, target, "target\n");
+		await journal.flush();
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		const index = path.join(root, ".git", "index");
+		await fs.rm(index, { force: true });
+		const lock = path.join(root, ".git", "index.lock");
+		await Bun.write(lock, "");
+		vi.spyOn(Bun, "sleep").mockImplementation(async ms => {
+			if (typeof ms !== "number") throw new Error(`expected milliseconds, got ${String(ms)}`);
+		});
+
+		const outcome = await commitSelection(draft, { subject: "feat: spaced" }, { journal, agent: { agent: "Main" } });
+
+		expect(outcome.paths).toEqual([target]);
+		expect(outcome.indexNotes).toHaveLength(1);
+		const command = outcome.indexNotes[0]?.match(/until `([^`]+)`\.$/)?.[1];
+		if (command === undefined) throw new Error(`note has no repair command: ${outcome.indexNotes[0]}`);
+		await fs.rm(lock);
+		await Bun.write(path.join(root, decoy), "decoy\n");
+		await git(root, ["add", "--", decoy]);
+		await shell(root, command);
+		expect(await git(root, ["--literal-pathspecs", "ls-files", "--", target])).toBe(`${target}\n`);
+		expect(await git(root, ["--literal-pathspecs", "diff", "--cached", "--name-only", "--", target])).toBe("");
+		expect(await git(root, ["--literal-pathspecs", "diff", "--cached", "--name-only", "--", decoy])).toBe(
+			`${decoy}\n`,
+		);
 	});
 
 	it("stops seeding a root commit's shared index when the caller aborts", async () => {

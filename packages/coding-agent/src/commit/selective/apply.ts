@@ -12,6 +12,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { VcsGitRepo } from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
+import { quotePosixArgument } from "../../utils/shell-quote";
 import type { Draft, SelectedChange } from "./draft";
 import type { ChangeJournal, JournalAgent } from "./journal";
 import { formatTextPatch } from "./patch";
@@ -43,20 +44,41 @@ async function applyToSharedIndex(repo: VcsGitRepo, patch: string, signal?: Abor
 	return failure;
 }
 
-async function seedSharedIndex(repo: VcsGitRepo, treeish: string, signal?: AbortSignal): Promise<string | undefined> {
+/**
+ * Write `treeish` into the missing shared index, retrying while `index.lock` is held.
+ * `wrote` is false with no `failure` when the index appears during a wait: it is left as is.
+ */
+async function seedSharedIndex(
+	repo: VcsGitRepo,
+	treeish: string,
+	indexPath: string,
+	signal?: AbortSignal,
+): Promise<{ wrote: boolean; failure?: string }> {
 	let failure = "";
 	for (let attempt = 0; attempt < INDEX_WRITE_ATTEMPTS; attempt++) {
 		if (attempt > 0) await Bun.sleep(INDEX_WRITE_BACKOFF_MS << (attempt - 1));
 		signal?.throwIfAborted();
+		// The lock holder may have created the index while this waited. Replacing it would drop
+		// the entries they staged, so the caller patches this commit's paths into it instead.
+		if (await Bun.file(indexPath).exists()) return { wrote: false };
 		try {
 			await repo.readTree(treeish, undefined, signal);
-			return undefined;
+			return { wrote: true };
 		} catch (error) {
 			if (signal?.aborted) signal.throwIfAborted();
 			failure = error instanceof Error ? error.message : String(error);
 		}
 	}
-	return failure;
+	return { wrote: false, failure };
+}
+
+/** Note naming the shell command that puts one committed path back into the shared index. */
+function sharedIndexWriteNote(filePath: string, failure: string): string {
+	const repair = `git --literal-pathspecs reset -q -- ${quotePosixArgument(filePath)}`;
+	return (
+		`${filePath}: the shared index could not be written (${failure}); ` +
+		`\`git diff --cached\` there shows this commit reverted until \`${repair}\`.`
+	);
 }
 
 /** Attempts when HEAD moves between building the private index and committing it. */
@@ -193,21 +215,20 @@ export async function commitSelection(
 	const indexNotes: string[] = [];
 	// A new repository may have no index file yet. Git reads that as an empty index, but patch
 	// application reads HEAD in its place, so seed it with the root commit's tree instead.
-	const seedIndex = parent === null && !(await Bun.file(path.join(repo.info().gitDir, "index")).exists());
-	if (seedIndex) {
-		const failure = await seedSharedIndex(repo, sha, context.signal);
-		if (failure !== undefined) {
-			for (const entry of patches) {
-				indexNotes.push(
-					`${entry.path}: the shared index could not be written (${failure}); ` +
-						`\`git diff --cached\` there shows this commit reverted until \`git reset -q -- ${entry.path}\`.`,
-				);
-			}
-		}
+	const sharedIndex = path.join(repo.info().gitDir, "index");
+	const seedIndex = parent === null && !(await Bun.file(sharedIndex).exists());
+	const seeded = seedIndex ? await seedSharedIndex(repo, sha, sharedIndex, context.signal) : undefined;
+	if (seeded?.failure !== undefined) {
+		for (const entry of patches) indexNotes.push(sharedIndexWriteNote(entry.path, seeded.failure));
 	}
 	// One write for every path: each write takes `index.lock`, which a concurrent git (a prompt's
 	// or an editor's `git status`) may hold. Per-path writes only when a path's entry differs.
-	const synced = seedIndex || (await applyToSharedIndex(repo, joined, context.signal)) === undefined;
+	// Seeding either wrote the whole tree or gave up after its own retries. An index that showed
+	// up during the wait is neither, so this commit's paths still have to be patched in.
+	const synced =
+		seeded?.wrote === true ||
+		seeded?.failure !== undefined ||
+		(await applyToSharedIndex(repo, joined, context.signal)) === undefined;
 	for (const entry of synced ? [] : patches) {
 		const failure = await applyToSharedIndex(repo, entry.patch, context.signal);
 		if (failure === undefined) continue;
@@ -217,8 +238,7 @@ export async function commitSelection(
 			staged === false
 				? `${entry.path}: its shared-index entry holds someone else's staged changes and was left as is; ` +
 						"`git diff --cached` there shows this commit reverted until they restage."
-				: `${entry.path}: the shared index could not be written (${failure}); ` +
-						`\`git diff --cached\` there shows this commit reverted until \`git reset -q -- ${entry.path}\`.`,
+				: sharedIndexWriteNote(entry.path, failure),
 		);
 	}
 	const paths = patches.map(entry => entry.path);
