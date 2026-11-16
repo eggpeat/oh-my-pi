@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import type { VcsGitRepo } from "../native/index.js";
 import { git, isVcsError } from "../native/vcs.js";
 
 const roots: string[] = [];
 afterEach(async () => {
-	await Promise.all(roots.splice(0).map(root => rm(root, { force: true, recursive: true })));
+	await Promise.all(roots.splice(0).map(root => fs.rm(root, { force: true, recursive: true })));
 });
 
 async function run(cwd: string, ...args: string[]): Promise<string> {
@@ -21,7 +22,7 @@ async function run(cwd: string, ...args: string[]): Promise<string> {
 }
 
 async function repository(): Promise<string> {
-	const root = await mkdtemp(join(tmpdir(), "pi-natives-head-race-"));
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-natives-head-race-"));
 	roots.push(root);
 	await run(root, "init", "-q", "-b", "main");
 	await run(root, "config", "user.name", "Head Race");
@@ -29,7 +30,7 @@ async function repository(): Promise<string> {
 	// The developer's global `core.hooksPath` would redirect hook lookup.
 	await run(root, "config", "core.hooksPath", ".git/hooks");
 	await run(root, "config", "commit.gpgSign", "false");
-	await writeFile(join(root, "tracked.txt"), "one\n");
+	await Bun.write(path.join(root, "tracked.txt"), "one\n");
 	await run(root, "add", "tracked.txt");
 	await run(root, "commit", "-q", "-m", "base");
 	return root;
@@ -37,16 +38,14 @@ async function repository(): Promise<string> {
 
 /** `commit-msg` runs after the expected-HEAD check and before the swap that updates HEAD. */
 async function commitMsgHook(root: string, command: string): Promise<void> {
-	const dir = join(root, ".git", "hooks");
-	await mkdir(dir, { recursive: true });
-	const hook = join(dir, "commit-msg");
-	await writeFile(hook, `#!/bin/sh\n${command}\n`);
-	await chmod(hook, 0o755);
+	const hook = path.join(root, ".git", "hooks", "commit-msg");
+	await Bun.write(hook, `#!/bin/sh\n${command}\n`);
+	await fs.chmod(hook, 0o755);
 }
 
 /** Stage a change so the commit has a tree to write before the hook moves HEAD. */
-async function stageChange(root: string, repo: NonNullable<ReturnType<typeof git>>): Promise<void> {
-	await writeFile(join(root, "tracked.txt"), "one\ntwo\n");
+async function stageChange(root: string, repo: VcsGitRepo): Promise<void> {
+	await Bun.write(path.join(root, "tracked.txt"), "one\ntwo\n");
 	await repo.stageFiles(["tracked.txt"]);
 }
 
