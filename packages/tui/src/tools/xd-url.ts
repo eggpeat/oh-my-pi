@@ -22,10 +22,10 @@ export function stripXdUnderscorePrefix(name: string): string {
  * Parse an `xd://` URL into its device target.
  * Returns `null` for other or malformed URLs and `name: null` for the root.
  *
- * A trailing `:raw` / `:A-B` stays in the name: the router peels read
- * selectors before the handler sees the URL, and `write` refuses a selector on
- * a device URL rather than peeling it, so approval and dispatch name the same
- * device.
+ * A trailing `:raw` / `:A-B` stays in the name. Reads peel a selector only after
+ * a topic path (`selectorsOnPath`); a bare device keeps the suffix. `write`
+ * refuses a selector on a device URL rather than peeling it, so approval and
+ * dispatch name the same device.
  */
 export function parseXdUrl(input: string): { name: string | null } | null {
 	const trimmed = input.trim();

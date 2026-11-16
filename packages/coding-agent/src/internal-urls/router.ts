@@ -274,10 +274,15 @@ export class InternalUrlRouter {
 	 * range, `raw:1-20`, a malformed `:-10` — throws ToolError: the tool addresses a whole file, and
 	 * dropping the selector would mutate a file the caller never named. Device URLs (xd://) refuse
 	 * every selector: write approval judges the unpeeled URL, so peeling `xd://ast_edit:raw` would
-	 * dispatch a device the gate never judged. Non-URLs pass through.
+	 * dispatch a device the gate never judged. Reads may keep a bare suffix in the name; a write
+	 * still sees that suffix and refuses it. Non-URLs pass through.
 	 */
 	peelWriteSelector(input: string, tool: string): string {
-		const { path, sel } = this.split(input);
+		const normalized = this.normalize(input);
+		const { path, sel } = splitInternalUrlSel(normalized, scheme => {
+			const spec = this.spec(scheme);
+			return spec?.selectorsOnPath ? { ...spec, selectorsOnPath: false } : spec;
+		});
 		if (sel === undefined) return path;
 		if (this.#registered(path)?.handler.spec.backing === "device") {
 			throw new ToolError(`${tool} does not accept the trailing selector ":${sel}" on a device URL. Remove it.`);

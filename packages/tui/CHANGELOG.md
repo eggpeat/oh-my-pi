@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a bare `xd://<device>:raw` or `:conflicts` read opening that device. The ending stays in the name, and `xd://<tool>/<topic>` still returns the requested lines ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+
 ## [18.20.1] - 2026-11-14
 
 ### Added

@@ -1,4 +1,5 @@
-import { isReadableUrlPath, type ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
+import { isReadableUrlPath, lineSelectorsApply, type ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
+import { splitUrlScheme } from "@oh-my-pi/pi-tui/tools/url-scheme-host";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type EditStore, notebookToEditableText } from "@oh-my-pi/pi-natives";
@@ -1070,14 +1071,17 @@ function repeatReadNotice(
 
 /**
  * Whether `path` takes a trailing `:A-B` line selector: filesystem paths, web
- * URLs and `lines` schemes do; selector-free schemes (`out://`, `attachment://`),
- * opaque MCP resources and unregistered schemes would read the tail as part of the URL.
+ * URLs and `lines` schemes do. Selector-free schemes (`out://`, `attachment://`),
+ * opaque MCP resources, unregistered schemes, and a bare `xd://<device>` would
+ * read the tail as part of the URL. A topic path (`xd://eval/browser`) pages
+ * like any other document.
  */
 function acceptsLineSelector(path: string): boolean {
 	const router = InternalUrlRouter.instance();
 	if (!router.canResolve(path)) return true;
-	const scheme = extractUriScheme(router.normalize(path));
-	return scheme !== undefined && router.spec(scheme)?.selectors === "lines";
+	const url = splitUrlScheme(router.normalize(path));
+	if (!url) return false;
+	return lineSelectorsApply(router.spec(url.scheme), url.rest);
 }
 
 const LOCAL_READ_SPECULATION_INELIGIBLE: ToolSpeculationAssessment = {

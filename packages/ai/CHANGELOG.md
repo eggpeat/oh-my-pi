@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Cursor reads of a bare `xd://<device>` so a line window is not added to the device name. A documentation page `xd://<tool>/<topic>` still returns the requested lines ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+
 ## [18.20.3] - 2026-11-16
 
 ### Breaking Changes

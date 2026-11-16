@@ -21,6 +21,8 @@ export interface InternalUrlSchemeSpec {
 	readonly selectors: "lines" | "none" | "opaque";
 	/** A trailing `:N` with no path after the authority is a port, not a selector (ssh://host:2222). */
 	readonly portAuthority?: boolean;
+	/** With `lines`, peel a selector only after a `/` path (`xd://tool/topic:1-20`). A bare authority keeps the suffix (`xd://tool:raw`). */
+	readonly selectorsOnPath?: boolean;
 	/** Read cards collapse into the compact read group like plain files instead of expanding. */
 	readonly compactTranscript?: boolean;
 	/** Write policy; absent on read-only schemes. Transcripts draw `reply`-scoped writes as assistant prose. */

@@ -68,6 +68,7 @@ export type SchemeBacking = "file" | "virtual" | "remote" | "device";
 /**
  * Read-selector grammar after the URL.
  * - `lines`: any trailing `:<selector>` chain is a read selector (`artifact://3:raw:1-50`).
+ *   {@link SchemeSpec.selectorsOnPath} limits that to URLs that already have a `/` path.
  * - `none`: never peel; the URL is passed through as written.
  * - `opaque`: server-defined URIs that may legitimately end in selector-shaped tails (mcp://).
  */
@@ -113,6 +114,12 @@ export interface SchemeSpec {
 	selectors: SchemeSelectors;
 	/** A trailing `:N` with no path after the authority is a port, not a selector (ssh://host:2222). */
 	portAuthority?: boolean;
+	/**
+	 * With `selectors: "lines"`, peel only after a `/` path. A bare authority keeps a
+	 * trailing suffix: `xd://ast_edit:raw` is not a raw read of `ast_edit` (write would
+	 * otherwise run the device). `xd://eval/browser:1-20` still pages.
+	 */
+	selectorsOnPath?: boolean;
 	/** The authority is the first path segment under one root (local://a/b), so a glob may start there; other schemes' authority is an id. */
 	pathAuthority?: true;
 	/** Default immutability of resolved resources; a resource may override it per URL. */

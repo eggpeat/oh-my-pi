@@ -208,6 +208,14 @@ export function splitPathAndSel(
 	return { path: basePath, sel: `${list}${rawSuffix}` };
 }
 
+/** Whether a trailing `:` chain on `scheme://` + `rest` is a read selector. */
+export function lineSelectorsApply(spec: InternalUrlSchemeSpec | undefined, rest: string): boolean {
+	if (spec?.selectors !== "lines") return false;
+	// Authority only: a port (`ssh://host:2222`) or a device suffix (`xd://tool:raw`).
+	if ((spec.portAuthority || spec.selectorsOnPath) && !rest.includes("/")) return false;
+	return true;
+}
+
 /**
  * Variant of {@link splitPathAndSel} for internal URLs (`scheme://...`).
  *
@@ -223,13 +231,15 @@ export function splitPathAndSel(
  * clean URL to the protocol handler and surface selector errors via parseSel
  * instead of as misleading "host invalid" errors from the handler.
  *
- * Only schemes whose spec declares `lines` selectors peel; server-defined URIs
- * (`opaque`), selector-free schemes, and unregistered schemes pass through
- * verbatim. `specOf` defaults to the installed scheme host, so nothing peels
- * before a host is installed.
+ * Only schemes whose spec declares `lines` selectors peel, and only the part
+ * {@link lineSelectorsApply} allows. Server-defined URIs (`opaque`),
+ * selector-free schemes, and unregistered schemes pass through verbatim.
+ * `specOf` defaults to the installed scheme host, so nothing peels before a
+ * host is installed.
  *
  * Falls back to the input unchanged when nothing matches.
  */
+
 export function splitInternalUrlSel(
 	rawPath: string,
 	specOf: (scheme: string) => InternalUrlSchemeSpec | undefined = internalUrlSchemeSpec,
@@ -237,10 +247,7 @@ export function splitInternalUrlSel(
 	const url = splitUrlScheme(rawPath);
 	if (!url) return { path: rawPath };
 	const spec = specOf(url.scheme);
-	if (spec?.selectors !== "lines") return { path: rawPath };
-	// With no `/path` after the authority, a trailing `:N` is the port
-	// (ssh://host:2222), not a read selector.
-	if (spec.portAuthority && !url.rest.includes("/")) return { path: rawPath };
+	if (!lineSelectorsApply(spec, url.rest)) return { path: rawPath };
 
 	const schemeEnd = rawPath.length - url.rest.length;
 	let path = rawPath;

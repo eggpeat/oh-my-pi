@@ -3,8 +3,10 @@ import { type } from "@oh-my-pi/omptype";
 import {
 	cursorExecReadPath,
 	cursorRawReadPath,
+	isXdDevicePath,
 	omitUndefinedArgs,
 	piGrepSkip,
+	piReadDisplayPath,
 	piReadPath,
 } from "../src/providers/cursor-pi-args";
 
@@ -113,5 +115,24 @@ describe("cursorRawReadPath", () => {
 	it("does not stack a second :raw when a range is composed onto a raw path", () => {
 		expect(piReadPath("/tmp/note.txt:raw", 2, 1)).toBe("/tmp/note.txt:raw:2+1");
 		expect(cursorExecReadPath("/tmp/note.txt", 2, 1)).toBe("/tmp/note.txt:raw:2+1");
+	});
+
+	it("does not append :raw to xd:// device URLs", () => {
+		expect(isXdDevicePath("xd://wiki_observe")).toBe(true);
+		expect(cursorRawReadPath("xd://wiki_observe")).toBe("xd://wiki_observe");
+		expect(cursorExecReadPath("xd://wiki_observe")).toBe("xd://wiki_observe");
+		expect(cursorExecReadPath("xd://wiki_observe", 1, 20)).toBe("xd://wiki_observe");
+		expect(piReadPath("xd://wiki_observe", 1, 20)).toBe("xd://wiki_observe");
+		expect(piReadDisplayPath("xd://wiki_observe", 1, 0)).toBe("xd://wiki_observe");
+	});
+
+	it("pages an xd:// topic document and still skips selectors on a device URL", () => {
+		expect(isXdDevicePath("xd://eval/browser")).toBe(false);
+		expect(cursorRawReadPath("xd://eval/browser")).toBe("xd://eval/browser:raw");
+		expect(piReadPath("xd://eval/browser", 1, 5)).toBe("xd://eval/browser:raw:1+5");
+		expect(cursorExecReadPath("xd://eval/browser", 1, 5)).toBe("xd://eval/browser:raw:1+5");
+		expect(piReadDisplayPath("xd://eval/browser", 1, 0)).toBe("xd://eval/browser:raw:1+0");
+		expect(isXdDevicePath("xd://wiki_observe:raw")).toBe(true);
+		expect(cursorRawReadPath("xd://wiki_observe:raw")).toBe("xd://wiki_observe:raw");
 	});
 });

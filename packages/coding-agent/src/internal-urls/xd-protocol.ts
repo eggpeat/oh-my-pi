@@ -60,6 +60,8 @@ export class XdProtocolHandler implements ProtocolHandler {
 	readonly spec: SchemeSpec = {
 		backing: "device",
 		selectors: "lines",
+		// Device suffixes stay in the name (`xd://ast_edit:raw`). Topic paths page (`xd://eval/browser:1-20`).
+		selectorsOnPath: true,
 		immutable: true,
 		compactTranscript: true,
 		write: { via: "handler", payload: "text", scope: "device", tier: deviceWriteTier },
