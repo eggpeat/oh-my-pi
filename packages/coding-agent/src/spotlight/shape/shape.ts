@@ -392,6 +392,8 @@ function payingRuns(lines: readonly string[], seen: Witnessed): boolean[] {
  * collapsed to one marker naming the read that brings the lines back.
  */
 async function collapseSeen(run: Run, view: View, steps: string[]): Promise<View> {
+	// Numbered edit rows unlock lines in EditStore; replacing them breaks the preview's provenance.
+	if (run.input.tool === "edit") return view;
 	const keep = seenKeeps(run, view.lines);
 	const seen = witnessedRuns(view.lines, run.state.seen, SHORT_SEEN_RUN, keep);
 	const mask = payingRuns(view.lines, seen);
@@ -473,7 +475,13 @@ async function shapeSubject(run: Run, subject: Subject): Promise<{ view: View; s
 	if (again) bump(run, "reasks");
 
 	const keep = seenKeeps(run, lines);
-	const { mask: witnessed, starts } = witnessedRuns(lines, state.seen, again ? Math.min(SEEN_RUN, 2) : SEEN_RUN, keep);
+	const { mask: witnessed, starts } =
+		input.tool === "edit"
+			? {
+					mask: Array.from<boolean>({ length: lines.length }).fill(false),
+					starts: Array.from<boolean>({ length: lines.length }).fill(false),
+				}
+			: witnessedRuns(lines, state.seen, again ? Math.min(SEEN_RUN, 2) : SEEN_RUN, keep);
 	const width = lines.map(l => (!again && l.length > MAX_LINE ? LINE_KEEP + 36 : l.length));
 	let shown = 0;
 	lines.forEach((_, i) => {

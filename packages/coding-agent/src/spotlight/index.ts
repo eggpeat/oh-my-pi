@@ -491,6 +491,7 @@ export type CalledToolShaper = (call: CalledToolResult) => Promise<AgentToolResu
  */
 export async function shapeCalledTool(session: ToolSession, call: CalledToolResult): Promise<AgentToolResult> {
 	const { tool, toolCallId, own, result } = call;
+	if (result.isError === true) return result;
 	const experiment = shapingExperiment(session);
 	if (!experiment) return result;
 	if (shapesItself(tool) || !experiment.shapesTool(tool)) return result;
