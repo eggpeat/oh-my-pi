@@ -802,9 +802,9 @@ const CD_TARGET_EXPANSION_CHARS = "$`()*?[]{}";
  * separator it was, or `null` when the command does not begin with exactly
  * `cd`, one path token, and a top-level `&&` or `;`. The scanner deliberately
  * bails on anything else in the prefix — redirects (`cd /tmp 2>/dev/null && ...`),
- * extra arguments, active shell expansion (`$`, backticks, globs, braces), or
- * shell-dependent targets (`-`, signed numeric operands, `~user`) — leaving the
- * whole command for the shell instead of absorbing shell syntax into `cwd`.
+ * extra arguments, or paths needing shell expansion (`$`, backticks, `(`) —
+ * leaving the whole command for the shell instead of absorbing shell syntax
+ * into `cwd`.
  */
 export function extractLeadingCdTarget(command: string): { path: string; rest: string; separator: "&&" | ";" } | null {
 	const prefix = /^cd[ \t]+/.exec(command);
