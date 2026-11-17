@@ -394,13 +394,18 @@ describe("stats subscription cost correction", () => {
 		]);
 
 		// Prompt input (1000 + 200 + 300000) crosses the inclusive 200K tier, so
-		// the whole request bills at 4/12/0.4; orchestration input/output are
-		// priced alongside the conversation buckets.
+		// the whole request uses that tier; orchestration input/output are priced
+		// alongside the conversation buckets.
+		const rates = getBundledModel("xai-oauth", "grok-4.20-multi-agent-0309").cost.longContext;
+		if (!rates) throw new Error("Expected multi-agent long-context pricing");
+		const input = (rates.input / 1e6) * 301_000;
+		const output = (rates.output / 1e6) * 1_500;
+		const cacheRead = (rates.cacheRead / 1e6) * 200;
 		const request = getRecentRequests(1)[0];
-		expect(request?.usage.cost.input).toBeCloseTo((4 / 1e6) * 301_000, 8);
-		expect(request?.usage.cost.output).toBeCloseTo((12 / 1e6) * 1_500, 8);
-		expect(request?.usage.cost.cacheRead).toBeCloseTo((0.4 / 1e6) * 200, 8);
-		expect(request?.usage.cost.total).toBeCloseTo(1.22208, 8);
+		expect(request?.usage.cost.input).toBeCloseTo(input, 8);
+		expect(request?.usage.cost.output).toBeCloseTo(output, 8);
+		expect(request?.usage.cost.cacheRead).toBeCloseTo(cacheRead, 8);
+		expect(request?.usage.cost.total).toBeCloseTo(input + output + cacheRead, 8);
 	});
 });
 

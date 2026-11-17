@@ -99,10 +99,13 @@ const fastWorkspacePackages = [
 // or coding-agent-adjacent benchmark paths. Keep them low-concurrency and in jobs
 // that have downloaded the Linux x64 native addon artifacts.
 const nativeAndIntegrationPackages = [
-	"packages/natives",
-	"packages/tui",
-	"packages/collab-web",
-	"packages/typescript-edit-benchmark",
+	{ pkg: "packages/natives", parallel: 4 },
+	{ pkg: "packages/tui", parallel: 4 },
+	{ pkg: "packages/collab-web", parallel: 4 },
+	{ pkg: "packages/typescript-edit-benchmark", parallel: 4 },
+	// Stats suites mutate process-wide environment, agent-directory, and database state.
+	{ pkg: "packages/stats", parallel: 1 },
+	{ pkg: "packages/metaharness", parallel: 4 },
 ];
 
 const projectToolTestCommand: TestCommand = {
@@ -115,6 +118,13 @@ const projectToolTestCommand: TestCommand = {
 // Packages the CI buckets deliberately skip but a local full run should still
 // cover. robomp-web lives under python/robomp and is outside every CI TS bucket.
 const localOnlyWorkspacePackages = ["python/robomp/web"];
+
+const scheduledPackageTestSuites = new Set([
+	...fastWorkspacePackages,
+	...nativeAndIntegrationPackages.map(({ pkg }) => pkg),
+	...localOnlyWorkspacePackages,
+	"packages/coding-agent",
+]);
 
 const codingAgentNativePathPatterns = [
 	/(^|\/)[^/]*(bash|native|browser|cmux|mnemopi|hindsight|memory)[^/]*\.test\.ts$/i,
@@ -247,6 +257,29 @@ async function collectTestsUnder(root: string, baseDir: string): Promise<string[
 	return files;
 }
 
+async function assertPackageTestSuitesScheduled(): Promise<void> {
+	const packagesRoot = path.join(repoRoot, "packages");
+	const entries = await fs.readdir(packagesRoot, { withFileTypes: true });
+	const unscheduled: string[] = [];
+	for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+		if (!entry.isDirectory()) continue;
+		const pkg = `packages/${entry.name}`;
+		if (scheduledPackageTestSuites.has(pkg)) continue;
+		try {
+			const testDir = await fs.stat(path.join(packagesRoot, entry.name, "test"));
+			if (testDir.isDirectory()) unscheduled.push(pkg);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw error;
+		}
+	}
+	if (unscheduled.length > 0) {
+		throw new Error(
+			`Unscheduled package test suites: ${unscheduled.join(", ")}. Add each package to fastWorkspacePackages, nativeAndIntegrationPackages, or localOnlyWorkspacePackages.`,
+		);
+	}
+}
+
 function hasAnyMarker(content: string, markers: string[]): boolean {
 	return markers.some(marker => content.includes(marker));
 }
@@ -335,7 +368,10 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 		case "workspace":
 			return fastWorkspacePackages.map(pkg => workspaceTestCommand(pkg, 8));
 		case "native":
-			return [...nativeAndIntegrationPackages.map(pkg => workspaceTestCommand(pkg, 4)), projectToolTestCommand];
+			return [
+				...nativeAndIntegrationPackages.map(({ pkg, parallel }) => workspaceTestCommand(pkg, parallel)),
+				projectToolTestCommand,
+			];
 		case "coding-agent-singleton":
 			return await codingAgentTestCommands("singleton");
 		case "coding-agent-ui":
@@ -358,14 +394,15 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 				...(await commandsForMode("coding-agent-heavy")),
 			];
 		// `local-ts` is the full local TypeScript run that root `bun run test:ts`
-		// drives: every package the old `--workspaces` fan-out covered (the CI
-		// `all` set plus robomp-web, which CI omits), routed through
-		// this one quiet runner so the whole suite shares one progress stream and
-		// one failure report.
+		// drives: every package test suite (the CI `all` set plus robomp-web,
+		// which CI omits), routed through this one quiet runner so the whole suite
+		// shares one progress stream and one failure report.
 		case "local-ts":
 			return [
 				...fastWorkspacePackages.map(pkg => workspaceTestCommand(pkg, 8, { extraArgs: onlyFailuresArgs })),
-				...nativeAndIntegrationPackages.map(pkg => workspaceTestCommand(pkg, 4, { extraArgs: onlyFailuresArgs })),
+				...nativeAndIntegrationPackages.map(({ pkg, parallel }) =>
+					workspaceTestCommand(pkg, parallel, { extraArgs: onlyFailuresArgs }),
+				),
 				projectToolTestCommand,
 				...localOnlyWorkspacePackages.map(pkg => workspaceTestCommand(pkg, 4, { extraArgs: onlyFailuresArgs })),
 				...(await commandsForMode("coding-agent-heavy")),
@@ -1015,6 +1052,7 @@ if (!(requestedMode in validModes)) {
 	throw new Error(`Unknown mode ${shellQuote(requestedMode)}. Expected one of: ${Object.keys(validModes).join(", ")}`);
 }
 
+await assertPackageTestSuitesScheduled();
 const requestedCommands = selectShard(await commandsForMode(requestedMode as Mode), Bun.env.OMP_TEST_SHARD);
 const explicitConcurrency = Boolean(Bun.env.OMP_TEST_CONCURRENCY?.trim());
 // CI defaults to one process at a time, but memory-sized workflow buckets
