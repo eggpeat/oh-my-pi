@@ -486,9 +486,8 @@ export type CalledToolShaper = (call: CalledToolResult) => Promise<AgentToolResu
  * result's text blocks are shaped as command output, the source being the tool's name and arguments
  * ({@link callSummary}); images and other blocks stay. What `plain` shows is the wrapper's result, spill and notices
  * included. A result the wrapper spilled is shaped whole from the tool's own text, up to
- * {@link SPOTLIGHT_FULL_OUTPUT_MAX_BYTES}, and a cut of it no longer carries the spill's truncation. An error result,
- * a result whose details are not an object, or one that already carries a trace is returned as is. Each call is
- * shaped at most once.
+ * {@link SPOTLIGHT_FULL_OUTPUT_MAX_BYTES}, and a cut of it no longer carries the spill's truncation. A result whose
+ * details are not an object, or already carry a trace, is returned as is. Each call is shaped at most once.
  */
 export async function shapeCalledTool(session: ToolSession, call: CalledToolResult): Promise<AgentToolResult> {
 	const { tool, toolCallId, own, result } = call;
