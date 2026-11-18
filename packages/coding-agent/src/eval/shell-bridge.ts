@@ -70,11 +70,11 @@ export async function runEvalShell(args: unknown, options: EvalShellBridgeOption
 		minimize: false,
 		gitGuard: cfgBashGitGuard.get(session.settings),
 		ovnfs: ovnfsCommand(session.settings),
-		// Builtins read internal URLs (`cat local://x`, `local://3.log`) like the bash tool's; read tier,
-		// and without reply/write sinks handler-written URLs refuse writes.
+		// Builtins read internal URLs (`cat local://x`, `local://3.log`) like the bash tool's; eval is exec-tier, so sh shares that approval;
+		// without reply/write sinks handler-written URLs refuse writes.
 		filesystem: new InternalUrlFilesystem({
 			context: sessionResolveContext(session, { signal }),
-			tier: "read",
+			tier: "exec",
 		}).shellFilesystem(),
 		speech: sessionShellSpeech(session),
 		// The sink's inline window is a bounded preview; collect the whole stream instead.
