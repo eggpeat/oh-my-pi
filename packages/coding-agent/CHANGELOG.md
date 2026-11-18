@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `web_search` ignoring per-session settings (and failing for SDK sessions that never initialize global settings); it now honors the session's web model role, timeout, and Exa/SearXNG configuration ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+
 ## [18.22.2] - 2026-11-18
 
 ### Added

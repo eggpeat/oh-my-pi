@@ -33,10 +33,10 @@
  * Reference: https://docs.searxng.org/dev/search_api.html
  */
 
-import type { AuthStorage, FetchImpl } from "@oh-my-pi/pi-ai";
+import type { Api, AuthStorage, FetchImpl, Model } from "@oh-my-pi/pi-ai";
 
 import type { Setting } from "../../../config/registry";
-import { isSettingsInitialized, settings } from "../../../config/settings";
+import { isSettingsInitialized, settings, Settings } from "../../../config/settings";
 import type { SearchResponse, SearchSource } from "../types";
 import { SearchProviderError } from "../../../web/search/types";
 import type { StructuredQuery } from "../query";
@@ -102,9 +102,13 @@ interface SearXNGConfig {
 	engines?: Array<{ name?: string; shortcut?: string }>;
 }
 
-/** SearXNG connection value from settings (env fallback declared on the definition); env only before settings load. */
-function findSetting(handle: Setting<string | undefined>): string | null {
-	return (isSettingsInitialized() ? handle.get(settings) : handle.envValue()) ?? null;
+function resolveSettings(explicit?: Settings): Settings {
+	return explicit ?? (isSettingsInitialized() ? settings : Settings.isolated());
+}
+
+/** SearXNG connection value from settings (env fallback declared on the definition). */
+function findSetting(handle: Setting<string | undefined>, effectiveSettings: Settings): string | null {
+	return handle.get(effectiveSettings) ?? null;
 }
 
 /** Build the RFC 7617 Basic auth credential using UTF-8 bytes. */
@@ -118,9 +122,9 @@ function hasControlCharacters(value: string): boolean {
 }
 
 /** Find SearXNG authentication from settings or environment. Basic auth takes precedence over bearer tokens. */
-function findAuth(): SearXNGAuth | null {
-	const basicUsername = findSetting(cfgSearxngBasicUsername);
-	const basicPassword = findSetting(cfgSearxngBasicPassword);
+function findAuth(effectiveSettings: Settings): SearXNGAuth | null {
+	const basicUsername = findSetting(cfgSearxngBasicUsername, effectiveSettings);
+	const basicPassword = findSetting(cfgSearxngBasicPassword, effectiveSettings);
 	if (basicUsername !== null || basicPassword !== null) {
 		if (basicUsername === null || basicPassword === null) {
 			throw new Error(
@@ -136,19 +140,13 @@ function findAuth(): SearXNGAuth | null {
 		return { type: "basic", value: buildBasicAuthValue(basicUsername, basicPassword) };
 	}
 
-	const token = findSetting(cfgSearxngToken);
+	const token = findSetting(cfgSearxngToken, effectiveSettings);
 	return token ? { type: "bearer", value: token } : null;
 }
 
 /** Find configured engine names/shortcuts from settings. */
-function findEngines(): string | null {
-	try {
-		const engines = cfgSearxngEngines.get(settings);
-		if (engines) return engines;
-	} catch {
-		// Settings not initialized yet
-	}
-	return null;
+function findEngines(effectiveSettings: Settings): string | null {
+	return cfgSearxngEngines.get(effectiveSettings) || null;
 }
 
 /** Build request headers including authentication. */
@@ -394,28 +392,23 @@ export async function searchSearXNG(params: {
 	signal?: AbortSignal;
 	timeoutMs?: number;
 	fetch?: FetchImpl;
+	settings?: Settings;
 }): Promise<SearchResponse> {
+	const effectiveSettings = resolveSettings(params.settings);
 	const numResults = clampNumResults(params.num_results, DEFAULT_NUM_RESULTS, MAX_NUM_RESULTS);
 
-	const endpoint = findSetting(cfgSearxngEndpoint);
+	const endpoint = findSetting(cfgSearxngEndpoint, effectiveSettings);
 	if (!endpoint) {
 		throw new Error(
 			"SearXNG endpoint not configured. Set searxng.endpoint in settings or SEARXNG_ENDPOINT in environment.",
 		);
 	}
 
-	const auth = findAuth();
+	const auth = findAuth(effectiveSettings);
 
-	let categories: string | undefined;
-	let language: string | undefined;
-	let configuredSafesearch: number | undefined;
-	try {
-		categories = cfgSearxngCategories.get(settings) ?? undefined;
-		language = cfgSearxngLanguage.get(settings) ?? undefined;
-		configuredSafesearch = cfgSearxngSafesearch.get(settings);
-	} catch {
-		// Settings not initialized yet
-	}
+	const categories: string | undefined = cfgSearxngCategories.get(effectiveSettings) ?? undefined;
+	let language: string | undefined = cfgSearxngLanguage.get(effectiveSettings) ?? undefined;
+	const configuredSafesearch: number | undefined = cfgSearxngSafesearch.get(effectiveSettings);
 	if (
 		configuredSafesearch !== undefined &&
 		configuredSafesearch !== 0 &&
@@ -425,7 +418,7 @@ export async function searchSearXNG(params: {
 		throw new Error("searxng.safesearch must be 0 (off), 1 (moderate), or 2 (strict).");
 	}
 	const safesearch = configuredSafesearch;
-	const configuredEngines = findEngines();
+	const configuredEngines = findEngines(effectiveSettings);
 
 	// SearXNG forwards `q` to downstream engines, so build it with the shared
 	// scraper formatter: operators are canonicalized and scraper-hostile ones
@@ -494,8 +487,8 @@ export class SearXNGProvider extends SearchProvider {
 	readonly id = "searxng";
 	readonly label = "SearXNG";
 
-	isAvailable(_authStorage: AuthStorage): boolean {
-		return !!findSetting(cfgSearxngEndpoint);
+	isAvailable(_authStorage: AuthStorage, _model?: Model<Api>, explicitSettings?: Settings): boolean {
+		return !!findSetting(cfgSearxngEndpoint, resolveSettings(explicitSettings));
 	}
 
 	search(params: SearchParams): Promise<SearchResponse> {
@@ -507,6 +500,7 @@ export class SearXNGProvider extends SearchProvider {
 			signal: params.signal,
 			timeoutMs: params.timeoutMs,
 			fetch: params.fetch,
+			settings: params.settings,
 		});
 	}
 }

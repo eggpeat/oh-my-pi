@@ -14,7 +14,7 @@ import { cfgOffline } from "../../config/auxiliary-model-policy";
 import { ModelRegistry } from "../../config/model-registry";
 import { type RoleChainCandidate, resolveModelRoleValue, resolveRoleChain } from "../../config/model-resolver";
 import { roleCandidatePool } from "../../config/model-roles";
-import { settings, type Settings } from "../../config/settings";
+import { isSettingsInitialized, settings, Settings } from "../../config/settings";
 import type { CustomTool, CustomToolContext } from "../../extensibility/custom-tools/types";
 import webSearchSystemPrompt from "../../prompts/system/web-search.md" with { type: "text" };
 import webSearchDescription from "../../prompts/tools/web-search.md" with { type: "text" };
@@ -191,10 +191,14 @@ function expandHostedCandidate(
  * or prepend {@link xaiModelChain} when the chain has none. Unchanged without
  * xAI credentials.
  */
-function preferXAI(chain: RoleChainCandidate[], modelRegistry: ModelRegistry): RoleChainCandidate[] {
+function preferXAI(
+	chain: RoleChainCandidate[],
+	modelRegistry: ModelRegistry,
+	effectiveSettings: Settings,
+): RoleChainCandidate[] {
 	const xai = chain.filter(candidate => candidate.model.webSearch === "xai");
 	if (xai.length > 0) return [...xai, ...chain.filter(candidate => candidate.model.webSearch !== "xai")];
-	return [...xaiModelChain(modelRegistry, settings).map(model => ({ model, explicit: false })), ...chain];
+	return [...xaiModelChain(modelRegistry, effectiveSettings).map(model => ({ model, explicit: false })), ...chain];
 }
 
 function isHackerNewsEngine(model: Model<Api>): boolean {
@@ -219,24 +223,26 @@ async function executeSearch(
 	options: ExecuteSearchOptions,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchResultDetails }> {
 	const { authStorage, sessionId, signal } = options;
-	const modelRegistry = options.modelRegistry ?? new ModelRegistry(authStorage, undefined, { settings });
-	const pool = roleCandidatePool("web", settings, modelRegistry);
+	const effectiveSettings = options.settings ?? (isSettingsInitialized() ? settings : Settings.isolated());
+	const modelRegistry =
+		options.modelRegistry ?? new ModelRegistry(authStorage, undefined, { settings: effectiveSettings });
+	const pool = roleCandidatePool("web", effectiveSettings, modelRegistry);
 	const candidates = params.model
 		? (() => {
-				const resolved = resolveModelRoleValue(params.model, pool, { settings });
+				const resolved = resolveModelRoleValue(params.model, pool, { settings: effectiveSettings });
 				return resolved.model
 					? [{ model: resolved.model, explicit: true, thinkingLevel: resolved.thinkingLevel }]
 					: [];
 			})()
-		: resolveRoleChain("web", settings, pool);
+		: resolveRoleChain("web", effectiveSettings, pool);
 	const parsedQuery = parseSearchQuery(params.query);
 	let expanded = rankXAIProviders(
 		candidates.flatMap(candidate => expandHostedCandidate(candidate, options.sessionModel, pool)),
 		candidate => candidate.model,
-		settings,
+		effectiveSettings,
 	);
 	// Only xAI reaches X posts; X-only queries try it first even when the role prefers another engine.
-	if (!params.model && targetsX(parsedQuery)) expanded = preferXAI(expanded, modelRegistry);
+	if (!params.model && targetsX(parsedQuery)) expanded = preferXAI(expanded, modelRegistry, effectiveSettings);
 	// General engines index HN threads sparsely and late; a query whose every
 	// `site:` is Hacker News (with or without a path) tries the HN Search API first.
 	const hnOnly =
@@ -244,32 +250,23 @@ async function executeSearch(
 	if (!params.model && hnOnly) expanded = preferHackerNews(expanded, pool);
 
 	// Invariant across candidates; resolve once before walking the role chain.
-	let antigravityEndpointMode: "auto" | "production" | "sandbox" | undefined;
-	try {
-		antigravityEndpointMode = cfgProvidersAntigravityEndpoint.get(settings);
-	} catch {
-		antigravityEndpointMode = undefined;
-	}
+	const antigravityEndpointMode = cfgProvidersAntigravityEndpoint.get(effectiveSettings);
 
 	let timeoutMs = DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS * 1_000;
-	try {
-		const configuredSeconds = cfgProvidersWebSearchTimeoutSeconds.get(settings);
-		if (Number.isFinite(configuredSeconds) && configuredSeconds > 0) {
-			timeoutMs = Math.ceil(Math.min(configuredSeconds, MAX_WEB_SEARCH_TIMEOUT_SECONDS) * 1_000);
-		}
-	} catch {
-		// Preserve the default for one-shot callers that do not initialize Settings.
+	const configuredSeconds = cfgProvidersWebSearchTimeoutSeconds.get(effectiveSettings);
+	if (Number.isFinite(configuredSeconds) && configuredSeconds > 0) {
+		timeoutMs = Math.ceil(Math.min(configuredSeconds, MAX_WEB_SEARCH_TIMEOUT_SECONDS) * 1_000);
 	}
 
 	// Only a per-request selector reaches a keyless service once the user turned them off.
-	const keylessAllowed = params.model !== undefined || cfgProvidersWebKeyless.get(options.settings ?? settings);
+	const keylessAllowed = params.model !== undefined || cfgProvidersWebKeyless.get(effectiveSettings);
 	let keylessSkipped = false;
 	const failures: SearchProviderFailure[] = [];
 	let availableProviderCount = 0;
 	let lastProvider: { id: string; label: string } | undefined;
 	let failedResponseProvider: SearchResponse["provider"] = "none";
 	for (const candidate of expanded) {
-		if (cfgOffline.get(options.settings ?? settings)) {
+		if (cfgOffline.get(effectiveSettings)) {
 			const activeProvider = options.sessionModel?.provider;
 			// Search-only catalog entries use the synthetic "web" provider; their
 			// backend is not the session's model endpoint, so do not infer a match.
@@ -303,8 +300,8 @@ async function executeSearch(
 			}
 			lastProvider = provider;
 			const available = candidate.explicit
-				? await provider.isExplicitlyAvailable(authStorage, model)
-				: await provider.isAvailable(authStorage, model);
+				? await provider.isExplicitlyAvailable(authStorage, model, effectiveSettings)
+				: await provider.isAvailable(authStorage, model, effectiveSettings);
 			if (!available && !candidate.explicit) continue;
 			if (!available && candidate.explicit) {
 				throw new SearchProviderError(
@@ -332,6 +329,7 @@ async function executeSearch(
 				modelRegistry,
 				explicit: candidate.explicit,
 				sessionId,
+				settings: effectiveSettings,
 				antigravityEndpointMode,
 			});
 
@@ -385,7 +383,7 @@ async function executeSearch(
 	}
 
 	if (availableProviderCount === 0 && failures.length === 0) {
-		const message = cfgOffline.get(options.settings ?? settings)
+		const message = cfgOffline.get(effectiveSettings)
 			? "No web search backend is available on the active model's provider under --offline."
 			: params.model
 				? `No web search model matches selector "${params.model}".`
@@ -532,6 +530,7 @@ export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchResul
 			modelRegistry: ctx.modelRegistry,
 			sessionId,
 			sessionModel: ctx.model,
+			settings: ctx.settings,
 			signal,
 		});
 	},
