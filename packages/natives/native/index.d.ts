@@ -242,7 +242,8 @@ export declare class EditStore {
   recordSnapshot(absolutePath: string, text: string, seenLines?: Array<number> | undefined | null): string
   /**
    * Read `absolutePath` from disk and record it; null when the file is
-   * unreadable or larger than 4 MiB.
+   * unreadable or larger than 64 MiB. Past 4 MiB only the tag is returned:
+   * no snapshot is retained.
    */
   recordSnapshotFile(absolutePath: string, seenLines?: Array<number> | undefined | null): string | null
   /** Merge displayed lines into the snapshot tagged `tag`. */
@@ -776,11 +777,12 @@ export declare class TextPredictor {
 
 /**
  * Dedicated, cancellable terminal writer. The destination must be a TTY that
- * can be independently reopened; pipes and files are deliberately rejected.
+ * can be independently reopened (unix) or a console (Windows); pipes and
+ * files are deliberately rejected.
  */
 export declare class TtyWriter {
   /**
-   * Start an independently opened terminal writer. onDrain runs when the
+   * Start a writer on its own handle to the terminal. onDrain runs when the
    * pending bound crosses from above drainThreshold to at/below it, and on
    * fatal writes even below the threshold. It does not retain the event loop.
    */
@@ -797,9 +799,10 @@ export declare class TtyWriter {
   /** Wait for queued output until the deadline. False on timeout or failure. */
   flushSync(timeoutMs: number): boolean
   /**
-   * Drain until the deadline, then cancel and join. Never detaches a writer
-   * or leaves old output running after return. Already queued JS callbacks
-   * may still run; callers must ignore callbacks from a stopped writer.
+   * Drain until the deadline, then cancel and join. Nothing is written after
+   * return, except one chunk a Windows console refused to abort. Already
+   * queued JS callbacks may still run; callers must ignore callbacks from a
+   * stopped writer.
    */
   stop(flushTimeoutMs: number): void
 }
@@ -884,6 +887,12 @@ export declare class VcsGitRepo {
   submodulePaths(signal?: unknown | undefined | null): Promise<Array<string>>
   /** Read blob bytes. */
   showBlob(spec: string, maxBytes?: number | undefined | null, signal?: unknown | undefined | null): Promise<VcsShowResult>
+  /**
+   * Convert worktree content to the blob `git add` would store per path
+   * (EOL/`text` attributes, `core.autocrlf`, `ident`, clean filters such as
+   * Git LFS), in input order.
+   */
+  worktreeToGit(entries: Array<VcsWorktreeContent>, signal?: unknown | undefined | null): Promise<Array<Buffer>>
   /** Read commit and patch bytes. */
   showCommit(rev: string, maxBytes?: number | undefined | null, signal?: unknown | undefined | null): Promise<VcsShowResult>
   /** Local LFS media directory. */
@@ -2548,6 +2557,11 @@ export interface GrepOptions {
   hidden?: boolean
   /** Respect .gitignore files (default: true). */
   gitignore?: boolean
+  /**
+   * Follow descendant symbolic links with cycle detection (default: false).
+   * The filesystem provider is responsible for enforcing mount containment.
+   */
+  followLinks?: boolean
   /** Maximum number of matches to return. */
   maxCount?: number
   /** Skip first N matches. */
@@ -2878,6 +2892,17 @@ export interface IsoFileChange {
  * failure when handling caught errors on the JS side.
  */
 export declare function isoIsUnavailableError(message: string): boolean
+
+/**
+ * Keep a stalled Windows console from blocking thread starts in this process.
+ *
+ * Stops `KernelBase`'s per-thread console call, which JSC's lazily started
+ * helper threads would otherwise wait on. Process-wide and permanent; repeat
+ * calls are no-ops. Returns false, leaving the process untouched, when
+ * `KernelBase`'s loader entry does not have the expected shape; always false
+ * off Windows.
+ */
+export declare function isolateThreadStartsFromConsole(): boolean
 
 /**
  * Probe whether the requested backend can start on this host. Pass
@@ -4075,6 +4100,13 @@ export interface ShellOptions {
   minimizer?: MinimizerOptions
   /** Filesystem backing every run of this session (native when absent). */
   filesystem?: ShellFilesystem
+  /**
+   * The shell is this process's own: every run reads the process's stdin
+   * and writes its stdout and stderr directly (`run` streams no chunks and
+   * minimizes nothing), and externals stay in the process's session and
+   * process group, sharing its controlling terminal.
+   */
+  process?: boolean
 }
 
 /** Options for running a shell command. */
@@ -4094,6 +4126,11 @@ export interface ShellRunOptions {
    * filesystem applies again to later runs.
    */
   filesystem?: ShellFilesystem
+  /**
+   * The application's speech synthesizer, which `say` speaks through when
+   * it has one configured; absent leaves `say` to the system's.
+   */
+  speech?: ShellSpeech
   /** Receives a copy of every byte crossing the run's pipeline pipes. */
   streams?: PipeStreams
   /** Folds the run's engine events into a live model of the command. */
@@ -4117,6 +4154,72 @@ export interface ShellRunResult {
   minimized?: MinimizerResult
   /** Shell working directory after command completion. */
   workingDir?: string
+}
+
+/** The application's speech synthesizer, injected into a shell run. */
+export interface ShellSpeech {
+  /**
+   * Serves every request; failures are returned as `error` data rather
+   * than thrown.
+   */
+  handler: (error: Error | null, request: ShellSpeechRequest) => Promise<ShellSpeechResponse>
+}
+
+/** What a [`ShellSpeechRequest`] asks of the handler. */
+export declare enum ShellSpeechOp {
+  /** List the synthesizer's voices. */
+  Voices = 'voices',
+  /** Speak `text`, or synthesize it when `capture` is set. */
+  Speak = 'speak',
+  /** Stop the `speak` request with this `id`. */
+  Cancel = 'cancel'
+}
+
+/** One speech request. Only the fields documented for `op` are set. */
+export interface ShellSpeechRequest {
+  op: ShellSpeechOp
+  /** Identifies a `speak` request to a later `cancel`. */
+  id?: number
+  /** `speak`: the text. */
+  text?: string
+  /** `speak`: the voice asked for (`say -v`), verbatim. */
+  voice?: string
+  /** `speak`: the rate asked for, in words per minute (`say -r`). */
+  rate?: number
+  /** `speak`: return the audio as `samples` instead of playing it. */
+  capture?: boolean
+  /**
+   * `voices`, `speak`: answer even when no synthesizer is configured,
+   * because the system has none either.
+   */
+  required?: boolean
+}
+
+/** Handler answer. */
+export interface ShellSpeechResponse {
+  /**
+   * False when the application has no synthesizer configured and the
+   * request did not require one; nothing was spoken.
+   */
+  configured: boolean
+  /** `voices`: the voices. */
+  voices?: Array<ShellSpeechVoice>
+  /** `speak` with `capture`: mono samples in `-1..=1`. */
+  samples?: Float32Array
+  /** `speak` with `capture`: samples per second. */
+  sampleRate?: number
+  /** Why the request failed. */
+  error?: string
+}
+
+/** One voice of the application's synthesizer. */
+export interface ShellSpeechVoice {
+  /** The name `say -v` selects it by. */
+  name: string
+  /** Its locale, `en_US` style. */
+  locale: string
+  /** A line describing it. */
+  sample: string
 }
 
 /** Native non-executing visualization transformations. */
@@ -4539,6 +4642,15 @@ export interface VcsWorktreeAddOptions {
 export interface VcsWorktreeAddResult {
   clonedWith?: IsoBackendKind
   cloneError?: string
+}
+
+/**
+ * Worktree content of one repo-relative path, for
+ * [`VcsGitRepo::worktree_to_git`].
+ */
+export interface VcsWorktreeContent {
+  path: string
+  data: Uint8Array
 }
 
 /** One worktree listing row. */
