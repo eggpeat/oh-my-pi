@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the published README installation and examples to use `@oh-my-pi/pi-agent-core` and current catalog imports ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+
 ## [18.22.1] - 2026-11-17
 
 ### Added
