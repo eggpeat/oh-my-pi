@@ -36,7 +36,7 @@
 import type { Api, AuthStorage, FetchImpl, Model } from "@oh-my-pi/pi-ai";
 
 import type { Setting } from "../../../config/registry";
-import { isSettingsInitialized, settings, Settings } from "../../../config/settings";
+import { resolveSettings, type Settings } from "../../../config/settings";
 import type { SearchResponse, SearchSource } from "../types";
 import { SearchProviderError } from "../../../web/search/types";
 import type { StructuredQuery } from "../query";
@@ -100,10 +100,6 @@ interface SearXNGAuth {
 /** Subset of the SearXNG /config payload used for engine shortcut resolution. */
 interface SearXNGConfig {
 	engines?: Array<{ name?: string; shortcut?: string }>;
-}
-
-function resolveSettings(explicit?: Settings): Settings {
-	return explicit ?? (isSettingsInitialized() ? settings : Settings.isolated());
 }
 
 /** SearXNG connection value from settings (env fallback declared on the definition). */

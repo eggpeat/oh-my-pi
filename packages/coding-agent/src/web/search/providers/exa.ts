@@ -16,7 +16,7 @@ import {
 	withAuth,
 } from "@oh-my-pi/pi-ai";
 import { $env, asRecord } from "@oh-my-pi/pi-utils";
-import { isSettingsInitialized, settings, Settings } from "../../../config/settings";
+import { resolveSettings, type Settings } from "../../../config/settings";
 import { normalizeMcpToolPayload } from "../../../exa/mcp-client";
 import { readMcpJsonRpcResponse } from "../../../mcp/json-rpc";
 import type { SearchResponse, SearchSource } from "../types";
@@ -36,10 +36,6 @@ const MAX_EXA_SNIPPET_CHARS = 500;
 
 let nextExaSearchRequestAt = 0;
 let exaSearchThrottle = Promise.resolve();
-
-function resolveSettings(explicit?: Settings): Settings {
-	return explicit ?? (isSettingsInitialized() ? settings : Settings.isolated());
-}
 
 function configuredExaSearchDelayMs(explicit?: Settings): number {
 	const delayMs = cfgExaSearchDelayMs.get(resolveSettings(explicit));

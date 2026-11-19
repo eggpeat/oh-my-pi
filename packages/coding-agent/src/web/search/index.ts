@@ -14,7 +14,7 @@ import { cfgOffline } from "../../config/auxiliary-model-policy";
 import { ModelRegistry } from "../../config/model-registry";
 import { type RoleChainCandidate, resolveModelRoleValue, resolveRoleChain } from "../../config/model-resolver";
 import { roleCandidatePool } from "../../config/model-roles";
-import { isSettingsInitialized, settings, Settings } from "../../config/settings";
+import { resolveSettings, type Settings } from "../../config/settings";
 import type { CustomTool, CustomToolContext } from "../../extensibility/custom-tools/types";
 import webSearchSystemPrompt from "../../prompts/system/web-search.md" with { type: "text" };
 import webSearchDescription from "../../prompts/tools/web-search.md" with { type: "text" };
@@ -223,7 +223,7 @@ async function executeSearch(
 	options: ExecuteSearchOptions,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchResultDetails }> {
 	const { authStorage, sessionId, signal } = options;
-	const effectiveSettings = options.settings ?? (isSettingsInitialized() ? settings : Settings.isolated());
+	const effectiveSettings = resolveSettings(options.settings);
 	const modelRegistry =
 		options.modelRegistry ?? new ModelRegistry(authStorage, undefined, { settings: effectiveSettings });
 	const pool = roleCandidatePool("web", effectiveSettings, modelRegistry);
