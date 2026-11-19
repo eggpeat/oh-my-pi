@@ -70,7 +70,7 @@
 
 ### Fixed
 
-- Eval `sh` commands now open internal URLs at eval's `exec` approval tier, so schemes such as `ssh://` and `vault://` work alongside `local://` spills ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+- Eval `sh` commands now run the internal URL filesystem at eval's `exec` approval tier, enabling `ssh://` reads and `vault://` writes ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 - Commit drafts no longer show a committed block as deleted in one hunk and re-added in the next (left out vs. selected) when part of the work was committed earlier and the block sits among repeated lines such as `return;` or `}`; committing the preselection duplicated those lines
 - A `reasoning_extraction` refusal that cuts off a turn mid-stream is retried once on the same model instead of failing the turn (subagents died on it and needed a manual resume)
 - `omp --restore` goes on with a turn cut off by SIGTERM or SIGHUP (a terminal such as Tern restarting its panes) instead of leaving it at "Operation aborted"; only its subagents went on before
