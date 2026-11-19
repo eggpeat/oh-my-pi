@@ -33,7 +33,7 @@ test("check reports every opted-in crate, including ones the strict query omits"
 	expect(castLossless).toBeGreaterThan(pedantic);
 });
 
-test("coverage fails only for opted-in targets missing the workspace lint config", async () => {
+test("coverage ignores stray files and fails only for opted-in targets missing the workspace lint config", async () => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-clippy-coverage-"));
 	try {
 		await writeCrate(
@@ -50,6 +50,7 @@ test("coverage fails only for opted-in targets missing the workspace lint config
 		);
 		await writeCrate(root, "pi-plain", false, `rust_library(\n    name = "pi-plain",\n)\n`);
 		await writeCrate(root, "pi-testonly", true, `rust_test(\n    name = "pi-testonly_test",\n)\n`);
+		await Bun.write(path.join(root, "crates", ".DS_Store"), "\u0000");
 
 		const result = await $`bun ${script} --check --coverage --root ${root}`.quiet().nothrow();
 		const stderr = result.stderr.toString();
@@ -58,6 +59,7 @@ test("coverage fails only for opted-in targets missing the workspace lint config
 		expect(stderr).toContain(`${gapPrefix} pi-testonly`);
 		expect(stderr).not.toContain("pi-wired");
 		expect(stderr).not.toContain("pi-plain");
+		expect(stderr).not.toContain("ENOTDIR");
 		expect(result.stdout.toString()).not.toContain(coveragePrefix);
 	} finally {
 		await fs.rm(root, { recursive: true, force: true });

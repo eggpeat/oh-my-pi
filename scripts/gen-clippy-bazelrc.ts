@@ -219,10 +219,10 @@ async function checkCoverage(root: string): Promise<Coverage> {
 	const gaps: CoverageGap[] = [];
 	for (const name of entries.sort()) {
 		const crateDir = path.join(cratesDir, name);
+		if (!(await fs.stat(crateDir)).isDirectory()) continue;
 		const cargoPath = path.join(crateDir, "Cargo.toml");
 		const cargoToml = await readText(cargoPath);
 		if (cargoToml == null) continue;
-		if (!(await fs.stat(crateDir)).isDirectory()) continue;
 		if (!optsIntoWorkspaceLints(cargoToml)) continue;
 
 		const buildPath = path.join(crateDir, "BUILD.bazel");
