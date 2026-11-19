@@ -586,23 +586,27 @@ async fn omp_receives_its_url_arguments_as_written() {
 	let script = format!(
 		"PATH='{bin}':$PATH; REF=virtual://docs/a.txt omp read virtual://docs/a.txt:1-2 \
 		 --from=virtual://docs/a.txt; nice omp read virtual://docs; '{omp}' read \
-		 @virtual://docs/a.txt",
+		 @virtual://docs/a.txt; {PROBE} probe omp ./omp virtual://docs/a.txt",
 		bin = bin.path().display(),
 		omp = omp.display(),
 	);
 	let run = run_virtual(directory.path(), &script).await;
 	assert_eq!(run.status, Some(0), "{}", run.stderr);
+	let file = docs.join("a.txt").display().to_string();
 	let expected = [
-		"read",
-		"virtual://docs/a.txt:1-2",
-		"--from=virtual://docs/a.txt",
-		"ref=virtual://docs/a.txt",
-		"read",
-		"virtual://docs",
-		"ref=",
-		"read",
-		"@virtual://docs/a.txt",
-		"ref=",
+		"read".to_owned(),
+		"virtual://docs/a.txt:1-2".to_owned(),
+		"--from=virtual://docs/a.txt".to_owned(),
+		"ref=virtual://docs/a.txt".to_owned(),
+		"read".to_owned(),
+		"virtual://docs".to_owned(),
+		"ref=".to_owned(),
+		"read".to_owned(),
+		"@virtual://docs/a.txt".to_owned(),
+		"ref=".to_owned(),
+		"probe:omp".to_owned(),
+		"probe:./omp".to_owned(),
+		format!("probe:{file}"),
 	];
 	assert_eq!(run.stdout.lines().collect::<Vec<_>>(), expected);
 }

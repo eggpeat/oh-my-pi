@@ -154,6 +154,34 @@ describe("bash internal URLs through the shell filesystem", () => {
 		expect(text).toContain("read\nlocal://data.txt:1-1\n--from=local://data.txt\n");
 	});
 
+	it("resolves backed URLs for an external program when omp is an argument, while keeping wrapped omp literal", async () => {
+		const script = path.join(tempDir, "argv.js");
+		await fs.writeFile(script, "console.log(process.argv.slice(2).concat(process.env.BODY ?? []).join('\\n'));\n");
+		await fs.mkdir(localRoot, { recursive: true });
+		await fs.writeFile(path.join(localRoot, "data.txt"), "payload\n");
+		const data = path.join(localRoot, "data.txt");
+
+		const plain = await run(`BODY=local://data.txt '${process.execPath}' '${script}' omp ./omp local://data.txt`);
+		expect(plain.isError).toBeUndefined();
+		expect(plain.text).toContain(`omp\n./omp\n${data}\n${data}\n`);
+
+		if (process.platform !== "win32") {
+			await fs.writeFile(path.join(tempDir, "omp"), `#!/bin/sh\nexec '${process.execPath}' '${script}' "$@"\n`, {
+				mode: 0o755,
+			});
+
+			const wrappedOmp = await run(
+				`PATH="$PWD:$PATH" BODY=local://data.txt nice -n 0 omp read local://data.txt:1-1`,
+			);
+			expect(wrappedOmp.isError).toBeUndefined();
+			expect(wrappedOmp.text).toContain("read\nlocal://data.txt:1-1\nlocal://data.txt\n");
+
+			const wrappedOther = await run(`nice -n 0 '${process.execPath}' '${script}' omp local://data.txt`);
+			expect(wrappedOther.isError).toBeUndefined();
+			expect(wrappedOther.text).toContain(`omp\n${data}\n`);
+		}
+	});
+
 	it("resolves URLs attached to an option, behind curl's @, and in the environment", async () => {
 		const script = path.join(tempDir, "argv.js");
 		await fs.writeFile(script, "console.log(process.argv.slice(2).concat(process.env.BODY).join('\\n'));\n");

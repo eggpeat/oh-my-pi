@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed bash internal URL rewriting so commands passing `omp` as an argument (such as `grep omp local://out.txt` or `ls ./omp local://dir`) still resolve backed URLs to host files ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+
 ## [19.0.0] - 2026-11-18
 
 ### Breaking Changes

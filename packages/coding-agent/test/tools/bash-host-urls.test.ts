@@ -86,6 +86,33 @@ describe("hostCommandUrls", () => {
 		);
 	});
 
+	it("only skips URL rewriting when omp is the command or a wrapper's target, not an argument", async () => {
+		expect(await host("grep omp local://out.txt")).toBe("grep omp /host/out.txt");
+		expect(await host("rg -n 'omp' local://SKILL.md && ls ./omp local://dir")).toBe(
+			"rg -n 'omp' /host/SKILL.md && ls ./omp /host/dir",
+		);
+		expect(await host("sudo -u omp grep needle local://out.txt")).toBe("sudo -u omp grep needle /host/out.txt");
+		expect(await host("OMP_BIN=/usr/local/bin/omp node local://run.mjs")).toBe(
+			"OMP_BIN=/usr/local/bin/omp node /host/run.mjs",
+		);
+		expect(await host("nice -n 5 npx -y eslint omp local://app.ts")).toBe("nice -n 5 npx -y eslint omp /host/app.ts");
+		expect(await host("node $(echo flag) omp local://run.mjs")).toBe("node $(echo flag) omp /host/run.mjs");
+
+		for (const command of [
+			"REF=local://x.md omp read local://x.md:1-5",
+			"nice -n 10 omp read local://x.md:1-5",
+			"nohup omp read local://x.md:1-5",
+			"env -u DEBUG FOO=1 omp read local://x.md:1-5",
+			"sudo -E -u root /usr/local/bin/omp read local://x.md:1-5",
+			"timeout -k 5 30 omp read local://x.md:1-5",
+			"time -p omp read local://x.md:1-5",
+			"npx -y -p @oh-my-pi/pi-coding-agent omp read local://x.md:1-5",
+			"bunx --bun omp read local://x.md:1-5",
+		]) {
+			expect(await host(command)).toBe(command);
+		}
+	});
+
 	it("treats a here-document body as input, not command text", async () => {
 		const command = [
 			"python3 - local://args.json <<'PY' && cat local://after.txt",
