@@ -403,6 +403,173 @@ describe("selective commit flow", () => {
 		},
 	);
 
+	it("seeds the shared index of a root commit once another git lets go of its lock", async () => {
+		const { root, journal, write } = await emptyRepo();
+		await write("Main", undefined, "first.txt", "first\n");
+		await journal.flush();
+		// ExFAT and FAT drives reject hard links; seeding must write through `index.lock` and rename.
+		vi.spyOn(fs, "link").mockRejectedValue(
+			Object.assign(new Error("ENOTSUP: hard links not supported"), { code: "ENOTSUP" }),
+		);
+		const lock = path.join(root, ".git", "index.lock");
+		await Bun.write(lock, "");
+		const realOpen = fs.open;
+		let attempts = 0;
+		vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+			if (String(target) === lock) {
+				attempts++;
+				try {
+					return await realOpen(target, flags, mode);
+				} catch (error) {
+					if (attempts === 1) await fs.rm(lock);
+					throw error;
+				}
+			}
+			return realOpen(target, flags, mode);
+		});
+
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		const outcome = await commitSelection(draft, { subject: "feat: first" }, { journal, agent: { agent: "Main" } });
+
+		expect(attempts).toBe(2);
+		expect(outcome.indexNotes).toEqual([]);
+		expect(await git(root, ["rev-parse", "HEAD"])).toBe(`${outcome.sha}\n`);
+		expect(await git(root, ["status", "--porcelain"])).toBe("");
+		expect(await Bun.file(lock).exists()).toBe(false);
+	});
+
+	it("warns when a root commit cannot seed the shared index because another git keeps index.lock", async () => {
+		const { root, journal, write } = await emptyRepo();
+		await write("Main", undefined, "first.txt", "first\n");
+		await Bun.write(path.join(root, "extra.txt"), "extra\n");
+		await journal.flush();
+		// Another `git add` holds `index.lock` across the whole wait and only commits its staged
+		// index afterwards: `commitSelection` must neither bypass the lock nor throw post-commit.
+		const indexFile = path.join(root, ".git", "index");
+		const lock = `${indexFile}.lock`;
+		await git(root, ["add", "extra.txt"], { GIT_INDEX_FILE: lock });
+
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		const outcome = await commitSelection(draft, { subject: "feat: first" }, { journal, agent: { agent: "Main" } });
+		expect(await Bun.file(indexFile).exists()).toBe(false);
+		await fs.rename(lock, indexFile);
+
+		expect(await git(root, ["rev-parse", "HEAD"])).toBe(`${outcome.sha}\n`);
+		expect(outcome.indexNotes).toHaveLength(1);
+		expect(outcome.indexNotes[0]).toContain("the shared index is missing");
+		expect(outcome.indexNotes[0]).toContain("git reset -q");
+		expect(await git(root, ["ls-files"])).toBe("extra.txt\n");
+	});
+
+	it("stops retrying the root-commit index seed and warns when aborted post-commit", async () => {
+		const { root, journal, write } = await emptyRepo();
+		await write("Main", undefined, "first.txt", "first\n");
+		await journal.flush();
+		const lock = path.join(root, ".git", "index.lock");
+		await Bun.write(lock, "");
+		const controller = new AbortController();
+		const realOpen = fs.open;
+		let attempts = 0;
+		vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+			if (String(target) === lock) {
+				attempts++;
+				try {
+					return await realOpen(target, flags, mode);
+				} catch (error) {
+					controller.abort();
+					throw error;
+				}
+			}
+			return realOpen(target, flags, mode);
+		});
+
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		const outcome = await commitSelection(
+			draft,
+			{ subject: "feat: first" },
+			{ journal, agent: { agent: "Main" }, signal: controller.signal },
+		);
+		await fs.rm(lock);
+
+		expect(attempts).toBe(1);
+		expect(await git(root, ["rev-parse", "HEAD"])).toBe(`${outcome.sha}\n`);
+		expect(outcome.indexNotes).toHaveLength(1);
+		expect(outcome.indexNotes[0]).toContain("aborted");
+	});
+
+	it("patches an index another git finishes writing while a root commit waits on index.lock", async () => {
+		const { root, journal, write } = await emptyRepo();
+		await write("Main", undefined, "first.txt", "first\n");
+		await Bun.write(path.join(root, "extra.txt"), "extra\n");
+		await journal.flush();
+		const indexFile = path.join(root, ".git", "index");
+		const lock = `${indexFile}.lock`;
+		await git(root, ["add", "extra.txt"], { GIT_INDEX_FILE: lock });
+		const realOpen = fs.open;
+		let attempts = 0;
+		vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+			if (String(target) === lock && ++attempts === 2) {
+				await fs.rename(lock, indexFile);
+			}
+			return realOpen(target, flags, mode);
+		});
+
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		const outcome = await commitSelection(draft, { subject: "feat: first" }, { journal, agent: { agent: "Main" } });
+
+		expect(attempts).toBe(2);
+		expect(outcome.indexNotes).toEqual([]);
+		expect(await git(root, ["status", "--porcelain"])).toBe("A  extra.txt\n");
+		expect(await Bun.file(lock).exists()).toBe(false);
+	});
+
+	it("checks an existing index for conflicts when a root commit sees index.lock held", async () => {
+		const { root, journal, write } = await emptyRepo();
+		await write("Main", undefined, "first.txt", "agent\n");
+		await Bun.write(path.join(root, "first.txt"), "user\n");
+		await Bun.write(path.join(root, "extra.txt"), "extra\n");
+		await git(root, ["add", "first.txt", "extra.txt"]);
+		await Bun.write(path.join(root, "first.txt"), "agent\n");
+		await journal.flush();
+		const lock = path.join(root, ".git", "index.lock");
+		await Bun.write(lock, "");
+
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		const outcome = await commitSelection(draft, { subject: "feat: first" }, { journal, agent: { agent: "Main" } });
+		await fs.rm(lock);
+
+		expect(await git(root, ["rev-parse", "HEAD"])).toBe(`${outcome.sha}\n`);
+		expect(outcome.indexNotes).toHaveLength(1);
+		expect(outcome.indexNotes[0]).toContain("first.txt: its shared-index entry holds someone else's staged changes");
+		expect(outcome.indexNotes[0]).not.toContain("git reset -q");
+		expect((await git(root, ["diff", "--cached", "--name-only"])).trim().split("\n").sort()).toEqual([
+			"extra.txt",
+			"first.txt",
+		]);
+	});
+
+	it("still reports a commit when removing its private index fails afterwards", async () => {
+		const { root, journal, write } = await emptyRepo();
+		await write("Main", undefined, "first.txt", "first\n");
+		await journal.flush();
+		// The commit has already landed when the private and seed index files are removed: those
+		// removals can only fail once the files exist, so a refusal there must not hide the commit.
+		const realRm = fs.rm;
+		vi.spyOn(fs, "rm").mockImplementation(async (target, options) => {
+			const targetPath = String(target);
+			if (/[\\/](omp-commit-|index\.omp-)/.test(targetPath) && (await fs.stat(targetPath).catch(() => null))) {
+				throw Object.assign(new Error("cleanup denied"), { code: "EACCES" });
+			}
+			return realRm(target, options);
+		});
+
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		const outcome = await commitSelection(draft, { subject: "feat: first" }, { journal, agent: { agent: "Main" } });
+
+		expect(await git(root, ["rev-parse", "HEAD"])).toBe(`${outcome.sha}\n`);
+		expect(outcome.indexNotes).toEqual([]);
+	});
+
 	it("commits only one subagent's changes when scoped to it", async () => {
 		const { root, journal } = await sharedWorkspace();
 

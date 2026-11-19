@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `/commit` and eval `commit` failing a first commit when another git process holds `index.lock`; seeding the missing index now waits on `index.lock`, warns if the lock stays busy instead of failing after the commit landed, and patches an index another process staged meanwhile instead of overwriting it ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+
 ## [19.0.0] - 2026-11-18
 
 ### Breaking Changes

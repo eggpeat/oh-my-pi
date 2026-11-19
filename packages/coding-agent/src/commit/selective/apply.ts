@@ -83,6 +83,56 @@ async function syncSharedIndex(
 	return notes;
 }
 
+/**
+ * Seed a missing shared index at `indexFile` with `sha`'s tree through `${indexFile}.lock`,
+ * retrying while another git process holds the lock: `"exists"` when an index is (or becomes)
+ * present so the caller updates it by patch and keeps staged entries, the failure's message once
+ * attempts run out or fail, or `undefined` once seeded.
+ */
+async function seedSharedIndex(
+	repo: VcsGitRepo,
+	sha: string,
+	indexFile: string,
+	signal?: AbortSignal,
+): Promise<"exists" | string | undefined> {
+	const lockFile = `${indexFile}.lock`;
+	const seedPath = `${indexFile}.omp-${Math.floor(Math.random() * 46656).toString(36)}`;
+	let failure = "";
+	try {
+		for (let attempt = 0; attempt < INDEX_WRITE_ATTEMPTS; attempt++) {
+			if (await Bun.file(indexFile).exists()) return "exists";
+			signal?.throwIfAborted();
+			let handle: fs.FileHandle | undefined;
+			try {
+				handle = await fs.open(lockFile, "wx");
+			} catch (error) {
+				failure = error instanceof Error ? error.message : String(error);
+				if (attempt + 1 < INDEX_WRITE_ATTEMPTS) await Bun.sleep(INDEX_WRITE_BACKOFF_MS << attempt);
+				continue;
+			}
+			let lockPath: string | undefined = lockFile;
+			try {
+				if (await Bun.file(indexFile).exists()) return "exists";
+				await repo.readTree(sha, seedPath, signal);
+				await handle.writeFile(await fs.readFile(seedPath));
+				await handle.close();
+				handle = undefined;
+				await fs.rename(lockFile, indexFile);
+				lockPath = undefined;
+				return undefined;
+			} finally {
+				await handle?.close().catch(() => {});
+				if (lockPath) await fs.rm(lockPath, { force: true }).catch(() => {});
+			}
+		}
+		return failure;
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
+	} finally {
+		await fs.rm(seedPath, { force: true }).catch(() => {});
+	}
+}
+
 /** Attempts when HEAD moves between building the private index and committing it. */
 const HEAD_RACE_ATTEMPTS = 3;
 
@@ -249,15 +299,16 @@ export async function commitSelection(
 			}
 		}
 	} finally {
-		await fs.rm(indexPath, { force: true });
+		await fs.rm(indexPath, { force: true }).catch(() => {});
 	}
 
 	const indexNotes: string[] = [];
-	// A new repository may have no index file yet. Git reads that as an empty index, but patch
-	// application reads HEAD in its place, so seed it with the root commit's tree instead.
-	if (base === null && !(await Bun.file(path.join(gitDir, "index")).exists())) {
-		await repo.readTree(sha, undefined, context.signal);
-	} else {
+	// A new repository may have no index file yet. Git reads that as an empty index, which shows
+	// every committed path as a staged deletion, while patch application reads HEAD in its place;
+	// seed it with the root commit's tree under `index.lock`, or fall back to patching when
+	// another process staged an index meanwhile so its entries survive.
+	const seed = base === null ? await seedSharedIndex(repo, sha, path.join(gitDir, "index"), context.signal) : "exists";
+	if (seed === "exists") {
 		const left = await syncSharedIndex(repo, patches, context.signal);
 		// Then what a hook changed on top of the selection, for paths that now hold the selection.
 		const kept = new Set(left.map(entry => entry.path));
@@ -269,6 +320,11 @@ export async function commitSelection(
 		}
 		if (rewrites.length > 0) left.push(...(await syncSharedIndex(repo, rewrites, context.signal)));
 		indexNotes.push(...left.map(entry => entry.note));
+	} else if (seed !== undefined) {
+		indexNotes.push(
+			`the shared index is missing and could not be written (${seed}); ` +
+				"`git status` shows every committed path staged for deletion until `git reset -q`.",
+		);
 	}
 	const selected = patches.map(entry => entry.path);
 	await context.journal?.recordCommit({
