@@ -3,6 +3,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { isEnoent } from "@oh-my-pi/pi-utils/fs-error";
 
 type Mode =
 	| "all"
@@ -269,7 +270,7 @@ async function assertPackageTestSuitesScheduled(): Promise<void> {
 			const testDir = await fs.stat(path.join(packagesRoot, entry.name, "test"));
 			if (testDir.isDirectory()) unscheduled.push(pkg);
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			if (isEnoent(error)) continue;
 			throw error;
 		}
 	}
