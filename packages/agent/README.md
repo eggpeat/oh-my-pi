@@ -17,7 +17,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 const agent = new Agent({
 	initialState: {
 		systemPrompt: ["You are a helpful assistant."],
-		model: getBundledModel("anthropic", "claude-sonnet-4-20250514"),
+		model: getBundledModel("anthropic", "claude-sonnet-4-5"),
 	},
 });
 

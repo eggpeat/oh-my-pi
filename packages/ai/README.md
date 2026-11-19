@@ -99,7 +99,7 @@ npm install @oh-my-pi/pi-ai @oh-my-pi/pi-catalog
 import { stream, complete, Context, Tool, type } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 
-// Fully typed with auto-complete support for both providers and models
+// Look up a bundled model by provider and model ID
 const model = getBundledModel("openai", "gpt-4o-mini");
 
 // Define tools with omptype schemas for type safety and validation
@@ -447,7 +447,7 @@ import { streamSimple, completeSimple } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 
 // Many models across providers support thinking/reasoning
-const model = getBundledModel("anthropic", "claude-sonnet-4-20250514");
+const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 // or getBundledModel('openai', 'gpt-5-mini');
 // or getBundledModel('google', 'gemini-2.5-flash');
 // or getBundledModel('xai', 'grok-code-fast-1');
@@ -497,7 +497,7 @@ await complete(openaiModel, context, {
 });
 
 // Anthropic Thinking (Claude Sonnet 4)
-const anthropicModel = getBundledModel("anthropic", "claude-sonnet-4-20250514");
+const anthropicModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 await complete(anthropicModel, context, {
 	thinkingEnabled: true,
 	thinkingBudgetTokens: 8192, // Optional token limit
@@ -684,7 +684,7 @@ import { getBundledProviders, getBundledModels, getBundledModel } from "@oh-my-p
 const providers = getBundledProviders();
 console.log(providers); // ['openai', 'anthropic', 'google', 'xai', 'groq', ...]
 
-// Get all models from a provider (fully typed)
+// Get all models from a provider
 const anthropicModels = getBundledModels("anthropic");
 for (const model of anthropicModels) {
 	console.log(`${model.id}: ${model.name}`);
@@ -694,7 +694,7 @@ for (const model of anthropicModels) {
 	console.log(`  Reasoning: ${model.reasoning}`);
 }
 
-// Get a specific model (both provider and model ID are auto-completed in IDEs)
+// Get a specific model
 const model = getBundledModel("openai", "gpt-4o-mini");
 console.log(`Using ${model.name} via ${model.api} API`);
 ```
@@ -805,8 +805,8 @@ If `compat` is not set, the library falls back to URL-based detection. If `compa
 Models are typed by their API, ensuring type-safe options:
 
 ```typescript
-// TypeScript knows this is an Anthropic model
-const claude = getBundledModel("anthropic", "claude-sonnet-4-20250514");
+// Type the lookup as an Anthropic Messages model
+const claude = getBundledModel<"anthropic-messages">("anthropic", "claude-sonnet-4-5");
 
 // So these options are type-checked for AnthropicOptions
 await stream(claude, context, {
@@ -836,7 +836,7 @@ import { complete, Context } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 
 // Start with Claude
-const claude = getBundledModel("anthropic", "claude-sonnet-4-20250514");
+const claude = getBundledModel("anthropic", "claude-sonnet-4-5");
 const context: Context = {
 	messages: [],
 };
@@ -1083,7 +1083,7 @@ import { complete } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 
 (async () => {
-	const model = getBundledModel("google-vertex", "gemini-2.5-flash");
+	const model = getBundledModel("google-vertex", "gemini-3.5-flash");
 	const response = await complete(model, {
 		messages: [{ role: "user", content: "Hello from Vertex AI" }],
 	});
