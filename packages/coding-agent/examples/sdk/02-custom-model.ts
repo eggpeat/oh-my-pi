@@ -17,7 +17,7 @@ if (opus) {
 	console.log(`Found model: ${opus.provider}/${opus.id}`);
 }
 
-// Option 2: Find model via registry (includes custom models from models.json)
+// Option 2: Find model via registry (includes custom models from models.yml)
 const customModel = modelRegistry.find("my-provider", "my-model");
 if (customModel) {
 	console.log(`Found custom model: ${customModel.provider}/${customModel.id}`);

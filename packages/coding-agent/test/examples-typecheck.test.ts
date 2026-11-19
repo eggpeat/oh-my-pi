@@ -28,8 +28,3 @@ it("includes published examples in the package typecheck without their private d
 	expect(files).toContain(path.join(packageRoot, "examples/sdk/02-custom-model.ts"));
 	expect(files).not.toContain(path.join(packageRoot, "examples/extensions/with-deps/index.ts"));
 }, 30000);
-
-it("typechecks published examples against current workspace APIs", async () => {
-	const result = await runTypechecker();
-	expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
-}, 30000);
