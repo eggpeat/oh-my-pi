@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed concurrent `commitCreate()` calls so a `commit-msg` hook that reads `.git/COMMIT_EDITMSG` sees its own commit message instead of another call's ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+
 ## [19.0.0] - 2026-11-18
 
 ### Added

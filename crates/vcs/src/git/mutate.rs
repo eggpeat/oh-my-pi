@@ -302,15 +302,38 @@ impl GitRepo {
 				.ok_or_else(|| Error::backend("git commit", "author identity is not configured"))?
 				.map_err(|err| Error::backend("git commit", err))?
 		};
+		// Whether a `commit-msg` hook may run for this call. Only then can a
+		// hook read the shared file below, so only then do failures to lock
+		// or write it abort the commit instead of skipping that write.
+		let commit_msg_hook = !options.no_verify
+			&& (hook_configured(self, "commit-msg")? || self.hook_path("commit-msg")?.is_some());
 		// Not `.git/COMMIT_EDITMSG`: overlapping calls reread whichever message
 		// landed last, including when `no_verify` skips the hook.
 		let message_file = CommitMessageFile::create(&self.info().git_dir, message)?;
 		// Hooks that read `.git/COMMIT_EDITMSG` instead of `$1` still see this
 		// message, as under `git commit`; only the private copy is read back.
-		let _ = fs::write(self.info().git_dir.join("COMMIT_EDITMSG"), message);
+		// Holding the lock across the hook keeps an overlapping call from
+		// replacing the shared file between this write and the hook's read.
+		let editmsg_lock = match CommitEditmsgLock::acquire(&self.info().git_dir) {
+			Ok(lock) => Some(lock),
+			Err(err) if commit_msg_hook => {
+				return Err(Error::backend("git commit write COMMIT_EDITMSG", err));
+			},
+			Err(_) => None,
+		};
+		if editmsg_lock.is_some() {
+			match fs::write(self.info().git_dir.join("COMMIT_EDITMSG"), message) {
+				Ok(()) => {},
+				Err(err) if commit_msg_hook => {
+					return Err(Error::backend("git commit write COMMIT_EDITMSG", err));
+				},
+				Err(_) => {},
+			}
+		}
 		if !options.no_verify {
 			run_commit_hook(self, "commit-msg", &[message_file.path.as_os_str()], index_path)?;
 		}
+		drop(editmsg_lock);
 		let message = fs::read_to_string(&message_file.path)
 			.map_err(|err| Error::backend("git commit read commit-msg result", err))?;
 		let id = if sign {
@@ -1128,6 +1151,47 @@ impl CommitMessageFile {
 impl Drop for CommitMessageFile {
 	fn drop(&mut self) {
 		let _ = fs::remove_file(&self.path);
+	}
+}
+
+/// Per-git-directory lock serializing `.git/COMMIT_EDITMSG` with the
+/// `commit-msg` hook that may read it. Held across the shared-file write and
+/// the hook, across omp processes as well as overlapping calls in one.
+///
+/// The lock file is never removed: unlinking it would let a later caller
+/// lock a fresh file while a waiter still blocks on the unlinked one.
+/// Closing the file — on drop, or when the process dies — releases the lock,
+/// so a crashed commit cannot wedge the repository.
+#[must_use = "dropping the guard releases the COMMIT_EDITMSG lock"]
+struct CommitEditmsgLock {
+	// Never read or written; the open file description carries the lock.
+	_file: fs::File,
+}
+
+impl CommitEditmsgLock {
+	fn acquire(git_dir: &Path) -> io::Result<Self> {
+		let path = git_dir.join(".omp-commit-editmsg.lock");
+		// The lock needs no write access to an existing file, so fall back to
+		// a read-only open when the file another user created (a shared or
+		// container-run checkout) refuses a write open.
+		let file = match fs::OpenOptions::new()
+			.read(true)
+			.write(true)
+			.create(true)
+			.truncate(false)
+			.open(&path)
+		{
+			Ok(file) => file,
+			Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+				match fs::OpenOptions::new().read(true).open(&path) {
+					Ok(file) => file,
+					Err(_) => return Err(err),
+				}
+			},
+			Err(err) => return Err(err),
+		};
+		file.lock()?;
+		Ok(Self { _file: file })
 	}
 }
 

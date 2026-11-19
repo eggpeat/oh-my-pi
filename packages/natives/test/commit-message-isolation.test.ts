@@ -5,6 +5,8 @@
  * read back. Replacing `COMMIT_EDITMSG` in that window is another call's
  * write. Each call has to commit its own subject and body, including the
  * hook's edit of the file it was given, and remove that file on every exit.
+ * A legacy hook that ignores that path and reads `COMMIT_EDITMSG` must
+ * likewise still see its own call's message while another call overlaps.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -52,6 +54,25 @@ async function installHook(root: string, script: string): Promise<void> {
 	await fs.chmod(hook, 0o755);
 }
 
+const EDITMSG_LOCK = ".omp-commit-editmsg.lock";
+
+/** Poll `check` until it passes or the wall-clock deadline passes. */
+async function waitFor(check: () => Promise<boolean>, timeoutMs = 30_000): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (!(await check())) {
+		if (Date.now() >= deadline) return false;
+		await Bun.sleep(10);
+	}
+	return true;
+}
+
+function settled(promise: Promise<string>): Promise<{ sha: string } | { error: unknown }> {
+	return promise.then(
+		sha => ({ sha }),
+		error => ({ error }),
+	);
+}
+
 describe("commitCreate message isolation", () => {
 	test("keeps its subject and body when another call replaces COMMIT_EDITMSG", async () => {
 		const root = await repository();
@@ -94,7 +115,9 @@ describe("commitCreate message isolation", () => {
 		expect(sha).toBe(await git(root, "rev-parse", "HEAD"));
 		expect(await git(root, "log", "-1", "--format=%B")).toBe("private message");
 		const added = (await fs.readdir(gitDir)).filter(name => !before.has(name));
-		expect(added).toEqual([]);
+		// Only the COMMIT_EDITMSG lock file persists, by design; the private
+		// message file is gone.
+		expect(added).toEqual([EDITMSG_LOCK]);
 	});
 
 	test("removes the message file when commit-msg rejects the commit", async () => {
@@ -114,4 +137,192 @@ describe("commitCreate message isolation", () => {
 		// Hooks that ignore `$1` and read COMMIT_EDITMSG see this call's message.
 		expect(await Bun.file(shared).text()).toBe("will not land\n");
 	});
+
+	test.skipIf(process.platform === "win32")(
+		"a legacy hook reading COMMIT_EDITMSG sees its own message during a concurrent commit",
+		async () => {
+			const root = await repository();
+			const gitDir = path.join(root, ".git");
+			// The validator under test reads the shared file, not `$1`; `$1`
+			// only tells this fixture which invocation is running and what the
+			// shared file must contain. The first invocation parks inside the
+			// hook until the test releases it, so the second call reaches its
+			// shared-file write while the first hook is still running.
+			await installHook(
+				root,
+				[
+					"#!/bin/sh",
+					'msg=$(cat "$1")',
+					'case "$msg" in',
+					"first*)",
+					'	: > "$GIT_DIR/first-entered"',
+					'	while [ ! -e "$GIT_DIR/release-first" ]; do sleep 0.02; done',
+					"	;;",
+					"second*)",
+					'	: > "$GIT_DIR/second-entered"',
+					"	;;",
+					"esac",
+					'shared=$(cat "$GIT_DIR/COMMIT_EDITMSG")',
+					'if [ "$shared" != "$msg" ]; then echo "legacy hook saw: $shared" >&2; exit 1; fi',
+					"",
+				].join("\n"),
+			);
+			const repo = vcsGitDiscover(root)!;
+			const first = settled(repo.commitCreate("first subject\n", { allowEmpty: true }));
+			let second: Promise<{ sha: string } | { error: unknown }> | undefined;
+			try {
+				if (!(await waitFor(() => Bun.file(path.join(gitDir, "first-entered")).exists()))) {
+					throw new Error("first commit-msg hook never entered");
+				}
+				second = settled(repo.commitCreate("second subject\n", { allowEmpty: true }));
+				// The second call is at its shared-file write once its private
+				// message file exists next to the first call's.
+				const bothMessaged = await waitFor(
+					async () => (await fs.readdir(gitDir)).filter(name => name.startsWith(".omp-commit-msg-")).length >= 2,
+				);
+				if (!bothMessaged) throw new Error("second call never wrote its message file");
+				// Unserialized, the second call overwrites COMMIT_EDITMSG and
+				// enters its hook right away. Serialized, it blocks until the
+				// first hook returns, so give it a bounded chance to enter
+				// before releasing the first hook either way.
+				await waitFor(() => Bun.file(path.join(gitDir, "second-entered")).exists(), 5_000);
+			} finally {
+				await Bun.write(path.join(gitDir, "release-first"), "");
+			}
+			const firstResult = await first;
+			const secondResult = await second!;
+			if (!("sha" in firstResult)) throw firstResult.error;
+			expect(firstResult.sha).toBe(await git(root, "rev-parse", "HEAD"));
+			expect(await git(root, "log", "-1", "--format=%B")).toBe("first subject");
+			// The overlapping call read the same HEAD before the first landed,
+			// so its ref update loses; it must not take the first's place.
+			expect("error" in secondResult).toBe(true);
+		},
+		60_000,
+	);
+
+	test.skipIf(process.platform === "win32" || !Bun.which("ssh-keygen"))(
+		"a concurrent commit reaches its commit-msg hook while the first commit is still signing",
+		async () => {
+			const root = await repository();
+			const gitDir = path.join(root, ".git");
+			await installHook(
+				root,
+				[
+					"#!/bin/sh",
+					'msg=$(cat "$1")',
+					'case "$msg" in',
+					"first*)",
+					'	: > "$GIT_DIR/first-entered"',
+					"	;;",
+					"second*)",
+					'	: > "$GIT_DIR/second-entered"',
+					"	;;",
+					"esac",
+					'shared=$(cat "$GIT_DIR/COMMIT_EDITMSG")',
+					'if [ "$shared" != "$msg" ]; then echo "legacy hook saw: $shared" >&2; exit 1; fi',
+					"",
+				].join("\n"),
+			);
+			// Signing runs after the commit-msg hook and can take arbitrarily
+			// long (an agent prompt), here until the test releases it. The
+			// COMMIT_EDITMSG lock exists for the hook, so it must be released
+			// before signing: while the first commit is parked in its signer,
+			// the second commit's hook has to be able to run.
+			const key = path.join(root, "signing-key");
+			const keygen = Bun.spawn(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key], {
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+			const [keygenStderr, keygenExit] = await Promise.all([new Response(keygen.stderr).text(), keygen.exited]);
+			if (keygenExit !== 0) throw new Error(keygenStderr);
+			const signer = path.join(root, "signer.sh");
+			await Bun.write(
+				signer,
+				[
+					"#!/bin/sh",
+					`: > "${path.join(gitDir, "sign-entered")}"`,
+					`while [ ! -e "${path.join(gitDir, "release-sign")}" ]; do sleep 0.02; done`,
+					'exec ssh-keygen "$@"',
+					"",
+				].join("\n"),
+			);
+			await fs.chmod(signer, 0o755);
+			await git(root, "config", "gpg.format", "ssh");
+			await git(root, "config", "gpg.ssh.program", signer);
+			await git(root, "config", "user.signingkey", key);
+			await git(root, "config", "commit.gpgsign", "true");
+			const repo = vcsGitDiscover(root)!;
+			const first = settled(repo.commitCreate("first subject\n", { allowEmpty: true }));
+			let second: Promise<{ sha: string } | { error: unknown }> | undefined;
+			try {
+				if (!(await waitFor(() => Bun.file(path.join(gitDir, "sign-entered")).exists()))) {
+					throw new Error("first commit never reached its signer");
+				}
+				second = settled(repo.commitCreate("second subject\n", { allowEmpty: true }));
+				if (!(await waitFor(() => Bun.file(path.join(gitDir, "second-entered")).exists()))) {
+					throw new Error("second commit-msg hook never ran while the first commit was signing");
+				}
+			} finally {
+				await Bun.write(path.join(gitDir, "release-sign"), "");
+			}
+			const firstResult = await first;
+			const secondResult = await second!;
+			if (!("sha" in firstResult)) throw firstResult.error;
+			expect(firstResult.sha).toBe(await git(root, "rev-parse", "HEAD"));
+			expect(await git(root, "log", "-1", "--format=%B")).toBe("first subject");
+			// Signing really ran: the parked signer was this path, not a
+			// fallback that skipped it.
+			expect(await git(root, "cat-file", "commit", "HEAD")).toContain("\ngpgsig ");
+			// The overlapping call read the same HEAD before the first landed,
+			// so its ref update loses; it must not take the first's place.
+			expect("error" in secondResult).toBe(true);
+		},
+		60_000,
+	);
+
+	test("a COMMIT_EDITMSG write failure aborts only when a commit-msg hook may read it", async () => {
+		const root = await repository();
+		await installHook(root, "#!/bin/sh\nexit 0\n");
+		const shared = path.join(root, ".git", "COMMIT_EDITMSG");
+		await fs.rm(shared, { force: true });
+		await fs.mkdir(shared);
+		const head = await git(root, "rev-parse", "HEAD");
+		const repo = vcsGitDiscover(root)!;
+
+		await expect(repo.commitCreate("hooked\n", { allowEmpty: true })).rejects.toThrow();
+		expect(await git(root, "rev-parse", "HEAD")).toBe(head);
+
+		const sha = await repo.commitCreate("unverified\n", { allowEmpty: true, noVerify: true });
+		expect(sha).toBe(await git(root, "rev-parse", "HEAD"));
+		expect(await git(root, "log", "-1", "--format=%B")).toBe("unverified");
+	});
+
+	test.skipIf(process.platform === "win32")(
+		"an unusable COMMIT_EDITMSG lock aborts only when a commit-msg hook may read the shared file",
+		async () => {
+			const root = await repository();
+			const lock = path.join(root, ".git", EDITMSG_LOCK);
+			await fs.symlink(path.join(root, "no-such-dir", "lock"), lock);
+			const repo = vcsGitDiscover(root)!;
+
+			// No hook reads the shared file, so the commit lands without it.
+			const unhooked = await repo.commitCreate("no hook\n", { allowEmpty: true });
+			expect(unhooked).toBe(await git(root, "rev-parse", "HEAD"));
+
+			await installHook(root, "#!/bin/sh\nexit 0\n");
+			const head = await git(root, "rev-parse", "HEAD");
+			await expect(repo.commitCreate("hooked\n", { allowEmpty: true })).rejects.toThrow();
+			expect(await git(root, "rev-parse", "HEAD")).toBe(head);
+
+			// A lock file another user left read-only still locks when opened
+			// read-only, so the hooked commit proceeds.
+			await fs.unlink(lock);
+			await Bun.write(lock, "");
+			await fs.chmod(lock, 0o444);
+			const hooked = await repo.commitCreate("read-only lock\n", { allowEmpty: true });
+			expect(hooked).toBe(await git(root, "rev-parse", "HEAD"));
+			expect(await git(root, "log", "-1", "--format=%B")).toBe("read-only lock");
+		},
+	);
 });
