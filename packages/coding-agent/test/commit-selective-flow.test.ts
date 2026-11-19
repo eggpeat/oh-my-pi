@@ -301,6 +301,105 @@ describe("selective commit flow", () => {
 		expect((await git(root, ["diff", "--cached", "--name-only"])).trim()).toBe("b.ts");
 	});
 
+	it("seeds a missing shared index for the first commit once another git process lets go of its lock", async () => {
+		const { root, journal, write } = await emptyRepo();
+		await write("Main", undefined, "first.txt", "first\n");
+		await journal.flush();
+		expect(await Bun.file(path.join(root, ".git", "index")).exists()).toBe(false);
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		const lock = path.join(root, ".git", "index.lock");
+		await Bun.write(lock, "");
+		const released = Bun.sleep(250).then(() => fs.rm(lock));
+
+		const outcome = await commitSelection(draft, { subject: "feat: first" }, { journal, agent: { agent: "Main" } });
+		await released;
+
+		expect(outcome.parent).toBeNull();
+		expect(outcome.indexNotes).toEqual([]);
+		expect((await git(root, ["rev-parse", "HEAD"])).trim()).toBe(outcome.sha);
+		expect(await git(root, ["status", "--porcelain"])).toBe("");
+	});
+
+	it("returns the first commit with a seeding note when the shared index stays locked", async () => {
+		const { root, journal, write } = await emptyRepo();
+		await write("Main", undefined, "first.txt", "first\n");
+		await journal.flush();
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		const lock = path.join(root, ".git", "index.lock");
+		await Bun.write(lock, "");
+
+		const outcome = await commitSelection(draft, { subject: "feat: first" }, { journal, agent: { agent: "Main" } });
+
+		expect(outcome.parent).toBeNull();
+		expect(outcome.paths).toEqual(["first.txt"]);
+		expect((await git(root, ["rev-parse", "HEAD"])).trim()).toBe(outcome.sha);
+		expect(commitIsRecorded(path.join(journal.dir, "changes.jsonl"), outcome.sha)).toBe(true);
+		expect(outcome.indexNotes).toHaveLength(1);
+		expect(outcome.indexNotes[0]).toContain("could not be seeded");
+		expect(outcome.indexNotes[0]).toContain("git read-tree HEAD");
+		expect(await Bun.file(path.join(root, ".git", "index")).exists()).toBe(false);
+		// The advised repair seeds the still-missing index once the lock is gone.
+		await fs.rm(lock);
+		await git(root, ["read-tree", "HEAD"]);
+		expect(await git(root, ["status", "--porcelain"])).toBe("");
+	});
+
+	it("syncs a first commit selectively when the shared index appears while seeding is locked out", async () => {
+		const { root, journal, write } = await emptyRepo();
+		await write("Main", undefined, "first.txt", "first\n");
+		await journal.flush();
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		// Another process is staging `user.txt`: its finished index, prepared here, lands while
+		// seeding waits on its lock. Seeding must then give way to a selective sync, not overwrite it.
+		const prepared = path.join(root, ".git", "prepared-index");
+		await Bun.write(path.join(root, "user.txt"), "user\n");
+		await git(root, ["add", "user.txt"], { GIT_INDEX_FILE: prepared });
+		expect(await Bun.file(path.join(root, ".git", "index")).exists()).toBe(false);
+		const lock = path.join(root, ".git", "index.lock");
+		await Bun.write(lock, "");
+		const appeared = (async () => {
+			const head = path.join(root, ".git", "refs", "heads", "main");
+			while (!(await Bun.file(head).exists())) await Bun.sleep(5);
+			await Bun.sleep(100);
+			await fs.copyFile(prepared, path.join(root, ".git", "index"));
+			await fs.rm(lock);
+		})();
+
+		const outcome = await commitSelection(draft, { subject: "feat: first" }, { journal, agent: { agent: "Main" } });
+		await appeared;
+
+		expect(outcome.indexNotes).toEqual([]);
+		expect(await git(root, ["show", "HEAD:first.txt"])).toBe("first\n");
+		expect(await git(root, ["show", ":first.txt"])).toBe("first\n");
+		expect(await git(root, ["show", ":user.txt"])).toBe("user\n");
+		expect(await git(root, ["diff", "--cached", "--name-only"])).toBe("user.txt\n");
+	});
+
+	it("leaves someone else's staged first-commit content alone when the shared index is locked", async () => {
+		const { root, journal, write } = await emptyRepo();
+		await write("Main", undefined, "first.txt", "agent\n");
+		await journal.flush();
+		const draft = await createDraft({ cwd: root, journal, caller: "Main" });
+		await Bun.write(path.join(root, "user.txt"), "user\n");
+		await git(root, ["add", "user.txt"]);
+		const stagedSource = path.join(root, ".git", "staged-source.txt");
+		await Bun.write(stagedSource, "user staged\n");
+		const blob = (await git(root, ["hash-object", "-w", stagedSource])).trim();
+		await git(root, ["update-index", "--add", "--cacheinfo", `100644,${blob},first.txt`]);
+		const lock = path.join(root, ".git", "index.lock");
+		await Bun.write(lock, "");
+
+		const outcome = await commitSelection(draft, { subject: "feat: first" }, { journal, agent: { agent: "Main" } });
+		await fs.rm(lock);
+
+		expect(outcome.parent).toBeNull();
+		expect(await git(root, ["show", "HEAD:first.txt"])).toBe("agent\n");
+		expect(outcome.indexNotes).toEqual([expect.stringContaining("someone else's staged changes")]);
+		expect(outcome.indexNotes[0]).not.toContain("git reset");
+		expect(await git(root, ["show", ":first.txt"])).toBe("user staged\n");
+		expect(await git(root, ["show", ":user.txt"])).toBe("user\n");
+	}, 15_000);
+
 	it.skipIf(process.platform === "win32")(
 		"runs hooks without reporting sparse-checkout paths as unstaged deletions",
 		async () => {

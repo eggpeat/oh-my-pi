@@ -45,6 +45,39 @@ async function applyToSharedIndex(repo: VcsGitRepo, patch: string, signal?: Abor
 	return failure;
 }
 
+/** Outcome of {@link seedSharedIndex}. */
+type SeedSharedIndexResult = { kind: "seeded" } | { kind: "appeared" } | { kind: "failed"; failure: string };
+
+/**
+ * Seed the missing shared index at `sharedIndexPath` from `sha`, retrying with the same bounded
+ * backoff as {@link applyToSharedIndex} while another git process holds `index.lock`. Existence
+ * is rechecked before every attempt: an index created meanwhile holds its creator's staged
+ * entries, so seeding gives way to a selective sync instead of overwriting it. An abort stops
+ * the retries; the caller reports the failure as a note on the commit that already happened.
+ */
+async function seedSharedIndex(
+	repo: VcsGitRepo,
+	sha: string,
+	sharedIndexPath: string,
+	signal?: AbortSignal,
+): Promise<SeedSharedIndexResult> {
+	let failure = "";
+	for (let attempt = 0; attempt < INDEX_WRITE_ATTEMPTS; attempt++) {
+		if (await Bun.file(sharedIndexPath).exists()) return { kind: "appeared" };
+		if (attempt > 0 && signal?.aborted) break;
+		try {
+			await repo.readTree(sha, undefined, signal);
+			return { kind: "seeded" };
+		} catch (error) {
+			failure = error instanceof Error ? error.message : String(error);
+		}
+		if (signal?.aborted || attempt + 1 === INDEX_WRITE_ATTEMPTS) break;
+		await Bun.sleep(INDEX_WRITE_BACKOFF_MS << attempt);
+	}
+	if (await Bun.file(sharedIndexPath).exists()) return { kind: "appeared" };
+	return { kind: "failed", failure };
+}
+
 /** One path's patch; joined with others, or applied alone when the joined write fails. */
 interface PathPatch {
 	path: string;
@@ -254,10 +287,23 @@ export async function commitSelection(
 
 	const indexNotes: string[] = [];
 	// A new repository may have no index file yet. Git reads that as an empty index, but patch
-	// application reads HEAD in its place, so seed it with the root commit's tree instead.
-	if (base === null && !(await Bun.file(path.join(gitDir, "index")).exists())) {
-		await repo.readTree(sha, undefined, context.signal);
-	} else {
+	// application reads HEAD in its place, so seed it with the root commit's tree instead. The
+	// commit is already made, so a seeding failure is reported as a note, never thrown; an index
+	// that exists (or appears while seeding waits) goes through the selective sync below.
+	let syncShared = true;
+	if (base === null) {
+		const seed = await seedSharedIndex(repo, sha, path.join(gitDir, "index"), context.signal);
+		if (seed.kind === "seeded") {
+			syncShared = false;
+		} else if (seed.kind === "failed") {
+			syncShared = false;
+			indexNotes.push(
+				`The shared index could not be seeded from this commit (${seed.failure}); ` +
+					"`git diff --cached` shows this commit reverted; if the index is still missing, `git read-tree HEAD` seeds it.",
+			);
+		}
+	}
+	if (syncShared) {
 		const left = await syncSharedIndex(repo, patches, context.signal);
 		// Then what a hook changed on top of the selection, for paths that now hold the selection.
 		const kept = new Set(left.map(entry => entry.path));

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the first selective commit in a new repository reporting failure after it had succeeded when another git process held the index lock; seeding the index now retries and otherwise returns the commit with a repair note ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+
 ## [19.0.0] - 2026-11-18
 
 ### Breaking Changes
