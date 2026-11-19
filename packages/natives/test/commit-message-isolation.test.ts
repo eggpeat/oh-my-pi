@@ -201,6 +201,86 @@ describe("commitCreate message isolation", () => {
 		60_000,
 	);
 
+	test.skipIf(process.platform === "win32" || !Bun.which("ssh-keygen"))(
+		"a concurrent commit reaches its commit-msg hook while the first commit is still signing",
+		async () => {
+			const root = await repository();
+			const gitDir = path.join(root, ".git");
+			await installHook(
+				root,
+				[
+					"#!/bin/sh",
+					'msg=$(cat "$1")',
+					'case "$msg" in',
+					"first*)",
+					'	: > "$GIT_DIR/first-entered"',
+					"	;;",
+					"second*)",
+					'	: > "$GIT_DIR/second-entered"',
+					"	;;",
+					"esac",
+					'shared=$(cat "$GIT_DIR/COMMIT_EDITMSG")',
+					'if [ "$shared" != "$msg" ]; then echo "legacy hook saw: $shared" >&2; exit 1; fi',
+					"",
+				].join("\n"),
+			);
+			// Signing runs after the commit-msg hook and can take arbitrarily
+			// long (an agent prompt), here until the test releases it. The
+			// COMMIT_EDITMSG lock exists for the hook, so it must be released
+			// before signing: while the first commit is parked in its signer,
+			// the second commit's hook has to be able to run.
+			const key = path.join(root, "signing-key");
+			const keygen = Bun.spawn(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key], {
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+			const [keygenStderr, keygenExit] = await Promise.all([new Response(keygen.stderr).text(), keygen.exited]);
+			if (keygenExit !== 0) throw new Error(keygenStderr);
+			const signer = path.join(root, "signer.sh");
+			await Bun.write(
+				signer,
+				[
+					"#!/bin/sh",
+					`: > "${path.join(gitDir, "sign-entered")}"`,
+					`while [ ! -e "${path.join(gitDir, "release-sign")}" ]; do sleep 0.02; done`,
+					'exec ssh-keygen "$@"',
+					"",
+				].join("\n"),
+			);
+			await fs.chmod(signer, 0o755);
+			await git(root, "config", "gpg.format", "ssh");
+			await git(root, "config", "gpg.ssh.program", signer);
+			await git(root, "config", "user.signingkey", key);
+			await git(root, "config", "commit.gpgsign", "true");
+			const repo = vcsGitDiscover(root)!;
+			const first = settled(repo.commitCreate("first subject\n", { allowEmpty: true }));
+			let second: Promise<{ sha: string } | { error: unknown }> | undefined;
+			try {
+				if (!(await waitFor(() => Bun.file(path.join(gitDir, "sign-entered")).exists()))) {
+					throw new Error("first commit never reached its signer");
+				}
+				second = settled(repo.commitCreate("second subject\n", { allowEmpty: true }));
+				if (!(await waitFor(() => Bun.file(path.join(gitDir, "second-entered")).exists()))) {
+					throw new Error("second commit-msg hook never ran while the first commit was signing");
+				}
+			} finally {
+				await Bun.write(path.join(gitDir, "release-sign"), "");
+			}
+			const firstResult = await first;
+			const secondResult = await second!;
+			if (!("sha" in firstResult)) throw firstResult.error;
+			expect(firstResult.sha).toBe(await git(root, "rev-parse", "HEAD"));
+			expect(await git(root, "log", "-1", "--format=%B")).toBe("first subject");
+			// Signing really ran: the parked signer was this path, not a
+			// fallback that skipped it.
+			expect(await git(root, "cat-file", "commit", "HEAD")).toContain("\ngpgsig ");
+			// The overlapping call read the same HEAD before the first landed,
+			// so its ref update loses; it must not take the first's place.
+			expect("error" in secondResult).toBe(true);
+		},
+		60_000,
+	);
+
 	test("a COMMIT_EDITMSG write failure aborts only when a commit-msg hook may read it", async () => {
 		const root = await repository();
 		await installHook(root, "#!/bin/sh\nexit 0\n");
