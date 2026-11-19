@@ -155,7 +155,31 @@ const NICE_LONG_VALUES = new Set(["adjustment"]);
 const TIME_LONG_VALUES = new Set(["format", "output"]);
 const TIMEOUT_LONG_VALUES = new Set(["signal", "kill-after"]);
 const STDBUF_LONG_VALUES = new Set(["input", "output", "error"]);
-const XARGS_LONG_VALUES = new Set(["arg-file", "delimiter", "max-args", "max-procs", "max-chars", "process-slot-var"]);
+const UV_LONG_VALUES = new Set([
+	"with",
+	"with-editable",
+	"with-requirements",
+	"python",
+	"package",
+	"project",
+	"directory",
+	"env-file",
+	"extra",
+	"group",
+	"only-group",
+	"no-group",
+	"index",
+	"default-index",
+	"index-url",
+	"extra-index-url",
+	"find-links",
+	"config-file",
+	"cache-dir",
+	"color",
+	"python-preference",
+]);
+const UV_PRE_STOP = new Set(["module", "help", "version"]);
+const UV_RUN_STOP = new Set(["module", "script", "help", "version"]);
 const NPX_LONG_VALUES = new Set([
 	"package",
 	"workspace",
@@ -170,6 +194,7 @@ const NPX_LONG_VALUES = new Set([
 ]);
 const NPX_LONG_ABORT = new Set(["call", "help", "version"]);
 const BUNX_LONG_VALUES = new Set(["package", "cwd", "config", "env-file"]);
+const BUN_GLOBAL_LONG_VALUES = new Set(["cwd", "config", "env-file", "preload"]);
 const BUN_LONG_ABORT = new Set(["eval", "print", "help", "version"]);
 const PNPM_LONG_VALUES = new Set(["dir", "filter", "package", "workspace-root", "cwd"]);
 const NPM_LONG_VALUES = new Set(["prefix", "workspace", "userconfig", "registry", "cache"]);
@@ -181,10 +206,19 @@ function skipEnv(words: readonly string[], start: number): number | undefined {
 		const word = words[i];
 		if (word === "--") {
 			i++;
-			while (i < words.length && isEnvVar(words[i])) i++;
+			while (i < words.length) {
+				if (words[i].startsWith("=")) return undefined;
+				if (!isEnvVar(words[i])) break;
+				i++;
+			}
 			return i;
 		}
-		if (word === "-" || isEnvVar(word)) {
+		if (word === "-") {
+			i++;
+			continue;
+		}
+		if (word.startsWith("=")) return undefined;
+		if (isEnvVar(word)) {
 			i++;
 			continue;
 		}
@@ -265,7 +299,35 @@ function skipExecBuiltin(words: readonly string[], start: number): number | unde
 	return i;
 }
 
-function unwrapWrapper(words: readonly string[], i: number): number | undefined {
+function skipShellPrefixes(words: readonly string[]): number | undefined {
+	let i = 0;
+	while (i < words.length && SHELL_KEYWORDS.has(words[i])) i++;
+	for (;;) {
+		while (i < words.length && ASSIGNMENT.test(words[i])) i++;
+		const word = words[i];
+		if (word === undefined) return undefined;
+		if (word === "noglob" || word === "nocorrect") {
+			i++;
+		} else if (word === "command") {
+			const next = skipCommandBuiltin(words, i + 1);
+			if (next === undefined) return undefined;
+			i = next;
+		} else if (word === "exec") {
+			const next = skipExecBuiltin(words, i + 1);
+			if (next === undefined) return undefined;
+			i = next;
+		} else if (word === "time") {
+			const next = skipOptions(words, i + 1, "fo", "V", TIME_LONG_VALUES, HELP_VERSION_ABORT);
+			if (next === undefined) return undefined;
+			i = next;
+		} else {
+			return i;
+		}
+	}
+}
+
+/** External launchers matching `crates/shell/src/bash/trace/viz/embedded.rs`. */
+function unwrapExternalWrapper(words: readonly string[], i: number): number | undefined {
 	const word = words[i];
 	if (word === undefined) return undefined;
 	switch (wrapperName(word)) {
@@ -291,25 +353,18 @@ function unwrapWrapper(words: readonly string[], i: number): number | undefined 
 		}
 		case "stdbuf":
 			return skipOptions(words, i + 1, "ioe", "", STDBUF_LONG_VALUES, HELP_VERSION_ABORT);
-		case "setsid":
-			return skipOptions(words, i + 1, "", "Vh", EMPTY_SET, HELP_VERSION_ABORT);
-		case "ifne":
-			return skipOptions(words, i + 1, "", "", EMPTY_SET, HELP_VERSION_ABORT);
-		case "xargs":
-			return skipOptions(words, i + 1, "IJLnPsdaESR", "", XARGS_LONG_VALUES, HELP_VERSION_ABORT);
-		case "command":
-			return skipCommandBuiltin(words, i + 1);
-		case "exec":
-			return skipExecBuiltin(words, i + 1);
-		case "noglob":
-		case "nocorrect":
-			return i + 1;
+		case "uv": {
+			const sub = skipOptions(words, i + 1, "pif", "Vhm", UV_LONG_VALUES, UV_PRE_STOP);
+			return sub !== undefined && words[sub] === "run"
+				? skipOptions(words, sub + 1, "pif", "Vhms", UV_LONG_VALUES, UV_RUN_STOP)
+				: undefined;
+		}
 		case "npx":
 			return skipOptions(words, i + 1, "pw", "cvh", NPX_LONG_VALUES, NPX_LONG_ABORT);
 		case "bunx":
 			return skipOptions(words, i + 1, "p", "vh", BUNX_LONG_VALUES, HELP_VERSION_ABORT);
 		case "bun": {
-			const sub = skipOptions(words, i + 1, "Ccr", "vhep", BUNX_LONG_VALUES, BUN_LONG_ABORT);
+			const sub = skipOptions(words, i + 1, "Ccr", "vhep", BUN_GLOBAL_LONG_VALUES, BUN_LONG_ABORT);
 			return sub !== undefined && words[sub] === "x"
 				? skipOptions(words, sub + 1, "p", "vh", BUNX_LONG_VALUES, HELP_VERSION_ABORT)
 				: undefined;
@@ -334,13 +389,12 @@ function unwrapWrapper(words: readonly string[], i: number): number | undefined 
 
 /** Whether a simple command's words invoke `omp`, directly or through wrappers. */
 function runsOmp(words: readonly string[]): boolean {
-	let i = 0;
-	while (i < words.length && SHELL_KEYWORDS.has(words[i])) i++;
+	let i = skipShellPrefixes(words);
+	if (i === undefined) return false;
 	for (;;) {
-		while (i < words.length && ASSIGNMENT.test(words[i])) i++;
 		const word = words[i];
 		if (word === undefined) return false;
-		const next = unwrapWrapper(words, i);
+		const next = unwrapExternalWrapper(words, i);
 		if (next === undefined) return isOmp(word);
 		if (next <= i) return false;
 		i = next;
@@ -476,8 +530,14 @@ class HostUrls {
 			return rendered;
 		};
 
-		let frame = { out: "", clause: emptyClause() };
-		const stack: Array<{ frame: typeof frame; substitution: boolean }> = [];
+		type CaseState = "header" | "need_in" | "pattern" | "body";
+		interface Frame {
+			out: string;
+			clause: Clause;
+			cases: CaseState[];
+		}
+		let frame: Frame = { out: "", clause: emptyClause(), cases: [] };
+		const stack: Array<{ frame: Frame; substitution: boolean }> = [];
 		const flush = async () => {
 			frame.out += await flushClause(frame.clause);
 			frame.clause = emptyClause();
@@ -487,7 +547,8 @@ class HostUrls {
 			const token = tokens[idx];
 			if (token.kind === "word") {
 				frame.clause.parts.push({ raw: token.raw, value: token.value });
-				if (frame.clause.mergeNextWord) {
+				const wasMerged = frame.clause.mergeNextWord;
+				if (wasMerged) {
 					frame.clause.mergeNextWord = false;
 					if (!frame.clause.inSkippedWord && frame.clause.words.length > 0) {
 						frame.clause.words[frame.clause.words.length - 1] += token.value;
@@ -501,6 +562,20 @@ class HostUrls {
 				} else if (ATTACHED_REDIRECT.test(token.raw)) {
 					frame.clause.inSkippedWord = true;
 				} else {
+					const caseTop = frame.cases.at(-1);
+					const atCommandStart = frame.clause.words.every(w => SHELL_KEYWORDS.has(w));
+					if (caseTop === "header") {
+						frame.cases[frame.cases.length - 1] = "need_in";
+					} else if (caseTop === "need_in" && token.raw === "in") {
+						frame.cases[frame.cases.length - 1] = "pattern";
+					} else if (
+						token.raw === "esac" &&
+						(caseTop === "pattern" || (caseTop === "body" && frame.clause.words.length === 0))
+					) {
+						frame.cases.pop();
+					} else if (token.raw === "case" && atCommandStart) {
+						frame.cases.push("header");
+					}
 					frame.clause.inSkippedWord = false;
 					frame.clause.words.push(token.value);
 				}
@@ -525,22 +600,39 @@ class HostUrls {
 						frame.out += "(";
 					}
 					stack.push({ frame, substitution: isCommandSubst });
-					frame = { out: "", clause: emptyClause() };
+					frame = { out: "", clause: emptyClause(), cases: [] };
 				} else if (ch === ")") {
 					await flush();
-					const parent = stack.pop();
-					if (parent) {
-						if (parent.substitution) {
-							parent.frame.clause.parts.push(`${frame.out})`);
+					if (frame.cases.at(-1) === "pattern") {
+						frame.out += ")";
+						frame.cases[frame.cases.length - 1] = "body";
+					} else {
+						const parent = stack.pop();
+						if (parent) {
+							if (parent.substitution) {
+								parent.frame.clause.parts.push(`${frame.out})`);
+								parent.frame.clause.mergeNextWord = true;
+							} else {
+								parent.frame.out += `${frame.out})`;
+								if (parent.frame.cases.at(-1) === "pattern") {
+									parent.frame.cases[parent.frame.cases.length - 1] = "body";
+								}
+							}
+							frame = parent.frame;
 						} else {
-							parent.frame.out += `${frame.out})`;
+							frame.out += ")";
 						}
-						parent.frame.clause.mergeNextWord = true;
-						frame = parent.frame;
 					}
 				} else if (ch === "\n" || ch === ";" || ch === "&" || ch === "|") {
 					await flush();
 					frame.out += ch;
+					if (
+						ch === ";" &&
+						frame.cases.at(-1) === "body" &&
+						(token.raw[c + 1] === ";" || token.raw[c + 1] === "&")
+					) {
+						frame.cases[frame.cases.length - 1] = "pattern";
+					}
 				} else {
 					frame.clause.parts.push(ch);
 					frame.clause.mergeNextWord = false;

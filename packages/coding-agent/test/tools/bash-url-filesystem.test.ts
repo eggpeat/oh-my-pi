@@ -179,6 +179,16 @@ describe("bash internal URLs through the shell filesystem", () => {
 			const wrappedOther = await run(`nice -n 0 '${process.execPath}' '${script}' omp local://data.txt`);
 			expect(wrappedOther.isError).toBeUndefined();
 			expect(wrappedOther.text).toContain(`omp\n${data}\n`);
+
+			const envDashOmp = await run(`/usr/bin/env - PATH="$PWD:$PATH" omp -e ext.ts local://data.txt:1-1`);
+			expect(envDashOmp.isError).toBeUndefined();
+			expect(envDashOmp.text).toContain("-e\next.ts\nlocal://data.txt:1-1\n");
+
+			const envDottedVar = await run(
+				`/usr/bin/env tool.name=/opt/omp '${process.execPath}' '${script}' local://data.txt`,
+			);
+			expect(envDottedVar.isError).toBeUndefined();
+			expect(envDottedVar.text).toContain(`${data}\n`);
 		}
 	});
 

@@ -109,8 +109,8 @@ pub(super) fn names_url(spec: &SpawnSpec<'_>) -> bool {
 }
 
 /// Whether a spawn runs `omp`: directly (`path` or `argv[0]`), or as the
-/// command word after leading `NAME=value` assignments and command-launching
-/// wrappers (`nice omp …`, `npx omp …`, `sudo -u root omp …`).
+/// command word after command-launching wrappers (`nice omp …`, `npx omp …`,
+/// `sudo -u root omp …`).
 fn runs_omp(path: &BStr, argv: &[BString]) -> bool {
 	is_omp(path) || runs_omp_argv(argv)
 }
@@ -386,17 +386,21 @@ mod tests {
 			&["nice", "-10", "omp", "read", "local://x"],
 			&["nohup", "omp", "read", "local://x"],
 			&["nohup", "--", "omp", "read", "local://x"],
-			&["env", "-u", "DEBUG", "A=1", "omp", "read", "local://x"],
+			&["env", "-", "-u", "DEBUG", "A=1", "omp", "read", "local://x"],
 			&["sudo", "-E", "-u", "root", "FOO=bar", "/usr/local/bin/omp", "read", "local://x"],
+			&["sudo", "omp", "-e", "ext.ts", "-p", "local://x"],
+			&["sudo", "-C", "5", "omp", "read", "local://x"],
 			&["doas", "-u", "root", "omp", "read", "local://x"],
 			&["time", "-p", "omp", "read", "local://x"],
 			&["timeout", "-k", "5s", "-s", "INT", "30", "omp", "read", "local://x"],
 			&["stdbuf", "-oL", "omp", "read", "local://x"],
+			&["uv", "run", "omp", "read", "local://x"],
 			&["npx", "-y", "-p", "@oh-my-pi/pi-coding-agent", "omp", "read", "local://x"],
 			&["bunx", "--bun", "omp", "read", "local://x"],
 			&["bun", "x", "omp", "read", "local://x"],
 			&["pnpm", "dlx", "omp", "read", "local://x"],
 			&["npm", "exec", "--", "omp", "read", "local://x"],
+			&["npm", "--prefix", "tools", "exec", "--", "omp", "read", "local://x"],
 		] {
 			assert!(runs(argv), "{argv:?}");
 		}
@@ -412,14 +416,22 @@ mod tests {
 			&["rg", "-n", "omp", "skill://x/SKILL.md"],
 			&["ls", "./omp", "local://dir"],
 			&["sudo", "-u", "omp", "grep", "needle", "local://out.txt"],
+			&["sudo", "-Eu", "omp", "grep", "needle", "local://out.txt"],
+			&["sudo", "--edit", "./omp", "local://notes"],
+			&["doas", "-C", "/etc/doas.conf", "omp", "local://notes"],
 			&["env", "BIN=/usr/local/bin/omp", "python3", "local://run.py"],
+			&["/usr/bin/env", "tool.name=/opt/omp", "grep", "needle", "local://out.txt"],
+			&["/usr/bin/env", "--argv0", "omp", "grep", "needle", "local://out.txt"],
+			&["/usr/bin/env", "--split-string=grep", "omp", "local://notes"],
 			&["env", "-S", "python3 s.py", "omp", "local://run.py"],
 			&["command", "-v", "omp"],
 			&["sudo", "-e", "omp", "local://out.txt"],
 			&["npx", "-c", "grep omp", "local://out.txt"],
+			&["npx", "--cache", "omp", "eslint", "local://app.ts"],
 			&["npx", "eslint", "omp", "local://app.ts"],
 			&["bun", "script.ts", "omp", "local://out.txt"],
 			&["npm", "run", "omp", "local://out.txt"],
+			&["setsid", "omp", "local://out.txt"],
 			&["timeout", "omp"],
 		] {
 			assert!(!runs(argv), "{argv:?}");

@@ -33,145 +33,317 @@ fn assignment(word: &[u8]) -> bool {
 	})
 }
 
-fn operand<W: AsRef<[u8]>>(words: &[W], from: usize, takes_value: impl Fn(&[u8]) -> bool) -> usize {
-	let mut i = from;
-	while let Some(word) = words.get(i).map(AsRef::as_ref) {
-		if word == b"--" {
-			return i + 1;
+/// Program name of `word` for launcher matching: on Unix, the exact filename
+/// after `/`; on Windows, the filename after `/` or `\`, without `.exe` or
+/// `.cmd`, in ASCII lowercase.
+fn program_key<'a>(word: &'a [u8], windows: bool, scratch: &'a mut [u8; 16]) -> &'a [u8] {
+	if !windows {
+		return word.rsplit(|&b| b == b'/').next().unwrap_or(word);
+	}
+	let base = word
+		.rsplit(|&b| b == b'/' || b == b'\\')
+		.next()
+		.unwrap_or(word);
+	let stem = if base.len() > 4 {
+		let ext = &base[base.len() - 4..];
+		if ext.eq_ignore_ascii_case(b".exe") || ext.eq_ignore_ascii_case(b".cmd") {
+			&base[..base.len() - 4]
+		} else {
+			base
 		}
-		if !word.starts_with(b"-") || word == b"-" {
+	} else {
+		base
+	};
+	if stem.len() <= scratch.len() {
+		for (dst, &src) in scratch.iter_mut().zip(stem) {
+			*dst = src.to_ascii_lowercase();
+		}
+		&scratch[..stem.len()]
+	} else {
+		stem
+	}
+}
+
+fn is_env_setting(word: &[u8]) -> bool {
+	!word.starts_with(b"-")
+		&& word
+			.iter()
+			.position(|&b| b == b'=')
+			.is_some_and(|eq| eq > 0)
+}
+
+const HELP_VERSION_STOP: &[&[u8]] = &[b"help", b"version"];
+const SUDO_LONG_VAL: &[&[u8]] = &[
+	b"auth-type",
+	b"class",
+	b"close-from",
+	b"chdir",
+	b"group",
+	b"host",
+	b"prompt",
+	b"chroot",
+	b"role",
+	b"command-timeout",
+	b"type",
+	b"other-user",
+	b"user",
+];
+const SUDO_LONG_STOP: &[&[u8]] =
+	&[b"edit", b"list", b"validate", b"version", b"help", b"remove-timestamp"];
+const UV_LONG_VAL: &[&[u8]] = &[
+	b"with",
+	b"with-editable",
+	b"with-requirements",
+	b"python",
+	b"package",
+	b"project",
+	b"directory",
+	b"env-file",
+	b"extra",
+	b"group",
+	b"only-group",
+	b"no-group",
+	b"index",
+	b"default-index",
+	b"index-url",
+	b"extra-index-url",
+	b"find-links",
+	b"config-file",
+	b"cache-dir",
+	b"color",
+	b"python-preference",
+];
+const NPX_LONG_VAL: &[&[u8]] = &[
+	b"package",
+	b"workspace",
+	b"cache",
+	b"userconfig",
+	b"registry",
+	b"shell",
+	b"script-shell",
+	b"node-options",
+	b"node-arg",
+	b"prefix",
+];
+const NPX_LONG_STOP: &[&[u8]] = &[b"call", b"help", b"version"];
+const BUNX_LONG_VAL: &[&[u8]] = &[b"package", b"cwd", b"config", b"env-file"];
+
+fn step_option<W: AsRef<[u8]>>(
+	words: &[W],
+	i: usize,
+	short_val: &[u8],
+	short_stop: &[u8],
+	long_val: &[&[u8]],
+	long_stop: &[&[u8]],
+) -> Option<usize> {
+	let word = words.get(i)?.as_ref();
+	if let Some(rest) = word.strip_prefix(b"--") {
+		let (name, inline) = match rest.iter().position(|&b| b == b'=') {
+			Some(eq) => (&rest[..eq], true),
+			None => (rest, false),
+		};
+		if long_stop.contains(&name) {
+			return None;
+		}
+		let step = if !inline && long_val.contains(&name) {
+			2
+		} else {
+			1
+		};
+		return (i + step <= words.len()).then_some(i + step);
+	}
+	let flags = word.strip_prefix(b"-").filter(|f| !f.is_empty())?;
+	let mut step = 1;
+	for (idx, &flag) in flags.iter().enumerate() {
+		if short_stop.contains(&flag) {
+			return None;
+		}
+		if short_val.contains(&flag) {
+			if idx + 1 == flags.len() {
+				step = 2;
+			}
 			break;
 		}
-		i += if takes_value(word) { 2 } else { 1 };
 	}
-	i
+	(i + step <= words.len()).then_some(i + step)
+}
+
+fn skip_options<W: AsRef<[u8]>>(
+	words: &[W],
+	mut i: usize,
+	short_val: &[u8],
+	short_stop: &[u8],
+	long_val: &[&[u8]],
+	long_stop: &[&[u8]],
+) -> Option<usize> {
+	while let Some(word) = words.get(i).map(AsRef::as_ref) {
+		if word == b"--" {
+			return Some(i + 1);
+		}
+		if word.len() <= 1 || word[0] != b'-' {
+			break;
+		}
+		i = step_option(words, i, short_val, short_stop, long_val, long_stop)?;
+	}
+	Some(i)
+}
+
+fn skip_env<W: AsRef<[u8]>>(words: &[W], mut i: usize) -> Option<usize> {
+	while let Some(word) = words.get(i).map(AsRef::as_ref) {
+		if word == b"--" {
+			i += 1;
+			while let Some(next) = words.get(i).map(AsRef::as_ref) {
+				if next.starts_with(b"=") {
+					return None;
+				}
+				if !is_env_setting(next) {
+					break;
+				}
+				i += 1;
+			}
+			return Some(i);
+		}
+		if word == b"-" {
+			i += 1;
+			continue;
+		}
+		if word.starts_with(b"=") {
+			return None;
+		}
+		if is_env_setting(word) {
+			i += 1;
+			continue;
+		}
+		if word.starts_with(b"-") {
+			i = step_option(
+				words,
+				i,
+				b"uCPa",
+				b"S0",
+				&[b"unset", b"chdir", b"default-path", b"argv0"],
+				&[b"split-string", b"null", b"help", b"version"],
+			)?;
+			continue;
+		}
+		break;
+	}
+	Some(i)
+}
+
+fn skip_sudo<W: AsRef<[u8]>>(words: &[W], mut i: usize) -> Option<usize> {
+	while let Some(word) = words.get(i).map(AsRef::as_ref) {
+		if word == b"--" {
+			i += 1;
+			while words.get(i).is_some_and(|w| assignment(w.as_ref())) {
+				i += 1;
+			}
+			return Some(i);
+		}
+		if assignment(word) {
+			i += 1;
+			continue;
+		}
+		if word.len() > 1 && word.starts_with(b"-") {
+			i = step_option(words, i, b"ugCDhpRrTtUac", b"eVvlK", SUDO_LONG_VAL, SUDO_LONG_STOP)?;
+			continue;
+		}
+		break;
+	}
+	Some(i)
+}
+
+fn skip_npx<W: AsRef<[u8]>>(words: &[W], i: usize) -> Option<usize> {
+	skip_options(words, i, b"pw", b"cvh", NPX_LONG_VAL, NPX_LONG_STOP)
+}
+
+fn skip_bunx<W: AsRef<[u8]>>(words: &[W], i: usize) -> Option<usize> {
+	skip_options(words, i, b"p", b"vh", BUNX_LONG_VAL, HELP_VERSION_STOP)
 }
 
 /// Words a launcher at the start of `words` takes before the command it runs
 /// (`timeout 5 cmd` → 2), and whether that command runs on an `ssh` host.
-fn launcher<W: AsRef<[u8]>>(words: &[W]) -> Option<(usize, bool)> {
-	let skip = match basename(words.first()?.as_ref()) {
-		b"env"
-			if words
-				.iter()
-				.skip(1)
-				.any(|w| matches!(w.as_ref(), b"-S" | b"--split-string")) =>
-		{
-			return None;
-		},
-		b"env" => {
-			let at = operand(words, 1, |w| {
-				matches!(w, b"-u" | b"--unset" | b"-C" | b"--chdir" | b"-S" | b"--split-string" | b"-P")
-			});
-			at + words
-				.iter()
-				.skip(at)
-				.take_while(|w| assignment(w.as_ref()))
-				.count()
-		},
-		b"sudo" | b"doas"
-			if words
-				.iter()
-				.skip(1)
-				.any(|w| matches!(w.as_ref(), b"-e" | b"-C" | b"-L")) =>
-		{
-			return None;
-		},
-		b"sudo" | b"doas" => {
-			let at = operand(words, 1, |w| {
-				matches!(
-					w,
-					b"-u"
-						| b"-g"
-						| b"-C"
-						| b"-D"
-						| b"-h"
-						| b"-p"
-						| b"-R"
-						| b"-r"
-						| b"-T"
-						| b"-t"
-						| b"-U"
-						| b"--user"
-						| b"--group"
-						| b"--close-from"
-						| b"--chdir"
-						| b"--host"
-						| b"--prompt"
-						| b"--chroot"
-						| b"--role"
-						| b"--command-timeout"
-						| b"--type"
-						| b"--other-user"
-				)
-			});
-			at + words
-				.iter()
-				.skip(at)
-				.take_while(|w| assignment(w.as_ref()))
-				.count()
-		},
+fn launcher_for<W: AsRef<[u8]>>(words: &[W], windows: bool) -> Option<(usize, bool)> {
+	let mut scratch = [0u8; 16];
+	let skip = match program_key(words.first()?.as_ref(), windows, &mut scratch) {
+		b"env" => skip_env(words, 1)?,
+		b"sudo" => skip_sudo(words, 1)?,
+		b"doas" => skip_options(words, 1, b"ua", b"CL", &[], HELP_VERSION_STOP)?,
 		// The first operand is the duration.
 		b"timeout" | b"gtimeout" => {
-			operand(words, 1, |w| matches!(w, b"-s" | b"--signal" | b"-k" | b"--kill-after")) + 1
+			let dur =
+				skip_options(words, 1, b"sk", b"", &[b"signal", b"kill-after"], HELP_VERSION_STOP)?;
+			if dur >= words.len() {
+				return None;
+			}
+			dur + 1
 		},
-		b"nice" => operand(words, 1, |w| matches!(w, b"-n" | b"--adjustment")),
-		b"nohup" | b"time" => {
-			operand(words, 1, |w| matches!(w, b"-o" | b"--output" | b"-f" | b"--format"))
+		b"nice" => skip_options(words, 1, b"n", b"", &[b"adjustment"], HELP_VERSION_STOP)?,
+		b"nohup" => match words.get(1).map(AsRef::as_ref) {
+			Some(b"--") => 2,
+			Some(w) if w.starts_with(b"-") => return None,
+			_ => 1,
 		},
-		b"stdbuf" => operand(words, 1, |w| {
-			matches!(w, b"-i" | b"-o" | b"-e" | b"--input" | b"--output" | b"--error")
-		}),
-		b"exec" => operand(words, 1, |w| w == b"-a"),
-		b"uv" if words.get(1).is_some_and(|w| w.as_ref() == b"run") => operand(words, 2, |w| {
-			matches!(
-				w,
-				b"--with"
-					| b"--with-editable"
-					| b"--with-requirements"
-					| b"-p"
-					| b"--python"
-					| b"--package"
-					| b"--project"
-					| b"--directory"
-					| b"--env-file"
-					| b"--extra"
-					| b"--group"
-					| b"--only-group"
-					| b"--no-group"
-					| b"--index"
-					| b"--default-index"
-					| b"-i"
-					| b"--index-url"
-					| b"--extra-index-url"
-					| b"-f"
-					| b"--find-links"
-					| b"--config-file"
-					| b"--cache-dir"
-			)
-		}),
-		b"npx" | b"bunx" => operand(words, 1, |w| {
-			matches!(w, b"-p" | b"--package" | b"-w" | b"--workspace" | b"--cwd" | b"--config")
-		}),
-		b"bun" if words.get(1).is_some_and(|w| w.as_ref() == b"x") => {
-			operand(words, 2, |w| matches!(w, b"-p" | b"--package" | b"--cwd" | b"--config"))
+		b"time" => skip_options(words, 1, b"fo", b"V", &[b"format", b"output"], HELP_VERSION_STOP)?,
+		b"stdbuf" => {
+			skip_options(words, 1, b"ioe", b"", &[b"input", b"output", b"error"], HELP_VERSION_STOP)?
 		},
-		b"pnpm" | b"yarn"
-			if words
-				.get(1)
-				.is_some_and(|w| matches!(w.as_ref(), b"dlx" | b"exec")) =>
-		{
-			operand(words, 2, |w| matches!(w, b"-p" | b"--package" | b"-w" | b"--workspace"))
+		b"exec" => skip_options(words, 1, b"a", b"", &[], HELP_VERSION_STOP)?,
+		b"uv" => {
+			let sub =
+				skip_options(words, 1, b"pif", b"Vhm", UV_LONG_VAL, &[b"module", b"help", b"version"])?;
+			if words.get(sub).map(AsRef::as_ref) != Some(b"run") {
+				return None;
+			}
+			skip_options(words, sub + 1, b"pif", b"Vhms", UV_LONG_VAL, &[
+				b"module", b"script", b"help", b"version",
+			])?
 		},
-		b"npm"
-			if words
-				.get(1)
-				.is_some_and(|w| matches!(w.as_ref(), b"exec" | b"x")) =>
-		{
-			operand(words, 2, |w| matches!(w, b"-p" | b"--package" | b"-w" | b"--workspace"))
+		b"npx" => skip_npx(words, 1)?,
+		b"bunx" => skip_bunx(words, 1)?,
+		b"bun" => {
+			let sub = skip_options(
+				words,
+				1,
+				b"Ccr",
+				b"vhep",
+				&[b"cwd", b"config", b"env-file", b"preload"],
+				&[b"eval", b"print", b"help", b"version"],
+			)?;
+			if words.get(sub).map(AsRef::as_ref) != Some(b"x") {
+				return None;
+			}
+			skip_bunx(words, sub + 1)?
+		},
+		b"pnpm" | b"yarn" => {
+			let sub = skip_options(
+				words,
+				1,
+				b"CFp",
+				b"vh",
+				&[b"dir", b"filter", b"package", b"workspace-root", b"cwd"],
+				HELP_VERSION_STOP,
+			)?;
+			if !matches!(words.get(sub).map(AsRef::as_ref), Some(b"dlx" | b"exec")) {
+				return None;
+			}
+			skip_npx(words, sub + 1)?
+		},
+		b"npm" => {
+			let sub = skip_options(
+				words,
+				1,
+				b"Cw",
+				b"vh",
+				&[b"prefix", b"workspace", b"userconfig", b"registry", b"cache"],
+				HELP_VERSION_STOP,
+			)?;
+			if !matches!(words.get(sub).map(AsRef::as_ref), Some(b"exec" | b"x")) {
+				return None;
+			}
+			skip_npx(words, sub + 1)?
 		},
 		b"ssh" => {
-			let host = operand(words, 1, |w| w.len() == 2 && b"pilojFSLRDWbcEemOQw".contains(&w[1]));
+			let host = skip_options(words, 1, b"pilojFSLRDWbcEemOQw", b"", &[], &[])?;
 			return (host < words.len()).then_some((host + 1, true));
 		},
 		_ => return None,
@@ -189,13 +361,20 @@ pub(crate) struct Launch {
 	pub(crate) remote: bool,
 }
 
-pub(crate) fn launch<W: AsRef<[u8]>>(words: &[W]) -> Launch {
+fn launch_for<W: AsRef<[u8]>>(words: &[W], windows: bool) -> Launch {
 	let mut launch = Launch { at: 0, remote: false };
-	while let Some((skip, remote)) = launcher(&words[launch.at..]) {
+	while let Some((skip, remote)) = launcher_for(&words[launch.at..], windows) {
+		if skip == 0 {
+			break;
+		}
 		launch.at = (launch.at + skip).min(words.len());
 		launch.remote |= remote;
 	}
 	launch
+}
+
+pub(crate) fn launch<W: AsRef<[u8]>>(words: &[W]) -> Launch {
+	launch_for(words, cfg!(windows))
 }
 
 /// The word holding a shell script the command line runs, and whether it runs
@@ -676,5 +855,12 @@ mod tests {
 		);
 		assert_eq!(s.iter().map(|s| s.text.as_str()).collect::<String>(), t);
 		assert!(s.iter().any(|s| s.style.as_deref() == Some("comment")));
+	}
+	#[test]
+	fn windows_launchers_match_case_insensitively_without_affecting_unix() {
+		assert_eq!(launch_for(&["C:\\Tools\\BUN.EXE", "x", "omp", "read"], true).at, 2);
+		assert_eq!(launch_for(&["NPX.CMD", "-y", "omp", "read"], true).at, 2);
+		assert_eq!(launch_for(&["bun.exe", "x", "omp", "read"], false).at, 0);
+		assert_eq!(launch_for(&["npx.cmd", "-y", "omp", "read"], false).at, 0);
 	}
 }

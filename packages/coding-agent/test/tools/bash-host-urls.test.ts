@@ -86,7 +86,7 @@ describe("hostCommandUrls", () => {
 		);
 	});
 
-	it("keeps separators inside command substitutions in order", async () => {
+	it("keeps separators and case patterns inside and outside command substitutions intact", async () => {
 		for (const [command, expected] of [
 			["echo $(cat local://a | head -1)", "echo $(cat /host/a | head -1)"],
 			["echo $(cat local://a; head -1)", "echo $(cat /host/a; head -1)"],
@@ -94,6 +94,16 @@ describe("hostCommandUrls", () => {
 			["echo $(echo $(cat local://a | head -1) | tail -1)", "echo $(echo $(cat /host/a | head -1) | tail -1)"],
 			["echo $( (cat local://a) )", "echo $( (cat /host/a) )"],
 			["echo $(cat local://a | head -1) https://x.com", "echo $(cat /host/a | head -1) https://x.com"],
+			["case x in x) cat local://a;; esac", "case x in x) cat /host/a;; esac"],
+			[
+				"case x in a|b) omp read local://a:1-5;; (c) cat local://b;; esac",
+				"case x in a|b) omp read local://a:1-5;; (c) cat /host/b;; esac",
+			],
+			["echo $(case x in x) cat local://a | head -1;; esac)", "echo $(case x in x) cat /host/a | head -1;; esac)"],
+			[
+				"case $(cat local://a) in omp) grep omp local://b;; esac",
+				"case $(cat /host/a) in omp) grep omp /host/b;; esac",
+			],
 		] as const) {
 			expect(await host(command)).toBe(expected);
 		}
@@ -105,10 +115,24 @@ describe("hostCommandUrls", () => {
 			"rg -n 'omp' /host/SKILL.md && ls ./omp /host/dir",
 		);
 		expect(await host("sudo -u omp grep needle local://out.txt")).toBe("sudo -u omp grep needle /host/out.txt");
+		expect(await host("sudo -Eu omp grep needle local://out.txt")).toBe("sudo -Eu omp grep needle /host/out.txt");
+		expect(await host("sudo --edit ./omp local://notes.txt")).toBe("sudo --edit ./omp /host/notes.txt");
+		expect(await host("doas -C local://doas.conf omp")).toBe("doas -C /host/doas.conf omp");
 		expect(await host("OMP_BIN=/usr/local/bin/omp node local://run.mjs")).toBe(
 			"OMP_BIN=/usr/local/bin/omp node /host/run.mjs",
 		);
+		expect(await host("/usr/bin/env --argv0 omp grep needle local://out.txt")).toBe(
+			"/usr/bin/env --argv0 omp grep needle /host/out.txt",
+		);
+		expect(await host("/usr/bin/env tool.name=/opt/omp grep needle local://out.txt")).toBe(
+			"/usr/bin/env tool.name=/opt/omp grep needle /host/out.txt",
+		);
+		expect(await host("/usr/bin/env --split-string=grep omp local://notes.txt")).toBe(
+			"/usr/bin/env --split-string=grep omp /host/notes.txt",
+		);
 		expect(await host("nice -n 5 npx -y eslint omp local://app.ts")).toBe("nice -n 5 npx -y eslint omp /host/app.ts");
+		expect(await host("npx --cache omp eslint local://app.ts")).toBe("npx --cache omp eslint /host/app.ts");
+		expect(await host("setsid omp local://out.txt")).toBe("setsid omp /host/out.txt");
 		expect(await host("node $(echo flag) omp local://run.mjs")).toBe("node $(echo flag) omp /host/run.mjs");
 
 		for (const command of [
@@ -116,10 +140,15 @@ describe("hostCommandUrls", () => {
 			"nice -n 10 omp read local://x.md:1-5",
 			"nohup omp read local://x.md:1-5",
 			"env -u DEBUG FOO=1 omp read local://x.md:1-5",
+			"/usr/bin/env - omp read local://x.md:1-5",
 			"sudo -E -u root /usr/local/bin/omp read local://x.md:1-5",
+			"sudo omp -e ext.ts -p local://x.md",
+			"sudo -C 5 omp read local://x.md:1-5",
 			"timeout -k 5 30 omp read local://x.md:1-5",
 			"time -p omp read local://x.md:1-5",
+			"uv run omp read local://x.md:1-5",
 			"npx -y -p @oh-my-pi/pi-coding-agent omp read local://x.md:1-5",
+			"npm --prefix tools exec -- omp read local://x.md:1-5",
 			"bunx --bun omp read local://x.md:1-5",
 		]) {
 			expect(await host(command)).toBe(command);
