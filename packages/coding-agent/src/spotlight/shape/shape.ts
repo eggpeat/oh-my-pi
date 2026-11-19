@@ -449,10 +449,11 @@ function viewOrigin(run: Run, view: View): Origin | undefined {
 }
 
 /**
- * The base layers, then the valve: already-seen runs collapse, lines over 400 characters keep 280, and a result over
- * 3.9k (the agent's own program output past 7.8k) is cut to ~3k, except outlines, source reads, sub-agent reports
- * (`task`, `wait`, `omp -p`), edit results and `pr://` / `issue://` threads up to 12k, and pictures. Output repeating
- * one line shape is cut to the lines that differ, its ends, and a line naming the shape.
+ * The base layers, then the valve: already-seen runs collapse except in edit results, whose numbered rows can prove
+ * lines seen in EditStore; lines over 400 characters keep 280, and a result over 3.9k (the agent's own program output
+ * past 7.8k) is cut to ~3k, except outlines, source reads, sub-agent reports (`task`, `wait`, `omp -p`), edit results
+ * and `pr://` / `issue://` threads up to 12k, and pictures. Output repeating one line shape is cut to the lines that
+ * differ, its ends, and a line naming the shape.
  * Re-asks (results up to 12k bringing back lines a cut hid) and reads of folded code come back whole.
  */
 async function shapeSubject(run: Run, subject: Subject): Promise<{ view: View; steps: string[] }> {
