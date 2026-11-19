@@ -86,6 +86,19 @@ describe("hostCommandUrls", () => {
 		);
 	});
 
+	it("keeps separators inside command substitutions in order", async () => {
+		for (const [command, expected] of [
+			["echo $(cat local://a | head -1)", "echo $(cat /host/a | head -1)"],
+			["echo $(cat local://a; head -1)", "echo $(cat /host/a; head -1)"],
+			["echo $(cat local://a && head -1)", "echo $(cat /host/a && head -1)"],
+			["echo $(echo $(cat local://a | head -1) | tail -1)", "echo $(echo $(cat /host/a | head -1) | tail -1)"],
+			["echo $( (cat local://a) )", "echo $( (cat /host/a) )"],
+			["echo $(cat local://a | head -1) https://x.com", "echo $(cat /host/a | head -1) https://x.com"],
+		] as const) {
+			expect(await host(command)).toBe(expected);
+		}
+	});
+
 	it("only skips URL rewriting when omp is the command or a wrapper's target, not an argument", async () => {
 		expect(await host("grep omp local://out.txt")).toBe("grep omp /host/out.txt");
 		expect(await host("rg -n 'omp' local://SKILL.md && ls ./omp local://dir")).toBe(

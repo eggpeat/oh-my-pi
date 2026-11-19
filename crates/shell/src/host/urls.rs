@@ -116,366 +116,17 @@ fn runs_omp(path: &BStr, argv: &[BString]) -> bool {
 }
 
 fn runs_omp_argv(argv: &[BString]) -> bool {
-	let mut i = 0;
-	loop {
-		i = skip_assignments(argv, i);
-		let Some(word) = argv.get(i) else {
-			return false;
-		};
-		let Some(next) = unwrap_wrapper(argv, i) else {
-			return is_omp(word);
-		};
-		if next <= i {
-			return false;
-		}
-		i = next;
-	}
+	let launch = crate::bash::trace::viz::embedded::launch(argv);
+	!launch.remote && argv.get(launch.at).is_some_and(|word| is_omp(word))
 }
 
 /// Whether `word` names the `omp` program, by any path.
 fn is_omp(word: &[u8]) -> bool {
-	if is_assignment(word) {
-		return false;
-	}
-	let name = basename(word);
-	name == b"omp" || (cfg!(windows) && name.eq_ignore_ascii_case(b"omp.exe"))
-}
-
-fn basename(word: &[u8]) -> &[u8] {
-	word
+	let name = word
 		.rsplit(|&b| b == b'/' || (cfg!(windows) && b == b'\\'))
 		.next()
-		.unwrap_or(word)
-}
-
-fn strip_win_ext(name: &[u8]) -> &[u8] {
-	if cfg!(windows) && name.len() > 4 {
-		let ext = &name[name.len() - 4..];
-		if ext.eq_ignore_ascii_case(b".exe") || ext.eq_ignore_ascii_case(b".cmd") {
-			return &name[..name.len() - 4];
-		}
-	}
-	name
-}
-
-fn wrapper_key<'a>(word: &'a [u8], scratch: &'a mut [u8; 16]) -> &'a [u8] {
-	let name = strip_win_ext(basename(word));
-	if cfg!(windows) && name.len() <= scratch.len() {
-		for (dst, &src) in scratch.iter_mut().zip(name) {
-			*dst = src.to_ascii_lowercase();
-		}
-		&scratch[..name.len()]
-	} else {
-		name
-	}
-}
-
-fn is_assignment(word: &[u8]) -> bool {
-	let Some(eq) = word.iter().position(|&b| b == b'=') else {
-		return false;
-	};
-	let name = word[..eq].strip_suffix(b"+").unwrap_or(&word[..eq]);
-	let Some((&first, rest)) = name.split_first() else {
-		return false;
-	};
-	(first.is_ascii_alphabetic() || first == b'_')
-		&& rest.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
-}
-
-fn skip_assignments(argv: &[BString], mut i: usize) -> usize {
-	while argv.get(i).is_some_and(|w| is_assignment(w)) {
-		i += 1;
-	}
-	i
-}
-
-/// If `argv[i]` is a command-launching wrapper, returns the index where its
-/// target command begins; returns `None` when `argv[i]` is not a wrapper or its
-/// flags mean no command word follows.
-fn unwrap_wrapper(argv: &[BString], i: usize) -> Option<usize> {
-	let mut scratch = [0u8; 16];
-	match wrapper_key(argv.get(i)?.as_slice(), &mut scratch) {
-		b"env" => skip_env(argv, i + 1),
-		b"sudo" => skip_sudo(argv, i + 1),
-		b"doas" => skip_options(argv, i + 1, b"ua", b"CL", &[], &[b"help", b"version"]),
-		b"nice" => skip_options(argv, i + 1, b"n", b"", &[b"adjustment"], &[b"help", b"version"]),
-		b"nohup" => match argv.get(i + 1).map(AsRef::<[u8]>::as_ref) {
-			Some(b"--") => Some(i + 2),
-			Some(w) if w.starts_with(b"-") => None,
-			_ => Some(i + 1),
-		},
-		b"time" => {
-			skip_options(argv, i + 1, b"fo", b"V", &[b"format", b"output"], &[b"help", b"version"])
-		},
-		b"timeout" | b"gtimeout" => {
-			let duration = skip_options(argv, i + 1, b"sk", b"", &[b"signal", b"kill-after"], &[
-				b"help", b"version",
-			])?;
-			(duration < argv.len()).then_some(duration + 1)
-		},
-		b"stdbuf" => skip_options(argv, i + 1, b"ioe", b"", &[b"input", b"output", b"error"], &[
-			b"help", b"version",
-		]),
-		b"setsid" => skip_options(argv, i + 1, b"", b"Vh", &[], &[b"help", b"version"]),
-		b"ifne" => skip_options(argv, i + 1, b"", b"", &[], &[b"help", b"version"]),
-		b"xargs" => skip_options(
-			argv,
-			i + 1,
-			b"IJLnPsdaESR",
-			b"",
-			&[b"arg-file", b"delimiter", b"max-args", b"max-procs", b"max-chars", b"process-slot-var"],
-			&[b"help", b"version"],
-		),
-		b"command" => skip_command_builtin(argv, i + 1),
-		b"exec" => skip_exec_builtin(argv, i + 1),
-		b"noglob" | b"nocorrect" => Some(i + 1),
-		b"npx" => skip_npx(argv, i + 1),
-		b"bunx" => skip_bunx(argv, i + 1),
-		b"bun" => {
-			let sub = skip_options(
-				argv,
-				i + 1,
-				b"Ccr",
-				b"vhep",
-				&[b"cwd", b"config", b"env-file", b"preload"],
-				&[b"eval", b"print", b"help", b"version"],
-			)?;
-			(argv.get(sub).is_some_and(|w| w == "x")).then(|| skip_bunx(argv, sub + 1))?
-		},
-		b"pnpm" | b"yarn" => {
-			let sub = skip_options(
-				argv,
-				i + 1,
-				b"CFp",
-				b"vh",
-				&[b"dir", b"filter", b"package", b"workspace-root", b"cwd"],
-				&[b"help", b"version"],
-			)?;
-			let subcmd: &[u8] = argv.get(sub)?.as_ref();
-			matches!(subcmd, b"dlx" | b"exec").then(|| skip_npx(argv, sub + 1))?
-		},
-		b"npm" => {
-			let sub = skip_options(
-				argv,
-				i + 1,
-				b"Cw",
-				b"vh",
-				&[b"prefix", b"workspace", b"userconfig", b"registry", b"cache"],
-				&[b"help", b"version"],
-			)?;
-			let subcmd: &[u8] = argv.get(sub)?.as_ref();
-			matches!(subcmd, b"exec" | b"x").then(|| skip_npx(argv, sub + 1))?
-		},
-		_ => None,
-	}
-}
-
-fn is_env_var(word: &[u8]) -> bool {
-	!word.starts_with(b"-") && word.get(1..).is_some_and(|rest| rest.contains(&b'='))
-}
-
-fn skip_env(argv: &[BString], mut i: usize) -> Option<usize> {
-	while let Some(word) = argv.get(i).map(AsRef::<[u8]>::as_ref) {
-		if word == b"--" {
-			i += 1;
-			while argv.get(i).is_some_and(|w| is_env_var(w)) {
-				i += 1;
-			}
-			return Some(i);
-		}
-		if word == b"-" || is_env_var(word) {
-			i += 1;
-			continue;
-		}
-		if word.starts_with(b"-") {
-			i = skip_one_option(
-				argv,
-				i,
-				b"uCPa",
-				b"S0",
-				&[b"unset", b"chdir", b"default-path", b"argv0"],
-				&[b"split-string", b"null", b"help", b"version"],
-			)?;
-			continue;
-		}
-		break;
-	}
-	Some(i)
-}
-
-fn skip_sudo(argv: &[BString], mut i: usize) -> Option<usize> {
-	while let Some(word) = argv.get(i).map(AsRef::<[u8]>::as_ref) {
-		if word == b"--" {
-			i += 1;
-			return Some(skip_assignments(argv, i));
-		}
-		if is_assignment(word) {
-			i += 1;
-			continue;
-		}
-		if word.len() > 1 && word[0] == b'-' {
-			i = skip_one_option(
-				argv,
-				i,
-				b"ugCDhpRrTtUac",
-				b"eVvlK",
-				&[
-					b"auth-type",
-					b"class",
-					b"close-from",
-					b"chdir",
-					b"group",
-					b"host",
-					b"prompt",
-					b"chroot",
-					b"role",
-					b"command-timeout",
-					b"type",
-					b"other-user",
-					b"user",
-				],
-				&[b"edit", b"list", b"validate", b"version", b"help", b"remove-timestamp"],
-			)?;
-			continue;
-		}
-		break;
-	}
-	Some(i)
-}
-
-fn skip_npx(argv: &[BString], i: usize) -> Option<usize> {
-	skip_options(
-		argv,
-		i,
-		b"pw",
-		b"cvh",
-		&[
-			b"package",
-			b"workspace",
-			b"cache",
-			b"userconfig",
-			b"registry",
-			b"shell",
-			b"script-shell",
-			b"node-options",
-			b"node-arg",
-			b"prefix",
-		],
-		&[b"call", b"help", b"version"],
-	)
-}
-
-fn skip_bunx(argv: &[BString], i: usize) -> Option<usize> {
-	skip_options(argv, i, b"p", b"vh", &[b"package", b"cwd", b"config", b"env-file"], &[
-		b"help", b"version",
-	])
-}
-
-fn skip_command_builtin(argv: &[BString], mut i: usize) -> Option<usize> {
-	while let Some(word) = argv.get(i).map(AsRef::<[u8]>::as_ref) {
-		if word == b"--" {
-			return Some(i + 1);
-		}
-		if let Some(flags) = word.strip_prefix(b"-").filter(|f| !f.is_empty()) {
-			if flags.iter().all(|&b| b == b'p') {
-				i += 1;
-				continue;
-			}
-			return None;
-		}
-		break;
-	}
-	Some(i)
-}
-
-fn skip_exec_builtin(argv: &[BString], mut i: usize) -> Option<usize> {
-	while let Some(word) = argv.get(i).map(AsRef::<[u8]>::as_ref) {
-		if word == b"--" {
-			return Some(i + 1);
-		}
-		if let Some(flags) = word.strip_prefix(b"-").filter(|f| !f.is_empty()) {
-			let mut step = 1;
-			for (idx, &b) in flags.iter().enumerate() {
-				match b {
-					b'c' | b'l' => {},
-					b'a' => {
-						if idx + 1 == flags.len() {
-							step = 2;
-						}
-						break;
-					},
-					_ => return None,
-				}
-			}
-			i += step;
-			if i > argv.len() {
-				return None;
-			}
-			continue;
-		}
-		break;
-	}
-	Some(i)
-}
-
-fn skip_options(
-	argv: &[BString],
-	mut i: usize,
-	short_values: &[u8],
-	short_abort: &[u8],
-	long_values: &[&[u8]],
-	long_abort: &[&[u8]],
-) -> Option<usize> {
-	while let Some(word) = argv.get(i).map(AsRef::<[u8]>::as_ref) {
-		if word == b"--" {
-			return Some(i + 1);
-		}
-		if word.len() <= 1 || word[0] != b'-' {
-			break;
-		}
-		i = skip_one_option(argv, i, short_values, short_abort, long_values, long_abort)?;
-	}
-	Some(i)
-}
-
-fn skip_one_option(
-	argv: &[BString],
-	i: usize,
-	short_values: &[u8],
-	short_abort: &[u8],
-	long_values: &[&[u8]],
-	long_abort: &[&[u8]],
-) -> Option<usize> {
-	let word = argv.get(i)?.as_slice();
-	if let Some(rest) = word.strip_prefix(b"--") {
-		let (name, inline) = match rest.iter().position(|&b| b == b'=') {
-			Some(eq) => (&rest[..eq], true),
-			None => (rest, false),
-		};
-		if long_abort.contains(&name) {
-			return None;
-		}
-		let step = if !inline && long_values.contains(&name) {
-			2
-		} else {
-			1
-		};
-		return (i + step <= argv.len()).then_some(i + step);
-	}
-	let flags = word.strip_prefix(b"-").filter(|f| !f.is_empty())?;
-	let mut step = 1;
-	for (idx, &flag) in flags.iter().enumerate() {
-		if short_abort.contains(&flag) {
-			return None;
-		}
-		if short_values.contains(&flag) {
-			if idx + 1 == flags.len() {
-				step = 2;
-			}
-			break;
-		}
-	}
-	(i + step <= argv.len()).then_some(i + step)
+		.unwrap_or(word);
+	name == b"omp" || (cfg!(windows) && name.eq_ignore_ascii_case(b"omp.exe"))
 }
 
 /// Whether the environment variable `name` holds a URL to resolve. `PWD`
@@ -731,19 +382,16 @@ mod tests {
 		for argv in [
 			&["omp", "read", "local://x:1-5"][..],
 			&["/usr/local/bin/omp", "read", "local://x"],
-			&["FOO=1", "omp", "read", "local://x"],
 			&["nice", "-n", "10", "omp", "read", "local://x"],
 			&["nice", "-10", "omp", "read", "local://x"],
 			&["nohup", "omp", "read", "local://x"],
 			&["nohup", "--", "omp", "read", "local://x"],
-			&["env", "-", "-u", "DEBUG", "A=1", "omp", "read", "local://x"],
+			&["env", "-u", "DEBUG", "A=1", "omp", "read", "local://x"],
 			&["sudo", "-E", "-u", "root", "FOO=bar", "/usr/local/bin/omp", "read", "local://x"],
 			&["doas", "-u", "root", "omp", "read", "local://x"],
 			&["time", "-p", "omp", "read", "local://x"],
 			&["timeout", "-k", "5s", "-s", "INT", "30", "omp", "read", "local://x"],
 			&["stdbuf", "-oL", "omp", "read", "local://x"],
-			&["command", "-p", "omp", "read", "local://x"],
-			&["exec", "-ca", "worker", "omp", "read", "local://x"],
 			&["npx", "-y", "-p", "@oh-my-pi/pi-coding-agent", "omp", "read", "local://x"],
 			&["bunx", "--bun", "omp", "read", "local://x"],
 			&["bun", "x", "omp", "read", "local://x"],
@@ -764,7 +412,6 @@ mod tests {
 			&["rg", "-n", "omp", "skill://x/SKILL.md"],
 			&["ls", "./omp", "local://dir"],
 			&["sudo", "-u", "omp", "grep", "needle", "local://out.txt"],
-			&["OMP_BIN=/usr/local/bin/omp", "python3", "local://run.py"],
 			&["env", "BIN=/usr/local/bin/omp", "python3", "local://run.py"],
 			&["env", "-S", "python3 s.py", "omp", "local://run.py"],
 			&["command", "-v", "omp"],

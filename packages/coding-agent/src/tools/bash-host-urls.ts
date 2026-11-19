@@ -476,37 +476,40 @@ class HostUrls {
 			return rendered;
 		};
 
-		let out = "";
-		let current = emptyClause();
-		const stack: Array<Clause | null> = [];
+		let frame = { out: "", clause: emptyClause() };
+		const stack: Array<{ frame: typeof frame; substitution: boolean }> = [];
+		const flush = async () => {
+			frame.out += await flushClause(frame.clause);
+			frame.clause = emptyClause();
+		};
 		const tokens = lexShellCommand(text);
 		for (let idx = 0; idx < tokens.length; idx++) {
 			const token = tokens[idx];
 			if (token.kind === "word") {
-				current.parts.push({ raw: token.raw, value: token.value });
-				if (current.mergeNextWord) {
-					current.mergeNextWord = false;
-					if (!current.inSkippedWord && current.words.length > 0) {
-						current.words[current.words.length - 1] += token.value;
+				frame.clause.parts.push({ raw: token.raw, value: token.value });
+				if (frame.clause.mergeNextWord) {
+					frame.clause.mergeNextWord = false;
+					if (!frame.clause.inSkippedWord && frame.clause.words.length > 0) {
+						frame.clause.words[frame.clause.words.length - 1] += token.value;
 					}
-				} else if (current.skipRedirectTarget) {
-					current.skipRedirectTarget = false;
-					current.inSkippedWord = true;
+				} else if (frame.clause.skipRedirectTarget) {
+					frame.clause.skipRedirectTarget = false;
+					frame.clause.inSkippedWord = true;
 				} else if (BARE_REDIRECT_OP.test(token.raw)) {
-					current.skipRedirectTarget = true;
-					current.inSkippedWord = false;
+					frame.clause.skipRedirectTarget = true;
+					frame.clause.inSkippedWord = false;
 				} else if (ATTACHED_REDIRECT.test(token.raw)) {
-					current.inSkippedWord = true;
+					frame.clause.inSkippedWord = true;
 				} else {
-					current.inSkippedWord = false;
-					current.words.push(token.value);
+					frame.clause.inSkippedWord = false;
+					frame.clause.words.push(token.value);
 				}
 				continue;
 			}
 			if (!/[\n;&|()]/.test(token.raw)) {
-				current.parts.push(token.raw);
-				current.mergeNextWord = false;
-				current.inSkippedWord = false;
+				frame.clause.parts.push(token.raw);
+				frame.clause.mergeNextWord = false;
+				frame.clause.inSkippedWord = false;
 				continue;
 			}
 			const prev = idx > 0 ? tokens[idx - 1] : undefined;
@@ -516,45 +519,49 @@ class HostUrls {
 					const isCommandSubst =
 						c === 0 && token.raw[1] !== "(" && prev?.kind === "word" && endsWithUnescapedDollar(prev.raw);
 					if (isCommandSubst) {
-						current.parts.push("(");
-						stack.push(current);
-						current = emptyClause();
+						frame.clause.parts.push("(");
 					} else {
-						out += `${await flushClause(current)}(`;
-						stack.push(null);
-						current = emptyClause();
+						await flush();
+						frame.out += "(";
 					}
+					stack.push({ frame, substitution: isCommandSubst });
+					frame = { out: "", clause: emptyClause() };
 				} else if (ch === ")") {
-					const inner = await flushClause(current);
-					const resumed = stack.pop();
-					if (resumed) {
-						resumed.parts.push(`${inner})`);
-						resumed.mergeNextWord = true;
-						current = resumed;
-					} else {
-						out += `${inner})`;
-						current = emptyClause();
+					await flush();
+					const parent = stack.pop();
+					if (parent) {
+						if (parent.substitution) {
+							parent.frame.clause.parts.push(`${frame.out})`);
+						} else {
+							parent.frame.out += `${frame.out})`;
+						}
+						parent.frame.clause.mergeNextWord = true;
+						frame = parent.frame;
 					}
 				} else if (ch === "\n" || ch === ";" || ch === "&" || ch === "|") {
-					out += `${await flushClause(current)}${ch}`;
-					current = emptyClause();
+					await flush();
+					frame.out += ch;
 				} else {
-					current.parts.push(ch);
-					current.mergeNextWord = false;
-					current.inSkippedWord = false;
+					frame.clause.parts.push(ch);
+					frame.clause.mergeNextWord = false;
+					frame.clause.inSkippedWord = false;
 				}
 			}
 		}
-		let tail = await flushClause(current);
+		await flush();
 		while (stack.length > 0) {
 			const parent = stack.pop();
 			if (parent) {
-				parent.parts.push(tail);
-				tail = await flushClause(parent);
+				if (parent.substitution) {
+					parent.frame.clause.parts.push(frame.out);
+				} else {
+					parent.frame.out += frame.out;
+				}
+				frame = parent.frame;
+				await flush();
 			}
 		}
-		out += tail;
-		return out;
+		return frame.out;
 	}
 
 	/** One word naming a URL: its spelling with the URL's file in place, or as written. */
