@@ -305,11 +305,28 @@ impl GitRepo {
 		// Not `.git/COMMIT_EDITMSG`: overlapping calls reread whichever message
 		// landed last, including when `no_verify` skips the hook.
 		let message_file = CommitMessageFile::create(&self.info().git_dir, message)?;
-		// Hooks that read `.git/COMMIT_EDITMSG` instead of `$1` still see this
-		// message, as under `git commit`; only the private copy is read back.
-		let _ = fs::write(self.info().git_dir.join("COMMIT_EDITMSG"), message);
-		if !options.no_verify {
-			run_commit_hook(self, "commit-msg", &[message_file.path.as_os_str()], index_path)?;
+		// Legacy hooks read `.git/COMMIT_EDITMSG` instead of the path they are
+		// given. Every commit, including `no_verify`, takes this git dir's lock
+		// around the shared write so it cannot replace the message another
+		// call's hook is checking. The lock is held through that hook. Its
+		// permissions follow `core.sharedRepository`, so a group-shared
+		// checkout is not stuck with a lock only its creator can open. The
+		// private file is still what the commit object records.
+		let shared_perm = shared_repository(&repo)?;
+		{
+			let _lock = SharedCommitMessageLock::acquire(&self.info().git_dir, shared_perm)?;
+			let shared = self.info().git_dir.join("COMMIT_EDITMSG");
+			// A missing or skipped hook never reads the shared file, so a failed
+			// write must not reject the commit. An executable or configured hook
+			// might.
+			let hook_reads_shared = !options.no_verify && commit_hook_exists(self, "commit-msg")?;
+			let wrote = fs::write(&shared, message);
+			if hook_reads_shared {
+				wrote.map_err(|err| Error::backend("git commit write COMMIT_EDITMSG", err))?;
+				run_commit_hook(self, "commit-msg", &[message_file.path.as_os_str()], index_path)?;
+			} else {
+				let _ = wrote;
+			}
 		}
 		let message = fs::read_to_string(&message_file.path)
 			.map_err(|err| Error::backend("git commit read commit-msg result", err))?;
@@ -1091,6 +1108,219 @@ impl GitRepo {
 	}
 }
 
+/// Cross-process lock around `.git/COMMIT_EDITMSG` for `commit-msg`.
+///
+/// `flock` on `omp-commit-msg.lock` in the git directory. The file is kept
+/// after release: deleting it lets a new inode reuse the name while another
+/// caller still holds the old one, so both would accept the message. The
+/// kernel releases the lock when this process exits, including a crash.
+#[must_use = "dropping the lock lets another commit replace COMMIT_EDITMSG"]
+struct SharedCommitMessageLock {
+	_file: fs::File,
+}
+
+impl SharedCommitMessageLock {
+	fn acquire(git_dir: &Path, shared: SharedRepository) -> Result<Self> {
+		let path = git_dir.join("omp-commit-msg.lock");
+		let file = fs::OpenOptions::new()
+			.read(true)
+			.write(true)
+			.create(true)
+			.truncate(false)
+			.open(&path)
+			.map_err(|err| Error::backend("git commit lock COMMIT_EDITMSG", err))?;
+		// `open` applies the process umask. With the usual 022 mask the new
+		// file is writable only by its creator, and a later commit by someone
+		// else in a group-shared checkout cannot open it — `no_verify`
+		// included, because every commit takes this lock. Git itself widens
+		// files it creates here according to `core.sharedRepository`.
+		apply_shared_repository_mode(&path, shared)?;
+		file
+			.lock()
+			.map_err(|err| Error::backend("git commit lock COMMIT_EDITMSG", err))?;
+		Ok(Self { _file: file })
+	}
+}
+
+/// How `core.sharedRepository` wants files in the git directory created.
+/// Same cases as Git's `git_config_perm`.
+#[derive(Clone, Copy)]
+enum SharedRepository {
+	/// Leave the mode `open` produced under the process umask.
+	Umask,
+	/// Add group read and write (`group`, `true`, or the `1` Git stores).
+	Group,
+	/// Add group read and write, plus world read (`all`, or the `2` Git stores).
+	Everybody,
+	/// Use these bits exactly. Execute bits are already stripped.
+	Exact(u32),
+}
+
+fn shared_repository(repo: &gix::Repository) -> Result<SharedRepository> {
+	// A key written with no `=` is boolean true, and for this setting true
+	// means group sharing. Spaces after the name do not change that. An
+	// explicit empty value (`sharedRepository =`) is a different setting and
+	// stays private. `string()` skips the no-equals form, so it cannot tell
+	// the two apart.
+	let config = repo.config_snapshot();
+	let Some(sections) = config.plumbing().sections_by_name("core") else {
+		return Ok(SharedRepository::Umask);
+	};
+	let mut sharing: Option<Option<String>> = None;
+	for section in sections {
+		if section.header().subsection_name().is_some() {
+			continue;
+		}
+		let Some(value) = section.value_implicit("sharedRepository") else {
+			continue;
+		};
+		sharing = Some(match value {
+			None => None,
+			Some(value) => {
+				let text = value.to_str().map_err(|_| {
+					Error::backend("git commit read core.sharedRepository", "value is not utf-8")
+				})?;
+				// gix reports `sharedRepository ` (no `=`, trailing space) as an
+				// empty string, the same bytes as `sharedRepository =`.
+				if text.is_empty() && shared_key_has_no_equals(&section.to_bstring()) {
+					None
+				} else {
+					Some(text.to_owned())
+				}
+			},
+		});
+	}
+	match sharing {
+		None => Ok(SharedRepository::Umask),
+		Some(None) => Ok(SharedRepository::Group),
+		Some(Some(value)) => parse_shared_repository(&value),
+	}
+}
+
+/// `true` when the last `sharedRepository` key in this section has no `=`.
+/// That is Git's boolean true. An explicit `=` with an empty value is false.
+fn shared_key_has_no_equals(section_text: &[u8]) -> bool {
+	let Ok(events) = gix::config::parse::Events::from_bytes(section_text, None) else {
+		return false;
+	};
+	let mut matching = false;
+	let mut saw_eq = false;
+	let mut implicit = false;
+	for event in events.into_iter() {
+		match event {
+			gix::config::parse::Event::SectionValueName(name)
+				if name.to_string().eq_ignore_ascii_case("sharedRepository") =>
+			{
+				matching = true;
+				saw_eq = false;
+			},
+			gix::config::parse::Event::SectionValueName(_) => matching = false,
+			gix::config::parse::Event::KeyValueSeparator if matching => saw_eq = true,
+			gix::config::parse::Event::Value(_) | gix::config::parse::Event::ValueDone(_)
+				if matching =>
+			{
+				implicit = !saw_eq;
+				matching = false;
+			},
+			_ => {},
+		}
+	}
+	implicit
+}
+
+fn parse_shared_repository(value: &str) -> Result<SharedRepository> {
+	let value = value.trim();
+	match value {
+		// `sharedRepository =` is an empty value. Git's octal parse of that is
+		// 0, which means the usual private permissions. The no-equals form is
+		// handled above and never reaches this match.
+		"" | "umask" => return Ok(SharedRepository::Umask),
+		"group" => return Ok(SharedRepository::Group),
+		"all" | "world" | "everybody" => return Ok(SharedRepository::Everybody),
+		_ => {},
+	}
+	if value.bytes().all(|byte| byte.is_ascii_digit()) {
+		let mode = u32::from_str_radix(value, 8).map_err(|_| {
+			Error::backend(
+				"git commit read core.sharedRepository",
+				format!("bad core.sharedRepository value {value:?}"),
+			)
+		})?;
+		return match mode {
+			0 => Ok(SharedRepository::Umask),
+			1 => Ok(SharedRepository::Group),
+			2 => Ok(SharedRepository::Everybody),
+			_ if (mode & 0o600) == 0o600 => Ok(SharedRepository::Exact(mode & 0o666)),
+			_ => Err(Error::backend(
+				"git commit read core.sharedRepository",
+				format!(
+					"problem with core.sharedRepository filemode value (0{mode:o}). The owner of files \
+					 must always have read and write permissions."
+				),
+			)),
+		};
+	}
+	match value.to_ascii_lowercase().as_str() {
+		"true" | "yes" | "on" => Ok(SharedRepository::Group),
+		"false" | "no" | "off" => Ok(SharedRepository::Umask),
+		_ => Err(Error::backend(
+			"git commit read core.sharedRepository",
+			format!("bad boolean config value {value:?} for 'core.sharedRepository'"),
+		)),
+	}
+}
+
+#[cfg(unix)]
+/// Permission bits Git would store for a regular file whose current mode is
+/// `current`. `None` means the umask result must be left alone.
+const fn desired_shared_mode(current: u32, shared: SharedRepository) -> Option<u32> {
+	let current = current & 0o777;
+	let mode = match shared {
+		SharedRepository::Umask => return None,
+		SharedRepository::Group => loosen_shared_mode(current, 0o660),
+		SharedRepository::Everybody => loosen_shared_mode(current, 0o664),
+		SharedRepository::Exact(mode) => mode & 0o666,
+	};
+	Some(mode)
+}
+
+#[cfg(unix)]
+/// Git's `calc_shared_perm` for a positive (loosening) shared-repository value.
+const fn loosen_shared_mode(current: u32, mut tweak: u32) -> u32 {
+	if current & 0o200 == 0 {
+		tweak &= !0o222;
+	}
+	if current & 0o100 != 0 {
+		tweak |= (tweak & 0o444) >> 2;
+	}
+	current | tweak
+}
+
+fn apply_shared_repository_mode(path: &Path, shared: SharedRepository) -> Result<()> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		let meta =
+			fs::metadata(path).map_err(|err| Error::backend("git commit lock COMMIT_EDITMSG", err))?;
+		let current = meta.permissions().mode();
+		let Some(mode) = desired_shared_mode(current, shared) else {
+			return Ok(());
+		};
+		if current & 0o777 == mode {
+			return Ok(());
+		}
+		let mut perms = meta.permissions();
+		perms.set_mode(mode);
+		fs::set_permissions(path, perms)
+			.map_err(|err| Error::backend("git commit lock COMMIT_EDITMSG", err))?;
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = (path, shared);
+	}
+	Ok(())
+}
+
 /// One call's commit message. Dropped on every exit, including hook, signer,
 /// and ref-update failures.
 ///
@@ -1216,6 +1446,10 @@ fn hook_configured(repository: &GitRepo, name: &str) -> Result<bool> {
 				.iter()
 				.any(|event| event.as_ref() == name)
 		}))
+}
+
+fn commit_hook_exists(repository: &GitRepo, name: &str) -> Result<bool> {
+	Ok(repository.hook_path(name)?.is_some() || hook_configured(repository, name)?)
 }
 
 /// Write a signed commit object through `git commit-tree -S`, which runs the

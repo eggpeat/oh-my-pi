@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed concurrent `commitCreate()` calls so a `commit-msg` hook that reads `.git/COMMIT_EDITMSG` sees that commit's message, and a failure to write the file rejects the commit when hooks run. ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+- Fixed commits in a shared Git checkout so other people using that checkout can commit too, including when sharing is turned on with no value, instead of being blocked by a lock only its creator could write. ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+
 ## [19.0.0] - 2026-11-18
 
 ### Added

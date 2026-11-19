@@ -94,7 +94,8 @@ describe("commitCreate message isolation", () => {
 		expect(sha).toBe(await git(root, "rev-parse", "HEAD"));
 		expect(await git(root, "log", "-1", "--format=%B")).toBe("private message");
 		const added = (await fs.readdir(gitDir)).filter(name => !before.has(name));
-		expect(added).toEqual([]);
+		// The lock file stays so later commits flock the same inode.
+		expect(added).toEqual(["omp-commit-msg.lock"]);
 	});
 
 	test("removes the message file when commit-msg rejects the commit", async () => {
