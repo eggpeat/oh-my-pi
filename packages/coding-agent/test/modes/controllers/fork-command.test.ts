@@ -5,6 +5,8 @@ import * as path from "node:path";
 import { classifyTerminalMultiplexer, type TerminalMultiplexer } from "@oh-my-pi/pi-tui/terminal-multiplexer";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
+import { extractProfileFlags } from "@oh-my-pi/pi-coding-agent/cli/profile-bootstrap";
 import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { Settings } from "../../../src/config/settings";
@@ -396,8 +398,14 @@ describe("/fork terminal placement", () => {
 		await forked.controller.handleForkCommand("pane");
 		const command = forked.launchTerminal.mock.calls[0]?.[0].command ?? [];
 		const appArgs = command.slice(command.indexOf("omp-entry") + 1);
-		expect(appArgs.slice(0, 5)).toEqual(["--plan", "--profile", "active-profile", "--model", "provider/model"]);
-		expect(appArgs).not.toContain("old-provider/model-a");
+		const extracted = extractProfileFlags(appArgs);
+		expect(extracted.profile).toBe("active-profile");
+		const startupChild = parseArgs(extracted.argv);
+		expect(startupChild.model).toBe("provider/model");
+		expect(startupChild.messages).toEqual([]);
+		const extChild = parseArgs(extracted.argv, new Map([["plan", { type: "boolean" }]]));
+		expect(extChild.unknownFlags.get("plan")).toBe(true);
+		expect(extChild.model).toBe("provider/model");
 	});
 
 	it("rejects placement forks without a persisted transcript", async () => {
