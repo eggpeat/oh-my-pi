@@ -161,7 +161,7 @@ function forwardStream<TApi extends Api>(
 			}
 		} catch (error) {
 			const stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-			const message = createProviderStreamError(model, error, stopReason);
+			const message = createProviderStreamError(model, error, stopReason, abortTracker, options.signal);
 			target.push({ type: "error", reason: stopReason, error: message });
 			target.end(message);
 		}
@@ -172,7 +172,13 @@ function createProviderStreamError<TApi extends Api>(
 	model: Model<TApi>,
 	error: unknown,
 	stopReason: Extract<AssistantMessage["stopReason"], "aborted" | "error"> = "error",
+	abortTracker?: AbortSourceTracker,
+	callerSignal?: AbortSignal,
 ): AssistantMessage {
+	// The thrown error is often the idle iterator's AbortError wrapper, or the
+	// provider's own "Request was aborted". Neither is the label the caller passed
+	// to abort(); that lives on the caller's signal.
+	const callerAbortReason = stopReason === "aborted" ? abortTracker?.getCallerAbortReason() : undefined;
 	return {
 		role: "assistant",
 		content: [],
@@ -188,11 +194,31 @@ function createProviderStreamError<TApi extends Api>(
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason,
-		errorId: stopReason === "error" ? AIError.classify(error, model.api) || undefined : undefined,
+		errorId: providerStreamErrorId(model.api, error, stopReason, callerAbortReason, callerSignal),
 		errorMessage:
-			stopReason === "aborted" ? "Request was aborted" : error instanceof Error ? error.message : String(error),
+			stopReason === "aborted"
+				? (callerAbortReason ?? "Request was aborted")
+				: error instanceof Error
+					? error.message
+					: String(error),
 		timestamp: Date.now(),
 	};
+}
+
+function providerStreamErrorId(
+	api: Api,
+	error: unknown,
+	stopReason: Extract<AssistantMessage["stopReason"], "aborted" | "error">,
+	callerAbortReason: string | undefined,
+	callerSignal: AbortSignal | undefined,
+): number | undefined {
+	if (stopReason === "error") return AIError.classify(error, api) || undefined;
+	// A string reason is rethrown as AbortError, which always carries Flag.Abort.
+	// That flag means a reasonless transport abort, so a labeled cancel must not
+	// inherit it. Keep a classification only when the caller passed a reason that
+	// itself classifies (a user-interrupt or silent-abort error, for example).
+	if (callerAbortReason === undefined) return undefined;
+	return AIError.classify(callerSignal?.reason, api) || undefined;
 }
 
 // ---------------------------------------------------------------------------

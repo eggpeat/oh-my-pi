@@ -316,4 +316,59 @@ describe("register-builtins lazy streams", () => {
 		expect(result.stopReason).toBe("aborted");
 		expect(result.errorMessage).toBe("Request was aborted");
 	});
+
+	it("reports the caller's abort reason when the lazy wrapper ends the stream", async () => {
+		const result = await abortForwardedBedrockStream(controller => controller.abort("Interrupted by user"));
+		// A labeled cancel must not look like a reasonless transport abort: that
+		// sentinel is what turn recovery retries, and what renderers treat as
+		// "no reason given".
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("Interrupted by user");
+		expect(result.errorId).toBeUndefined();
+	});
+
+	it("keeps a classified caller abort reason on the forwarded stream", async () => {
+		const reason = new Error("planner cancelled");
+		AIError.attach(reason, AIError.create(AIError.Flag.SilentAbort));
+		const result = await abortForwardedBedrockStream(controller => controller.abort(reason));
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("planner cancelled");
+		expect(AIError.is(result.errorId, AIError.Flag.SilentAbort)).toBe(true);
+		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(false);
+	});
 });
+
+async function abortForwardedBedrockStream(abort: (controller: AbortController) => void): Promise<AssistantMessage> {
+	const abortController = new AbortController();
+	const partialMessage = createAssistantMessage("stop");
+	let providerSignal: AbortSignal | undefined;
+	const source = {
+		async *[Symbol.asyncIterator]() {
+			yield { type: "start", partial: partialMessage } as const;
+			const { promise, reject } = Promise.withResolvers<never>();
+			if (providerSignal?.aborted) {
+				reject(new Error("Request was aborted"));
+			}
+			providerSignal?.addEventListener("abort", () => reject(new Error("Request was aborted")), { once: true });
+			await promise;
+		},
+	} as unknown as AssistantMessageEventStream;
+
+	setBedrockProviderModule({
+		streamBedrock: (_model, _context, options) => {
+			providerSignal = options.signal;
+			return source;
+		},
+	});
+
+	const stream = streamBedrock(createModel(), baseContext, {
+		signal: abortController.signal,
+		// The abort itself must end the stream; a watchdog timeout would hide a missed reason.
+		streamFirstEventTimeoutMs: 0,
+		streamIdleTimeoutMs: 60_000,
+	});
+	const firstEvent = await stream[Symbol.asyncIterator]().next();
+	expect(firstEvent.value?.type).toBe("start");
+	abort(abortController);
+	return stream.result();
+}
