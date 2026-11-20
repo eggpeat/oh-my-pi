@@ -49,6 +49,7 @@
 
 ### Fixed
 
+- Fixed ACP and RPC `/todo done` and `/todo drop` without arguments leaving tasks unchanged, `/todo` mutations ignoring errors, and `/todo` edits omitting the user-edit reminder to the model ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 - `--continue` (and `autoResume`) no longer resumes a session another running omp is writing, which duplicated its conversation into a new file on the first message; it starts a new session as plain `omp` does
 - `/handoff` now shows its progress like `/compact` while it writes the summary: a working row with a spinner and timer while the agent is idle, and a row above it while a turn runs. Previously only a one-off status line said it had started
 - On macOS, reading a cloud-only iCloud Drive, Desktop & Documents, Google Drive or Dropbox file now downloads it instead of failing with `EDEADLK`, in tools and in the commands omp runs, even when the terminal turned downloads off for its shells
