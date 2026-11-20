@@ -15,7 +15,8 @@
 //! of a command that runs `omp` stay as written. A word spelled `omp` is
 //! not enough: only the program, or the command a known wrapper (`nice omp`,
 //! `npx --loglevel warn omp`, `env -u NAME - omp`) is given, counts. That
-//! wrapper's own file arguments are still rewritten.
+//! wrapper's own file arguments — and an `omp` executable path handed to a
+//! wrapper (`env local://bin/omp …`) — are still rewritten.
 //!
 //! A spawn that names a URL is taken apart ([`split`]) into the [`Names`] to
 //! resolve and the [`Rest`] it moves untouched; the provider is awaited
@@ -23,6 +24,7 @@
 //! returns owns everything it needs and is `Send`.
 
 use std::{
+	borrow::Cow,
 	io,
 	path::{Path, PathBuf},
 };
@@ -45,6 +47,8 @@ pub(super) struct Names {
 	pub env:  EnvView,
 	/// The working directory.
 	pub cwd:  BString,
+	/// Which arguments and environment belong to `omp` and stay literal.
+	owned:    OmpOwned,
 }
 
 /// The parts of a [`SpawnSpec`] URL resolution does not touch, owned.
@@ -100,86 +104,52 @@ impl Rest {
 	}
 }
 
-/// Whether `spec` names a URL (program, working directory, an argument
-/// containing `://`, or an environment value that is one): then it resolves
-/// first, else it spawns as it is.
-pub(super) fn names_url(spec: &SpawnSpec<'_>) -> bool {
-	if is_url(spec.path) || is_url(spec.cwd) {
-		return true;
-	}
-	let owned = omp_owned(spec.argv);
-	spec
-		.argv
-		.iter()
-		.enumerate()
-		.skip(1)
-		.any(|(index, arg)| !owned.args[index] && arg.contains_str("://"))
-		|| (!owned.env && spec.env.iter().any(|(name, value)| env_url(name, value)))
-}
-
 /// Arguments `omp` itself reads, and whether the environment reaches `omp`.
-struct OmpOwned {
-	/// `args[i]` is a word `omp` reads (its name, an argument, or an
-	/// assignment a wrapper puts in `omp`'s environment).
+pub(super) struct OmpOwned {
+	/// `args[i]` is a word `omp` reads (an argument passed to `omp`, or an
+	/// assignment a wrapper puts in `omp`'s environment). Empty when no
+	/// argument had a URL candidate.
 	args: Vec<bool>,
 	/// The spawned environment is handed to `omp`, so its URLs stay as written.
 	env:  bool,
 }
 
-/// `omp` as the program, or as the command a known wrapper runs. An argument
-/// merely spelled `omp` (`grep omp local://out.txt`, `ls ./omp local://dir`)
-/// does not count. The same walk the client terminal applies
-/// (`bash-host-urls.ts`).
-fn omp_owned(argv: &[BString]) -> OmpOwned {
-	let mut args = vec![false; argv.len()];
-	if argv.is_empty() {
-		return OmpOwned { args, env: false };
+impl OmpOwned {
+	fn arg(&self, index: usize) -> bool {
+		self.args.get(index).copied().unwrap_or(false)
 	}
-	let scan = Scan { argv, remote: false, end: argv.len() };
-	if program_is(argv[0].as_slice(), b"ssh") {
-		mark_ssh_at(&mut args, &scan, 0);
-		return OmpOwned { args, env: false };
-	}
-	if program_is(argv[0].as_slice(), b"find") {
-		let env = mark_find_at(&mut args, &scan, 0);
-		return OmpOwned { args, env };
-	}
-	let launch = launch_of(&scan, 0);
-	if launch.at < argv.len() && program_is(argv[launch.at].as_slice(), b"ssh") {
-		mark_ssh_at(&mut args, &scan, launch.at);
-		return OmpOwned { args, env: false };
-	}
-	if launch.at < argv.len() && program_is(argv[launch.at].as_slice(), b"find") {
-		let env = mark_find_at(&mut args, &scan, launch.at);
-		return OmpOwned { args, env };
-	}
-	apply_omp(&mut args, &scan, &launch, argv.len());
-	let env = launch.at < argv.len() && is_omp(argv[launch.at].as_slice());
-	OmpOwned { args, env }
 }
 
-/// Whether `word` names the `omp` program, by any path.
-fn is_omp(word: &[u8]) -> bool {
-	let name = word
-		.rsplit(|&b| b == b'/' || (cfg!(windows) && b == b'\\'))
-		.next()
-		.unwrap_or(word);
-	name == b"omp" || (cfg!(windows) && name.eq_ignore_ascii_case(b"omp.exe"))
+/// Plan URL resolution for `spec`, returning `None` (with no allocation or
+/// launcher walk when no candidate URL is present) when `spec` can spawn as-is.
+pub(super) fn plan(spec: &SpawnSpec<'_>) -> Option<OmpOwned> {
+	let path_or_cwd_url = is_url(spec.path) || is_url(spec.cwd);
+	let arg_has_url = spec.argv.iter().skip(1).any(|arg| arg.contains_str("://"));
+	let env_has_url = spec.env.iter().any(|(name, value)| env_url(name, value));
+	if !path_or_cwd_url && !arg_has_url && !env_has_url {
+		return None;
+	}
+	if !arg_has_url && !env_has_url {
+		return Some(OmpOwned { args: Vec::new(), env: true });
+	}
+	let owned = omp_owned(spec.argv);
+	let needs_arg = arg_has_url
+		&& spec
+			.argv
+			.iter()
+			.enumerate()
+			.skip(1)
+			.any(|(index, arg)| !owned.arg(index) && arg.contains_str("://"));
+	let needs_env = env_has_url && !owned.env;
+	if !path_or_cwd_url && !needs_arg && !needs_env {
+		return None;
+	}
+	Some(owned)
 }
 
-/// Whether the environment variable `name` holds a URL to resolve. `PWD`
-/// follows the working directory instead, and a web address aliases no file,
-/// so the provider is not asked about one on every spawn.
-fn env_url(name: &BStr, value: &BStr) -> bool {
-	name != "PWD"
-		&& as_path(value)
-			.and_then(omp_vfs::url_scheme)
-			.is_some_and(|scheme| !matches!(scheme, "http" | "https"))
-}
-
-/// Take `spec` apart for a spawn that waits on the provider: the names as
-/// written (copied) and the rest (moved, its borrowed slice copied).
-pub(super) fn split(spec: SpawnSpec<'_>) -> (Names, Rest) {
+/// Take `spec` apart for a spawn that waits on the provider, carrying `owned`
+/// forward so [`resolve`] does not walk `argv` a second time.
+pub(super) fn split(spec: SpawnSpec<'_>, owned: OmpOwned) -> (Names, Rest) {
 	let SpawnSpec {
 		path,
 		argv,
@@ -200,8 +170,9 @@ pub(super) fn split(spec: SpawnSpec<'_>) -> (Names, Rest) {
 	let names = Names {
 		path: BString::from(path.as_bytes()),
 		argv: argv.to_vec(),
-		env:  env.clone(),
-		cwd:  BString::from(cwd.as_bytes()),
+		env: env.clone(),
+		cwd: BString::from(cwd.as_bytes()),
+		owned,
 	};
 	let rest = Rest {
 		stdio,
@@ -217,6 +188,66 @@ pub(super) fn split(spec: SpawnSpec<'_>) -> (Names, Rest) {
 		ctty,
 	};
 	(names, rest)
+}
+
+/// `omp` as the program, or as the command a known wrapper runs. An argument
+/// merely spelled `omp` (`grep omp local://out.txt`, `ls ./omp local://dir`)
+/// does not count. The same walk the client terminal applies
+/// (`bash-host-urls.ts`).
+fn omp_owned(argv: &[BString]) -> OmpOwned {
+	let mut args = vec![false; argv.len()];
+	if argv.is_empty() {
+		return OmpOwned { args, env: false };
+	}
+	let vwords: Vec<VWord<'_>> = argv
+		.iter()
+		.enumerate()
+		.map(|(origin, word)| VWord { text: Cow::Borrowed(word.as_slice()), origin })
+		.collect();
+	let launch = launch_of(vwords);
+	if launch.aborted || launch.at >= launch.words.len() {
+		return OmpOwned { args, env: false };
+	}
+	let cmd = launch.words[launch.at].text.as_ref();
+	if program_is(cmd, b"ssh") {
+		mark_ssh(&mut args, &launch.words[launch.at..]);
+		return OmpOwned { args, env: false };
+	}
+	if program_is(cmd, b"find") {
+		let env = mark_find(&mut args, &launch.words[launch.at..]);
+		if env {
+			for &passed in &launch.passed {
+				if passed < args.len() {
+					args[passed] = true;
+				}
+			}
+		}
+		return OmpOwned { args, env };
+	}
+	if !is_omp(cmd) {
+		return OmpOwned { args, env: false };
+	}
+	mark_omp_args(&mut args, &launch.words, launch.at, &launch.passed, false);
+	OmpOwned { args, env: true }
+}
+
+/// Whether `word` names the `omp` program, by any path.
+fn is_omp(word: &[u8]) -> bool {
+	let name = word
+		.rsplit(|&b| b == b'/' || (cfg!(windows) && b == b'\\'))
+		.next()
+		.unwrap_or(word);
+	name == b"omp" || (cfg!(windows) && name.eq_ignore_ascii_case(b"omp.exe"))
+}
+
+/// Whether the environment variable `name` holds a URL to resolve. `PWD`
+/// follows the working directory instead, and a web address aliases no file,
+/// so the provider is not asked about one on every spawn.
+fn env_url(name: &BStr, value: &BStr) -> bool {
+	name != "PWD"
+		&& as_path(value)
+			.and_then(omp_vfs::url_scheme)
+			.is_some_and(|scheme| !matches!(scheme, "http" | "https"))
 }
 
 fn is_url(path: &BStr) -> bool {
@@ -279,10 +310,9 @@ pub(super) async fn resolve(fs: &omp_vfs::Fs, names: &Names) -> io::Result<Names
 		},
 		_ => names.path.clone(),
 	};
-	let owned = omp_owned(&names.argv);
 	let mut argv = Vec::with_capacity(names.argv.len());
 	for (i, arg) in names.argv.iter().enumerate() {
-		let host = if i == 0 || owned.args[i] {
+		let host = if i == 0 || names.owned.arg(i) {
 			None
 		} else {
 			host_arg(fs, arg.as_bstr()).await
@@ -291,7 +321,7 @@ pub(super) async fn resolve(fs: &omp_vfs::Fs, names: &Names) -> io::Result<Names
 	}
 	// What the child's environment says differently from the shell's.
 	let mut hosted: Vec<(BString, BString)> = Vec::new();
-	if !owned.env {
+	if !names.owned.env {
 		for (name, value) in names.env.iter() {
 			if env_url(name, value)
 				&& let Some(host) = host_arg(fs, value).await
@@ -322,7 +352,7 @@ pub(super) async fn resolve(fs: &omp_vfs::Fs, names: &Names) -> io::Result<Names
 		pairs.append(&mut hosted);
 		EnvView::new(pairs)
 	};
-	Ok(Names { path, argv, env, cwd })
+	Ok(Names { path, argv, env, cwd, owned: OmpOwned { args: Vec::new(), env: names.owned.env } })
 }
 
 /// The host path `path` aliases, if it is a URL the filesystem backs.
@@ -405,45 +435,41 @@ fn names_nothing(text: &str) -> bool {
 	})
 }
 
-/// A view of `argv` a launcher walk may not read past, and whether a remote
-/// command separator (`|`, `&&`, …) ends the command being identified.
-struct Scan<'a> {
-	argv:   &'a [BString],
-	remote: bool,
-	end:    usize,
+/// One logical word in a command walk, and the `argv` slot it came from.
+#[derive(Clone)]
+struct VWord<'a> {
+	text:   Cow<'a, [u8]>,
+	origin: usize,
 }
 
-impl Scan<'_> {
-	fn get(&self, index: usize) -> Option<&[u8]> {
-		if index >= self.end {
-			return None;
-		}
-		self.argv.get(index).map(|arg| arg.as_slice())
-	}
-
-	fn at_stop(&self, index: usize) -> bool {
-		index >= self.end || self.remote && self.get(index).is_some_and(remote_sep)
-	}
+/// Result of walking past launchers (`env`, `sudo`, `npx`, `uv run`, …).
+struct Launch<'a> {
+	words:   Vec<VWord<'a>>,
+	at:      usize,
+	passed:  Vec<usize>,
+	aborted: bool,
 }
 
-/// Where a wrapper's command sits, and which earlier words it copies into
-/// that command's environment (`env NAME=value`, `sudo NAME=value`).
-struct Launch {
-	at:     usize,
-	passed: Vec<usize>,
-}
-
-/// Options a launcher takes before the command it runs.
+/// Options a launcher takes before the command it runs. Shared 1-for-1 with
+/// `bash-host-urls.ts`.
 struct OptSet {
-	/// Short letters whose value is the next word when it is not attached.
-	short_val: &'static [u8],
-	/// Long names (without `--`) that always take a value.
-	long_val:  &'static [&'static str],
-	/// Long names that are flags. With `open`, any other long name takes a
-	/// following word that does not itself look like an option.
-	long_bool: &'static [&'static str],
-	open:      bool,
+	/// Short letters whose value is the next word when last in a cluster.
+	short_val:  &'static [u8],
+	/// Long names (without `--`) whose value is the next word when not `=`.
+	long_val:   &'static [&'static str],
+	/// Short letters that select a non-exec mode (lookup, edit, module, …).
+	stop_short: &'static [u8],
+	/// Long names that select a non-exec mode.
+	stop_long:  &'static [&'static str],
 }
+
+enum ShortStep {
+	One,
+	Next,
+	Stop,
+}
+
+const MAX_ENV_SPLITS: usize = 64;
 
 fn program_name(word: &[u8]) -> &[u8] {
 	let name = word
@@ -466,8 +492,11 @@ fn program_is(word: &[u8], expect: &[u8]) -> bool {
 	}
 }
 
-const fn remote_sep(word: &[u8]) -> bool {
-	matches!(word, b"|" | b"||" | b"&" | b"&&" | b";" | b";;" | b";&" | b";;&" | b"\n")
+const fn shell_keyword(word: &[u8]) -> bool {
+	matches!(
+		word,
+		b"if" | b"then" | b"elif" | b"else" | b"while" | b"until" | b"do" | b"{" | b"}" | b"!"
+	)
 }
 
 fn ident_assignment(word: &[u8]) -> bool {
@@ -494,257 +523,750 @@ fn listed(name: &[u8], names: &[&str]) -> bool {
 	names.iter().any(|item| item.as_bytes() == name)
 }
 
-fn apply_omp(args: &mut [bool], scan: &Scan<'_>, launch: &Launch, end: usize) {
-	if launch.at >= end || scan.at_stop(launch.at) || !is_omp(scan.argv[launch.at].as_slice()) {
-		return;
+/// Mark arguments passed to `omp` (and `passed` environment settings). Local
+/// spawns resolve the executable at `omp_at` itself (`env local://bin/omp …`);
+/// remote SSH commands keep the whole `omp` command untouched.
+fn mark_omp_args(
+	args: &mut [bool],
+	words: &[VWord<'_>],
+	omp_at: usize,
+	passed: &[usize],
+	include_exec: bool,
+) {
+	let from = if include_exec { omp_at } else { omp_at + 1 };
+	for word in words.iter().skip(from) {
+		if word.origin < args.len() {
+			args[word.origin] = true;
+		}
 	}
-	for slot in args.iter_mut().take(end).skip(launch.at) {
-		*slot = true;
-	}
-	for &passed in &launch.passed {
-		if passed < end {
-			args[passed] = true;
+	for &origin in passed {
+		if origin < args.len() {
+			args[origin] = true;
 		}
 	}
 }
 
-fn launch_of(scan: &Scan<'_>, index: usize) -> Launch {
-	let Some(word) = scan.get(index) else {
-		return Launch { at: index, passed: Vec::new() };
-	};
-	if scan.at_stop(index) {
-		return Launch { at: index, passed: Vec::new() };
-	}
-	if program_is(word, b"env") {
-		return env_launch(scan, index);
-	}
-	if program_is(word, b"sudo") {
-		return assignment_launch(scan, index, &SUDO);
-	}
-	if program_is(word, b"doas") {
-		return follow(scan, skip_opts(scan, index + 1, &DOAS), Vec::new());
-	}
-	if program_is(word, b"nice") {
-		return follow(scan, skip_opts(scan, index + 1, &NICE), Vec::new());
-	}
-	if program_is(word, b"nohup") {
-		return follow(scan, skip_opts(scan, index + 1, &NOHUP), Vec::new());
-	}
-	if program_is(word, b"time") {
-		return follow(scan, skip_opts(scan, index + 1, &TIME), Vec::new());
-	}
-	if program_is(word, b"timeout") || program_is(word, b"gtimeout") {
-		return timeout_launch(scan, index);
-	}
-	if program_is(word, b"stdbuf") {
-		return follow(scan, skip_opts(scan, index + 1, &STDBUF), Vec::new());
-	}
-	if program_is(word, b"setsid") {
-		return follow(scan, skip_opts(scan, index + 1, &SETSID), Vec::new());
-	}
-	if program_is(word, b"ifne") {
-		return follow(scan, skip_opts(scan, index + 1, &IFNE), Vec::new());
-	}
-	if program_is(word, b"xargs") {
-		return follow(scan, skip_opts(scan, index + 1, &XARGS), Vec::new());
-	}
-	if program_is(word, b"exec") {
-		return follow(scan, skip_opts(scan, index + 1, &EXEC), Vec::new());
-	}
-	if program_is(word, b"command") || program_is(word, b"builtin") {
-		return follow(scan, skip_opts(scan, index + 1, &COMMAND), Vec::new());
-	}
-	if program_is(word, b"npx") {
-		return follow(scan, skip_opts(scan, index + 1, &NPX), Vec::new());
-	}
-	if program_is(word, b"npm") {
-		return npm_launch(scan, index);
-	}
-	if program_is(word, b"bunx") || program_is(word, b"bun") {
-		return bun_launch(scan, index);
-	}
-	if program_is(word, b"uv") || program_is(word, b"uvx") {
-		return uv_launch(scan, index);
-	}
-	Launch { at: index, passed: Vec::new() }
-}
-
-fn follow(scan: &Scan<'_>, at: usize, mut passed: Vec<usize>) -> Launch {
-	if scan.get(at).is_none() || scan.at_stop(at) {
-		return Launch { at, passed };
-	}
-	let inner = launch_of(scan, at);
-	passed.extend(inner.passed);
-	Launch { at: inner.at, passed }
-}
-
-fn env_launch(scan: &Scan<'_>, index: usize) -> Launch {
-	let mut at = skip_opts(scan, index + 1, &ENV);
+/// Iterative walk past launchers (`while` loop: constant stack depth).
+fn launch_of(mut words: Vec<VWord<'_>>) -> Launch<'_> {
+	let mut at = 0;
 	let mut passed = Vec::new();
-	if scan.get(at) == Some(b"-") {
-		at += 1;
-	}
-	while !scan.at_stop(at) && scan.get(at).is_some_and(|word| word.contains(&b'=')) {
-		passed.push(at);
-		at += 1;
-	}
-	follow(scan, at, passed)
-}
-
-fn assignment_launch(scan: &Scan<'_>, index: usize, opts: &OptSet) -> Launch {
-	let mut at = skip_opts(scan, index + 1, opts);
-	let mut passed = Vec::new();
-	while !scan.at_stop(at) && scan.get(at).is_some_and(ident_assignment) {
-		passed.push(at);
-		at += 1;
-	}
-	follow(scan, at, passed)
-}
-
-fn timeout_launch(scan: &Scan<'_>, index: usize) -> Launch {
-	let duration = skip_opts(scan, index + 1, &TIMEOUT);
-	let command = if scan.get(duration).is_some() && !scan.at_stop(duration) {
-		duration + 1
-	} else {
-		duration
-	};
-	follow(scan, command, Vec::new())
-}
-
-fn npm_launch(scan: &Scan<'_>, index: usize) -> Launch {
-	let sub = skip_opts(scan, index + 1, &NPM);
-	if scan.at_stop(sub)
-		|| !scan
-			.get(sub)
-			.is_some_and(|word| word == b"exec" || word == b"x")
-	{
-		return Launch { at: index, passed: Vec::new() };
-	}
-	follow(scan, skip_opts(scan, sub + 1, &NPM), Vec::new())
-}
-
-fn bun_launch(scan: &Scan<'_>, index: usize) -> Launch {
-	if program_is(scan.argv[index].as_slice(), b"bunx") {
-		return follow(scan, skip_opts(scan, index + 1, &BUNX), Vec::new());
-	}
-	let sub = skip_opts(scan, index + 1, &BUNX);
-	if scan.get(sub) == Some(b"x") {
-		return follow(scan, skip_opts(scan, sub + 1, &BUNX), Vec::new());
-	}
-	Launch { at: index, passed: Vec::new() }
-}
-
-fn uv_launch(scan: &Scan<'_>, index: usize) -> Launch {
-	if program_is(scan.argv[index].as_slice(), b"uvx") {
-		return follow(scan, skip_opts(scan, index + 1, &UV), Vec::new());
-	}
-	let sub = skip_opts(scan, index + 1, &UV);
-	if scan.get(sub) == Some(b"run") {
-		return follow(scan, skip_opts(scan, sub + 1, &UV), Vec::new());
-	}
-	if scan.get(sub) == Some(b"tool") && scan.get(sub + 1) == Some(b"run") {
-		return follow(scan, skip_opts(scan, sub + 2, &UV), Vec::new());
-	}
-	Launch { at: index, passed: Vec::new() }
-}
-
-fn skip_opts(scan: &Scan<'_>, mut index: usize, opts: &OptSet) -> usize {
-	while !scan.at_stop(index) {
-		let Some(word) = scan.get(index) else {
+	let mut splits = 0usize;
+	while at < words.len() {
+		let word = words[at].text.as_ref();
+		if program_is(word, b"env") {
+			let Some(next) = step_env(&mut words, at, &mut passed, &mut splits) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			at = next;
+			continue;
+		}
+		if program_is(word, b"sudo") {
+			let Some(mut next) = skip_opts(&words, at + 1, &SUDO) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			while next < words.len() && ident_assignment(words[next].text.as_ref()) {
+				passed.push(words[next].origin);
+				next += 1;
+			}
+			at = next;
+			continue;
+		}
+		if program_is(word, b"doas") {
+			let Some(next) = skip_opts(&words, at + 1, &DOAS) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			at = next;
+			continue;
+		}
+		if program_is(word, b"nice") {
+			let Some(next) = skip_opts(&words, at + 1, &NICE) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			at = next;
+			continue;
+		}
+		if program_is(word, b"nohup") {
+			let Some(next) = skip_opts(&words, at + 1, &NOHUP) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			at = next;
+			continue;
+		}
+		if program_is(word, b"time") {
+			let Some(next) = skip_opts(&words, at + 1, &TIME) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			at = next;
+			continue;
+		}
+		if program_is(word, b"timeout") || program_is(word, b"gtimeout") {
+			let Some(duration) = skip_opts(&words, at + 1, &TIMEOUT) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			if duration >= words.len() {
+				return Launch { words, at: duration, passed, aborted: true };
+			}
+			at = duration + 1;
+			continue;
+		}
+		if program_is(word, b"stdbuf") {
+			let Some(next) = skip_opts(&words, at + 1, &STDBUF) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			at = next;
+			continue;
+		}
+		if program_is(word, b"setsid") {
+			let Some(next) = skip_opts(&words, at + 1, &SETSID) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			at = next;
+			continue;
+		}
+		if program_is(word, b"ifne") {
+			let Some(next) = skip_opts(&words, at + 1, &IFNE) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			at = next;
+			continue;
+		}
+		if program_is(word, b"xargs") {
+			let Some(next) = skip_opts(&words, at + 1, &XARGS) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			at = next;
+			continue;
+		}
+		if program_is(word, b"exec") {
+			let Some(next) = skip_opts(&words, at + 1, &EXEC) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			at = next;
+			continue;
+		}
+		if program_is(word, b"command") {
+			let Some(next) = skip_opts(&words, at + 1, &COMMAND) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			at = next;
+			continue;
+		}
+		if program_is(word, b"npx") {
+			let Some(next) = skip_opts(&words, at + 1, &NPX) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			at = next;
+			continue;
+		}
+		if program_is(word, b"npm") {
+			let Some(sub) = skip_opts(&words, at + 1, &NPM) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			if sub >= words.len() || !matches!(words[sub].text.as_ref(), b"exec" | b"x") {
+				break;
+			}
+			let Some(next) = skip_opts(&words, sub + 1, &NPM) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			at = next;
+			continue;
+		}
+		if program_is(word, b"bunx") {
+			let Some(next) = skip_opts(&words, at + 1, &BUNX) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			at = next;
+			continue;
+		}
+		if program_is(word, b"bun") {
+			let Some(sub) = skip_opts(&words, at + 1, &BUN_GLOBAL) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			if sub >= words.len() || words[sub].text.as_ref() != b"x" {
+				break;
+			}
+			let Some(next) = skip_opts(&words, sub + 1, &BUNX) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			at = next;
+			continue;
+		}
+		if program_is(word, b"uvx") {
+			let Some(next) = skip_opts(&words, at + 1, &UVX) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			at = next;
+			continue;
+		}
+		if program_is(word, b"uv") {
+			let Some(sub) = skip_opts(&words, at + 1, &UV_GLOBAL) else {
+				return Launch { words, at, passed, aborted: true };
+			};
+			if sub < words.len() && words[sub].text.as_ref() == b"run" {
+				let Some(next) = skip_opts(&words, sub + 1, &UV_RUN) else {
+					return Launch { words, at, passed, aborted: true };
+				};
+				at = next;
+				continue;
+			}
+			if sub + 1 < words.len()
+				&& words[sub].text.as_ref() == b"tool"
+				&& words[sub + 1].text.as_ref() == b"run"
+			{
+				let Some(next) = skip_opts(&words, sub + 2, &UVX) else {
+					return Launch { words, at, passed, aborted: true };
+				};
+				at = next;
+				continue;
+			}
 			break;
-		};
+		}
+		break;
+	}
+	Launch { words, at, passed, aborted: false }
+}
+
+/// Step past `env` at `env_at`, expanding `-S` / `--split-string` in place.
+fn step_env(
+	words: &mut Vec<VWord<'_>>,
+	env_at: usize,
+	passed: &mut Vec<usize>,
+	splits: &mut usize,
+) -> Option<usize> {
+	let mut at = env_at + 1;
+	while at < words.len() {
+		let word = words[at].text.as_ref();
 		if word == b"-" || !word.starts_with(b"-") {
 			break;
 		}
 		if word == b"--" {
-			return index + 1;
+			at += 1;
+			break;
 		}
-		if let Some(name) = word.strip_prefix(b"--") {
-			let (name, attached) = split_eq(name);
+		if let Some(body) = word.strip_prefix(b"--") {
+			let (name, attached) = split_eq(body);
+			if listed(name, ENV.stop_long) {
+				return None;
+			}
+			if name == b"split-string" {
+				if *splits >= MAX_ENV_SPLITS {
+					return None;
+				}
+				*splits += 1;
+				if let Some(raw) = attached {
+					let origin = words[at].origin;
+					let extra = split_env_s(raw, origin);
+					words.splice(at..=at, extra);
+				} else if at + 1 < words.len() {
+					let origin = words[at + 1].origin;
+					let extra = split_env_s(words[at + 1].text.as_ref(), origin);
+					words.splice(at..=at + 1, extra);
+				} else {
+					return None;
+				}
+				continue;
+			}
+			if attached.is_some() {
+				at += 1;
+				continue;
+			}
+			at += if listed(name, ENV.long_val) && at + 1 < words.len() {
+				2
+			} else {
+				1
+			};
+			continue;
+		}
+		// Short option cluster `-...`: check `-0`, `-S`, and value-taking flags.
+		let letters = &word[1..];
+		let mut split_at = None;
+		for (offset, &letter) in letters.iter().enumerate() {
+			if ENV.stop_short.contains(&letter) {
+				return None;
+			}
+			if letter == b'S' {
+				split_at = Some(offset);
+				break;
+			}
+			if ENV.short_val.contains(&letter) {
+				at += if offset + 1 == letters.len() && at + 1 < words.len() {
+					2
+				} else {
+					1
+				};
+				split_at = Some(usize::MAX);
+				break;
+			}
+		}
+		match split_at {
+			None => at += 1,
+			Some(usize::MAX) => {},
+			Some(offset) => {
+				if *splits >= MAX_ENV_SPLITS {
+					return None;
+				}
+				*splits += 1;
+				if offset + 1 < letters.len() {
+					let origin = words[at].origin;
+					let extra = split_env_s(&letters[offset + 1..], origin);
+					words.splice(at..=at, extra);
+				} else if at + 1 < words.len() {
+					let origin = words[at + 1].origin;
+					let extra = split_env_s(words[at + 1].text.as_ref(), origin);
+					words.splice(at..=at + 1, extra);
+				} else {
+					return None;
+				}
+			},
+		}
+	}
+	if at < words.len() && words[at].text.as_ref() == b"-" {
+		at += 1;
+	}
+	while at < words.len() && words[at].text.contains(&b'=') {
+		passed.push(words[at].origin);
+		at += 1;
+	}
+	Some(at)
+}
+
+/// Split an `env -S` string into words (`'…'`, `"…"`, `\` escapes, `#`
+/// comments).
+fn split_env_s(raw: &[u8], origin: usize) -> Vec<VWord<'static>> {
+	let mut out = Vec::new();
+	let mut current = Vec::new();
+	let mut in_word = false;
+	let mut quote = 0u8;
+	let mut i = 0;
+	while i < raw.len() {
+		let ch = raw[i];
+		if quote == b'\'' {
+			if ch == b'\\' && i + 1 < raw.len() && matches!(raw[i + 1], b'\'' | b'\\') {
+				current.push(raw[i + 1]);
+				i += 2;
+				continue;
+			}
+			if ch == b'\'' {
+				quote = 0;
+			} else {
+				current.push(ch);
+			}
+			i += 1;
+			continue;
+		}
+		if quote == b'"' {
+			if ch == b'\\' && i + 1 < raw.len() {
+				let esc = raw[i + 1];
+				if esc == b'c' {
+					break;
+				}
+				current.push(unescape_env_s(esc));
+				i += 2;
+				continue;
+			}
+			if ch == b'"' {
+				quote = 0;
+			} else {
+				current.push(ch);
+			}
+			i += 1;
+			continue;
+		}
+		if ch.is_ascii_whitespace() {
+			if in_word {
+				out.push(VWord { text: Cow::Owned(std::mem::take(&mut current)), origin });
+				in_word = false;
+			}
+			i += 1;
+			continue;
+		}
+		if ch == b'#' && !in_word {
+			while i < raw.len() && raw[i] != b'\n' {
+				i += 1;
+			}
+			continue;
+		}
+		if ch == b'\'' || ch == b'"' {
+			quote = ch;
+			in_word = true;
+			i += 1;
+			continue;
+		}
+		if ch == b'\\' && i + 1 < raw.len() {
+			let esc = raw[i + 1];
+			if esc == b'c' {
+				break;
+			}
+			if esc == b'_' {
+				if in_word {
+					out.push(VWord { text: Cow::Owned(std::mem::take(&mut current)), origin });
+					in_word = false;
+				}
+				i += 2;
+				continue;
+			}
+			in_word = true;
+			current.push(unescape_env_s(esc));
+			i += 2;
+			continue;
+		}
+		in_word = true;
+		current.push(ch);
+		i += 1;
+	}
+	if in_word {
+		out.push(VWord { text: Cow::Owned(current), origin });
+	}
+	out
+}
+
+const fn unescape_env_s(byte: u8) -> u8 {
+	match byte {
+		b'n' => b'\n',
+		b't' => b'\t',
+		b'r' => b'\r',
+		b'f' => 0x0c,
+		b'v' => 0x0b,
+		b'_' => b' ',
+		other => other,
+	}
+}
+
+/// Skip options from `index`; returns `None` when a stop/non-exec option hits.
+fn skip_opts(words: &[VWord<'_>], mut index: usize, opts: &OptSet) -> Option<usize> {
+	while index < words.len() {
+		let word = words[index].text.as_ref();
+		if word == b"-" || !word.starts_with(b"-") {
+			break;
+		}
+		if word == b"--" {
+			return Some(index + 1);
+		}
+		if let Some(body) = word.strip_prefix(b"--") {
+			let (name, attached) = split_eq(body);
+			if listed(name, opts.stop_long) {
+				return None;
+			}
 			if attached.is_some() {
 				index += 1;
 				continue;
 			}
-			let next = scan.get(index + 1).filter(|_| !scan.at_stop(index + 1));
-			index += if long_takes(name, next, opts) { 2 } else { 1 };
+			index += if listed(name, opts.long_val) && index + 1 < words.len() {
+				2
+			} else {
+				1
+			};
 			continue;
 		}
-		index += if short_takes_next(&word[1..], opts.short_val) && !scan.at_stop(index + 1) {
-			2
-		} else {
-			1
-		};
-	}
-	index
-}
-
-fn long_takes(name: &[u8], next: Option<&[u8]>, opts: &OptSet) -> bool {
-	if listed(name, opts.long_bool) {
-		return false;
-	}
-	if listed(name, opts.long_val) {
-		return next.is_some();
-	}
-	opts.open && next.is_some_and(|word| !word.starts_with(b"-"))
-}
-
-fn short_takes_next(letters: &[u8], short_val: &[u8]) -> bool {
-	for (offset, &letter) in letters.iter().enumerate() {
-		if short_val.contains(&letter) {
-			return letters[offset + 1..].is_empty();
+		match short_step(&word[1..], opts) {
+			ShortStep::Stop => return None,
+			ShortStep::Next => index += if index + 1 < words.len() { 2 } else { 1 },
+			ShortStep::One => index += 1,
 		}
+	}
+	Some(index)
+}
+
+fn short_step(letters: &[u8], opts: &OptSet) -> ShortStep {
+	for (offset, &letter) in letters.iter().enumerate() {
+		if opts.stop_short.contains(&letter) {
+			return ShortStep::Stop;
+		}
+		if opts.short_val.contains(&letter) {
+			return if offset + 1 == letters.len() {
+				ShortStep::Next
+			} else {
+				ShortStep::One
+			};
+		}
+	}
+	ShortStep::One
+}
+
+enum RemoteTok {
+	Sep,
+	Redir { has_target: bool },
+	Word(VWord<'static>),
+}
+
+/// Separate local `SSH` options and destination from the remote shell command,
+/// then protect remote `omp` (and ambiguous) simple commands.
+fn mark_ssh(args: &mut [bool], ssh_words: &[VWord<'_>]) {
+	let Some(host) = skip_opts(ssh_words, 1, &SSH) else {
+		return;
+	};
+	let remote = host + 1;
+	if remote >= ssh_words.len() {
+		return;
+	}
+	let Some(tokens) = lex_remote(&ssh_words[remote..]) else {
+		for word in &ssh_words[remote..] {
+			if word.origin < args.len() {
+				args[word.origin] = true;
+			}
+		}
+		return;
+	};
+	let mut i = 0;
+	while i < tokens.len() {
+		if matches!(tokens[i], RemoteTok::Sep) {
+			i += 1;
+			continue;
+		}
+		let mut cmd_words: Vec<VWord<'_>> = Vec::new();
+		let mut all_origins: Vec<usize> = Vec::new();
+		while i < tokens.len() && !matches!(tokens[i], RemoteTok::Sep) {
+			match &tokens[i] {
+				RemoteTok::Sep => break,
+				RemoteTok::Redir { has_target } => {
+					i += 1;
+					if !has_target && let Some(RemoteTok::Word(target)) = tokens.get(i) {
+						all_origins.push(target.origin);
+						i += 1;
+					}
+				},
+				RemoteTok::Word(word) => {
+					all_origins.push(word.origin);
+					cmd_words.push(word.clone());
+					i += 1;
+				},
+			}
+		}
+		let mut start = 0;
+		while start < cmd_words.len() && shell_keyword(cmd_words[start].text.as_ref()) {
+			start += 1;
+		}
+		let mut lead_assigns = Vec::new();
+		while start < cmd_words.len() && ident_assignment(cmd_words[start].text.as_ref()) {
+			lead_assigns.push(cmd_words[start].origin);
+			start += 1;
+		}
+		if start >= cmd_words.len() {
+			continue;
+		}
+		let launch = launch_of(cmd_words[start..].to_vec());
+		if launch.aborted || launch.at >= launch.words.len() {
+			continue;
+		}
+		let cmd = launch.words[launch.at].text.as_ref();
+		if is_omp(cmd) {
+			mark_omp_args(args, &launch.words, launch.at, &launch.passed, true);
+			for origin in lead_assigns {
+				if origin < args.len() {
+					args[origin] = true;
+				}
+			}
+		} else if ambiguous_remote_cmd(&launch.words[launch.at..]) {
+			for origin in all_origins {
+				if origin < args.len() {
+					args[origin] = true;
+				}
+			}
+		}
+	}
+}
+
+fn ambiguous_remote_cmd(words: &[VWord<'_>]) -> bool {
+	let Some(first) = words.first() else {
+		return false;
+	};
+	let cmd = first.text.as_ref();
+	if cmd
+		.iter()
+		.any(|byte| matches!(byte, b'$' | b'`' | b'*' | b'?' | b'['))
+	{
+		return true;
+	}
+	let base = program_name(cmd);
+	if matches!(base, b"eval" | b"." | b"source") {
+		return true;
+	}
+	if matches!(base, b"sh" | b"bash" | b"zsh" | b"dash" | b"ksh") {
+		return words[1..]
+			.iter()
+			.take_while(|w| w.text.starts_with(b"-") && w.text.as_ref() != b"--")
+			.any(|w| !w.text.starts_with(b"--") && w.text[1..].contains(&b'c'));
 	}
 	false
 }
 
-fn mark_ssh_at(args: &mut [bool], scan: &Scan<'_>, ssh_at: usize) {
-	let host = skip_opts(scan, ssh_at + 1, &SSH);
-	let remote = host + 1;
-	if remote >= scan.end {
-		return;
+/// Tokenize the remote command arguments `ssh` joins for the remote shell.
+/// Returns `None` if quoting is unclosed/ambiguous across arguments.
+fn lex_remote(remote_words: &[VWord<'_>]) -> Option<Vec<RemoteTok>> {
+	let mut out = Vec::new();
+	for item in remote_words {
+		let bytes = item.text.as_ref();
+		let origin = item.origin;
+		let mut i = 0;
+		while i < bytes.len() {
+			let ch = bytes[i];
+			if ch == b' ' || ch == b'\t' {
+				i += 1;
+				continue;
+			}
+			if ch == b'#' {
+				while i < bytes.len() && bytes[i] != b'\n' {
+					i += 1;
+				}
+				continue;
+			}
+			if ch == b'&' && bytes.get(i + 1) == Some(&b'>') {
+				i += if bytes.get(i + 2) == Some(&b'>') {
+					3
+				} else {
+					2
+				};
+				let has_target = if i < bytes.len() && !is_remote_meta(bytes[i]) {
+					let (_, next) = read_remote_word(bytes, i)?;
+					i = next;
+					true
+				} else {
+					false
+				};
+				out.push(RemoteTok::Redir { has_target });
+				continue;
+			}
+			if matches!(ch, b'\n' | b';' | b'|' | b'&' | b'(' | b')') {
+				i += remote_op_len(&bytes[i..]);
+				out.push(RemoteTok::Sep);
+				continue;
+			}
+			if let Some((op_end, _)) = remote_redir_at(bytes, i) {
+				i = op_end;
+				let has_target = if i < bytes.len() && !is_remote_meta(bytes[i]) {
+					let (_, next) = read_remote_word(bytes, i)?;
+					i = next;
+					true
+				} else {
+					false
+				};
+				out.push(RemoteTok::Redir { has_target });
+				continue;
+			}
+			let (word, next) = read_remote_word(bytes, i)?;
+			out.push(RemoteTok::Word(VWord { text: Cow::Owned(word), origin }));
+			i = next;
+		}
 	}
-	let remote_scan = Scan { argv: scan.argv, remote: true, end: scan.end };
-	let mut index = remote;
-	while index < remote_scan.end {
-		if remote_scan.get(index).is_some_and(remote_sep) {
-			index += 1;
-			continue;
-		}
-		let launch = launch_of(&remote_scan, index);
-		if launch.at >= remote_scan.end {
-			break;
-		}
-		if remote_scan.at_stop(launch.at) {
-			index = launch.at;
-			continue;
-		}
-		let mut end = launch.at;
-		while end < remote_scan.end && !remote_sep(remote_scan.argv[end].as_slice()) {
-			end += 1;
-		}
-		apply_omp(args, &remote_scan, &launch, end);
-		index = end;
+	Some(out)
+}
+
+const fn is_remote_meta(ch: u8) -> bool {
+	matches!(ch, b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>')
+}
+
+fn remote_op_len(rest: &[u8]) -> usize {
+	if rest.starts_with(b";;&") {
+		3
+	} else if rest.starts_with(b"||")
+		|| rest.starts_with(b"|&")
+		|| rest.starts_with(b"&&")
+		|| rest.starts_with(b";;")
+		|| rest.starts_with(b";&")
+	{
+		2
+	} else {
+		1
 	}
 }
 
-fn mark_find_at(args: &mut [bool], scan: &Scan<'_>, find_at: usize) -> bool {
-	let mut index = find_at + 1;
+fn remote_redir_at(bytes: &[u8], start: usize) -> Option<(usize, u8)> {
+	let mut j = start;
+	while j < bytes.len() && bytes[j].is_ascii_digit() {
+		j += 1;
+	}
+	let first = *bytes.get(j)?;
+	if first != b'<' && first != b'>' {
+		return None;
+	}
+	let rest = &bytes[j..];
+	let len = if rest.starts_with(b"<<<") || rest.starts_with(b"<<-") {
+		3
+	} else if rest.starts_with(b"<<")
+		|| rest.starts_with(b"<>")
+		|| rest.starts_with(b"<&")
+		|| rest.starts_with(b">>")
+		|| rest.starts_with(b">|")
+		|| rest.starts_with(b">&")
+	{
+		2
+	} else {
+		1
+	};
+	Some((j + len, first))
+}
+
+fn read_remote_word(bytes: &[u8], start: usize) -> Option<(Vec<u8>, usize)> {
+	let mut value = Vec::new();
+	let mut i = start;
+	while i < bytes.len() && !is_remote_meta(bytes[i]) {
+		let ch = bytes[i];
+		if ch == b'\'' {
+			i += 1;
+			while i < bytes.len() && bytes[i] != b'\'' {
+				value.push(bytes[i]);
+				i += 1;
+			}
+			if i >= bytes.len() {
+				return None;
+			}
+			i += 1;
+			continue;
+		}
+		if ch == b'"' {
+			i += 1;
+			while i < bytes.len() && bytes[i] != b'"' {
+				if bytes[i] == b'\\'
+					&& i + 1 < bytes.len()
+					&& matches!(bytes[i + 1], b'"' | b'\\' | b'$' | b'`')
+				{
+					value.push(bytes[i + 1]);
+					i += 2;
+					continue;
+				}
+				value.push(bytes[i]);
+				i += 1;
+			}
+			if i >= bytes.len() {
+				return None;
+			}
+			i += 1;
+			continue;
+		}
+		if ch == b'\\' {
+			if i + 1 >= bytes.len() {
+				return None;
+			}
+			value.push(bytes[i + 1]);
+			i += 2;
+			continue;
+		}
+		value.push(ch);
+		i += 1;
+	}
+	Some((value, i))
+}
+
+fn mark_find(args: &mut [bool], find_words: &[VWord<'_>]) -> bool {
+	let mut index = 1;
 	let mut reaches = false;
-	while index < scan.end {
-		let word = scan.argv[index].as_slice();
+	while index < find_words.len() {
+		let word = find_words[index].text.as_ref();
 		if matches!(word, b"-exec" | b"-execdir" | b"-ok" | b"-okdir") {
 			let start = index + 1;
 			let mut end = start;
-			while end < scan.end && !matches!(scan.argv[end].as_slice(), b";" | b"+") {
+			while end < find_words.len() && !matches!(find_words[end].text.as_ref(), b";" | b"+") {
 				end += 1;
 			}
 			if start < end {
-				let limited = Scan { argv: scan.argv, remote: false, end };
-				let launch = launch_of(&limited, start);
-				if launch.at < end && is_omp(scan.argv[launch.at].as_slice()) {
+				let launch = launch_of(find_words[start..end].to_vec());
+				if !launch.aborted
+					&& launch.at < launch.words.len()
+					&& is_omp(launch.words[launch.at].text.as_ref())
+				{
 					reaches = true;
+					mark_omp_args(args, &launch.words, launch.at, &launch.passed, false);
 				}
-				apply_omp(args, &limited, &launch, end);
 			}
 			index = end + 1;
 			continue;
@@ -754,235 +1276,195 @@ fn mark_find_at(args: &mut [bool], scan: &Scan<'_>, find_at: usize) -> bool {
 	reaches
 }
 
+// ── Launcher option tables (identical to
+// packages/coding-agent/src/tools/bash-host-urls.ts) ──
+
 const ENV: OptSet = OptSet {
-	short_val: b"uCSafP",
-	long_val:  &[
-		"unset",
-		"chdir",
-		"split-string",
-		"argv0",
-		"file",
-		"env0-from",
-		"block-signal",
-		"default-signal",
-		"ignore-signal",
-	],
-	long_bool: &["ignore-environment", "null", "debug", "list-signal-handling", "help", "version"],
-	open:      false,
+	short_val:  b"CPafu",
+	long_val:   &["argv0", "chdir", "env0-from", "file", "unset"],
+	stop_short: b"0",
+	stop_long:  &["help", "list-signal-handling", "null", "version"],
 };
 
 const SUDO: OptSet = OptSet {
-	short_val: b"ugCDhpRrTtU",
-	long_val:  &[
-		"user",
-		"group",
-		"close-from",
+	short_val:  b"CDRTUghprtu",
+	long_val:   &[
 		"chdir",
-		"host",
-		"prompt",
 		"chroot",
-		"role",
+		"close-from",
 		"command-timeout",
-		"type",
+		"group",
+		"host",
 		"other-user",
+		"prompt",
+		"role",
+		"type",
+		"user",
 	],
-	long_bool: &["help", "version"],
-	open:      false,
+	stop_short: b"KVevl",
+	stop_long:  &["edit", "help", "list", "remove-timestamp", "validate", "version"],
 };
 
-const DOAS: OptSet = OptSet { short_val: b"aCu", long_val: &[], long_bool: &[], open: false };
+const DOAS: OptSet =
+	OptSet { short_val: b"au", long_val: &[], stop_short: b"CL", stop_long: &[] };
 
 const NICE: OptSet = OptSet {
-	short_val: b"n",
-	long_val:  &["adjustment"],
-	long_bool: &["help", "version"],
-	open:      false,
+	short_val:  b"n",
+	long_val:   &["adjustment"],
+	stop_short: b"",
+	stop_long:  &["help", "version"],
 };
 
 const NOHUP: OptSet =
-	OptSet { short_val: b"", long_val: &[], long_bool: &["help", "version"], open: false };
+	OptSet { short_val: b"", long_val: &[], stop_short: b"", stop_long: &["help", "version"] };
 
 const TIME: OptSet = OptSet {
-	short_val: b"of",
-	long_val:  &["output", "format"],
-	long_bool: &["help", "version", "portability", "verbose", "append"],
-	open:      false,
+	short_val:  b"fo",
+	long_val:   &["format", "output"],
+	stop_short: b"",
+	stop_long:  &["help", "version"],
 };
 
 const TIMEOUT: OptSet = OptSet {
-	short_val: b"sk",
-	long_val:  &["signal", "kill-after"],
-	long_bool: &["preserve-status", "foreground", "verbose", "help", "version"],
-	open:      false,
+	short_val:  b"ks",
+	long_val:   &["kill-after", "signal"],
+	stop_short: b"",
+	stop_long:  &["help", "version"],
 };
 
 const STDBUF: OptSet = OptSet {
-	short_val: b"ioe",
-	long_val:  &["input", "output", "error"],
-	long_bool: &["help", "version"],
-	open:      false,
+	short_val:  b"eio",
+	long_val:   &["error", "input", "output"],
+	stop_short: b"",
+	stop_long:  &["help", "version"],
 };
 
-const SETSID: OptSet = OptSet {
-	short_val: b"",
-	long_val:  &[],
-	long_bool: &["ctty", "fork", "wait", "help", "version"],
-	open:      false,
-};
+const SETSID: OptSet =
+	OptSet { short_val: b"", long_val: &[], stop_short: b"Vh", stop_long: &["help", "version"] };
 
 const IFNE: OptSet =
-	OptSet { short_val: b"", long_val: &[], long_bool: &["help"], open: false };
+	OptSet { short_val: b"", long_val: &[], stop_short: b"h", stop_long: &["help", "version"] };
 
 const XARGS: OptSet = OptSet {
-	short_val: b"adnLPsIE",
-	long_val:  &[
+	short_val:  b"EILPadns",
+	long_val:   &[
 		"arg-file",
 		"delimiter",
 		"max-args",
+		"max-chars",
 		"max-lines",
 		"max-procs",
-		"max-chars",
-		"replace",
-		"eof",
+		"process-slot-var",
 	],
-	long_bool: &["exit", "interactive", "no-run-if-empty", "null", "verbose", "help", "version"],
-	open:      false,
+	stop_short: b"",
+	stop_long:  &["help", "version"],
 };
 
-const EXEC: OptSet = OptSet { short_val: b"a", long_val: &[], long_bool: &[], open: false };
+const EXEC: OptSet =
+	OptSet { short_val: b"a", long_val: &[], stop_short: b"", stop_long: &["help"] };
 
-const COMMAND: OptSet = OptSet { short_val: b"", long_val: &[], long_bool: &[], open: false };
-
-const NPM_BOOL: &[&str] = &[
-	"all",
-	"allow-same-version",
-	"allow-scripts-pending",
-	"allow-scripts-pin",
-	"audit",
-	"bin-links",
-	"bypass-2fa",
-	"color",
-	"commit-hooks",
-	"dangerously-allow-all-scripts",
-	"description",
-	"dev",
-	"diff-ignore-all-space",
-	"diff-name-only",
-	"diff-no-prefix",
-	"diff-text",
-	"dry-run",
-	"engine-strict",
-	"expect-results",
-	"force",
-	"foreground-scripts",
-	"format-package-lock",
-	"fund",
-	"git-tag-version",
-	"global",
-	"global-style",
-	"help",
-	"if-present",
-	"ignore-scripts",
-	"include-attestations",
-	"include-staged",
-	"include-workspace-root",
-	"init-private",
-	"install-links",
-	"json",
-	"legacy-bundling",
-	"legacy-peer-deps",
-	"link",
-	"long",
-	"no-install",
-	"offline",
-	"omit-lockfile-registry-resolved",
-	"optional",
-	"package-lock",
-	"package-lock-only",
-	"packages-all",
-	"parseable",
-	"prefer-dedupe",
-	"prefer-offline",
-	"prefer-online",
-	"production",
-	"progress",
-	"provenance",
-	"quiet",
-	"read-only",
-	"rebuild-bundle",
-	"save",
-	"save-bundle",
-	"save-dev",
-	"save-exact",
-	"save-optional",
-	"save-peer",
-	"save-prod",
-	"shrinkwrap",
-	"sign-git-commit",
-	"sign-git-tag",
-	"silent",
-	"strict-allow-scripts",
-	"strict-peer-deps",
-	"strict-ssl",
-	"timing",
-	"unicode",
-	"update-notifier",
-	"usage",
-	"verbose",
-	"version",
-	"versions",
-	"workspaces",
-	"workspaces-update",
-	"yes",
-];
+const COMMAND: OptSet =
+	OptSet { short_val: b"", long_val: &[], stop_short: b"Vv", stop_long: &["help"] };
 
 const NPM_VAL: &[&str] = &[
+	"_auth",
+	"access",
+	"allow-directory",
+	"allow-file",
+	"allow-git",
+	"allow-remote",
 	"allow-scripts",
+	"also",
+	"audit-level",
 	"auth-type",
 	"before",
+	"ca",
 	"cache",
 	"cache-max",
 	"cache-min",
 	"cafile",
-	"call",
 	"cert",
 	"cidr",
 	"cpu",
 	"depth",
 	"diff",
+	"diff-dst-prefix",
+	"diff-src-prefix",
+	"diff-unified",
 	"editor",
+	"expect-result-count",
+	"expires",
 	"fetch-retries",
+	"fetch-retry-factor",
+	"fetch-retry-maxtimeout",
+	"fetch-retry-mintimeout",
 	"fetch-timeout",
 	"git",
 	"globalconfig",
 	"heading",
 	"https-proxy",
 	"include",
+	"init-author-email",
+	"init-author-name",
+	"init-author-url",
+	"init-license",
+	"init-module",
+	"init-type",
+	"init-version",
+	"init.author.email",
+	"init.author.name",
+	"init.author.url",
+	"init.license",
+	"init.module",
+	"init.version",
+	"install-strategy",
 	"key",
 	"libc",
 	"local-address",
 	"location",
 	"lockfile-version",
 	"loglevel",
+	"logs-dir",
 	"logs-max",
+	"maxsockets",
 	"message",
 	"min-release-age",
+	"name",
+	"node-arg",
+	"node-gyp",
 	"node-options",
 	"noproxy",
 	"omit",
+	"only",
+	"orgs",
+	"orgs-permission",
 	"os",
 	"otp",
-	"package",
 	"pack-destination",
+	"package",
+	"packages",
+	"packages-and-scopes-permission",
+	"password",
 	"prefix",
+	"preid",
+	"provenance-file",
 	"proxy",
 	"registry",
+	"replace-registry-host",
 	"save-prefix",
+	"sbom-format",
+	"sbom-type",
 	"scope",
+	"scopes",
 	"script-shell",
+	"searchexclude",
 	"searchlimit",
+	"searchopts",
+	"searchstaleness",
 	"shell",
 	"tag",
+	"tag-version-prefix",
+	"token-description",
 	"umask",
 	"user-agent",
 	"userconfig",
@@ -991,126 +1473,150 @@ const NPM_VAL: &[&str] = &[
 	"workspace",
 ];
 
-const NPM: OptSet =
-	OptSet { short_val: b"cCwmL", long_val: NPM_VAL, long_bool: NPM_BOOL, open: true };
-
-const NPX: OptSet =
-	OptSet { short_val: b"pcCwmL", long_val: NPM_VAL, long_bool: NPM_BOOL, open: true };
-
-const BUNX: OptSet = OptSet {
-	short_val: b"p",
-	long_val:  &["package", "cwd", "env-file", "minimum-release-age", "registry", "ca", "cafile"],
-	long_bool: &[
-		"bun",
-		"no-install",
-		"trust",
-		"ignore-scripts",
-		"verbose",
-		"silent",
-		"help",
-		"version",
-	],
-	open:      false,
+const NPM: OptSet = OptSet {
+	short_val:  b"CLmw",
+	long_val:   NPM_VAL,
+	stop_short: b"H?chv",
+	stop_long:  &["call", "help", "usage", "version", "versions"],
 };
 
-const UV: OptSet = OptSet {
-	short_val: b"wpifPC",
-	long_val:  &[
-		"allow-insecure-host",
-		"cache-dir",
-		"color",
-		"config-file",
-		"config-setting",
-		"config-settings-package",
-		"default-index",
-		"directory",
+const NPX: OptSet = OptSet {
+	short_val:  b"CLmpw",
+	long_val:   NPM_VAL,
+	stop_short: b"H?chv",
+	stop_long:  &["call", "help", "usage", "version", "versions"],
+};
+
+const BUN_GLOBAL: OptSet = OptSet {
+	short_val:  b"Fcr",
+	long_val:   &[
+		"ca",
+		"cafile",
+		"conditions",
+		"config",
+		"cpu-prof-dir",
+		"cpu-prof-interval",
+		"cpu-prof-name",
+		"cwd",
+		"dns-result-order",
+		"elide-lines",
 		"env-file",
-		"exclude-newer",
-		"exclude-newer-package",
-		"extra",
-		"extra-index-url",
-		"find-links",
-		"fork-strategy",
-		"group",
-		"index",
-		"index-strategy",
-		"index-url",
-		"keyring-provider",
-		"link-mode",
-		"no-binary-package",
-		"no-build-isolation-package",
-		"no-build-package",
-		"no-editable-package",
-		"no-extra",
-		"no-group",
-		"no-sources-package",
-		"only-group",
+		"fetch-preconnect",
+		"filter",
+		"heap-prof-dir",
+		"heap-prof-interval",
+		"heap-prof-name",
+		"import",
+		"install",
+		"max-http-header-size",
+		"minimum-release-age",
+		"port",
+		"preload",
+		"redirect-warnings",
+		"registry",
+		"require",
+		"shell",
+		"watch-kill-signal",
+	],
+	stop_short: b"epv",
+	stop_long:  &["eval", "help", "print", "revision", "version"],
+};
+
+const BUNX: OptSet = OptSet {
+	short_val:  b"p",
+	long_val:   &[
+		"ca",
+		"cafile",
+		"config",
+		"cwd",
+		"env-file",
+		"minimum-release-age",
 		"package",
-		"prerelease",
-		"prerelease-package",
-		"project",
-		"python",
-		"python-platform",
-		"refresh-package",
-		"reinstall-package",
-		"resolution",
-		"upgrade-group",
-		"upgrade-package",
-		"with",
-		"with-editable",
-		"with-requirements",
+		"registry",
 	],
-	long_bool: &[
-		"active",
-		"all-extras",
-		"all-groups",
-		"all-packages",
-		"compile-bytecode",
-		"exact",
-		"frozen",
-		"gui-script",
-		"help",
-		"isolated",
-		"locked",
-		"managed-python",
-		"module",
-		"no-binary",
-		"no-build",
-		"no-build-isolation",
-		"no-cache",
-		"no-config",
-		"no-dev",
-		"no-default-groups",
-		"no-editable",
-		"no-env-file",
-		"no-index",
-		"no-managed-python",
-		"no-progress",
-		"no-project",
-		"no-python-downloads",
-		"no-sources",
-		"no-sync",
-		"offline",
-		"only-dev",
-		"quiet",
-		"refresh",
-		"reinstall",
-		"script",
-		"system-certs",
-		"upgrade",
-		"verbose",
-		"version",
-	],
-	open:      false,
+	stop_short: b"v",
+	stop_long:  &["help", "version"],
+};
+
+const UV_VAL: &[&str] = &[
+	"allow-insecure-host",
+	"build-constraints",
+	"cache-dir",
+	"color",
+	"config-file",
+	"config-setting",
+	"config-settings-package",
+	"constraints",
+	"default-index",
+	"directory",
+	"env-file",
+	"exclude-newer",
+	"exclude-newer-package",
+	"extra",
+	"extra-index-url",
+	"find-links",
+	"fork-strategy",
+	"from",
+	"group",
+	"index",
+	"index-strategy",
+	"index-url",
+	"keyring-provider",
+	"link-mode",
+	"no-binary-package",
+	"no-build-isolation-package",
+	"no-build-package",
+	"no-editable-package",
+	"no-extra",
+	"no-group",
+	"no-sources-package",
+	"only-group",
+	"overrides",
+	"package",
+	"prerelease",
+	"prerelease-package",
+	"project",
+	"python",
+	"python-platform",
+	"refresh-package",
+	"reinstall-package",
+	"resolution",
+	"torch-backend",
+	"upgrade-group",
+	"upgrade-package",
+	"with",
+	"with-editable",
+	"with-requirements",
+];
+
+const UV_GLOBAL: OptSet = OptSet {
+	short_val:  b"CPfipw",
+	long_val:   UV_VAL,
+	stop_short: b"Vh",
+	stop_long:  &["help", "version"],
+};
+
+const UV_RUN: OptSet = OptSet {
+	short_val:  b"CPfipw",
+	long_val:   UV_VAL,
+	stop_short: b"Vhms",
+	stop_long:  &["gui-script", "help", "module", "script", "version"],
+};
+
+const UVX: OptSet = OptSet {
+	short_val:  b"CPbcfipw",
+	long_val:   UV_VAL,
+	stop_short: b"Vh",
+	stop_long:  &["help", "version"],
 };
 
 const SSH: OptSet = OptSet {
 	// OpenSSH options whose argument is the next word: -B -b -c -D -E -e -F
 	// -I -i -J -L -l -m -O -o -p -Q -R -S -W -w.
-	short_val: b"BbcDEeFIJiLlmOopQRWSw",
-	long_val:  &[],
-	long_bool: &[],
-	open:      false,
+	short_val:  b"BbcDEeFIJiLlmOopQRWSw",
+	long_val:   &[],
+	stop_short: b"GNV",
+	stop_long:  &[],
 };
 
 #[cfg(test)]
@@ -1145,27 +1651,27 @@ mod tests {
 	}
 
 	#[test]
-	fn omp_keeps_its_arguments_and_environment() {
-		assert_eq!(owned(&["omp", "read", "local://x"]), (vec![0, 1, 2], true));
-		assert_eq!(owned(&["/usr/local/bin/omp", "read", "local://x"]), (vec![0, 1, 2], true));
-		assert_eq!(owned(&["nice", "omp", "read", "local://x"]), (vec![1, 2, 3], true));
-		assert_eq!(owned(&["/usr/bin/env", "-", "omp", "read", "local://x"]), (vec![2, 3, 4], true));
-		assert_eq!(
-			owned(&["env", "-u", "FOO", "-", "omp", "read", "local://x"]),
-			(vec![4, 5, 6], true)
-		);
+	fn omp_protects_its_arguments_and_resolves_launcher_executables() {
+		assert_eq!(owned(&["omp", "read", "local://x"]), (vec![1, 2], true));
+		assert_eq!(owned(&["/usr/local/bin/omp", "read", "local://x"]), (vec![1, 2], true));
+		assert_eq!(owned(&["nice", "omp", "read", "local://x"]), (vec![2, 3], true));
+		// `env local://bin/omp`: index 1 is resolved for `env`; `read` and
+		// `local://doc` stay omp's.
+		assert_eq!(owned(&["env", "local://bin/omp", "read", "local://doc"]), (vec![2, 3], true));
+		assert_eq!(owned(&["/usr/bin/env", "-", "omp", "read", "local://x"]), (vec![3, 4], true));
+		assert_eq!(owned(&["env", "-u", "FOO", "-", "omp", "read", "local://x"]), (vec![5, 6], true));
 		assert_eq!(
 			owned(&["sudo", "-u", "root", "F=local://x", "omp", "read", "local://y"]),
-			(vec![3, 4, 5, 6], true)
+			(vec![3, 5, 6], true)
 		);
 		assert_eq!(
 			owned(&["sudo", "env", "-u", "FOO", "nice", "omp", "read", "local://x"]),
-			(vec![5, 6, 7], true)
+			(vec![6, 7], true)
 		);
 	}
 
 	#[test]
-	fn env_settings_are_not_the_program() {
+	fn env_settings_split_strings_and_attached_only_flags_work() {
 		assert_eq!(
 			owned(&["env", "--", "-flag=/opt/omp", "grep", "x", "local://file"]),
 			(vec![], false)
@@ -1176,76 +1682,117 @@ mod tests {
 		);
 		assert_eq!(
 			owned(&["env", "-C", "local://dir", "omp", "read", "local://x"]),
-			(vec![3, 4, 5], true)
+			(vec![4, 5], true)
 		);
 		assert_eq!(
 			owned(&["env", "FILE=local://in", "omp", "read", "local://x"]),
-			(vec![1, 2, 3, 4], true)
+			(vec![1, 3, 4], true)
 		);
-		// A dash after settings is the command: real env tries to run `-u`.
 		assert_eq!(owned(&["env", "-", "-u", "FOO", "omp"]), (vec![], false));
+		assert_eq!(owned(&["env", "-S", "cat", "omp", "local://in"]), (vec![], false));
+		assert_eq!(owned(&["env", "-S", "omp", "read", "local://in"]), (vec![3, 4], true));
+		assert_eq!(owned(&["env", "-S", "omp read", "local://in"]), (vec![2, 3], true));
+		assert_eq!(
+			owned(&["env", "-S", "local://bin/omp", "read", "local://in"]),
+			(vec![3, 4], true)
+		);
+		assert_eq!(
+			owned(&["env", "--default-signal", "omp", "read", "local://x"]),
+			(vec![3, 4], true)
+		);
+		assert_eq!(
+			owned(&["env", "--default-signal=PIPE", "omp", "read", "local://x"]),
+			(vec![3, 4], true)
+		);
 	}
 
 	#[test]
-	fn package_runners_consume_option_values_before_the_program() {
+	fn package_runners_and_non_exec_modes_match_client() {
 		assert_eq!(
 			owned(&["npx", "--loglevel", "warn", "omp", "read", "local://x"]),
-			(vec![3, 4, 5], true)
+			(vec![4, 5], true)
 		);
+		assert_eq!(owned(&["npx", "--no-audit", "omp", "read", "local://x"]), (vec![3, 4], true));
 		assert_eq!(owned(&["npx", "--cache", "omp", "eslint", "local://app.ts"]), (vec![], false));
 		assert_eq!(owned(&["npx", "-p", "eslint", "local://app.ts"]), (vec![], false));
-		assert_eq!(owned(&["npm", "exec", "-p", "omp", "read", "local://x"]), (vec![3, 4, 5], true));
+		assert_eq!(owned(&["npx", "-c", "omp", "local://app.ts"]), (vec![], false));
+		assert_eq!(owned(&["npm", "exec", "-p", "omp", "read", "local://x"]), (vec![4, 5], true));
 		assert_eq!(
-			owned(&["npm", "--prefix", "local://tools", "exec", "--", "omp", "read", "local://book",]),
-			(vec![5, 6, 7], true)
+			owned(&["npm", "--prefix", "local://tools", "exec", "--", "omp", "read", "local://book"]),
+			(vec![6, 7], true)
 		);
 		assert_eq!(owned(&["npm", "install", "local://pkg"]), (vec![], false));
 		assert_eq!(
 			owned(&["bunx", "--minimum-release-age", "86400", "omp", "read", "local://book"]),
-			(vec![3, 4, 5], true)
+			(vec![4, 5], true)
 		);
 		assert_eq!(
 			owned(&["bunx", "--registry", "https://example", "omp", "read", "local://book"]),
-			(vec![3, 4, 5], true)
+			(vec![4, 5], true)
 		);
 		assert_eq!(
 			owned(&["uv", "run", "-w", "requests", "omp", "read", "local://book"]),
-			(vec![4, 5, 6], true)
+			(vec![5, 6], true)
 		);
 		assert_eq!(
 			owned(&["uv", "run", "--with", "requests", "omp", "read", "local://book"]),
-			(vec![4, 5, 6], true)
+			(vec![5, 6], true)
 		);
+		assert_eq!(
+			owned(&["uv", "run", "--resolution", "lowest", "omp", "read", "local://book"]),
+			(vec![5, 6], true)
+		);
+		// Lookup, module, script and edit modes do not run the `omp` binary.
+		assert_eq!(owned(&["command", "-v", "omp", "local://file"]), (vec![], false));
+		assert_eq!(owned(&["command", "-V", "omp", "local://file"]), (vec![], false));
+		assert_eq!(owned(&["command", "-p", "omp", "read", "local://x"]), (vec![3, 4], true));
+		assert_eq!(owned(&["builtin", "omp", "local://file"]), (vec![], false));
+		assert_eq!(owned(&["uv", "run", "--module", "omp", "local://file"]), (vec![], false));
+		assert_eq!(owned(&["uv", "run", "-m", "omp", "local://file"]), (vec![], false));
+		assert_eq!(owned(&["uv", "run", "--script", "omp", "local://file"]), (vec![], false));
+		assert_eq!(owned(&["sudo", "-e", "omp", "local://file"]), (vec![], false));
+		assert_eq!(owned(&["sudo", "-l", "omp", "local://file"]), (vec![], false));
 	}
 
 	#[test]
-	fn launchers_that_exec_their_command_are_wrappers() {
-		assert_eq!(owned(&["setsid", "omp", "read", "local://x"]), (vec![1, 2, 3], true));
+	fn launchers_and_deep_chains_stay_iterative() {
+		assert_eq!(owned(&["setsid", "omp", "read", "local://x"]), (vec![2, 3], true));
 		assert_eq!(owned(&["setsid", "grep", "omp", "local://x"]), (vec![], false));
-		assert_eq!(owned(&["xargs", "omp", "read", "local://x"]), (vec![1, 2, 3], true));
-		assert_eq!(owned(&["xargs", "-a", "local://list", "omp", "read"]), (vec![3, 4], true));
+		assert_eq!(owned(&["xargs", "omp", "read", "local://x"]), (vec![2, 3], true));
+		assert_eq!(owned(&["xargs", "--replace", "omp", "read", "local://x"]), (vec![3, 4], true));
+		assert_eq!(owned(&["xargs", "-a", "local://list", "omp", "read"]), (vec![4], true));
 		assert_eq!(owned(&["ifne", "-n", "grep", "local://x"]), (vec![], false));
-		assert_eq!(owned(&["ifne", "omp", "read", "local://x"]), (vec![1, 2, 3], true));
+		assert_eq!(owned(&["ifne", "omp", "read", "local://x"]), (vec![2, 3], true));
 		assert_eq!(
 			owned(&["timeout", "-k", "5", "30", "omp", "read", "local://x"]),
-			(vec![4, 5, 6], true)
+			(vec![5, 6], true)
 		);
-		assert_eq!(owned(&["stdbuf", "-o", "L", "omp", "read", "local://x"]), (vec![3, 4, 5], true));
+		assert_eq!(owned(&["stdbuf", "-o", "L", "omp", "read", "local://x"]), (vec![4, 5], true));
+
+		let mut chain = vec!["nice"; 5_000];
+		chain.extend(["omp", "read", "local://x"]);
+		assert_eq!(owned(&chain), (vec![5_001, 5_002], true));
 	}
 
 	#[test]
-	fn ssh_keeps_each_remote_commands_omp_arguments_literal() {
+	fn ssh_separates_local_options_from_remote_commands() {
 		assert_eq!(
 			owned(&["ssh", "-F", "local://config", "server", "omp", "read", "skill://x"]),
 			(vec![4, 5, 6], false)
 		);
+		assert_eq!(
+			owned(&["ssh", "host", "LANG=C", "omp", "read", "local://in"]),
+			(vec![2, 3, 4, 5], false)
+		);
+		assert_eq!(owned(&["ssh", "host", "LANG=C omp read", "local://in"]), (vec![2, 3], false));
+		assert_eq!(owned(&["ssh", "host", "$RUNNER", "local://in"]), (vec![2, 3], false));
 		assert_eq!(
 			owned(&["ssh", "server", "omp", "read", "local://book", "|", "cat", "local://other"]),
 			(vec![2, 3, 4], false)
 		);
 		assert_eq!(
 			owned(&["ssh", "server", "omp", "read", "local://book", "2>&1"]),
-			(vec![2, 3, 4, 5], false)
+			(vec![2, 3, 4], false)
 		);
 		assert_eq!(
 			owned(&["ssh", "server", "cat", "local://file", "|", "omp", "read", "local://book"]),
@@ -1258,10 +1805,26 @@ mod tests {
 	}
 
 	#[test]
-	fn find_exec_owns_only_the_command_it_runs() {
+	fn find_exec_preserves_outer_settings_without_blocking_launcher_files() {
 		assert_eq!(
 			owned(&["find", "local://docs", "-exec", "omp", "read", "local://x", ";"]),
-			(vec![3, 4, 5], true)
+			(vec![4, 5], true)
+		);
+		assert_eq!(
+			owned(&[
+				"env",
+				"-C",
+				"local://dir",
+				"FOO=local://var",
+				"find",
+				"local://docs",
+				"-exec",
+				"local://bin/omp",
+				"read",
+				"local://doc",
+				";",
+			]),
+			(vec![3, 8, 9], true)
 		);
 		assert_eq!(
 			owned(&["find", "local://docs", "-name", "a.txt", "-exec", "probe", "{}", ";"]),

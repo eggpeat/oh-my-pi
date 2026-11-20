@@ -608,9 +608,11 @@ async fn omp_receives_its_url_arguments_as_written() {
 }
 
 /// An argument spelled `omp` is not a command that runs `omp`: `echo omp
-/// virtual://…` receives the host file, and so does `echo` after an `env`
-/// setting whose value only looks like `omp`. A wrapper's own file is
-/// rewritten even when the command it runs is `omp`.
+/// virtual://…` receives the host file, and so does `echo` after `env`
+/// settings or `env -S` commands whose arguments only mention `omp`. A
+/// wrapper's own directory/file and an `omp` executable path handed to a
+/// wrapper (`env virtual://bin/omp …`) resolve to host files while `omp`'s
+/// own arguments and settings stay as written.
 #[cfg(unix)]
 #[tokio::test]
 async fn an_argument_named_omp_does_not_keep_a_url_from_being_rewritten() {
@@ -618,8 +620,14 @@ async fn an_argument_named_omp_does_not_keep_a_url_from_being_rewritten() {
 
 	let directory = tempfile::tempdir().expect("isolated provider filesystem");
 	let docs = directory.path().join("docs");
+	let vbin = directory.path().join("bin");
 	fs::create_dir(&docs).expect("provider directory");
+	fs::create_dir(&vbin).expect("virtual bin directory");
 	fs::write(docs.join("a.txt"), b"alpha\n").expect("document");
+	let vomp = vbin.join("omp");
+	fs::write(&vomp, b"#!/bin/sh\nprintf '%s\\n' \"$@\" \"ref=$REF\"\n")
+		.expect("virtual stand-in omp");
+	fs::set_permissions(&vomp, fs::Permissions::from_mode(0o755)).expect("executable stand-in");
 	let bin = tempfile::tempdir().expect("program directory");
 	let ssh = bin.path().join("ssh");
 	fs::write(&ssh, b"#!/bin/sh\nprintf '%s\\n' \"$@\"\n").expect("stand-in ssh");
@@ -627,8 +635,10 @@ async fn an_argument_named_omp_does_not_keep_a_url_from_being_rewritten() {
 	let file = docs.join("a.txt");
 	let script = format!(
 		"/bin/echo omp virtual://docs/a.txt; /usr/bin/env -- -flag=/opt/omp /bin/echo \
-		 virtual://docs/a.txt; PATH='{bin}':$PATH ssh -F virtual://docs/a.txt server omp read \
-		 virtual://docs/a.txt '|' cat virtual://docs/a.txt",
+		 virtual://docs/a.txt; /usr/bin/env -S '/bin/echo' omp virtual://docs/a.txt; /usr/bin/env \
+		 --default-signal -C virtual://docs REF=virtual://docs/a.txt virtual://bin/omp read \
+		 virtual://docs/a.txt; PATH='{bin}':$PATH ssh -F virtual://docs/a.txt server LANG=C omp \
+		 read virtual://docs/a.txt '|' cat virtual://docs/a.txt",
 		bin = bin.path().display(),
 	);
 	let run = run_virtual(directory.path(), &script).await;
@@ -637,9 +647,14 @@ async fn an_argument_named_omp_does_not_keep_a_url_from_being_rewritten() {
 	let expected = [
 		format!("omp {host}"),
 		host.clone(),
+		format!("omp {host}"),
+		"read".to_owned(),
+		"virtual://docs/a.txt".to_owned(),
+		"ref=virtual://docs/a.txt".to_owned(),
 		"-F".to_owned(),
 		host.clone(),
 		"server".to_owned(),
+		"LANG=C".to_owned(),
 		"omp".to_owned(),
 		"read".to_owned(),
 		"virtual://docs/a.txt".to_owned(),
