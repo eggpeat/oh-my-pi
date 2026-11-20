@@ -2027,6 +2027,7 @@ export class Agent {
 			return refreshToolChoiceForActiveTools(options?.toolChoice, this.#state.tools);
 		};
 
+		let requestModel: Model | undefined;
 		const config: AgentLoopConfig = {
 			model,
 			reasoning,
@@ -2115,7 +2116,10 @@ export class Agent {
 			onToolChoiceRejected: () => {
 				if (claimedToolChoice !== undefined) this.#deferredToolChoice = claimedToolChoice;
 			},
-			getModel: () => this.#state.model ?? model,
+			getModel: () => {
+				requestModel = this.#state.model ?? model;
+				return requestModel;
+			},
 			getReasoning: () => this.#state.thinkingLevel,
 			getDisableReasoning: () => this.#state.disableReasoning,
 			getServiceTier: this.#serviceTierResolver,
@@ -2169,7 +2173,10 @@ export class Agent {
 					if (messages.length < event.messages.length) event = { ...event, messages };
 				}
 				if (event.type === "turn_start") turnOpen = true;
-				if (event.type === "turn_end") turnOpen = false;
+				if (event.type === "turn_end") {
+					turnOpen = false;
+					requestModel = undefined;
+				}
 				// Update internal state based on events
 				switch (event.type) {
 					case "message_start":
@@ -2245,12 +2252,13 @@ export class Agent {
 				: err instanceof Error
 					? err.message
 					: String(err);
+			const errorModel = requestModel ?? this.#state.model ?? model;
 			const errorStatus = stoppedForAbort ? undefined : AIError.status(err);
 			const errorId = stoppedForAbort
 				? errorMessage === "Request was aborted"
 					? AIError.create(AIError.Flag.Abort)
 					: AIError.classify(loopSignal.reason) || undefined
-				: AIError.classify(err, model.api) || undefined;
+				: AIError.classify(err, errorModel.api) || undefined;
 			const shouldEmitVisibleError = !stoppedForAbort;
 			const assistantPartial = partial?.role === "assistant" ? partial : undefined;
 			const hadAssistantStart = assistantPartial !== undefined;
@@ -2284,9 +2292,9 @@ export class Agent {
 					: {
 							role: "assistant",
 							content: [{ type: "text", text: "" }],
-							api: model.api,
-							provider: model.provider,
-							model: model.id,
+							api: errorModel.api,
+							provider: errorModel.provider,
+							model: errorModel.id,
 							usage: {
 								input: 0,
 								output: 0,

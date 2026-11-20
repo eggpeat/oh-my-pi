@@ -855,6 +855,79 @@ describe("Agent", () => {
 		expect(unclassifiedFinal.errorId).toBeUndefined();
 	});
 
+	it("uses the model selected for the failed request after a mid-run switch to Codex", async () => {
+		const runWithMidRunSwitch = async (switchBackInFlight: boolean) => {
+			const mock = createMockModel({ responses: [] });
+			const codexModel: Model = {
+				...mock.model,
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				id: "gpt-5.4",
+			};
+			const switchToolSchema = type({});
+			const agentRef = {} as { current: Agent };
+			const switchTool: AgentTool<typeof switchToolSchema, Record<string, never>> = {
+				name: "switch_model",
+				label: "Switch Model",
+				description: "Switches active model to Codex",
+				parameters: switchToolSchema,
+				async execute() {
+					agentRef.current.setModel(codexModel);
+					return { content: [{ type: "text", text: "switched" }], details: {} };
+				},
+			};
+
+			let callCount = 0;
+			const agent = new Agent({
+				initialState: { model: mock.model, systemPrompt: ["Test"], tools: [switchTool], messages: [] },
+				streamFn: requestedModel => {
+					callCount += 1;
+					const stream = new AssistantMessageEventStream();
+					if (callCount === 1) {
+						const firstTurn = createAssistantMessage(
+							[{ type: "toolCall", id: "call-switch", name: "switch_model", arguments: {} }],
+							"toolUse",
+						);
+						queueMicrotask(() => {
+							stream.push({ type: "start", partial: firstTurn });
+							stream.push({
+								type: "toolcall_end",
+								contentIndex: 0,
+								toolCall: { type: "toolCall", id: "call-switch", name: "switch_model", arguments: {} },
+								partial: firstTurn,
+							});
+							stream.push({ type: "done", reason: "toolUse", message: firstTurn });
+						});
+					} else {
+						expect(requestedModel).toEqual(codexModel);
+						if (switchBackInFlight) {
+							agentRef.current.setModel(mock.model);
+						}
+						queueMicrotask(() => {
+							stream.fail(new Error(`code=${AIError.CODEX_NATIVE_LANE_STEER_REJECTED_CODE}`));
+						});
+					}
+					return stream;
+				},
+			});
+			agentRef.current = agent;
+
+			await agent.prompt("switch and fail");
+
+			const terminal = agent.state.messages.at(-1);
+			expect(terminal?.role).toBe("assistant");
+			if (terminal?.role !== "assistant") throw new Error("Expected terminal assistant message");
+			expect(terminal.stopReason).toBe("error");
+			expect(terminal.api).toBe(codexModel.api);
+			expect(terminal.provider).toBe(codexModel.provider);
+			expect(terminal.model).toBe(codexModel.id);
+			expect(terminal.errorId).toBe(AIError.create(AIError.Flag.Transient));
+		};
+
+		await runWithMidRunSwitch(false);
+		await runWithMidRunSwitch(true);
+	});
+
 	it("preserves errorStatus and errorId when a partial stream rejects mid-response", async () => {
 		const mock = createMockModel({ responses: [] });
 		const started = createAssistantMessage([{ type: "text", text: "partial" }]);

@@ -8,7 +8,7 @@
 
 ### Fixed
 
-- Preserved `errorId` and `errorStatus` on assistant error and abort messages when a provider stream rejects, so gateway HTTP errors and stream timeouts retain their retry and status classification ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+- Fixed rejected provider streams dropping `errorStatus` and `errorId` on assistant replies so failed turns keep their HTTP status and retry classification and cancelled turns keep their cancellation marker ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 
 ## [19.0.0] - 2026-11-18
 
