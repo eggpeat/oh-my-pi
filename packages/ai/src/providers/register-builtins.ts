@@ -161,7 +161,7 @@ function forwardStream<TApi extends Api>(
 			}
 		} catch (error) {
 			const stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-			const message = createProviderStreamError(model, error, stopReason);
+			const message = createProviderStreamError(model, error, stopReason, abortTracker);
 			target.push({ type: "error", reason: stopReason, error: message });
 			target.end(message);
 		}
@@ -172,6 +172,7 @@ function createProviderStreamError<TApi extends Api>(
 	model: Model<TApi>,
 	error: unknown,
 	stopReason: Extract<AssistantMessage["stopReason"], "aborted" | "error"> = "error",
+	abortTracker?: AbortSourceTracker,
 ): AssistantMessage {
 	return {
 		role: "assistant",
@@ -188,9 +189,17 @@ function createProviderStreamError<TApi extends Api>(
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason,
-		errorId: stopReason === "error" ? AIError.classify(error, model.api) || undefined : undefined,
+		errorId: AIError.classify(error, model.api) || undefined,
+		// A caller abort carries the reason passed to `abort()` (e.g. the user-
+		// interrupt label), matching `AIError.finalize`; only a bare `abort()`
+		// falls back to the generic sentinel downstream code treats as
+		// "no specific reason".
 		errorMessage:
-			stopReason === "aborted" ? "Request was aborted" : error instanceof Error ? error.message : String(error),
+			stopReason === "aborted"
+				? (abortTracker?.getCallerAbortReason() ?? "Request was aborted")
+				: error instanceof Error
+					? error.message
+					: String(error),
 		timestamp: Date.now(),
 	};
 }

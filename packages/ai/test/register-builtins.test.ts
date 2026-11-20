@@ -316,4 +316,48 @@ describe("register-builtins lazy streams", () => {
 		expect(result.stopReason).toBe("aborted");
 		expect(result.errorMessage).toBe("Request was aborted");
 	});
+
+	it("surfaces the caller's abort reason on the forwarded result", async () => {
+		const abortController = new AbortController();
+		const partialMessage = createAssistantMessage("stop");
+		let providerSignal: AbortSignal | undefined;
+		const source = {
+			async *[Symbol.asyncIterator]() {
+				yield { type: "start", partial: partialMessage } as const;
+				const { promise, reject } = Promise.withResolvers<never>();
+				if (providerSignal?.aborted) {
+					reject(new Error("Request was aborted"));
+				}
+				providerSignal?.addEventListener("abort", () => reject(new Error("Request was aborted")), {
+					once: true,
+				});
+				await promise;
+			},
+		} as unknown as AssistantMessageEventStream;
+
+		setBedrockProviderModule({
+			streamBedrock: (_model, _context, options) => {
+				providerSignal = options.signal;
+				return source;
+			},
+		});
+
+		const stream = streamBedrock(createModel(), baseContext, {
+			signal: abortController.signal,
+			streamIdleTimeoutMs: 500,
+		});
+		const iterator = stream[Symbol.asyncIterator]();
+		const firstEvent = await iterator.next();
+		expect(firstEvent.value?.type).toBe("start");
+
+		abortController.abort("Interrupted by user");
+		const result = await stream.result();
+
+		// The forwarded terminal message must carry the caller's abort reason so
+		// downstream consumers (`isUserInterruptAbort`, retry policy) can tell a
+		// deliberate interrupt from a reasonless transport abort.
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("Interrupted by user");
+		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(true);
+	});
 });
