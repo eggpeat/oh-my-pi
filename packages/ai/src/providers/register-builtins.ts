@@ -189,11 +189,16 @@ function createProviderStreamError<TApi extends Api>(
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason,
-		errorId: AIError.classify(error, model.api) || undefined,
-		// A caller abort carries the reason passed to `abort()` (e.g. the user-
-		// interrupt label), matching `AIError.finalize`; only a bare `abort()`
-		// falls back to the generic sentinel downstream code treats as
-		// "no specific reason".
+		errorId:
+			AIError.classify(
+				stopReason === "aborted" ? (abortTracker?.getCallerAbortError() ?? error) : error,
+				model.api,
+			) || undefined,
+		// A caller abort carries the reason passed to `abort()` (non-whitespace
+		// string or non-`AbortError` `Error`, e.g. the user-interrupt label),
+		// matching `AIError.finalize`; a bare `abort()`, blank reason, or an
+		// `Error` named `"AbortError"` falls back to the generic sentinel
+		// downstream code treats as "no specific reason".
 		errorMessage:
 			stopReason === "aborted"
 				? (abortTracker?.getCallerAbortReason() ?? "Request was aborted")

@@ -126,9 +126,11 @@ export function resolveAbortLabel(
 	retryAttempt = 0,
 ): string {
 	const genericAbort =
-		AIError.is(message.errorId, AIError.Flag.Abort) ||
-		!message.errorMessage ||
+		!message.errorMessage?.trim() ||
 		message.errorMessage === GENERIC_ABORT_SENTINEL ||
+		message.errorMessage === "Request was aborted." ||
+		message.errorMessage === "The operation was aborted" ||
+		message.errorMessage === "The operation was aborted." ||
 		isSilentAbort(message);
 	if (!genericAbort) {
 		return message.errorMessage!;

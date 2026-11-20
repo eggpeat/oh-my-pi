@@ -7,6 +7,8 @@ export interface AbortSourceTracker {
 	getLocalAbortReason(): Error | undefined;
 	/** The reason the caller passed to `abort()`, read from the caller's own signal, never the racy merged one. */
 	getCallerAbortReason(): string | undefined;
+	/** Error representing the caller's original abort reason (never a raced local timeout), for classification. */
+	getCallerAbortError(): Error | undefined;
 	wasCallerAbort(): boolean;
 }
 
@@ -44,6 +46,13 @@ export function createAbortSourceTracker(callerSignal?: AbortSignal): AbortSourc
 		},
 		getCallerAbortReason() {
 			return AIError.callerAbortReason(callerSignal);
+		},
+		getCallerAbortError() {
+			if (!callerSignal?.aborted) return undefined;
+			const reason = callerSignal.reason;
+			if (reason instanceof Error) return reason;
+			if (typeof reason === "string") return new AIError.AbortError(reason);
+			return new AIError.AbortError();
 		},
 		wasCallerAbort() {
 			// If the caller signal aborted, treat it as a caller abort regardless of which

@@ -141,6 +141,14 @@ const GENERIC_ABORT_MESSAGES: Record<string, true> = {
 	"The operation was aborted.": true,
 };
 
+function isGenericAbortMessage(errorMessage: string | undefined): boolean {
+	return errorMessage !== undefined && Object.hasOwn(GENERIC_ABORT_MESSAGES, errorMessage);
+}
+
+function isReasonlessAbortText(errorMessage: string | undefined): boolean {
+	return errorMessage === undefined || !hasNonWhitespace(errorMessage) || isGenericAbortMessage(errorMessage);
+}
+
 function hasNonWhitespace(value: string): boolean {
 	return NON_WHITESPACE_RE.test(value);
 }
@@ -1594,8 +1602,14 @@ export class TurnRecovery {
 		}
 
 		const id = this.#classifyRetryMessage(message);
-		if (message.stopReason === "aborted" && AIError.is(id, AIError.Flag.Abort)) return true;
-		if (message.errorMessage === undefined || !Object.hasOwn(GENERIC_ABORT_MESSAGES, message.errorMessage)) {
+		if (AIError.is(id, AIError.Flag.UserInterrupt) || AIError.is(id, AIError.Flag.SilentAbort)) {
+			return false;
+		}
+		const genericAbort = isGenericAbortMessage(message.errorMessage);
+		if (message.stopReason === "aborted" && AIError.is(id, AIError.Flag.Abort)) {
+			return isReasonlessAbortText(message.errorMessage);
+		}
+		if (!genericAbort) {
 			return false;
 		}
 
@@ -1748,14 +1762,18 @@ export class TurnRecovery {
 	 */
 	classifyResolvedInterruptedToolTurn(message: AssistantMessage): "reasonless-abort" | "stream-stall" | undefined {
 		const id = this.#classifyRetryMessage(message);
-		const genericAbort =
-			message.errorMessage !== undefined && Object.hasOwn(GENERIC_ABORT_MESSAGES, message.errorMessage);
+		const genericAbort = isGenericAbortMessage(message.errorMessage);
+		const deliberateAbort = AIError.is(id, AIError.Flag.UserInterrupt) || AIError.is(id, AIError.Flag.SilentAbort);
 		const reasonlessAbort =
 			(message.stopReason === "aborted" || message.stopReason === "error") &&
 			!this.#host.abortInProgress() &&
 			!this.#host.isDisposed() &&
 			!this.#host.streamingEditAbortTriggered() &&
-			((message.stopReason === "aborted" && AIError.is(id, AIError.Flag.Abort)) || genericAbort);
+			!deliberateAbort &&
+			((message.stopReason === "aborted" &&
+				AIError.is(id, AIError.Flag.Abort) &&
+				isReasonlessAbortText(message.errorMessage)) ||
+				genericAbort);
 		if (!reasonlessAbort && !this.#isMidStreamTransportFailure(message, id)) return undefined;
 		if (reasonlessAbort && genericAbort) message.errorId = AIError.create(AIError.Flag.Abort);
 

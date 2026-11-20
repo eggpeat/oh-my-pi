@@ -360,4 +360,54 @@ describe("register-builtins lazy streams", () => {
 		expect(result.errorMessage).toBe("Interrupted by user");
 		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(true);
 	});
+
+	it("classifies the caller's abort reason instead of a raced timeout when cancellation wins", async () => {
+		const abortController = new AbortController();
+		const partialMessage = createAssistantMessage("stop");
+		let providerSignal: AbortSignal | undefined;
+		const source = {
+			async *[Symbol.asyncIterator]() {
+				yield { type: "start", partial: partialMessage } as const;
+				const { promise } = Promise.withResolvers<never>();
+				providerSignal?.addEventListener(
+					"abort",
+					() => {
+						// Simulate the caller cancelling immediately after the local idle
+						// watchdog fires, before forwardStream's catch block executes.
+						abortController.abort("Interrupted by user");
+					},
+					{ once: true },
+				);
+				await promise;
+			},
+		} as unknown as AssistantMessageEventStream;
+
+		setBedrockProviderModule({
+			streamBedrock: (_model, _context, options) => {
+				providerSignal = options.signal;
+				return source;
+			},
+		});
+
+		const stream = streamBedrock(createModel(), baseContext, {
+			signal: abortController.signal,
+			streamIdleTimeoutMs: 10,
+			streamFirstEventTimeoutMs: 10,
+		});
+		const iterator = stream[Symbol.asyncIterator]();
+		const firstEvent = await iterator.next();
+		expect(firstEvent.value?.type).toBe("start");
+
+		const result = await Promise.race([stream.result(), Bun.sleep(500).then(() => "timeout" as const)]);
+		expect(result).not.toBe("timeout");
+		if (result === "timeout") {
+			throw new Error("Timed out waiting for raced caller abort result");
+		}
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("Interrupted by user");
+		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(true);
+		expect(AIError.is(result.errorId, AIError.Flag.Timeout)).toBe(false);
+		expect(AIError.is(result.errorId, AIError.Flag.Transient)).toBe(false);
+		expect(AIError.retriable(result.errorId)).toBe(false);
+	});
 });
