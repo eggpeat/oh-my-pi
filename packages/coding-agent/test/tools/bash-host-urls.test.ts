@@ -106,6 +106,7 @@ describe("hostCommandUrls", () => {
 			["env -S grep omp local://file", "env -S grep omp /host/file"],
 			['env -C local://dir -S "omp read" local://file', 'env -C /host/dir -S "omp read" local://file'],
 			["env --split-string=grep omp local://file", "env --split-string=grep omp /host/file"],
+			["env -S 'omp\\_read' local://file", "env -S 'omp\\_read' local://file"],
 			[
 				"bunx --minimum-release-age 86400 omp read local://book:1",
 				"bunx --minimum-release-age 86400 omp read local://book:1",
@@ -129,6 +130,10 @@ describe("hostCommandUrls", () => {
 			["sudo -He omp local://file", "sudo -He omp /host/file"],
 			["uv run -m omp local://file", "uv run -m omp /host/file"],
 			["uv run --script omp local://file", "uv run --script omp /host/file"],
+			[
+				"uv --color auto run --reinstall-package omp ruff local://input.py",
+				"uv --color auto run --reinstall-package omp ruff /host/input.py",
+			],
 			["command -p omp read local://x:1", "command -p omp read local://x:1"],
 			["command -v omp local://file", "command -v omp /host/file"],
 			["command -pv omp local://file", "command -pv omp /host/file"],
@@ -145,6 +150,10 @@ describe("hostCommandUrls", () => {
 			"command omp read local://x:1",
 			"FLAGS+=x omp read local://x:1",
 			"time MODE=one omp read local://x:1",
+			"time -p ! MODE=one omp read local://x:1",
+			"time -p ! MODE=local://in omp read local://x:1",
+			"ssh server -t omp read local://x:1",
+			'ssh server "omp read" local://x:1',
 			"SOURCE=local://in omp read local://x:1",
 			"/usr/bin/env SOURCE=local://in omp read local://x:1",
 			"ssh server omp read local://x:1",
@@ -168,10 +177,18 @@ describe("hostCommandUrls", () => {
 				"sudo -D /host/dir SOURCE=local://in omp read local://arg",
 			],
 			[
-				"time -o local://out MODE=local://in omp read local://arg",
-				"time -o /host/out MODE=local://in omp read local://arg",
+				"/usr/bin/time -o local://out env MODE=local://in omp read local://arg",
+				"/usr/bin/time -o /host/out env MODE=local://in omp read local://arg",
 			],
 			["ssh -F local://cfg server omp read local://arg", "ssh -F /host/cfg server omp read local://arg"],
+			[
+				"SSH_ASKPASS=local://ask ssh server omp read local://x",
+				"SSH_ASKPASS=/host/ask ssh server omp read local://x",
+			],
+			[
+				"/usr/bin/env SSH_ASKPASS=local://ask ssh server omp read local://x",
+				"/usr/bin/env SSH_ASKPASS=/host/ask ssh server omp read local://x",
+			],
 			["/usr/bin/env SOURCE=local://in grep omp local://file", "/usr/bin/env SOURCE=/host/in grep omp /host/file"],
 			["cat \\\nlocal://file", "cat \\\n/host/file"],
 		]) {
@@ -189,20 +206,33 @@ describe("hostCommandUrls", () => {
 		expect(await host("bunx.exe -p pkg omp.cmd read local://file", "powershell.exe")).toBe(
 			"bunx.exe -p pkg omp.cmd read local://file",
 		);
+		expect(await host(".\\omp.exe read local://file", "powershell.exe")).toBe(".\\omp.exe read local://file");
+		expect(await host("C:\\tools\\npx.cmd omp read local://file", "powershell.exe")).toBe(
+			"C:\\tools\\npx.cmd omp read local://file",
+		);
 	});
 
 	it("handles redirects, command substitutions, and case constructs independently of omp", async () => {
 		for (const [command, expected] of [
 			["omp read local://in > local://out", "omp read local://in > /host/out"],
+			["omp>local://log read local://arg", "omp>/host/log read local://arg"],
+			["omp >&local://log read local://arg", "omp >&/host/log read local://arg"],
 			["2>/dev/null omp read local://in", "2>/dev/null omp read local://in"],
 			["<local://in omp read local://arg", "</host/in omp read local://arg"],
 			["omp read local://in 2>&1 local://more", "omp read local://in 2>&1 local://more"],
 			["omp read local://in &> local://out", "omp read local://in &> /host/out"],
+			["omp <<< local://text", "omp <<< local://text"],
+			["cat <<< local://text", "cat <<< local://text"],
 			["echo $(pwd) omp local://file", "echo $(pwd) omp /host/file"],
 			["echo $((1 + 2)) omp local://file", "echo $((1 + 2)) omp /host/file"],
+			["grep <(printf x) omp local://file", "grep <(printf x) omp /host/file"],
+			["omp read <(cat local://a) local://b", "omp read <(cat /host/a) local://b"],
 			['omp read "$(cat local://index)"', 'omp read "$(cat /host/index)"'],
 			["omp read $(cat local://index) local://arg", "omp read $(cat /host/index) local://arg"],
+			['omp read "`cat local://index`"', 'omp read "`cat /host/index`"'],
+			["omp read `cat local://index` local://arg", "omp read `cat /host/index` local://arg"],
 			["echo $(omp read local://a) local://b", "echo $(omp read local://a) /host/b"],
+			['echo "$(\n# comment with )\ncat local://index\n)"', 'echo "$(\n# comment with )\ncat /host/index\n)"'],
 			[
 				"case x in x) cat local://a;; omp) omp read local://b;; esac",
 				"case x in x) cat /host/a;; omp) omp read local://b;; esac",
@@ -211,6 +241,8 @@ describe("hostCommandUrls", () => {
 				'echo "$(case x in x) cat local://a;; omp) omp read local://b;; esac)"',
 				'echo "$(case x in x) cat /host/a;; omp) omp read local://b;; esac)"',
 			],
+			['echo "$( { case x in x) cat local://a;; esac; } )"', 'echo "$( { case x in x) cat /host/a;; esac; } )"'],
+			['echo "$( ! case x in x) cat local://a;; esac )"', 'echo "$( ! case x in x) cat /host/a;; esac )"'],
 			['echo "$(case=ok cat local://file)"', 'echo "$(case=ok cat /host/file)"'],
 			[
 				'echo "$(case x in case) cat local://a;; a|case) cat local://b;; (c) cat local://c;; esac)"',
@@ -220,6 +252,12 @@ describe("hostCommandUrls", () => {
 		]) {
 			expect(await host(command)).toBe(expected);
 		}
+		const heredocMarker = ["omp << 'local://done'", "cat local://inside", "local://done", "cat local://after"].join(
+			"\n",
+		);
+		expect(await host(heredocMarker)).toBe(
+			["omp << 'local://done'", "cat local://inside", "local://done", "cat /host/after"].join("\n"),
+		);
 	});
 
 	it("treats a here-document body as input, not command text", async () => {

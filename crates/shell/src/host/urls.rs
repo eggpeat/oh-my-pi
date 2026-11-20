@@ -110,7 +110,8 @@ pub(super) fn names_url(spec: &SpawnSpec<'_>) -> bool {
 			.enumerate()
 			.skip(1)
 			.any(|(i, arg)| arg.contains_str("://") && omp.as_ref().is_none_or(|o| !o.is_literal(i)))
-		|| (omp.is_none() && spec.env.iter().any(|(name, value)| env_url(name, value)))
+		|| (omp.as_ref().is_none_or(|o| o.remote)
+			&& spec.env.iter().any(|(name, value)| env_url(name, value)))
 }
 
 /// Whether the environment variable `name` holds a URL to resolve. `PWD`
@@ -237,7 +238,7 @@ pub(super) async fn resolve(fs: &omp_vfs::Fs, names: &Names) -> io::Result<Names
 	}
 	// What the child's environment says differently from the shell's.
 	let mut hosted: Vec<(BString, BString)> = Vec::new();
-	if omp.is_none() {
+	if omp.as_ref().is_none_or(|o| o.remote) {
 		for (name, value) in names.env.iter() {
 			if env_url(name, value)
 				&& let Some(host) = host_arg(fs, value).await

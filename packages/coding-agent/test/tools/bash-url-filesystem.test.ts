@@ -173,9 +173,14 @@ describe("bash internal URLs through the shell filesystem", () => {
 			await fs.writeFile(path.join(localRoot, "data.txt"), "payload\n");
 			await fs.mkdir(path.join(localRoot, "tools"));
 			const printArgs = "#!/bin/sh\nprintf '%s\\n' \"$@\"\n";
-			for (const name of ["grep", "npm", "npx", "bun", "bunx", "uv", "setsid", "sudo", "ssh", "xargs"]) {
+			for (const name of ["grep", "npm", "npx", "bun", "bunx", "uv", "setsid", "sudo", "xargs"]) {
 				await fs.writeFile(path.join(tempDir, name), printArgs, { mode: 0o755 });
 			}
+			await fs.writeFile(
+				path.join(tempDir, "ssh"),
+				'#!/bin/sh\n[ "$CHECK_ASKPASS" = "1" ] && printf \'SSH_ASKPASS=%s\\n\' "$SSH_ASKPASS"\nprintf \'%s\\n\' "$@"\n',
+				{ mode: 0o755 },
+			);
 			await fs.writeFile(
 				path.join(tempDir, "omp"),
 				'#!/bin/sh\nprintf \'PWD=%s\\nSOURCE=%s\\n\' "$PWD" "$SOURCE"\nprintf \'%s\\n\' "$@"\n',
@@ -212,10 +217,23 @@ describe("bash internal URLs through the shell filesystem", () => {
 					["run", "-w", "requests", "omp", "read", "local://data.txt:1", "--from=local://data.txt"],
 				],
 				["uv run -m omp local://data.txt", ["run", "-m", "omp", data]],
+				[
+					"uv --color auto run --reinstall-package omp ruff local://data.txt",
+					["--color", "auto", "run", "--reinstall-package", "omp", "ruff", data],
+				],
 				["sudo -e omp local://data.txt", ["-e", "omp", data]],
 				[
 					"ssh -F local://data.txt server omp read local://data.txt:1 --from=local://data.txt",
 					["-F", data, "server", "omp", "read", "local://data.txt:1", "--from=local://data.txt"],
+				],
+				[
+					"ssh server -t omp read local://data.txt:1 --from=local://data.txt",
+					["server", "-t", "omp", "read", "local://data.txt:1", "--from=local://data.txt"],
+				],
+				['ssh server "omp read" local://data.txt', ["server", "omp read", "local://data.txt"]],
+				[
+					"CHECK_ASKPASS=1 SSH_ASKPASS=local://data.txt ssh server omp read local://data.txt:1 --from=local://data.txt",
+					[`SSH_ASKPASS=${data}`, "server", "omp", "read", "local://data.txt:1", "--from=local://data.txt"],
 				],
 				[
 					'"$PWD/xargs" -0n 1 omp read local://data.txt:1 --from=local://data.txt',
@@ -229,6 +247,10 @@ describe("bash internal URLs through the shell filesystem", () => {
 				],
 				["/usr/bin/env -u FOO -- -flag=/opt/omp grep x local://data.txt", ["x", data]],
 				["/usr/bin/env -S grep omp local://data.txt", ["omp", data]],
+				[
+					"/usr/bin/env -S 'omp\\_read' local://data.txt",
+					[`PWD=${tempDir}`, "SOURCE=", "read", "local://data.txt"],
+				],
 				[
 					"/usr/bin/env -C local://tools SOURCE=local://data.txt omp read local://data.txt:1 --from=local://data.txt",
 					[`PWD=${tools}`, "SOURCE=local://data.txt", "read", "local://data.txt:1", "--from=local://data.txt"],

@@ -23,15 +23,30 @@ pub(crate) struct Launch {
 /// that belong to `omp` rather than to the launcher itself.
 pub(crate) struct OmpLaunch {
 	/// Argument indices at or after this position are `omp`'s own arguments.
-	literal_from: usize,
-	/// Original argument indices holding environment assignments inherited by
-	/// `omp`.
-	env_indices:  SmallVec<[usize; 4]>,
+	literal_from:      usize,
+	/// Sorted, merged `[start, end)` ranges of original argument indices
+	/// holding environment assignments inherited by `omp`.
+	env_ranges:        SmallVec<[(usize, usize); 2]>,
+	/// The `omp` command runs on a remote host via `ssh`, so the local
+	/// process's environment belongs to `ssh` rather than to `omp`.
+	pub(crate) remote: bool,
 }
 
 impl OmpLaunch {
 	pub(crate) fn is_literal(&self, index: usize) -> bool {
-		index >= self.literal_from || self.env_indices.contains(&index)
+		index >= self.literal_from
+			|| self
+				.env_ranges
+				.binary_search_by(|&(start, end)| {
+					if index < start {
+						std::cmp::Ordering::Greater
+					} else if index >= end {
+						std::cmp::Ordering::Less
+					} else {
+						std::cmp::Ordering::Equal
+					}
+				})
+				.is_ok()
 	}
 }
 
@@ -468,10 +483,33 @@ const UV_RUN_SPEC: OptionSpec = OptionSpec {
 		"--index-url",
 		"--extra-index-url",
 		"--find-links",
+		"--index-strategy",
+		"--keyring-provider",
+		"--upgrade-package",
+		"--upgrade-group",
+		"--resolution",
+		"--prerelease",
+		"--prerelease-package",
+		"--fork-strategy",
+		"--exclude-newer",
+		"--exclude-newer-package",
+		"--no-sources-package",
+		"--reinstall-package",
+		"--link-mode",
+		"--config-setting",
+		"--config-settings-package",
+		"--no-build-isolation-package",
+		"--no-build-package",
+		"--no-binary-package",
+		"--refresh-package",
+		"--color",
+		"--allow-insecure-host",
+		"--python-preference",
+		"--python-fetch",
 		"--config-file",
 		"--cache-dir",
 	],
-	short_value: "wpif",
+	short_value: "wpifPC",
 	long_abort: &["--module", "--script", "--gui-script"],
 	short_abort: "ms",
 	..OptionSpec::EMPTY
@@ -480,7 +518,9 @@ const UV_RUN_SPEC: OptionSpec = OptionSpec {
 const SSH_SPEC: OptionSpec =
 	OptionSpec { short_value: "BbcDEeFIiJLlmOopQRSWw", short_abort: "GV", ..OptionSpec::EMPTY };
 
-/// Split the operand of `env -S` / `--split-string` into words.
+/// Split the operand of `env -S` / `--split-string` into words following GNU
+/// `env` rules (`\_` separates words outside quotes and is a literal space
+/// inside double quotes; only `\'` and `\\` escape inside single quotes).
 fn split_env_string(input: &str) -> Vec<String> {
 	let mut words = Vec::new();
 	let mut current = String::new();
@@ -489,13 +529,32 @@ fn split_env_string(input: &str) -> Vec<String> {
 	let mut chars = input.chars().peekable();
 	while let Some(ch) = chars.next() {
 		if let Some(q) = quote {
-			if ch == '\\'
-				&& let Some(&next) = chars.peek()
-				&& (next == q || next == '\\')
-			{
-				current.push(next);
-				chars.next();
-			} else if ch == q {
+			if q == '\'' {
+				if ch == '\\'
+					&& let Some(&next) = chars.peek()
+					&& (next == '\'' || next == '\\')
+				{
+					current.push(next);
+					chars.next();
+				} else if ch == '\'' {
+					quote = None;
+				} else {
+					current.push(ch);
+				}
+			} else if ch == '\\' {
+				if let Some(next) = chars.next() {
+					match next {
+						'_' => current.push(' '),
+						't' => current.push('\t'),
+						'n' => current.push('\n'),
+						'r' => current.push('\r'),
+						'f' => current.push('\x0c'),
+						'v' => current.push('\x0b'),
+						'c' => break,
+						_ => current.push(next),
+					}
+				}
+			} else if ch == '"' {
 				quote = None;
 			} else {
 				current.push(ch);
@@ -512,22 +571,53 @@ fn split_env_string(input: &str) -> Vec<String> {
 		if ch == '#' && !in_word {
 			break;
 		}
-		in_word = true;
 		match ch {
-			'\'' | '"' => quote = Some(ch),
+			'\'' | '"' => {
+				in_word = true;
+				quote = Some(ch);
+			},
 			'\\' => {
 				if let Some(next) = chars.next() {
 					match next {
-						'_' => current.push(' '),
-						't' => current.push('\t'),
-						'n' => current.push('\n'),
-						'r' => current.push('\r'),
+						'_' => {
+							// Outside quotes, GNU env treats `\_` as a word separator.
+							if in_word {
+								words.push(std::mem::take(&mut current));
+								in_word = false;
+							}
+						},
 						'c' => break,
-						_ => current.push(next),
+						't' => {
+							in_word = true;
+							current.push('\t');
+						},
+						'n' => {
+							in_word = true;
+							current.push('\n');
+						},
+						'r' => {
+							in_word = true;
+							current.push('\r');
+						},
+						'f' => {
+							in_word = true;
+							current.push('\x0c');
+						},
+						'v' => {
+							in_word = true;
+							current.push('\x0b');
+						},
+						_ => {
+							in_word = true;
+							current.push(next);
+						},
 					}
 				}
 			},
-			_ => current.push(ch),
+			_ => {
+				in_word = true;
+				current.push(ch);
+			},
 		}
 	}
 	if in_word {
@@ -536,9 +626,105 @@ fn split_env_string(input: &str) -> Vec<String> {
 	words
 }
 
+/// Whether a remote `ssh` word needs shell splitting (contains whitespace,
+/// quotes, escapes, or command separators).
+fn needs_remote_split(word: &str) -> bool {
+	word.bytes().any(|b| {
+		b.is_ascii_whitespace()
+			|| matches!(b, b'\'' | b'"' | b'\\' | b';' | b'&' | b'|' | b'(' | b')')
+	})
+}
+
+fn is_shell_prefix(word: &str) -> bool {
+	matches!(word, "if" | "then" | "elif" | "else" | "while" | "until" | "do" | "!" | "{" | "}")
+}
+
+/// Split remote `ssh` words (joined by spaces in the remote shell) into the
+/// last simple command segment that owns the trailing arguments.
+fn build_ssh_splice<'a, W: WordSlice + ?Sized>(words: &'a W, from: usize) -> Vec<LaunchWord<'a>> {
+	let mut segment: Vec<LaunchWord<'a>> = Vec::new();
+	let mut reset_on_next = false;
+	for j in from..words.len() {
+		let w = words.text(j);
+		let origin = words.origin(j);
+		if !needs_remote_split(w) {
+			if reset_on_next {
+				segment.clear();
+				reset_on_next = false;
+			}
+			if segment.is_empty() && is_shell_prefix(w) {
+				continue;
+			}
+			segment.push(LaunchWord { text: Cow::Borrowed(w), bytes: Some(words.bytes(j)), origin });
+			continue;
+		}
+		let src = origin.index();
+		let mut current = String::new();
+		let mut in_word = false;
+		let mut quote: Option<char> = None;
+		let mut chars = w.chars().peekable();
+		let mut flush = |current: &mut String, in_word: &mut bool, reset_on_next: &mut bool| {
+			if !*in_word {
+				return;
+			}
+			let piece = std::mem::take(current);
+			*in_word = false;
+			if *reset_on_next {
+				segment.clear();
+				*reset_on_next = false;
+			}
+			if segment.is_empty() && is_shell_prefix(&piece) {
+				return;
+			}
+			segment.push(LaunchWord {
+				text:   Cow::Owned(piece),
+				bytes:  None,
+				origin: Origin::Split { index: src, sole_word: false },
+			});
+		};
+		while let Some(ch) = chars.next() {
+			if let Some(q) = quote {
+				if q == '"'
+					&& ch == '\\'
+					&& let Some(&next) = chars.peek()
+					&& matches!(next, '"' | '\\' | '$' | '`')
+				{
+					current.push(next);
+					chars.next();
+				} else if ch == q {
+					quote = None;
+				} else {
+					current.push(ch);
+				}
+				continue;
+			}
+			if ch == ' ' || ch == '\t' {
+				flush(&mut current, &mut in_word, &mut reset_on_next);
+				continue;
+			}
+			if matches!(ch, '\n' | ';' | '&' | '|' | '(' | ')') {
+				flush(&mut current, &mut in_word, &mut reset_on_next);
+				reset_on_next = true;
+				continue;
+			}
+			in_word = true;
+			match ch {
+				'\'' | '"' => quote = Some(ch),
+				'\\' => {
+					if let Some(next) = chars.next() {
+						current.push(next);
+					}
+				},
+				_ => current.push(ch),
+			}
+		}
+		flush(&mut current, &mut in_word, &mut reset_on_next);
+	}
+	segment
+}
+
 const ENV_LONG_VALUE: &[&str] = &["--unset", "--chdir", "--file", "--argv0"];
 const ENV_SHORT_VALUE: &str = "uCfPa";
-
 enum EnvStep<'a> {
 	Done(usize),
 	Splice(Vec<LaunchWord<'a>>),
@@ -551,7 +737,7 @@ fn step_env<'a, W: WordSlice + ?Sized>(
 	words: &'a W,
 	from: usize,
 	splits_remaining: usize,
-	env_indices: &mut SmallVec<[usize; 4]>,
+	env_ranges: &mut SmallVec<[(usize, usize); 2]>,
 ) -> EnvStep<'a> {
 	let mut i = from;
 	while i < words.len() {
@@ -618,7 +804,7 @@ fn step_env<'a, W: WordSlice + ?Sized>(
 		i += 1;
 	}
 	while i < words.len() && env_assignment(words.text(i)) {
-		record_env_origin(words.origin(i), env_indices);
+		record_env_origin(words.origin(i), env_ranges);
 		i += 1;
 	}
 	EnvStep::Done(i)
@@ -651,44 +837,47 @@ fn build_env_splice<'a, W: WordSlice + ?Sized>(
 	spliced
 }
 
-fn record_env_origin(origin: Origin, env_indices: &mut SmallVec<[usize; 4]>) {
-	match origin {
-		Origin::Arg(idx) | Origin::Split { index: idx, sole_word: true } => {
-			if !env_indices.contains(&idx) {
-				env_indices.push(idx);
-			}
-		},
-		Origin::Split { sole_word: false, .. } => {},
+/// Append `origin` to sorted, merged `[start, end)` ranges in O(1) time.
+fn record_env_origin(origin: Origin, env_ranges: &mut SmallVec<[(usize, usize); 2]>) {
+	let idx = match origin {
+		Origin::Arg(idx) | Origin::Split { index: idx, sole_word: true } => idx,
+		Origin::Split { sole_word: false, .. } => return,
+	};
+	match env_ranges.last_mut() {
+		Some((_, end)) if idx < *end => {},
+		Some((_, end)) if idx == *end => *end = idx + 1,
+		_ => env_ranges.push((idx, idx + 1)),
 	}
 }
 
 enum StepResult<'a> {
 	Advance { at: usize, remote: bool },
 	SpliceEnv(Vec<LaunchWord<'a>>),
+	SpliceRemote(Vec<LaunchWord<'a>>),
 	Stop,
 }
 
 /// Advance past one launcher at `from`, recording inherited environment
-/// assignments into `env_indices`.
+/// assignments into `env_ranges`.
 fn step_launcher<'a, W: WordSlice + ?Sized>(
 	words: &'a W,
 	from: usize,
 	windows: bool,
 	splits_remaining: usize,
-	env_indices: &mut SmallVec<[usize; 4]>,
+	env_ranges: &mut SmallVec<[(usize, usize); 2]>,
 ) -> StepResult<'a> {
 	let raw = words.text(from);
 	let mut buf = [0u8; 16];
 	let program = launcher_name(raw, windows, &mut buf);
 	match program {
-		"env" => match step_env(words, from + 1, splits_remaining, env_indices) {
+		"env" => match step_env(words, from + 1, splits_remaining, env_ranges) {
 			EnvStep::Done(at) => StepResult::Advance { at, remote: false },
 			EnvStep::Splice(spliced) => StepResult::SpliceEnv(spliced),
 		},
 		"sudo" => match scan_options(words, from + 1, &SUDO_SPEC) {
 			ScanOutcome::Operand { mut at, .. } => {
 				while at < words.len() && plain_assignment(words.text(at)) {
-					record_env_origin(words.origin(at), env_indices);
+					record_env_origin(words.origin(at), env_ranges);
 					at += 1;
 				}
 				StepResult::Advance { at, remote: false }
@@ -698,7 +887,7 @@ fn step_launcher<'a, W: WordSlice + ?Sized>(
 		"doas" => match scan_options(words, from + 1, &DOAS_SPEC) {
 			ScanOutcome::Operand { mut at, .. } => {
 				while at < words.len() && plain_assignment(words.text(at)) {
-					record_env_origin(words.origin(at), env_indices);
+					record_env_origin(words.origin(at), env_ranges);
 					at += 1;
 				}
 				StepResult::Advance { at, remote: false }
@@ -724,11 +913,14 @@ fn step_launcher<'a, W: WordSlice + ?Sized>(
 		},
 		"time" => match scan_options(words, from + 1, &TIME_SPEC) {
 			ScanOutcome::Operand { mut at, .. } => {
-				// Bare `time` is a shell reserved word, so assignments after it
-				// precede the command.
+				// Bare `time` is a shell keyword before a pipeline, so `!` and
+				// assignments after it precede the command.
 				if raw == "time" {
+					while at < words.len() && matches!(words.text(at), "!" | "{") {
+						at += 1;
+					}
 					while at < words.len() && assignment(words.text(at)) {
-						record_env_origin(words.origin(at), env_indices);
+						record_env_origin(words.origin(at), env_ranges);
 						at += 1;
 					}
 				}
@@ -790,8 +982,25 @@ fn step_launcher<'a, W: WordSlice + ?Sized>(
 			_ => StepResult::Stop,
 		},
 		"ssh" => match scan_options(words, from + 1, &SSH_SPEC) {
-			ScanOutcome::Operand { at: host, .. } if host < words.len() => {
-				StepResult::Advance { at: host + 1, remote: true }
+			ScanOutcome::Operand { at: host, after_double_dash } if host < words.len() => {
+				let cmd_start = if after_double_dash {
+					host + 1
+				} else {
+					match scan_options(words, host + 1, &SSH_SPEC) {
+						ScanOutcome::Operand { at, .. } => at,
+						ScanOutcome::Abort => return StepResult::Stop,
+					}
+				};
+				// Local settings before `ssh` belong to the local `ssh` client, not
+				// the remote program.
+				env_ranges.clear();
+				if cmd_start < words.len()
+					&& (cmd_start..words.len()).any(|j| needs_remote_split(words.text(j)))
+				{
+					StepResult::SpliceRemote(build_ssh_splice(words, cmd_start))
+				} else {
+					StepResult::Advance { at: cmd_start, remote: true }
+				}
 			},
 			_ => StepResult::Stop,
 		},
@@ -812,11 +1021,11 @@ fn resolve_slice<W: WordSlice + ?Sized>(
 	windows: bool,
 	mut remote: bool,
 	splits_remaining: usize,
-	env_indices: &mut SmallVec<[usize; 4]>,
+	env_ranges: &mut SmallVec<[(usize, usize); 2]>,
 	in_env: bool,
 ) -> Resolved {
 	if in_env {
-		match step_env(words, at, splits_remaining, env_indices) {
+		match step_env(words, at, splits_remaining, env_ranges) {
 			EnvStep::Done(next) => at = next.min(words.len()),
 			EnvStep::Splice(spliced) => {
 				return resolve_slice(
@@ -826,17 +1035,23 @@ fn resolve_slice<W: WordSlice + ?Sized>(
 					windows,
 					remote,
 					splits_remaining.saturating_sub(1),
-					env_indices,
+					env_ranges,
 					true,
 				);
 			},
 		}
 	}
 	while at < words.len() {
-		match step_launcher(words, at, windows, splits_remaining, env_indices) {
+		match step_launcher(words, at, windows, splits_remaining, env_ranges) {
 			StepResult::Advance { at: next, remote: is_remote } => {
 				at = next.min(words.len());
-				remote |= is_remote;
+				if is_remote {
+					remote = true;
+					while at < words.len() && assignment(words.text(at)) {
+						record_env_origin(words.origin(at), env_ranges);
+						at += 1;
+					}
+				}
 			},
 			StepResult::SpliceEnv(spliced) => {
 				return resolve_slice(
@@ -846,8 +1061,25 @@ fn resolve_slice<W: WordSlice + ?Sized>(
 					windows,
 					remote,
 					splits_remaining.saturating_sub(1),
-					env_indices,
+					env_ranges,
 					true,
+				);
+			},
+			StepResult::SpliceRemote(spliced) => {
+				let mut remote_at = 0;
+				while remote_at < spliced.len() && assignment(spliced.text(remote_at)) {
+					record_env_origin(spliced.origin(remote_at), env_ranges);
+					remote_at += 1;
+				}
+				return resolve_slice(
+					spliced.as_slice(),
+					remote_at,
+					orig_len,
+					windows,
+					true,
+					splits_remaining,
+					env_ranges,
+					false,
 				);
 			},
 			StepResult::Stop => break,
@@ -865,19 +1097,19 @@ fn resolve_slice<W: WordSlice + ?Sized>(
 				Origin::Split { .. } => None,
 			})
 			.unwrap_or(orig_len);
-		OmpLaunch { literal_from, env_indices: std::mem::take(env_indices) }
+		OmpLaunch { literal_from, env_ranges: std::mem::take(env_ranges), remote }
 	});
 	Resolved { at: orig_at, remote, omp }
 }
 
 fn resolve_launch<T: AsRef<[u8]>>(words: &[T], windows: bool) -> Resolved {
-	let mut env_indices = SmallVec::new();
+	let mut env_ranges = SmallVec::new();
 	let mut at = 0;
 	while at < words.len() && assignment(words.text(at)) {
-		env_indices.push(at);
+		record_env_origin(Origin::Arg(at), &mut env_ranges);
 		at += 1;
 	}
-	resolve_slice(words, at, words.len(), windows, false, 4, &mut env_indices, false)
+	resolve_slice(words, at, words.len(), windows, false, 4, &mut env_ranges, false)
 }
 
 pub(crate) fn launch<T: AsRef<[u8]>>(words: &[T]) -> Launch {
@@ -968,12 +1200,16 @@ mod tests {
 			.expect("env -S running omp");
 		assert!(!split_omp.is_literal(2));
 		assert!(split_omp.is_literal(5));
+		let underscore =
+			omp(&["env", "-S", r"omp\_read", "local://file"]).expect("env -S with \\_ separator");
+		assert!(underscore.is_literal(3));
 
 		let inherited = omp(&[
 			"/usr/bin/env",
 			"-C",
 			"local://dir",
 			"SOURCE=local://in",
+			"OTHER=local://b",
 			"omp",
 			"read",
 			"local://arg",
@@ -981,7 +1217,9 @@ mod tests {
 		.expect("env running omp");
 		assert!(!inherited.is_literal(2));
 		assert!(inherited.is_literal(3));
-		assert!(inherited.is_literal(6));
+		assert!(inherited.is_literal(4));
+		assert!(inherited.is_literal(7));
+		assert_eq!(inherited.env_ranges.len(), 1);
 	}
 
 	#[test]
@@ -992,16 +1230,35 @@ mod tests {
 		assert!(omp(&["uv", "run", "-m", "omp", "local://file"]).is_none());
 		assert!(omp(&["uv", "run", "--script", "omp", "local://file"]).is_none());
 		assert!(omp(&["uv", "run", "--gui-script", "omp", "local://file"]).is_none());
+		assert!(
+			omp(&["uv", "--color", "auto", "run", "--reinstall-package", "omp", "ruff", "local://in"])
+				.is_none()
+		);
 		assert!(omp(&["npx", "-c", "echo hi", "omp", "local://file"]).is_none());
 		assert!(omp(&["doas", "-C", "conf", "omp", "local://file"]).is_none());
 
 		let remote =
 			omp(&["ssh", "-F", "local://cfg", "server", "omp", "read", "skill://demo/SKILL.md"])
 				.expect("remote ssh omp");
+		assert!(remote.remote);
 		assert!(!remote.is_literal(2));
 		assert!(remote.is_literal(6));
-	}
 
+		let after_host = omp(&["ssh", "server", "-t", "omp", "read", "local://data"])
+			.expect("ssh option after host");
+		assert!(after_host.is_literal(5));
+
+		let quoted_cmd =
+			omp(&["ssh", "server", "omp read", "local://data"]).expect("ssh quoted command word");
+		assert!(quoted_cmd.is_literal(3));
+
+		let local_env =
+			omp(&["env", "SSH_ASKPASS=local://ask", "ssh", "server", "omp", "read", "local://x"])
+				.expect("local env before ssh");
+		assert!(local_env.remote);
+		assert!(!local_env.is_literal(1));
+		assert!(local_env.is_literal(6));
+	}
 	#[test]
 	fn recognizes_windows_launcher_paths_and_suffixes() {
 		assert_eq!(

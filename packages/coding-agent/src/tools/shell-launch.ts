@@ -333,10 +333,33 @@ const UV_RUN_SPEC: OptionSpec = {
 		"--index-url",
 		"--extra-index-url",
 		"--find-links",
+		"--index-strategy",
+		"--keyring-provider",
+		"--upgrade-package",
+		"--upgrade-group",
+		"--resolution",
+		"--prerelease",
+		"--prerelease-package",
+		"--fork-strategy",
+		"--exclude-newer",
+		"--exclude-newer-package",
+		"--no-sources-package",
+		"--reinstall-package",
+		"--link-mode",
+		"--config-setting",
+		"--config-settings-package",
+		"--no-build-isolation-package",
+		"--no-build-package",
+		"--no-binary-package",
+		"--refresh-package",
+		"--color",
+		"--allow-insecure-host",
+		"--python-preference",
+		"--python-fetch",
 		"--config-file",
 		"--cache-dir",
 	]),
-	shortValue: "wpif",
+	shortValue: "wpifPC",
 	shortOptional: "",
 	longAbort: new Set(["--module", "--script", "--gui-script"]),
 	shortAbort: "ms",
@@ -353,7 +376,11 @@ const SSH_SPEC: OptionSpec = {
 const ENV_LONG_VALUE = new Set(["--unset", "--chdir", "--file", "--argv0"]);
 const ENV_SHORT_VALUE = "uCfPa";
 
-/** Split the operand of `env -S` / `--split-string` into words. */
+/**
+ * Split the operand of `env -S` / `--split-string` into words following GNU `env` rules:
+ * `\_` separates words outside quotes and is a literal space inside double quotes;
+ * inside single quotes only `\'` and `\\` are escaped.
+ */
 function splitEnvString(input: string): string[] {
 	const words: string[] = [];
 	let current = "";
@@ -361,17 +388,35 @@ function splitEnvString(input: string): string[] {
 	let quote = "";
 	for (let i = 0; i < input.length; i++) {
 		const ch = input[i]!;
-		if (quote) {
-			if (ch === "\\" && i + 1 < input.length && (input[i + 1] === quote || input[i + 1] === "\\")) {
+		if (quote === "'") {
+			if (ch === "\\" && i + 1 < input.length && (input[i + 1] === "'" || input[i + 1] === "\\")) {
 				current += input[++i]!;
-			} else if (ch === quote) {
+			} else if (ch === "'") {
 				quote = "";
 			} else {
 				current += ch;
 			}
 			continue;
 		}
-		if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") {
+		if (quote === '"') {
+			if (ch === "\\" && i + 1 < input.length) {
+				const next = input[++i]!;
+				if (next === "_") current += " ";
+				else if (next === "t") current += "\t";
+				else if (next === "n") current += "\n";
+				else if (next === "r") current += "\r";
+				else if (next === "f") current += "\f";
+				else if (next === "v") current += "\v";
+				else if (next === "c") break;
+				else current += next;
+			} else if (ch === '"') {
+				quote = "";
+			} else {
+				current += ch;
+			}
+			continue;
+		}
+		if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r" || ch === "\f" || ch === "\v") {
 			if (inWord) {
 				words.push(current);
 				current = "";
@@ -380,18 +425,31 @@ function splitEnvString(input: string): string[] {
 			continue;
 		}
 		if (ch === "#" && !inWord) break;
-		inWord = true;
 		if (ch === "'" || ch === '"') {
+			inWord = true;
 			quote = ch;
 		} else if (ch === "\\" && i + 1 < input.length) {
 			const next = input[++i]!;
-			if (next === "_") current += " ";
-			else if (next === "t") current += "\t";
-			else if (next === "n") current += "\n";
-			else if (next === "r") current += "\r";
-			else if (next === "c") break;
-			else current += next;
+			if (next === "_") {
+				// Outside quotes, GNU env treats `\_` as a word separator.
+				if (inWord) {
+					words.push(current);
+					current = "";
+					inWord = false;
+				}
+			} else if (next === "c") {
+				break;
+			} else {
+				inWord = true;
+				if (next === "t") current += "\t";
+				else if (next === "n") current += "\n";
+				else if (next === "r") current += "\r";
+				else if (next === "f") current += "\f";
+				else if (next === "v") current += "\v";
+				else current += next;
+			}
 		} else {
+			inWord = true;
 			current += ch;
 		}
 	}
@@ -399,12 +457,86 @@ function splitEnvString(input: string): string[] {
 	return words;
 }
 
-function recordEnvOrigin(origin: WordOrigin, envIndices: number[]): void {
-	if (origin.kind === "arg" || origin.soleWord) {
-		if (!envIndices.includes(origin.index)) envIndices.push(origin.index);
+const REMOTE_SPLIT_RE = /[\s'"\\;&|()]/;
+const REMOTE_PREFIX = new Set(["if", "then", "elif", "else", "while", "until", "do", "!", "{", "}"]);
+
+/** Split remote `ssh` words into the last simple command segment that owns trailing arguments. */
+function buildSshSplice(words: readonly LaunchWord[], from: number): LaunchWord[] {
+	const segment: LaunchWord[] = [];
+	let resetOnNext = false;
+	for (let j = from; j < words.length; j++) {
+		const word = words[j]!;
+		const w = word.text;
+		if (!REMOTE_SPLIT_RE.test(w)) {
+			if (resetOnNext) {
+				segment.length = 0;
+				resetOnNext = false;
+			}
+			if (segment.length === 0 && REMOTE_PREFIX.has(w)) continue;
+			segment.push(word);
+			continue;
+		}
+		const src = word.origin.index;
+		let current = "";
+		let inWord = false;
+		let quote = "";
+		const flush = () => {
+			if (!inWord) return;
+			const piece = current;
+			current = "";
+			inWord = false;
+			if (resetOnNext) {
+				segment.length = 0;
+				resetOnNext = false;
+			}
+			if (segment.length === 0 && REMOTE_PREFIX.has(piece)) return;
+			segment.push({ text: piece, origin: { kind: "split", index: src, soleWord: false } });
+		};
+		for (let k = 0; k < w.length; k++) {
+			const ch = w[k]!;
+			if (quote) {
+				if (
+					quote === '"' &&
+					ch === "\\" &&
+					k + 1 < w.length &&
+					(w[k + 1] === '"' || w[k + 1] === "\\" || w[k + 1] === "$" || w[k + 1] === "`")
+				) {
+					current += w[++k]!;
+				} else if (ch === quote) {
+					quote = "";
+				} else {
+					current += ch;
+				}
+				continue;
+			}
+			if (ch === " " || ch === "\t") {
+				flush();
+				continue;
+			}
+			if (ch === "\n" || ch === ";" || ch === "&" || ch === "|" || ch === "(" || ch === ")") {
+				flush();
+				resetOnNext = true;
+				continue;
+			}
+			inWord = true;
+			if (ch === "'" || ch === '"') {
+				quote = ch;
+			} else if (ch === "\\" && k + 1 < w.length) {
+				current += w[++k]!;
+			} else {
+				current += ch;
+			}
+		}
+		flush();
 	}
+	return segment;
 }
 
+function recordEnvOrigin(origin: WordOrigin, envIndices: number[]): void {
+	if (origin.kind === "arg" || origin.soleWord) {
+		if (envIndices.at(-1) !== origin.index) envIndices.push(origin.index);
+	}
+}
 function buildEnvSplice(
 	words: readonly LaunchWord[],
 	splitText: string,
@@ -499,8 +631,8 @@ function stepEnv(words: readonly LaunchWord[], from: number, splitsRemaining: nu
 type StepResult =
 	| { kind: "advance"; at: number; remote: boolean }
 	| { kind: "spliceEnv"; words: LaunchWord[] }
+	| { kind: "spliceRemote"; words: LaunchWord[] }
 	| { kind: "stop" };
-
 function stepLauncher(
 	words: readonly LaunchWord[],
 	from: number,
@@ -554,8 +686,11 @@ function stepLauncher(
 		case "time":
 			outcome = scanOptions(words, from + 1, TIME_SPEC);
 			if (outcome.kind === "abort") return { kind: "stop" };
-			// Bare `time` is a shell reserved word, so assignments after it precede the command.
+			// Bare `time` is a shell keyword before a pipeline, so `!` and assignments precede the command.
 			if (raw === "time") {
+				while (outcome.at < words.length && (words[outcome.at]!.text === "!" || words[outcome.at]!.text === "{")) {
+					outcome.at++;
+				}
 				while (outcome.at < words.length && isShellEnvironmentAssignment(words[outcome.at]!.text)) {
 					recordEnvOrigin(words[outcome.at]!.origin, envIndices);
 					outcome.at++;
@@ -613,11 +748,25 @@ function stepLauncher(
 			}
 			outcome = scanOptions(words, outcome.at + 1, UV_RUN_SPEC);
 			return outcome.kind === "abort" ? { kind: "stop" } : { kind: "advance", at: outcome.at, remote: false };
-		case "ssh":
+		case "ssh": {
 			outcome = scanOptions(words, from + 1, SSH_SPEC);
-			return outcome.kind === "operand" && outcome.at < words.length
-				? { kind: "advance", at: outcome.at + 1, remote: true }
-				: { kind: "stop" };
+			if (outcome.kind !== "operand" || outcome.at >= words.length) return { kind: "stop" };
+			const host = outcome.at;
+			let cmdStart = host + 1;
+			if (!outcome.afterDoubleDash) {
+				const trailing = scanOptions(words, cmdStart, SSH_SPEC);
+				if (trailing.kind === "abort") return { kind: "stop" };
+				cmdStart = trailing.at;
+			}
+			// Local settings before `ssh` belong to the local `ssh` client, not the remote program.
+			envIndices.length = 0;
+			for (let j = cmdStart; j < words.length; j++) {
+				if (REMOTE_SPLIT_RE.test(words[j]!.text)) {
+					return { kind: "spliceRemote", words: buildSshSplice(words, cmdStart) };
+				}
+			}
+			return { kind: "advance", at: cmdStart, remote: true };
+		}
 		default:
 			return { kind: "stop" };
 	}
@@ -657,12 +806,26 @@ function resolveLaunch(words: string[], windows: boolean): ResolvedLaunch {
 		const step = stepLauncher(cur, at, windows, splitsRemaining, envIndices);
 		if (step.kind === "advance") {
 			at = Math.min(step.at, cur.length);
-			remote ||= step.remote;
+			if (step.remote) {
+				remote = true;
+				while (at < cur.length && isShellEnvironmentAssignment(cur[at]!.text)) {
+					recordEnvOrigin(cur[at]!.origin, envIndices);
+					at++;
+				}
+			}
 		} else if (step.kind === "spliceEnv") {
 			cur = step.words;
 			at = 0;
 			splitsRemaining = Math.max(0, splitsRemaining - 1);
 			inEnv = true;
+		} else if (step.kind === "spliceRemote") {
+			cur = step.words;
+			at = 0;
+			remote = true;
+			while (at < cur.length && isShellEnvironmentAssignment(cur[at]!.text)) {
+				recordEnvOrigin(cur[at]!.origin, envIndices);
+				at++;
+			}
 		} else {
 			break;
 		}
