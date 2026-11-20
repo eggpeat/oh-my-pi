@@ -15,7 +15,8 @@ import * as fs from "node:fs/promises";
 import { ShellFsOp } from "@oh-my-pi/pi-natives";
 import { isCmdShell } from "@oh-my-pi/pi-utils/procmgr";
 import type { InternalUrlFilesystem } from "../internal-urls/url-filesystem";
-import { lexShellCommand } from "./shell-tokenize";
+import { lexShellCommand, type ShellToken } from "./shell-tokenize";
+import { ompCommand } from "./shell-launch";
 
 /** The host path backing `url`, or `undefined` when nothing backs it or it cannot be resolved. */
 export type UrlBacking = (url: string) => Promise<string | undefined>;
@@ -58,12 +59,6 @@ function urlStart(text: string): number | undefined {
 	return URL_ROOT.test(text.slice(at)) ? at : undefined;
 }
 
-/** Whether `word` names the `omp` program, by any path. */
-function isOmp(word: string): boolean {
-	const name = word.slice(Math.max(word.lastIndexOf("/"), word.lastIndexOf("\\")) + 1).toLowerCase();
-	return name === "omp" || name === "omp.exe";
-}
-
 /** `text` as one literal shell word. */
 function quoteWord(text: string, cmd: boolean): string {
 	if (text === "" || WORD_SAFE.test(text)) return text;
@@ -85,18 +80,79 @@ function spellWord(lead: string, host: string, url: string, cmd: boolean, live: 
 	return quoteWord(lead + host.slice(0, host.length - pattern.length), cmd) + spelled;
 }
 
+/** Reserved words that introduce the simple command which follows them. */
+const COMMAND_PREFIX = new Set(["if", "then", "elif", "else", "while", "until", "do", "!", "{", "}"]);
+
+/** Word tokens that belong to omp rather than to a launcher ahead of it. */
+function ompArguments(tokens: ShellToken[]): Set<number> {
+	const literal = new Set<number>();
+	const segment: number[] = [];
+	const words: string[] = [];
+	const finish = () => {
+		const command = ompCommand(words);
+		if (command !== undefined) {
+			for (let i = command + 1; i < segment.length; i++) literal.add(segment[i]!);
+		}
+		segment.length = 0;
+		words.length = 0;
+	};
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i]!;
+		if (token.kind === "word") {
+			if (words.length === 0 && COMMAND_PREFIX.has(token.value)) {
+				finish();
+				continue;
+			}
+			segment.push(i);
+			words.push(token.value);
+		} else if (/[\n;&|()]/.test(token.raw)) finish();
+	}
+	finish();
+	return literal;
+}
+
 /** The end of the `$(` substitution opened just before `start` in `text`: the index of its `)`, or -1. */
 function substitutionEnd(text: string, start: number): number {
 	let depth = 1;
 	let quote = "";
+	let commandStart = true;
+	// A case pattern's `)` does not close the substitution containing the case.
+	const cases: number[] = [];
+	const reserved = /(?:case|esac|if|then|do|else|elif|while|until)\b/y;
 	for (let i = start; i < text.length; i++) {
-		const ch = text[i];
-		if (ch === "\\") i++;
-		else if (quote) {
+		const ch = text[i]!;
+		if (ch === "\\") {
+			commandStart = false;
+			i++;
+		} else if (quote) {
 			if (ch === quote) quote = "";
-		} else if (ch === "'" || ch === '"') quote = ch;
-		else if (ch === "(") depth++;
-		else if (ch === ")" && --depth === 0) return i;
+		} else if (ch === "'" || ch === '"') {
+			quote = ch;
+			commandStart = false;
+		} else if (/[\s;&|]/.test(ch)) {
+			if (ch === "\n" || !/\s/.test(ch)) commandStart = true;
+		} else if (ch === "(") {
+			depth++;
+			commandStart = true;
+		} else if (ch === ")") {
+			if (cases.at(-1) === depth) {
+				commandStart = true;
+				continue;
+			}
+			if (--depth === 0) return i;
+			commandStart = true;
+		} else if (commandStart) {
+			reserved.lastIndex = i;
+			const word = reserved.exec(text)?.[0];
+			if (word) {
+				if (word === "case") cases.push(depth);
+				else if (word === "esac" && cases.at(-1) === depth) cases.pop();
+				commandStart = word !== "case" && word !== "esac";
+				i += word.length - 1;
+			} else {
+				commandStart = false;
+			}
+		}
 	}
 	return -1;
 }
@@ -142,26 +198,17 @@ class HostUrls {
 	async #code(text: string): Promise<string> {
 		if (!text.includes("://")) return text;
 		let out = "";
-		// `omp` resolves the URLs it is given itself (`omp read skill://x:1-20`): once a command
-		// names it ahead of any URL, the rest of that command is its own.
-		let omp = false;
-		let sawUrl = false;
-		for (const token of lexShellCommand(text)) {
-			if (token.kind === "separator") {
-				if (/[\n;&|()]/.test(token.raw)) {
-					omp = false;
-					sawUrl = false;
-				}
+		const tokens = lexShellCommand(text);
+		// omp resolves its own URLs. A launcher's options still belong to the
+		// launcher, so only words after the actual omp command stay literal.
+		const literal = ompArguments(tokens);
+		for (let i = 0; i < tokens.length; i++) {
+			const token = tokens[i]!;
+			if (token.kind === "separator" || !token.value.includes("://") || literal.has(i)) {
 				out += token.raw;
 				continue;
 			}
-			if (!token.value.includes("://")) {
-				omp ||= !sawUrl && isOmp(token.value);
-				out += token.raw;
-				continue;
-			}
-			sawUrl = true;
-			out += omp ? token.raw : await this.#word(token.raw, token.value);
+			out += await this.#word(token.raw, token.value);
 		}
 		return out;
 	}
@@ -226,7 +273,7 @@ class HostUrls {
 /**
  * `command` as `shell` should run it: every word naming a URL that `backing` resolves is rewritten
  * to the host file, attached options, redirections, variable assignments and `$(…)` included.
- * `omp` commands, here-document bodies, message text, and URLs nothing backs stay as written.
+ * `omp`'s own arguments, here-document bodies, message text, and URLs nothing backs stay as written.
  */
 export function hostCommandUrls(command: string, backing: UrlBacking, shell?: string): Promise<string> {
 	return new HostUrls(backing, shell !== undefined && isCmdShell(shell)).command(command);

@@ -48,6 +48,7 @@ mod ids;
 mod image;
 pub mod invocation;
 pub mod ir;
+pub(crate) mod launch;
 mod mem;
 mod mem_store;
 mod packed_names;

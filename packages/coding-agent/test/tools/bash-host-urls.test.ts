@@ -86,6 +86,60 @@ describe("hostCommandUrls", () => {
 		);
 	});
 
+	it("rewrites a URL when an earlier argument, rather than the command, is named omp", async () => {
+		for (const [command, expected] of [
+			["grep omp local://out.txt", "grep omp /host/out.txt"],
+			["rg -n 'omp' local://out.txt", "rg -n 'omp' /host/out.txt"],
+			["ls ./omp local://dir", "ls ./omp /host/dir"],
+		]) {
+			expect(await host(command)).toBe(expected);
+		}
+	});
+
+	it("distinguishes omp from launcher options, settings and their values", async () => {
+		for (const [command, expected] of [
+			["npx --cache omp eslint local://app.ts", "npx --cache omp eslint /host/app.ts"],
+			["npx --loglevel warn omp read local://x:1", "npx --loglevel warn omp read local://x:1"],
+			["npm exec -p omp read local://x:1", "npm exec -p omp read local://x:1"],
+			["env -u FOO -- -flag=/opt/omp grep x local://file", "env -u FOO -- -flag=/opt/omp grep x /host/file"],
+			["env - tool.name=/opt/omp omp read local://x:1", "env - tool.name=/opt/omp omp read local://x:1"],
+			[
+				"bunx --minimum-release-age 86400 omp read local://book:1",
+				"bunx --minimum-release-age 86400 omp read local://book:1",
+			],
+			["bunx --registry omp eslint local://app.ts", "bunx --registry omp eslint /host/app.ts"],
+			["uv run -w requests omp read local://book:1", "uv run -w requests omp read local://book:1"],
+		]) {
+			expect(await host(command)).toBe(expected);
+		}
+	});
+
+	it("preserves omp's arguments behind process launchers but rewrites a launcher's files", async () => {
+		for (const command of [
+			"setsid omp read local://x:1",
+			"xargs -n 2 omp read local://x:1",
+			"ifne -n omp read local://x:1",
+		]) {
+			expect(await host(command)).toBe(command);
+		}
+		expect(await host("setsid grep omp local://x")).toBe("setsid grep omp /host/x");
+		expect(await host("npm --prefix local://tools exec -- omp read local://book:1")).toBe(
+			"npm --prefix /host/tools exec -- omp read local://book:1",
+		);
+	});
+
+	it("resolves commands after case patterns, including inside quoted substitutions", async () => {
+		expect(await host("case x in x) cat local://a;; omp) omp read local://b;; esac")).toBe(
+			"case x in x) cat /host/a;; omp) omp read local://b;; esac",
+		);
+		expect(await host('echo "$(case x in x) cat local://a;; omp) omp read local://b;; esac)"')).toBe(
+			'echo "$(case x in x) cat /host/a;; omp) omp read local://b;; esac)"',
+		);
+		expect(await host("if omp read local://a; then cat local://b; fi")).toBe(
+			"if omp read local://a; then cat /host/b; fi",
+		);
+	});
+
 	it("treats a here-document body as input, not command text", async () => {
 		const command = [
 			"python3 - local://args.json <<'PY' && cat local://after.txt",

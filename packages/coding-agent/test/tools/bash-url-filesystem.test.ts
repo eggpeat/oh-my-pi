@@ -104,6 +104,18 @@ describe("bash internal URLs through the shell filesystem", () => {
 		expect(text.split("\n")).toContain("local://");
 	});
 
+	it("does not mistake an external program's omp argument for the program", async () => {
+		const script = path.join(tempDir, "argv.js");
+		await fs.writeFile(script, "console.log(process.argv.slice(2).join('\\n'));\n");
+		await fs.mkdir(localRoot, { recursive: true });
+		await fs.writeFile(path.join(localRoot, "data.txt"), "payload\n");
+
+		const { text, isError } = await run(`'${process.execPath}' '${script}' omp local://data.txt ./omp`);
+
+		expect(isError).toBeUndefined();
+		expect(text).toBe(`omp\n${path.join(localRoot, "data.txt")}\n./omp\n`);
+	});
+
 	it("runs a skill's script by URL but refuses the read-only skill directory as a working directory", async () => {
 		const skillDir = path.join(tempDir, "skills", "demo");
 		await fs.mkdir(skillDir, { recursive: true });
@@ -153,6 +165,51 @@ describe("bash internal URLs through the shell filesystem", () => {
 		expect(isError).toBeUndefined();
 		expect(text).toContain("read\nlocal://data.txt:1-1\n--from=local://data.txt\n");
 	});
+
+	it.skipIf(process.platform === "win32")(
+		"finds omp behind launchers without hiding the launchers' own URLs",
+		async () => {
+			await fs.mkdir(localRoot, { recursive: true });
+			await fs.writeFile(path.join(localRoot, "data.txt"), "payload\n");
+			await fs.mkdir(path.join(localRoot, "tools"));
+			const printArgs = "#!/bin/sh\nprintf '%s\\n' \"$@\"\n";
+			for (const name of ["grep", "npm", "npx", "bunx", "uv", "setsid"]) {
+				await fs.writeFile(path.join(tempDir, name), printArgs, { mode: 0o755 });
+			}
+			const data = path.join(localRoot, "data.txt");
+			const tools = path.join(localRoot, "tools");
+			const cases: [command: string, expected: string[]][] = [
+				["npx --cache omp eslint local://data.txt", ["--cache", "omp", "eslint", data]],
+				[
+					"npx --loglevel warn omp read local://data.txt:1 --from=local://data.txt",
+					["--loglevel", "warn", "omp", "read", "local://data.txt:1", "--from=local://data.txt"],
+				],
+				[
+					"npm --prefix local://tools exec -- omp read local://data.txt:1 --from=local://data.txt",
+					["--prefix", tools, "exec", "--", "omp", "read", "local://data.txt:1", "--from=local://data.txt"],
+				],
+				[
+					"bunx --minimum-release-age 86400 omp read local://data.txt:1 --from=local://data.txt",
+					["--minimum-release-age", "86400", "omp", "read", "local://data.txt:1", "--from=local://data.txt"],
+				],
+				[
+					"uv run -w requests omp read local://data.txt:1 --from=local://data.txt",
+					["run", "-w", "requests", "omp", "read", "local://data.txt:1", "--from=local://data.txt"],
+				],
+				["setsid grep omp local://data.txt", ["grep", "omp", data]],
+				[
+					"setsid omp read local://data.txt:1 --from=local://data.txt",
+					["omp", "read", "local://data.txt:1", "--from=local://data.txt"],
+				],
+				["/usr/bin/env -u FOO -- -flag=/opt/omp grep x local://data.txt", ["x", data]],
+			];
+			for (const [command, expected] of cases) {
+				const { text, isError } = await run(`PATH="$PWD:$PATH" ${command}`);
+				expect(isError, `${command}: ${text}`).toBeUndefined();
+				expect(text, command).toBe(`${expected.join("\n")}\n`);
+			}
+		},
+	);
 
 	it("resolves URLs attached to an option, behind curl's @, and in the environment", async () => {
 		const script = path.join(tempDir, "argv.js");

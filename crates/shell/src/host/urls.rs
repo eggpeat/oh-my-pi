@@ -28,7 +28,7 @@ use bstr::{BStr, BString, ByteSlice};
 
 use crate::bash::{
 	ChildRedirs, CmdTag, EnvView, Lineage, OsHandle, PgroupSpec, Rlimit, SigSet, SpawnSpec,
-	StdioSpec, Vpid,
+	StdioSpec, Vpid, launch::launch,
 };
 
 /// What a spawn hands the OS in place of the URLs it names; before
@@ -101,20 +101,23 @@ impl Rest {
 /// containing `://`, or an environment value that is one): then it resolves
 /// first, else it spawns as it is.
 pub(super) fn names_url(spec: &SpawnSpec<'_>) -> bool {
+	let omp = omp_command(spec.argv);
 	is_url(spec.path)
 		|| is_url(spec.cwd)
-		|| (!runs_omp(spec.argv)
-			&& (spec.argv.iter().skip(1).any(|arg| arg.contains_str("://"))
-				|| spec.env.iter().any(|(name, value)| env_url(name, value))))
+		|| spec
+			.argv
+			.iter()
+			.enumerate()
+			.skip(1)
+			.any(|(i, arg)| arg.contains_str("://") && omp.map_or(true, |at| i <= at))
+		|| (omp.is_none() && spec.env.iter().any(|(name, value)| env_url(name, value)))
 }
 
-/// Whether `argv` runs `omp`: as the program, or as the command a wrapper
-/// (`nice omp …`, `npx omp …`) is given ahead of any URL.
-fn runs_omp(argv: &[BString]) -> bool {
-	argv
-		.iter()
-		.take_while(|arg| !arg.contains_str("://"))
-		.any(|arg| is_omp(arg))
+/// Index of the `omp` program in `argv`, behind any launchers and their
+/// options. Its arguments stay literal; the launcher's own arguments do not.
+fn omp_command(argv: &[BString]) -> Option<usize> {
+	let launch = launch(argv);
+	(!launch.remote && argv.get(launch.at).is_some_and(|arg| is_omp(arg))).then_some(launch.at)
 }
 
 /// Whether `word` names the `omp` program, by any path.
@@ -238,10 +241,10 @@ pub(super) async fn resolve(fs: &omp_vfs::Fs, names: &Names) -> io::Result<Names
 		},
 		_ => names.path.clone(),
 	};
-	let literal = runs_omp(&names.argv);
+	let omp = omp_command(&names.argv);
 	let mut argv = Vec::with_capacity(names.argv.len());
 	for (i, arg) in names.argv.iter().enumerate() {
-		let host = if i == 0 || literal {
+		let host = if i == 0 || omp.is_some_and(|at| i > at) {
 			None
 		} else {
 			host_arg(fs, arg.as_bstr()).await
@@ -250,7 +253,7 @@ pub(super) async fn resolve(fs: &omp_vfs::Fs, names: &Names) -> io::Result<Names
 	}
 	// What the child's environment says differently from the shell's.
 	let mut hosted: Vec<(BString, BString)> = Vec::new();
-	if !literal {
+	if omp.is_none() {
 		for (name, value) in names.env.iter() {
 			if env_url(name, value)
 				&& let Some(host) = host_arg(fs, value).await
