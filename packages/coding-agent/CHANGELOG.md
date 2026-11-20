@@ -22,6 +22,7 @@
 
 ### Fixed
 
+- Quiet and user-interrupt cancellations whose stream reports a generic abort are no longer retried or shown as generic aborts ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 - Failed browser launches no longer log URL userinfo, query strings (including OAuth device codes), or fragments ([#19844](https://github.com/can1357/oh-my-pi/pull/19844) by [@JustasMasiulis](https://github.com/JustasMasiulis))
 - `read` suggests the line-range syntax for `file:1:2` when `file` exists, directly or by unique suffix, but `file:1` does not ([#19821](https://github.com/can1357/oh-my-pi/pull/19821) by [@baekjosh](https://github.com/baekjosh)).
 - `read` suggests only the line for a `file:line:column` selector such as `file:10:5`, instead of a reversed range it would reject

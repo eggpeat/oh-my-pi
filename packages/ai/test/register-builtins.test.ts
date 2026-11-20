@@ -349,25 +349,73 @@ describe("register-builtins lazy streams", () => {
 		expect(AIError.is(result.errorId, AIError.Flag.SilentAbort)).toBe(true);
 	});
 
-	it("reads the abort reason and its mark from the signal the stream started with", async () => {
-		const replacement = new AbortController();
+	it("reads the abort reason and its mark from the signal captured before load()", async () => {
+		const firstController = new AbortController();
+		const secondController = new AbortController();
+		const thirdController = new AbortController();
 		const other = new Error("Interrupted by user");
 		AIError.attach(other, AIError.create(AIError.Flag.UserInterrupt));
-		replacement.abort(other);
-		const result = await abortForwardedBedrockStream((controller, options) => {
-			// The caller reuses its options object for another request.
-			options.signal = replacement.signal;
-			controller.abort("planner cancelled");
+		thirdController.abort(other);
+
+		const partialMessage = createAssistantMessage("stop");
+		let providerSignal: AbortSignal | undefined;
+		const source = {
+			async *[Symbol.asyncIterator]() {
+				yield { type: "start", partial: partialMessage } as const;
+				const { promise, reject } = Promise.withResolvers<never>();
+				if (providerSignal?.aborted) {
+					reject(new Error("Request was aborted"));
+				}
+				providerSignal?.addEventListener("abort", () => reject(new Error("Request was aborted")), {
+					once: true,
+				});
+				await promise;
+			},
+		} as unknown as AssistantMessageEventStream;
+		setBedrockProviderModule({
+			streamBedrock: (_model, _context, opts) => {
+				providerSignal = opts.signal;
+				return source;
+			},
 		});
-		expect(result.stopReason).toBe("aborted");
-		expect(result.errorMessage).toBe("planner cancelled");
-		expect(result.errorId).toBeUndefined();
+
+		const options: OptionsForApi<"bedrock-converse-stream"> = {
+			signal: firstController.signal,
+			streamFirstEventTimeoutMs: 0,
+			streamIdleTimeoutMs: 60_000,
+		};
+		const stream = streamBedrock(createModel(), baseContext, options);
+		// Reuse options immediately, before the lazy import settles or `start` arrives.
+		options.signal = secondController.signal;
+		try {
+			const firstEvent = await stream[Symbol.asyncIterator]().next();
+			expect(firstEvent.value?.type).toBe("start");
+
+			// Swap again before aborting so a catch-time read of `options.signal` would
+			// pick up `thirdController`'s mark.
+			options.signal = thirdController.signal;
+			let settled = false;
+			const resultPromise = stream.result().then(res => {
+				settled = true;
+				return res;
+			});
+			firstController.abort("planner cancelled");
+			await drainMicrotasksUntil(
+				() => settled,
+				"First stream did not settle when its starting signal aborted after options reuse",
+			);
+			const result = await resultPromise;
+			expect(result.stopReason).toBe("aborted");
+			expect(result.errorMessage).toBe("planner cancelled");
+			expect(result.errorId).toBeUndefined();
+			expect(secondController.signal.aborted).toBe(false);
+		} finally {
+			secondController.abort();
+		}
 	});
 });
 
-async function abortForwardedBedrockStream(
-	abort: (controller: AbortController, options: { signal?: AbortSignal }) => void,
-): Promise<AssistantMessage> {
+async function abortForwardedBedrockStream(abort: (controller: AbortController) => void): Promise<AssistantMessage> {
 	const abortController = new AbortController();
 	const partialMessage = createAssistantMessage("stop");
 	let providerSignal: AbortSignal | undefined;
@@ -399,6 +447,6 @@ async function abortForwardedBedrockStream(
 	const stream = streamBedrock(createModel(), baseContext, options);
 	const firstEvent = await stream[Symbol.asyncIterator]().next();
 	expect(firstEvent.value?.type).toBe("start");
-	abort(abortController, options);
+	abort(abortController);
 	return stream.result();
 }

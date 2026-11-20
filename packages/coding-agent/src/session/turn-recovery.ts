@@ -60,7 +60,9 @@ import {
 	assistantTurnProducedOutput,
 	isEmptyAssistantStop,
 	isEmptyErrorTurn,
+	isSilentAbort,
 	isUserAuthoredMessage,
+	isUserInterruptAbort,
 	operatorTitleText,
 } from "./messages";
 import {
@@ -1575,12 +1577,15 @@ export class TurnRecovery {
 	 * preview) is deliberate and MUST settle the turn instead: routing it through
 	 * retry would orphan `#retryPromise` on a continuation the guard skips
 	 * (hanging the in-flight `prompt()`) or silently undo the guard's intended
-	 * abort. Deliberate user interrupts (`UserInterrupt`) and silent aborts carry
-	 * their own marker, not the generic sentinel, so they never match here.
+	 * abort. Deliberate user interrupts (`UserInterrupt`) and silent aborts are
+	 * excluded first because their structural flags can accompany `"Request was
+	 * aborted"` or `Flag.Abort`.
 	 */
 	isRetryableReasonlessAbort(message: AssistantMessage): boolean {
 		if (
 			(message.stopReason !== "aborted" && message.stopReason !== "error") ||
+			isSilentAbort(message) ||
+			isUserInterruptAbort(message) ||
 			// A `fallback` boundary is bookkeeping, not output: a stream aborted
 			// right after a mid-turn server-side fallback persists `[fallback]`,
 			// which is as replay-safe to retry as an empty turn (`isEmptyErrorTurn`
@@ -1747,6 +1752,7 @@ export class TurnRecovery {
 	 * unexecuted call must be reissued.
 	 */
 	classifyResolvedInterruptedToolTurn(message: AssistantMessage): "reasonless-abort" | "stream-stall" | undefined {
+		if (isSilentAbort(message) || isUserInterruptAbort(message)) return undefined;
 		const id = this.#classifyRetryMessage(message);
 		const genericAbort =
 			message.errorMessage !== undefined && Object.hasOwn(GENERIC_ABORT_MESSAGES, message.errorMessage);

@@ -15,8 +15,12 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, TextContent } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, TextContent, ToolCall } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import * as BedrockProvider from "@oh-my-pi/pi-ai/providers/amazon-bedrock";
+import { setBedrockProviderModule, streamBedrock } from "@oh-my-pi/pi-ai/providers/register-builtins";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -26,6 +30,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SILENT_ABORT_MARKER } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { mockSchedulerWaitWithClock } from "./helpers/mock-scheduler-clock";
 
 function makeAbortedAssistantMessage(text = "partial draft"): AssistantMessage {
 	return {
@@ -95,6 +100,7 @@ describe("AgentSession silent-abort marker stamping", () => {
 		fixtureDir = TempDir.createSync("@pi-silent-abort-fixture-");
 		authStorage = await AuthStorage.create(path.join(fixtureDir.path(), "testauth.db"));
 		authStorage.keys.setRuntime("anthropic", "test-key");
+		authStorage.keys.setRuntime("amazon-bedrock", "test-key");
 		modelRegistry = new ModelRegistry(authStorage);
 	});
 	afterEach(async () => {
@@ -102,6 +108,7 @@ describe("AgentSession silent-abort marker stamping", () => {
 			await fixture.session.dispose();
 			fixture = undefined;
 		}
+		setBedrockProviderModule(BedrockProvider);
 		vi.restoreAllMocks();
 	});
 
@@ -237,5 +244,221 @@ describe("AgentSession silent-abort marker stamping", () => {
 
 		// Flag is consumed.
 		expect(session.isPlanInternalAbortPending).toBe(false);
+	});
+
+	it("does not schedule a retry or clear the mark when an empty stream aborts with a quiet or user-interrupt AbortError", async () => {
+		mockSchedulerWaitWithClock();
+		const bedrockModel = buildModel({
+			id: "mock-bedrock",
+			name: "Mock Bedrock",
+			api: "bedrock-converse-stream",
+			provider: "amazon-bedrock",
+			baseUrl: "https://example.invalid",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 8192,
+			maxTokens: 2048,
+		});
+
+		for (const flag of [AIError.Flag.SilentAbort, AIError.Flag.UserInterrupt] as const) {
+			let calls = 0;
+			const controller = new AbortController();
+			// Cause carries Flag.Abort while name === "AbortError" leaves errorMessage
+			// as "Request was aborted", exercising both the Flag.Abort and generic-text
+			// retry arms in TurnRecovery.
+			const reason = new Error("marked cancel", { cause: new AIError.AbortError() });
+			reason.name = "AbortError";
+			AIError.attach(reason, AIError.create(flag));
+
+			setBedrockProviderModule({
+				streamBedrock: (_model, _context, options) => {
+					const partial: AssistantMessage = {
+						role: "assistant",
+						content: [],
+						api: bedrockModel.api,
+						provider: bedrockModel.provider,
+						model: bedrockModel.id,
+						stopReason: "stop",
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						timestamp: Date.now(),
+					};
+					return {
+						async *[Symbol.asyncIterator]() {
+							yield { type: "start", partial } as const;
+							controller.abort(reason);
+							const { promise, reject } = Promise.withResolvers<never>();
+							if (options.signal?.aborted) reject(new Error("Request was aborted"));
+							options.signal?.addEventListener("abort", () => reject(new Error("Request was aborted")), {
+								once: true,
+							});
+							await promise;
+						},
+					} as unknown as AssistantMessageEventStream;
+				},
+			});
+
+			const agent = new Agent({
+				getApiKey: () => "bedrock-test-key",
+				initialState: {
+					model: bedrockModel,
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+				},
+				streamFn: (_requestedModel, context) => {
+					calls += 1;
+					if (calls > 1) {
+						const unexpected = new AssistantMessageEventStream();
+						const doneMsg: AssistantMessage = {
+							...makeStoppedAssistantMessage("unexpected retry"),
+							api: bedrockModel.api,
+							provider: bedrockModel.provider,
+							model: bedrockModel.id,
+						};
+						queueMicrotask(() => {
+							unexpected.push({ type: "done", reason: "stop", message: doneMsg });
+							unexpected.end(doneMsg);
+						});
+						return unexpected;
+					}
+					return streamBedrock(bedrockModel, context, {
+						signal: controller.signal,
+						streamFirstEventTimeoutMs: 0,
+						streamIdleTimeoutMs: 60_000,
+					});
+				},
+			});
+
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.baseDelayMs": 5,
+				"retry.maxDelayMs": 100,
+			});
+			fixture = {
+				session: new AgentSession({
+					agent,
+					sessionManager: SessionManager.inMemory(),
+					settings,
+					modelRegistry,
+				}),
+			};
+			const retryStarts: AgentSessionEvent[] = [];
+			fixture.session.subscribe(event => {
+				if (event.type === "auto_retry_start") retryStarts.push(event);
+			});
+
+			await fixture.session.prompt("Cancel quietly");
+			await fixture.session.waitForIdle();
+
+			expect(calls).toBe(1);
+			expect(retryStarts).toHaveLength(0);
+			expect(fixture.session.isRetrying).toBe(false);
+			const last = fixture.session.agent.state.messages.findLast(
+				(m): m is AssistantMessage => m.role === "assistant",
+			);
+			expect(last?.stopReason).toBe("aborted");
+			expect(last?.errorMessage).toBe("Request was aborted");
+			expect(AIError.is(last?.errorId, flag)).toBe(true);
+
+			await fixture.session.dispose();
+			fixture = undefined;
+		}
+	});
+
+	it("does not schedule a resolved-tool-turn retry when the aborted turn carries a quiet or user-interrupt mark", async () => {
+		mockSchedulerWaitWithClock();
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+
+		for (const flag of [AIError.Flag.SilentAbort, AIError.Flag.UserInterrupt] as const) {
+			let calls = 0;
+			const toolCall: ToolCall = {
+				type: "toolCall",
+				id: "call_marked_abort",
+				name: "bash",
+				arguments: { command: "pwd" },
+			};
+			const agent = new Agent({
+				getApiKey: () => "anthropic-test-key",
+				initialState: {
+					model,
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+				},
+				streamFn: () => {
+					calls += 1;
+					const stream = new AssistantMessageEventStream();
+					if (calls > 1) {
+						const doneMsg = makeStoppedAssistantMessage("unexpected retry");
+						queueMicrotask(() => {
+							stream.push({ type: "done", reason: "stop", message: doneMsg });
+							stream.end(doneMsg);
+						});
+						return stream;
+					}
+					const partial: AssistantMessage = {
+						...makeAbortedAssistantMessage(),
+						content: [toolCall],
+						stopReason: "toolUse",
+					};
+					const aborted: AssistantMessage = {
+						...partial,
+						stopReason: "aborted",
+						errorMessage: "Request was aborted",
+						errorId: AIError.create(AIError.Flag.Abort, flag),
+					};
+					queueMicrotask(() => {
+						stream.push({ type: "start", partial });
+						stream.push({ type: "toolcall_start", contentIndex: 0, partial });
+						stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial });
+						stream.push({ type: "error", reason: "aborted", error: aborted });
+						stream.end(aborted);
+					});
+					return stream;
+				},
+			});
+
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.baseDelayMs": 5,
+				"retry.maxDelayMs": 100,
+			});
+			fixture = {
+				session: new AgentSession({
+					agent,
+					sessionManager: SessionManager.inMemory(),
+					settings,
+					modelRegistry,
+				}),
+			};
+			const retryStarts: AgentSessionEvent[] = [];
+			fixture.session.subscribe(event => {
+				if (event.type === "auto_retry_start") retryStarts.push(event);
+			});
+
+			await fixture.session.prompt("Run tool then cancel");
+			await fixture.session.waitForIdle();
+
+			expect(calls).toBe(1);
+			expect(retryStarts).toHaveLength(0);
+			expect(fixture.session.isRetrying).toBe(false);
+			const last = fixture.session.agent.state.messages.findLast(
+				(m): m is AssistantMessage => m.role === "assistant",
+			);
+			expect(last?.stopReason).toBe("aborted");
+			expect(AIError.is(last?.errorId, flag)).toBe(true);
+
+			await fixture.session.dispose();
+			fixture = undefined;
+		}
 	});
 });

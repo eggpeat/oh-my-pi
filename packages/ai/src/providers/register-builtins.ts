@@ -99,11 +99,9 @@ function forwardStream<TApi extends Api>(
 	model: Model<TApi>,
 	options: OptionsForApi<TApi>,
 	abortTracker: AbortSourceTracker,
+	callerSignal: AbortSignal | undefined,
 	limits?: StreamLimits,
 ): void {
-	// Captured once, in the same tick the tracker read it: a caller that later
-	// swaps `options.signal` for another request must not change this stream.
-	const callerSignal = options.signal;
 	(async () => {
 		try {
 			const providerHandlesStreamTimeouts = limits?.providerHandlesStreamTimeouts === true;
@@ -243,14 +241,17 @@ function createLazyProviderStream<TModule, TApi extends Api>(
 ): (model: Model<TApi>, context: Context, options: OptionsForApi<TApi>) => EventStreamImpl {
 	return (model, context, options) => {
 		const outer = new EventStreamImpl();
+		// Capture the signal before `load()` yields: reusing `options` right after
+		// `streamXxx()` returns must not move this stream onto the next signal.
 		const streamOptions: OptionsForApi<TApi> = options ?? {};
+		const callerSignal = streamOptions.signal;
 
 		load()
 			.then(mod => {
-				const abortTracker = createAbortSourceTracker(streamOptions.signal);
+				const abortTracker = createAbortSourceTracker(callerSignal);
 				const providerOptions: OptionsForApi<TApi> = { ...streamOptions, signal: abortTracker.requestSignal };
 				const inner = pick(mod)(model, context, providerOptions);
-				forwardStream(outer, inner, model, streamOptions, abortTracker, limits);
+				forwardStream(outer, inner, model, streamOptions, abortTracker, callerSignal, limits);
 			})
 			.catch(error => {
 				const message = createProviderStreamError(model, error);
