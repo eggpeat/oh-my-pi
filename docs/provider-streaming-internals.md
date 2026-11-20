@@ -250,7 +250,7 @@ Observed behavior in current implementation:
 Cancellation is layered:
 
 - AI provider request: `options.signal` is passed into provider client stream call.
-- Provider wrapper: after stream loop, aborted signal forces error path (`"Request was aborted"`).
+- Provider wrapper: after stream loop, aborted signal forces error path (caller's abort reason, or `"Request was aborted"` for a bare `abort()`).
 - Agent loop: checks `signal.aborted` before handling each provider event and can synthesize an aborted assistant message from the latest partial.
 - Session/agent controls: `AgentSession.abort()` -> `agent.abort()` -> shared abort controller cancellation.
 
