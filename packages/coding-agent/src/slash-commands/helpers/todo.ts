@@ -1,4 +1,7 @@
-import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
+import type { Agent } from "@oh-my-pi/pi-agent-core";
+import type { TodoItem, TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
+import type { AgentSession } from "../../session/agent-session";
+import type { SessionManager } from "../../session/session-manager";
 import {
 	applyOpsToPhases,
 	getLatestTodoPhasesFromEntries,
@@ -9,13 +12,23 @@ import {
 import type { ParsedSlashCommand, SlashCommandResult, SlashCommandRuntime } from "../types";
 import { commandConsumed, errorMessage, parseSubcommand, usage } from "./parse";
 
-type TodoMutationVerb = "done" | "drop" | "rm";
+export type TodoMutationVerb = "done" | "drop" | "rm";
 
 interface TodoTaskMatch {
-	task: { content: string; status: string };
+	task: TodoItem;
 	phase: TodoPhase;
 }
 
+export interface TodoCommitHost {
+	session: Pick<AgentSession, "commitTodoPhases">;
+	agent: Pick<Agent, "appendMessage">;
+	sessionManager: Pick<SessionManager, "appendMessage">;
+	onCommit?: (phases: TodoPhase[]) => void;
+}
+
+export type TodoCommandMutationResult =
+	| { ok: true; nextPhases: TodoPhase[]; action: string; status: string; removed?: boolean }
+	| { ok: false; error: string };
 function tokenize(input: string): string[] {
 	const tokens: string[] = [];
 	let current = "";
@@ -89,13 +102,174 @@ function findTaskFuzzy(phases: TodoPhase[], query: string): TodoTaskMatch | unde
 	return undefined;
 }
 
-function currentPhases(runtime: SlashCommandRuntime): TodoPhase[] {
-	const fromEntries = getLatestTodoPhasesFromEntries(runtime.sessionManager.getBranch());
-	return fromEntries.length > 0 ? fromEntries : runtime.session.getTodoPhases();
+export function getLatestSlashTodoPhases(
+	sessionManager: Pick<SessionManager, "getBranch">,
+	session: Pick<AgentSession, "getTodoPhases">,
+): TodoPhase[] {
+	const fromEntries = getLatestTodoPhasesFromEntries(sessionManager.getBranch());
+	return fromEntries.length > 0 ? fromEntries : session.getTodoPhases();
 }
 
-function commitTodos(runtime: SlashCommandRuntime, phases: TodoPhase[]): void {
-	runtime.session.commitTodoPhases(phases);
+function buildTodoSystemReminder(action: string, phases: TodoPhase[], removed = false): string {
+	const md = phases.length === 0 ? "(empty)" : phasesToMarkdown(phases).trimEnd();
+	const lines = ["<system-reminder>", `The user manually modified the todo list (${action}).`];
+	if (removed) {
+		lines.push(
+			phases.length === 0
+				? "The user intentionally cleared the todo list. Do NOT recreate or re-populate it unless the user explicitly asks; continue the current request without a todo list."
+				: "The user intentionally removed the entries no longer shown below. Do NOT re-add them unless the user explicitly asks.",
+		);
+	}
+	lines.push("Current todo list:", "", md, "</system-reminder>");
+	return lines.join("\n");
+}
+
+export function commitTodoEdit(
+	host: TodoCommitHost,
+	nextPhases: TodoPhase[],
+	action: string,
+	opts?: { removed?: boolean },
+): void {
+	// Commit first so HUD visibility binds to the new canonical source.
+	host.session.commitTodoPhases(nextPhases);
+	host.onCommit?.(nextPhases);
+
+	// Inject system reminder so the agent learns about the change next turn.
+	// Removals carry explicit intent so the agent does not rebuild the
+	// cleared/removed items on its next turn (issue #5258).
+	const reminderText = buildTodoSystemReminder(action, nextPhases, opts?.removed ?? false);
+	const message = {
+		role: "developer" as const,
+		content: [{ type: "text" as const, text: reminderText }],
+		attribution: "user" as const,
+		timestamp: Date.now(),
+	};
+	host.agent.appendMessage(message);
+	host.sessionManager.appendMessage(message);
+}
+
+function currentPhases(runtime: SlashCommandRuntime): TodoPhase[] {
+	return getLatestSlashTodoPhases(runtime.sessionManager, runtime.session);
+}
+
+function commitHost(runtime: SlashCommandRuntime): TodoCommitHost {
+	return {
+		session: runtime.session,
+		agent: runtime.session.agent,
+		sessionManager: runtime.sessionManager,
+	};
+}
+
+export function planTodoAppend(current: TodoPhase[], restArgs: string): TodoCommandMutationResult {
+	const tokens = tokenize(restArgs);
+	if (tokens.length === 0) return { ok: false, error: "Usage: /todo append [<phase>] <task...>" };
+
+	const phaseName = tokens.length === 1 ? undefined : tokens[0];
+	const content = tokens.length === 1 ? tokens[0]! : tokens.slice(1).join(" ");
+	const next = current.map(phase => ({ ...phase, tasks: phase.tasks.slice() }));
+	let targetPhase: TodoPhase;
+
+	if (phaseName) {
+		const existing = findPhaseFuzzy(next, phaseName);
+		targetPhase = existing ?? { name: titleCaseWords(phaseName), tasks: [] };
+		if (!existing) next.push(targetPhase);
+	} else if (next.length > 0) {
+		targetPhase = next[next.length - 1]!;
+	} else {
+		targetPhase = { name: "Todos", tasks: [] };
+		next.push(targetPhase);
+	}
+
+	const finalContent = titleCaseSentence(content);
+	targetPhase.tasks.push({ content: finalContent, status: "pending" });
+	return {
+		ok: true,
+		nextPhases: next,
+		action: `/todo append → ${targetPhase.name}`,
+		status: `Appended to ${targetPhase.name}: ${finalContent}`,
+	};
+}
+
+export function planTodoStart(current: TodoPhase[], restArgs: string): TodoCommandMutationResult {
+	const trimmed = restArgs.trim();
+	if (!trimmed) return { ok: false, error: "Usage: /todo start <task>" };
+	const query = tokenize(trimmed).join(" ") || trimmed;
+	const hit = findTaskFuzzy(current, query);
+	if (!hit) return { ok: false, error: `No task matched "${trimmed}". Use /todo to list current tasks.` };
+	const { phases, errors } = applyOpsToPhases(current, [{ op: "start", task: hit.task.content }]);
+	if (errors.length > 0) return { ok: false, error: errors.join("; ") };
+	return {
+		ok: true,
+		nextPhases: phases,
+		action: `/todo start ${hit.task.content}`,
+		status: `Started: ${hit.task.content}`,
+	};
+}
+
+export function planTodoMutation(
+	current: TodoPhase[],
+	verb: TodoMutationVerb,
+	restArgs: string,
+): TodoCommandMutationResult {
+	const trimmed = restArgs.trim();
+	const isRemove = verb === "rm";
+	if (!trimmed) {
+		if (isRemove) {
+			return {
+				ok: true,
+				nextPhases: [],
+				action: "/todo rm (all)",
+				status: "Cleared all todos.",
+				removed: true,
+			};
+		}
+		// no-arg: apply to all. The tool refuses a bare done/drop, so every task is named.
+		const all = current.flatMap(phase => phase.tasks.map(task => task.content));
+		const { phases, errors } =
+			all.length > 0 ? applyOpsToPhases(current, [{ op: verb, task: all }]) : { phases: current, errors: [] };
+		if (errors.length > 0) return { ok: false, error: errors.join("; ") };
+		return {
+			ok: true,
+			nextPhases: phases,
+			action: `/todo ${verb} (all)`,
+			status: verb === "done" ? "Marked all tasks completed." : "Marked all tasks abandoned.",
+		};
+	}
+
+	const taskHit = findTaskFuzzy(current, trimmed);
+	if (taskHit) {
+		const { phases, errors } = applyOpsToPhases(current, [{ op: verb, task: taskHit.task.content }]);
+		if (errors.length > 0) return { ok: false, error: errors.join("; ") };
+		const label = verb === "done" ? "Marked completed" : verb === "drop" ? "Marked abandoned" : "Removed";
+		return {
+			ok: true,
+			nextPhases: phases,
+			action: `/todo ${verb} ${taskHit.task.content}`,
+			status: `${label}: ${taskHit.task.content}`,
+			removed: isRemove,
+		};
+	}
+
+	const phaseHit = findPhaseFuzzy(current, trimmed);
+	if (phaseHit) {
+		const { phases, errors } = applyOpsToPhases(current, [{ op: verb, phase: phaseHit.name }]);
+		if (errors.length > 0) return { ok: false, error: errors.join("; ") };
+		const status =
+			verb === "done"
+				? `Marked phase ${phaseHit.name} completed.`
+				: verb === "drop"
+					? `Marked phase ${phaseHit.name} abandoned.`
+					: `Removed phase: ${phaseHit.name}`;
+		return {
+			ok: true,
+			nextPhases: phases,
+			action: `/todo ${verb} ${phaseHit.name}`,
+			status,
+			removed: isRemove,
+		};
+	}
+
+	return { ok: false, error: `No task or phase matched "${trimmed}".` };
 }
 
 const TODO_HELP_TEXT = [
@@ -149,50 +323,28 @@ async function handleTodoImportCommand(restArgs: string, runtime: SlashCommandRu
 	}
 	const { phases, errors } = markdownToPhases(content);
 	if (errors.length > 0) return usage(`Could not parse ${target}:\n  ${errors.join("\n  ")}`, runtime);
-	commitTodos(runtime, phases);
+	commitTodoEdit(commitHost(runtime), phases, `/todo import ${target}`);
 	const taskCount = phases.reduce((sum, phase) => sum + phase.tasks.length, 0);
 	await runtime.output(`Imported ${phases.length} phase(s), ${taskCount} task(s) from ${target}.`);
 	return commandConsumed();
 }
 
-async function handleTodoAppendCommand(restArgs: string, runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
-	const tokens = tokenize(restArgs);
-	if (tokens.length === 0) return usage("Usage: /todo append [<phase>] <task...>", runtime);
-
-	const current = currentPhases(runtime);
-	const phaseName = tokens.length === 1 ? undefined : tokens[0];
-	const content = tokens.length === 1 ? tokens[0]! : tokens.slice(1).join(" ");
-	const next = current.map(phase => ({ ...phase, tasks: phase.tasks.slice() }));
-	let targetPhase: TodoPhase;
-
-	if (phaseName) {
-		const existing = findPhaseFuzzy(next, phaseName);
-		targetPhase = existing ?? { name: titleCaseWords(phaseName), tasks: [] };
-		if (!existing) next.push(targetPhase);
-	} else if (next.length > 0) {
-		targetPhase = next[next.length - 1]!;
-	} else {
-		targetPhase = { name: "Todos", tasks: [] };
-		next.push(targetPhase);
-	}
-
-	const finalContent = titleCaseSentence(content);
-	targetPhase.tasks.push({ content: finalContent, status: "pending" });
-	commitTodos(runtime, next);
-	await runtime.output(`Appended to ${targetPhase.name}: ${finalContent}`);
+async function applyPlannedMutation(
+	result: TodoCommandMutationResult,
+	runtime: SlashCommandRuntime,
+): Promise<SlashCommandResult> {
+	if (!result.ok) return usage(result.error, runtime);
+	commitTodoEdit(commitHost(runtime), result.nextPhases, result.action, { removed: result.removed });
+	await runtime.output(result.status);
 	return commandConsumed();
 }
 
+async function handleTodoAppendCommand(restArgs: string, runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
+	return await applyPlannedMutation(planTodoAppend(currentPhases(runtime), restArgs), runtime);
+}
+
 async function handleTodoStartCommand(restArgs: string, runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
-	if (!restArgs) return usage("Usage: /todo start <task>", runtime);
-	const current = currentPhases(runtime);
-	const query = tokenize(restArgs).join(" ") || restArgs;
-	const hit = findTaskFuzzy(current, query);
-	if (!hit) return usage(`No task matched "${restArgs}". Use /todo to list current tasks.`, runtime);
-	const { phases } = applyOpsToPhases(current, [{ op: "start", task: hit.task.content }]);
-	commitTodos(runtime, phases);
-	await runtime.output(`Started: ${hit.task.content}`);
-	return commandConsumed();
+	return await applyPlannedMutation(planTodoStart(currentPhases(runtime), restArgs), runtime);
 }
 
 async function handleTodoMutationCommand(
@@ -200,44 +352,7 @@ async function handleTodoMutationCommand(
 	restArgs: string,
 	runtime: SlashCommandRuntime,
 ): Promise<SlashCommandResult> {
-	const current = currentPhases(runtime);
-	const trimmedArg = restArgs.trim();
-	if (!trimmedArg) {
-		if (verb === "rm") {
-			commitTodos(runtime, []);
-			await runtime.output("Cleared all todos.");
-			return commandConsumed();
-		}
-		const { phases } = applyOpsToPhases(current, [{ op: verb }]);
-		commitTodos(runtime, phases);
-		await runtime.output(verb === "done" ? "Marked all tasks completed." : "Marked all tasks abandoned.");
-		return commandConsumed();
-	}
-
-	const taskHit = findTaskFuzzy(current, trimmedArg);
-	if (taskHit) {
-		const { phases } = applyOpsToPhases(current, [{ op: verb, task: taskHit.task.content }]);
-		commitTodos(runtime, phases);
-		const label = verb === "done" ? "Marked completed" : verb === "drop" ? "Marked abandoned" : "Removed";
-		await runtime.output(`${label}: ${taskHit.task.content}`);
-		return commandConsumed();
-	}
-
-	const phaseHit = findPhaseFuzzy(current, trimmedArg);
-	if (phaseHit) {
-		const { phases } = applyOpsToPhases(current, [{ op: verb, phase: phaseHit.name }]);
-		commitTodos(runtime, phases);
-		const message =
-			verb === "done"
-				? `Marked phase ${phaseHit.name} completed.`
-				: verb === "drop"
-					? `Marked phase ${phaseHit.name} abandoned.`
-					: `Removed phase: ${phaseHit.name}`;
-		await runtime.output(message);
-		return commandConsumed();
-	}
-
-	return usage(`No task or phase matched "${trimmedArg}".`, runtime);
+	return await applyPlannedMutation(planTodoMutation(currentPhases(runtime), verb, restArgs), runtime);
 }
 
 /** ACP/text-mode `/todo` handler. Shared by both dispatchers via the spec. */

@@ -52,6 +52,10 @@ interface FakeAcpBuiltinSession {
 	dumpSessionArchiveToTmpDir: () => Promise<SessionDumpArchive | undefined>;
 	getLastAssistantText: () => string | undefined;
 	messages: unknown[];
+	agent: {
+		_appendedMessages: unknown[];
+		appendMessage(message: unknown): void;
+	};
 	settings: Settings;
 	model: { provider: string; id: string } | undefined;
 	newSession(opts?: { drop?: boolean; parentSession?: string }): Promise<boolean>;
@@ -177,6 +181,12 @@ function createRuntime() {
 		dumpSessionArchiveToTmpDir: async () => undefined,
 		getLastAssistantText: () => undefined,
 		messages: [],
+		agent: {
+			_appendedMessages: [],
+			appendMessage(message: unknown) {
+				this._appendedMessages.push(message);
+			},
+		},
 		model: undefined,
 		settings,
 		getToolByName: (_name: string) => undefined,
@@ -197,6 +207,7 @@ function createRuntime() {
 		_cwd: "/tmp/project",
 		_entries: [] as { type: string }[],
 		_customEntries: [] as Array<{ customType: string; data: unknown }>,
+		_appendedMessages: [] as unknown[],
 		_movedTo: undefined as string | undefined,
 		_flushed: false,
 		_droppedSessions: [] as string[],
@@ -216,6 +227,10 @@ function createRuntime() {
 		appendCustomEntry(customType: string, data?: unknown): string {
 			this._customEntries.push({ customType, data });
 			return "fake-entry-id";
+		},
+		appendMessage(message: unknown): string {
+			this._appendedMessages.push(message);
+			return "fake-message-id";
 		},
 		async flush() {
 			this._flushed = true;
