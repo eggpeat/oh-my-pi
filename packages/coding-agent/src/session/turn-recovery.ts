@@ -131,20 +131,12 @@ const HTTP2_STREAM_RESET_ERROR_RE =
 const PREMATURE_STREAM_CLOSE_ERROR_RE =
 	/(?:stream closed before a (?:finish_reason|terminal response event)|Codex stream ended before terminal completion event|Cursor stream ended before turnEnded)/i;
 
-/**
- * Bare abort sentinels with no provider reason: our own `"Request was aborted"`
- * plus Node/Bun `AbortError`s (`"The operation was aborted"`) surfaced by
- * transports when an internal (non-caller) abort fires.
- */
-const GENERIC_ABORT_MESSAGES: Record<string, true> = {
-	"Request was aborted": true,
-	"Request was aborted.": true,
-	"The operation was aborted": true,
-	"The operation was aborted.": true,
-};
-
 function hasNonWhitespace(value: string): boolean {
 	return NON_WHITESPACE_RE.test(value);
+}
+
+function isMissingOrGenericAbortMessage(errorMessage: string | undefined): boolean {
+	return errorMessage === undefined || !hasNonWhitespace(errorMessage) || AIError.isGenericAbortMessage(errorMessage);
 }
 
 /**
@@ -1597,8 +1589,14 @@ export class TurnRecovery {
 			return false;
 		}
 		const id = this.#classifyRetryMessage(message);
-		if (message.stopReason === "aborted" && AIError.is(id, AIError.Flag.Abort)) return true;
-		if (message.errorMessage === undefined || !Object.hasOwn(GENERIC_ABORT_MESSAGES, message.errorMessage)) {
+		if (
+			message.stopReason === "aborted" &&
+			AIError.is(id, AIError.Flag.Abort) &&
+			isMissingOrGenericAbortMessage(message.errorMessage)
+		) {
+			return true;
+		}
+		if (!AIError.isGenericAbortMessage(message.errorMessage)) {
 			return false;
 		}
 
@@ -1751,8 +1749,7 @@ export class TurnRecovery {
 	 */
 	classifyResolvedInterruptedToolTurn(message: AssistantMessage): "reasonless-abort" | "stream-stall" | undefined {
 		const id = this.#classifyRetryMessage(message);
-		const genericAbort =
-			message.errorMessage !== undefined && Object.hasOwn(GENERIC_ABORT_MESSAGES, message.errorMessage);
+		const genericAbort = AIError.isGenericAbortMessage(message.errorMessage);
 		const reasonlessAbort =
 			(message.stopReason === "aborted" || message.stopReason === "error") &&
 			!this.#host.abortInProgress() &&
@@ -1760,7 +1757,10 @@ export class TurnRecovery {
 			!this.#host.streamingEditAbortTriggered() &&
 			!isUserInterruptAbort(message) &&
 			!isSilentAbort(message) &&
-			((message.stopReason === "aborted" && AIError.is(id, AIError.Flag.Abort)) || genericAbort);
+			((message.stopReason === "aborted" &&
+				AIError.is(id, AIError.Flag.Abort) &&
+				isMissingOrGenericAbortMessage(message.errorMessage)) ||
+				genericAbort);
 		if (!reasonlessAbort && !this.#isMidStreamTransportFailure(message, id)) return undefined;
 		if (reasonlessAbort && genericAbort) message.errorId = AIError.create(AIError.Flag.Abort);
 
@@ -2801,10 +2801,7 @@ export class TurnRecovery {
 		const generation = this.#host.promptGeneration();
 		if (this.#retryAttempt === 0) this.#genericAbortStreak = 0;
 		this.#retryAttempt++;
-		this.#genericAbortStreak =
-			message.errorMessage !== undefined && Object.hasOwn(GENERIC_ABORT_MESSAGES, message.errorMessage)
-				? this.#genericAbortStreak + 1
-				: 0;
+		this.#genericAbortStreak = AIError.isGenericAbortMessage(message.errorMessage) ? this.#genericAbortStreak + 1 : 0;
 
 		// Create retry promise on first attempt so waitForRetry() can await it
 		// Ensure only one promise exists (avoid orphaned promises from concurrent calls)

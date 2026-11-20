@@ -99,6 +99,7 @@ function forwardStream<TApi extends Api>(
 	model: Model<TApi>,
 	options: OptionsForApi<TApi>,
 	abortTracker: AbortSourceTracker,
+	callerSignal: AbortSignal | undefined,
 	limits?: StreamLimits,
 ): void {
 	(async () => {
@@ -141,7 +142,7 @@ function forwardStream<TApi extends Api>(
 				onIdle: () => abortTracker.abortLocally(new AIError.StreamTimeoutError(STREAM_IDLE_TIMEOUT_ERROR)),
 				onFirstItemTimeout: () =>
 					abortTracker.abortLocally(new AIError.StreamTimeoutError(STREAM_FIRST_EVENT_TIMEOUT_ERROR)),
-				abortSignal: options.signal,
+				abortSignal: callerSignal,
 				// The synthetic `start` event is yielded immediately by every provider before
 				// the upstream model has emitted any tokens. Treating it as the first "real"
 				// item would flip the watchdog from `firstItemTimeoutMs` to the much shorter
@@ -161,7 +162,7 @@ function forwardStream<TApi extends Api>(
 			}
 		} catch (error) {
 			const stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-			const message = createProviderStreamError(model, error, stopReason, abortTracker, options.signal?.reason);
+			const message = createProviderStreamError(model, error, stopReason, abortTracker, callerSignal);
 			target.push({ type: "error", reason: stopReason, error: message });
 			target.end(message);
 		}
@@ -173,19 +174,11 @@ function createProviderStreamError<TApi extends Api>(
 	error: unknown,
 	stopReason: Extract<AssistantMessage["stopReason"], "aborted" | "error"> = "error",
 	abortTracker?: AbortSourceTracker,
-	callerSignalReason?: unknown,
+	callerSignal?: AbortSignal,
 ): AssistantMessage {
 	const callerAbortReason = stopReason === "aborted" ? abortTracker?.getCallerAbortReason() : undefined;
-	// Keep caller-supplied classification (e.g. UserInterrupt, SilentAbort, AbortError)
-	// while shielding caller aborts from racing local timeout/transport errors.
-	const classificationTarget =
-		stopReason === "aborted"
-			? callerSignalReason instanceof Error
-				? callerSignalReason
-				: error instanceof AIError.AbortError
-					? error
-					: callerSignalReason
-			: error;
+	// Classify the caller's own abort reason rather than a competing provider or watchdog error.
+	const classificationTarget = stopReason === "aborted" ? callerSignal?.reason : error;
 	return {
 		role: "assistant",
 		content: [],
@@ -230,24 +223,20 @@ function createLazyProviderStream<TModule, TApi extends Api>(
 ): (model: Model<TApi>, context: Context, options: OptionsForApi<TApi>) => EventStreamImpl {
 	return (model, context, options) => {
 		const outer = new EventStreamImpl();
-		const streamOptions: OptionsForApi<TApi> = options ?? {};
-		const abortTracker = createAbortSourceTracker(streamOptions.signal);
+		const rawOptions: OptionsForApi<TApi> = options ?? {};
+		const callerSignal = rawOptions.signal;
+		const streamOptions: OptionsForApi<TApi> = { ...rawOptions, signal: callerSignal };
+		const abortTracker = createAbortSourceTracker(callerSignal);
 		const providerOptions: OptionsForApi<TApi> = { ...streamOptions, signal: abortTracker.requestSignal };
 
 		load()
 			.then(mod => {
 				const inner = pick(mod)(model, context, providerOptions);
-				forwardStream(outer, inner, model, streamOptions, abortTracker, limits);
+				forwardStream(outer, inner, model, streamOptions, abortTracker, callerSignal, limits);
 			})
 			.catch(error => {
 				const stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-				const message = createProviderStreamError(
-					model,
-					error,
-					stopReason,
-					abortTracker,
-					streamOptions.signal?.reason,
-				);
+				const message = createProviderStreamError(model, error, stopReason, abortTracker, callerSignal);
 				outer.push({ type: "error", reason: stopReason, error: message });
 				outer.end(message);
 			});

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { createAbortSourceTracker } from "@oh-my-pi/pi-ai/utils/abort";
 
 /**
@@ -32,6 +33,16 @@ describe("createAbortSourceTracker", () => {
 		tracker.abortLocally(new Error("idle timeout"));
 		caller.abort("Interrupted by user");
 		expect(tracker.getCallerAbortReason()).toBe("Interrupted by user");
+
+		const explicitAbortError = new AbortController();
+		const explicitTracker = createAbortSourceTracker(explicitAbortError.signal);
+		explicitAbortError.abort(new AIError.AbortError("Stopped by operator"));
+		expect(explicitTracker.getCallerAbortReason()).toBe("Stopped by operator");
+
+		const defaultAbortError = new AbortController();
+		const defaultTracker = createAbortSourceTracker(defaultAbortError.signal);
+		defaultAbortError.abort(new AIError.AbortError());
+		expect(defaultTracker.getCallerAbortReason()).toBeUndefined();
 
 		const bare = new AbortController();
 		const untold = createAbortSourceTracker(bare.signal);

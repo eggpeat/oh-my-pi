@@ -17,14 +17,39 @@ export class AbortError extends Error {
 	}
 }
 
+const GENERIC_ABORT_MESSAGES = new Set([
+	"Request was aborted",
+	"Request was aborted.",
+	"The operation was aborted",
+	"The operation was aborted.",
+	"This operation was aborted",
+	"This operation was aborted.",
+]);
+
 /**
- * The text a caller gave `AbortController.abort(reason)`, a string or an `Error` other than an abort, such as the coding
- * agent's user-interrupt label; `undefined` for a bare `abort()`, whose reason is the default `AbortError`.
+ * Whether an error message is one of the default runtime or transport abort
+ * sentinels emitted when `AbortController.abort()` is called without a custom reason.
+ */
+export function isGenericAbortMessage(message: string | undefined): boolean {
+	return message !== undefined && GENERIC_ABORT_MESSAGES.has(message.trim());
+}
+
+/**
+ * The explicit text a caller gave `AbortController.abort(reason)`; `undefined`
+ * for a bare `abort()` or an `AbortError` carrying only a default abort sentinel.
  */
 export function callerAbortReason(signal: AbortSignal | undefined): string | undefined {
 	const reason = signal?.reason;
-	if (typeof reason === "string" && reason.trim().length > 0) return reason;
-	if (reason instanceof Error && reason.name !== "AbortError" && reason.message.trim().length > 0)
+	if (typeof reason === "string") {
+		return reason.trim().length > 0 ? reason : undefined;
+	}
+	if (typeof reason === "object" && reason !== null && "message" in reason && typeof reason.message === "string") {
+		const trimmed = reason.message.trim();
+		if (trimmed.length === 0) return undefined;
+		if ("name" in reason && reason.name === "AbortError" && isGenericAbortMessage(trimmed)) {
+			return undefined;
+		}
 		return reason.message;
+	}
 	return undefined;
 }

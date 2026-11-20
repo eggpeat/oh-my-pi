@@ -1621,28 +1621,43 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 			expect(new TurnRecovery(createHost(model, modelRegistry)).isRetryableReasonlessAbort(withOutput)).toBe(false);
 		});
 
-		it("never retries user-interrupt or silent aborts even when Flag.Abort is attached", () => {
+		it("only retries Flag.Abort turns when the reason is missing or generic", () => {
 			const recovery = new TurnRecovery(createHost(model, modelRegistry));
+
+			const missingReasonWithAbortFlag = abortedTurn([]);
+			missingReasonWithAbortFlag.errorMessage = undefined;
+			missingReasonWithAbortFlag.errorId = AIError.create(AIError.Flag.Abort);
+			expect(recovery.isRetryableReasonlessAbort(missingReasonWithAbortFlag)).toBe(true);
+
+			const genericReasonWithAbortFlag = abortedTurn([]);
+			genericReasonWithAbortFlag.errorMessage = "Request was aborted";
+			genericReasonWithAbortFlag.errorId = AIError.create(AIError.Flag.Abort);
+			expect(recovery.isRetryableReasonlessAbort(genericReasonWithAbortFlag)).toBe(true);
+
+			const namedPolicyWithAbortFlag = abortedTurn([]);
+			namedPolicyWithAbortFlag.errorMessage = "Stopped by policy";
+			namedPolicyWithAbortFlag.errorId = AIError.create(AIError.Flag.Abort);
+			expect(recovery.isRetryableReasonlessAbort(namedPolicyWithAbortFlag)).toBe(false);
 
 			const userInterruptWithAbortFlag = abortedTurn([]);
 			userInterruptWithAbortFlag.errorMessage = USER_INTERRUPT_LABEL;
 			userInterruptWithAbortFlag.errorId = AIError.create(AIError.Flag.Abort);
 			expect(recovery.isRetryableReasonlessAbort(userInterruptWithAbortFlag)).toBe(false);
 
-			const userInterruptWithBothFlags = abortedTurn([]);
-			userInterruptWithBothFlags.errorMessage = "Custom cancel";
-			userInterruptWithBothFlags.errorId = AIError.create(AIError.Flag.Abort, AIError.Flag.UserInterrupt);
-			expect(recovery.isRetryableReasonlessAbort(userInterruptWithBothFlags)).toBe(false);
+			const userInterruptBareText = abortedTurn([]);
+			userInterruptBareText.errorMessage = "Request was aborted";
+			userInterruptBareText.errorId = AIError.create(AIError.Flag.Abort, AIError.Flag.UserInterrupt);
+			expect(recovery.isRetryableReasonlessAbort(userInterruptBareText)).toBe(false);
 
 			const silentWithAbortFlag = abortedTurn([]);
 			silentWithAbortFlag.errorMessage = SILENT_ABORT_MARKER;
 			silentWithAbortFlag.errorId = AIError.create(AIError.Flag.Abort);
 			expect(recovery.isRetryableReasonlessAbort(silentWithAbortFlag)).toBe(false);
 
-			const silentWithBothFlags = abortedTurn([]);
-			silentWithBothFlags.errorMessage = "TTSR rule";
-			silentWithBothFlags.errorId = AIError.create(AIError.Flag.Abort, AIError.Flag.SilentAbort);
-			expect(recovery.isRetryableReasonlessAbort(silentWithBothFlags)).toBe(false);
+			const silentBareText = abortedTurn([]);
+			silentBareText.errorMessage = "Request was aborted";
+			silentBareText.errorId = AIError.create(AIError.Flag.Abort, AIError.Flag.SilentAbort);
+			expect(recovery.isRetryableReasonlessAbort(silentBareText)).toBe(false);
 
 			const resolvedCall: AssistantMessage["content"][number] = {
 				type: "toolCall",
@@ -1658,6 +1673,25 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 				isError: false,
 				timestamp: Date.now(),
 			};
+
+			const missingReasonToolTurn = abortedTurn([resolvedCall]);
+			missingReasonToolTurn.errorMessage = undefined;
+			missingReasonToolTurn.errorId = AIError.create(AIError.Flag.Abort);
+			const missingToolRecovery = new TurnRecovery(
+				createHost(model, modelRegistry, { messages: [missingReasonToolTurn as AgentMessage, toolResult] }),
+			);
+			expect(missingToolRecovery.classifyResolvedInterruptedToolTurn(missingReasonToolTurn)).toBe(
+				"reasonless-abort",
+			);
+
+			const policyToolTurn = abortedTurn([resolvedCall]);
+			policyToolTurn.errorMessage = "Stopped by policy";
+			policyToolTurn.errorId = AIError.create(AIError.Flag.Abort);
+			const policyToolRecovery = new TurnRecovery(
+				createHost(model, modelRegistry, { messages: [policyToolTurn as AgentMessage, toolResult] }),
+			);
+			expect(policyToolRecovery.classifyResolvedInterruptedToolTurn(policyToolTurn)).toBeUndefined();
+
 			const interruptedToolTurn = abortedTurn([resolvedCall]);
 			interruptedToolTurn.errorMessage = USER_INTERRUPT_LABEL;
 			interruptedToolTurn.errorId = AIError.create(AIError.Flag.Abort);
@@ -1667,8 +1701,8 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 			expect(toolRecovery.classifyResolvedInterruptedToolTurn(interruptedToolTurn)).toBeUndefined();
 
 			const silentToolTurn = abortedTurn([resolvedCall]);
-			silentToolTurn.errorMessage = SILENT_ABORT_MARKER;
-			silentToolTurn.errorId = AIError.create(AIError.Flag.Abort);
+			silentToolTurn.errorMessage = undefined;
+			silentToolTurn.errorId = AIError.create(AIError.Flag.Abort, AIError.Flag.SilentAbort);
 			const silentToolRecovery = new TurnRecovery(
 				createHost(model, modelRegistry, { messages: [silentToolTurn as AgentMessage, toolResult] }),
 			);

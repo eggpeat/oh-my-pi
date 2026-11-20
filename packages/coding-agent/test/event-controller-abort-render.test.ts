@@ -163,6 +163,41 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		expect(arg.stopReason).toBe("aborted");
 	});
 
+	it("C2c: custom abort reason carrying Flag.Abort renders its specific label instead of 'Operation aborted'", async () => {
+		const message = makeAssistantMessage({
+			content: [],
+			stopReason: "aborted",
+			errorMessage: "Stopped by policy",
+			errorId: AIError.create(AIError.Flag.Abort),
+		});
+		const { controller, updateContent } = createFixture({
+			streamingMessage: message,
+			isTtsrAbortPending: false,
+		});
+
+		await controller.handleEvent({ type: "message_end", message });
+
+		expect(message.errorMessage).toBe("Stopped by policy");
+		expect(updateContent).toHaveBeenCalledTimes(1);
+		expect(resolveAssistantErrorPresentation(message)).toEqual({
+			kind: "full",
+			text: "Stopped by policy",
+			isError: true,
+		});
+		const rendered = Bun.stripANSI(new AssistantMessageComponent(message).render(120).join("\n"));
+		expect(rendered).toContain("Stopped by policy");
+		expect(rendered).not.toContain("Operation aborted");
+
+		const genericFlagged = makeAssistantMessage({
+			content: [],
+			stopReason: "aborted",
+			errorMessage: "Request was aborted.",
+			errorId: AIError.create(AIError.Flag.Abort),
+		});
+		const genericRendered = Bun.stripANSI(new AssistantMessageComponent(genericFlagged).render(120).join("\n"));
+		expect(genericRendered).toContain("Operation aborted");
+	});
+
 	it("C3: a TTSR abort (SilentAbort flag + rule reason) is suppressed live and on rebuild", async () => {
 		// AgentSession stamps the SilentAbort flag on TTSR aborts while keeping the
 		// rule reason text on the message. The controller must downgrade the display

@@ -125,11 +125,8 @@ export function resolveAbortLabel(
 	message: Pick<AssistantMessage, "errorId" | "errorMessage">,
 	retryAttempt = 0,
 ): string {
-	const genericAbort =
-		AIError.is(message.errorId, AIError.Flag.Abort) ||
-		!message.errorMessage ||
-		message.errorMessage === GENERIC_ABORT_SENTINEL ||
-		isSilentAbort(message);
+	const trimmed = message.errorMessage?.trim();
+	const genericAbort = !trimmed || AIError.isGenericAbortMessage(trimmed) || isSilentAbort(message);
 	if (!genericAbort) {
 		return message.errorMessage!;
 	}
