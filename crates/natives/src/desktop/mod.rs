@@ -445,6 +445,24 @@ impl Request {
 		)
 	}
 
+	/// Requests that send pointer or keyboard input, which a desktop with no
+	/// input route refuses ([`Backend::refuse_input`]). An element click is one:
+	/// it clicks at the element's bounds.
+	const fn is_raw_input(&self) -> bool {
+		matches!(
+			self,
+			Self::Click { .. }
+				| Self::MoveMouse { .. }
+				| Self::Drag { .. }
+				| Self::Scroll { .. }
+				| Self::TypeText { .. }
+				| Self::KeyChord { .. }
+				| Self::AxClick { .. }
+				| Self::HoldKeys { .. }
+				| Self::HoldMouse { .. }
+		)
+	}
+
 	/// Whether this mutation takes over the user's own input or foreground,
 	/// which arms the physical-Escape stop: `takeover: true` delivery, input
 	/// to a desktop or display target (it drives the user's real pointer and
@@ -803,6 +821,28 @@ impl Worker {
 		}
 	}
 
+	/// Whether `request` is an element action on an element whose input may
+	/// not show yet (letters typed on a macOS popup, [`AxBackend::pending`]),
+	/// which it waits for before taking the input lease. Keys and typing never
+	/// wait: further letters join the same search.
+	fn awaits_late_input(&mut self, request: &Request) -> bool {
+		if !request.is_mutation() || matches!(request, Request::AxInput { .. }) {
+			return false;
+		}
+		let Some(handle) = request
+			.reference()
+			.and_then(|reference| self.registry.resolve(reference).ok())
+		else {
+			return false;
+		};
+		self
+			.backend
+			.as_mut()
+			.ok()
+			.and_then(|backend| backend.ax())
+			.is_some_and(|ax| ax.pending(&handle))
+	}
+
 	fn backend(&mut self) -> CoreResult<&mut Box<dyn Backend>> {
 		self.backend.as_mut().map_err(|error| error.clone())
 	}
@@ -878,13 +918,31 @@ impl Worker {
 		Ok((x, y, frame))
 	}
 
+	fn minimized_root(&mut self, id: &str) -> CoreResult<Option<ax::WindowRoot>> {
+		let retained = self.registry.retained_root(id);
+		self
+			.backend
+			.as_mut()
+			.map_err(|error| error.clone())?
+			.minimized_root(id, retained)
+	}
+
 	fn explicit_window(&mut self, target: &Target) -> CoreResult<DesktopWindow> {
-		if !matches!(target, Target::Window(_)) {
+		let Target::Window(id) = target else {
 			return Err(DesktopError::invalid_target(
 				"this operation requires an explicit window target",
 			));
+		};
+		match self.window(target) {
+			Err(error) if error.code == ErrorCode::WindowNotFound => {
+				if self.minimized_root(id)?.is_some() {
+					Err(menus::minimized_window(id))
+				} else {
+					Err(error)
+				}
+			},
+			result => result,
 		}
-		self.window(target)
 	}
 
 	fn validate_keyboard_target(&mut self, target: &Target) -> CoreResult<()> {
@@ -914,15 +972,34 @@ impl Worker {
 		Ok(())
 	}
 
+	fn read_root(&mut self, target: &Target) -> CoreResult<ax::WindowRoot> {
+		match self.window(target) {
+			Ok(window) => ax::WindowRoot::listed(self.ax()?, window),
+			Err(error) => {
+				if error.code == ErrorCode::WindowNotFound
+					&& let Target::Window(id) = target
+					&& let Some(root) = self.minimized_root(id)?
+				{
+					Ok(root)
+				} else {
+					Err(error)
+				}
+			},
+		}
+	}
+
 	fn snapshot(&mut self, target: &Target, options: &AxSnapshotOptions) -> CoreResult<AxSnapshot> {
-		let window = self.window(target)?;
+		let window = self.read_root(target)?;
+		let covered_before = self.backend()?.window_covered(&window.id);
 		let (backend, registry) = (&mut self.backend, &mut self.registry);
 		let ax = backend
 			.as_mut()
 			.map_err(|error| error.clone())?
 			.ax()
 			.ok_or_else(DesktopError::ax_unsupported)?;
-		ax::snapshot(ax, registry, &window, options)
+		let mut snapshot = ax::snapshot(ax, registry, &window, options)?;
+		snapshot.covered = covered_before || self.backend()?.window_covered(&window.id);
+		Ok(snapshot)
 	}
 
 	fn capture_full(
@@ -933,13 +1010,16 @@ impl Worker {
 	) -> CoreResult<DesktopCapture> {
 		let selector = target.display_selector();
 		let mut attempt = 1;
-		let (image, geometry, displays, screen_locked, source_width, source_height) = loop {
+		let (image, geometry, displays, screen_locked, covered, source_width, source_height) = loop {
 			// Bracket the acquisition: a lock on either side marks the frame, so a
 			// later unlock during encoding cannot pass lock-screen pixels as the
-			// app.
+			// app. A cover on either side marks it the same way: an app that
+			// stopped drawing under it needs time to draw again once uncovered.
 			let locked_before = self.backend()?.screen_state(None).locked;
+			let covered_before = self.window_covered(target)?;
 			let (image, mut geometry) = self.backend()?.capture(target, caps, selector.as_ref())?;
 			let screen_locked = locked_before || self.backend()?.screen_state(None).locked;
+			let covered = covered_before || self.window_covered(target)?;
 			let source_width = image.width();
 			let source_height = image.height();
 			let layout = self.backend()?.displays()?;
@@ -947,7 +1027,15 @@ impl Worker {
 			let image = apply_capture_caps(image, &mut geometry, caps)?;
 			match self.capture_metadata(target, &geometry, &layout, source_width, source_height) {
 				Ok(displays) => {
-					break (image, geometry, displays, screen_locked, source_width, source_height);
+					break (
+						image,
+						geometry,
+						displays,
+						screen_locked,
+						covered,
+						source_width,
+						source_height,
+					);
 				},
 				// A window that appeared, animated or resized while it was
 				// captured: the pixels match a size it no longer has, so capture it
@@ -996,6 +1084,15 @@ impl Worker {
 			backend: capabilities.backend,
 			display_server: capabilities.display_server,
 			screen_locked,
+			covered,
+		})
+	}
+
+	/// Whether `target` is a window that appears fully covered.
+	fn window_covered(&mut self, target: &Target) -> CoreResult<bool> {
+		Ok(match target {
+			Target::Window(id) => self.backend()?.window_covered(id),
+			Target::Desktop | Target::Display(_) => false,
 		})
 	}
 
@@ -1012,14 +1109,15 @@ impl Worker {
 			Target::Window(_) => {
 				let window = self.window(target)?;
 				geometry.validate_window(Some(&window))?;
+				let (part_x, part_y, part_width, part_height) = geometry.window_part(&window);
 				DesktopDisplay {
 					id:           window.id,
 					name:         format!("{} — {}", window.app, window.title),
-					x:            window.x,
-					y:            window.y,
-					width:        window.width,
-					height:       window.height,
-					scale:        f64::from(source_width) / f64::from(window.width.max(1)),
+					x:            part_x,
+					y:            part_y,
+					width:        part_width,
+					height:       part_height,
+					scale:        f64::from(source_width) / f64::from(part_width.max(1)),
 					pixel_x:      0,
 					pixel_y:      0,
 					pixel_width:  source_width,
@@ -1131,15 +1229,30 @@ impl Worker {
 			return Ok(Response::Unit);
 		}
 		token.check()?;
+		// Pointer and keyboard input on a desktop with no input route is refused
+		// before it waits for the input lease or resolves its target or frame. A
+		// backend that could not be built leaves the call to fail where it did.
+		if request.is_raw_input()
+			&& let Ok(backend) = self.backend.as_mut()
+		{
+			backend.refuse_input()?;
+		}
 		let _scope = token.enter();
+		if request.is_mutation()
+			&& let Some(reference) = request.reference()
+		{
+			self.registry.require_actionable(reference)?;
+		}
+		let awaits_input = self.awaits_late_input(request);
 		// A ref whose row the app rebuilt names the row's copy before the
-		// request reads its element or its app. That probe asks the element's
-		// app, so on macOS the user's front app is read before it, for the
-		// whole request (`EntryFront` in `macos::input`).
+		// request reads its element or its app, and an element action waits
+		// for its element's late input; both ask the element's app, so on
+		// macOS the user's front app is read before them, for the whole
+		// request (`EntryFront` in `macos::input`).
 		#[cfg(target_os = "macos")]
 		let _front = request
 			.reference()
-			.filter(|reference| self.registry.has_row(reference))
+			.filter(|reference| awaits_input || self.registry.has_row(reference))
 			.map(|_| macos::pin_entry_front());
 		self.row_read = None;
 		if let Some(reference) = request.reference() {
@@ -1162,6 +1275,15 @@ impl Worker {
 				},
 			}
 		};
+		// An element action reads its element under the input lease, where
+		// nothing may wait, so it waits for the element's late input here.
+		if awaits_input
+			&& let Some(reference) = request.reference()
+			&& let Ok(handle) = self.registry.resolve(reference)
+			&& let Some(ax) = self.backend()?.ax()
+		{
+			ax.settle(&handle)?;
+		}
 		let lease = if !request.is_mutation() {
 			None
 		} else if request.takes_over_a_window() {
@@ -1423,6 +1545,13 @@ impl Worker {
 			// Input whose app cannot be named fails like the input itself
 			// would; a ref that no longer resolves fails in `process`.
 			return match access {
+				AppAccess::Input(id)
+					if matches!(request, Request::MenuItems { .. } | Request::MenuSelect { .. })
+						&& self.registry.retained_root(id).is_some()
+						&& self.minimized_root(id)?.is_some() =>
+				{
+					Err(menus::minimized_window(id))
+				},
 				AppAccess::Input(id) => Err(DesktopError::window_not_found(format!(
 					"window '{id}' was not found; it may be closed"
 				))),
@@ -1581,11 +1710,13 @@ impl Worker {
 				let selector = base.capture_selector();
 				token.check()?;
 				let locked_before = self.backend()?.screen_state(None).locked;
+				let covered_before = self.window_covered(target)?;
 				let (image, fresh) =
 					self
 						.backend()?
 						.capture(target, &CaptureCaps::default(), selector.as_ref())?;
 				let screen_locked = locked_before || self.backend()?.screen_state(None).locked;
+				let covered = covered_before || self.window_covered(target)?;
 				let layout = self.backend()?.displays().map_err(|error| {
 					DesktopError::invalid_coordinate_frame(format!(
 						"could not validate captured display layout: {error}"
@@ -1617,6 +1748,7 @@ impl Worker {
 					backend: capabilities.backend,
 					display_server: capabilities.display_server,
 					screen_locked,
+					covered,
 				}))
 			},
 			Request::Click { target, x, y, options, .. } => {
@@ -1713,7 +1845,7 @@ impl Worker {
 				Ok(Response::Snapshot(self.snapshot(target, options)?))
 			},
 			Request::AxQuery { target, query, .. } => {
-				let window = self.window(target)?;
+				let window = self.read_root(target)?;
 				let (backend, registry) = (&mut self.backend, &mut self.registry);
 				let ax = backend
 					.as_mut()
@@ -3010,6 +3142,10 @@ mod capture_tests {
 		reads:             u32,
 		/// Runs as each press is delivered and as each probe asks.
 		on_call:           Option<Box<dyn Fn(Call) + Send>>,
+		/// Elements whose input may not show yet.
+		late_input:        HashSet<u64>,
+		/// Runs as an element's late input is awaited.
+		on_settle:         Option<Box<dyn Fn() + Send>>,
 		/// A press is delivered and the app answers with an unrelated error.
 		unconfirmed:       bool,
 	}
@@ -3039,6 +3175,7 @@ mod capture_tests {
 		window:                 DesktopWindow,
 		overlap:                Option<DesktopWindow>,
 		window_present:         bool,
+		minimized_id:           Option<&'static str>,
 		/// An AX tree the app can rebuild; `None` answers every element as one
 		/// button.
 		tree:                   Option<Arc<Mutex<FakeTree>>>,
@@ -3081,11 +3218,15 @@ mod capture_tests {
 		input_lookups:          Arc<Mutex<u32>>,
 		/// Every click lands on a control whose menu would take the keyboard.
 		menu_control:           bool,
+		/// The desktop has no input route at all.
+		no_input:               bool,
 		/// What a drag is made as instead of input; `None` posts it.
 		drag_selection:         Option<AxTextSelection>,
 		/// Captures after which the window grows 8 px wider, as one that animates
 		/// while it is captured.
 		grow_on_capture:        u32,
+		/// Nothing of the window shows on screen.
+		covered:                bool,
 	}
 
 	impl FakeWaylandBackend {
@@ -3155,8 +3296,10 @@ mod capture_tests {
 				},
 				overlap: None,
 				window_present: true,
+				minimized_id: None,
 				tree: None,
 				menu_control: false,
+				no_input: false,
 				clicks: Arc::new(Mutex::new(Vec::new())),
 				modes: Arc::new(Mutex::new(Vec::new())),
 				layout: Arc::new(Mutex::new(vec![DesktopDisplay {
@@ -3196,6 +3339,7 @@ mod capture_tests {
 				input_lookups: Arc::new(Mutex::new(0)),
 				drag_selection: None,
 				grow_on_capture: 0,
+				covered: false,
 			}
 		}
 	}
@@ -3212,7 +3356,7 @@ mod capture_tests {
 			if let Some(tree) = &self.tree {
 				tree.lock().roots += 1;
 			}
-			Ok(AxHandle::Test(1))
+			Ok(AxHandle::Test(if self.minimized_id.is_some() { 2 } else { 1 }))
 		}
 
 		fn window_id(&mut self, _: &AxHandle, windows: &[DesktopWindow]) -> CoreResult<String> {
@@ -3365,6 +3509,23 @@ mod capture_tests {
 				tree.destroyed.contains(id)
 			})
 		}
+
+		fn pending(&mut self, h: &AxHandle) -> bool {
+			let AxHandle::Test(id) = h else { return false };
+			self
+				.tree
+				.as_ref()
+				.is_some_and(|tree| tree.lock().late_input.contains(id))
+		}
+
+		fn settle(&mut self, _: &AxHandle) -> CoreResult<()> {
+			if let Some(tree) = &self.tree
+				&& let Some(on_settle) = &tree.lock().on_settle
+			{
+				on_settle();
+			}
+			Ok(())
+		}
 	}
 
 	impl Backend for FakeWaylandBackend {
@@ -3382,6 +3543,13 @@ mod capture_tests {
 				display_asleep: screen.display_asleep,
 				..DesktopCapabilities::unavailable()
 			}
+		}
+
+		fn refuse_input(&mut self) -> CoreResult<()> {
+			if self.no_input {
+				return Err(DesktopError::permission_denied("no input route"));
+			}
+			Ok(())
 		}
 
 		fn displays(&mut self) -> CoreResult<Vec<DesktopDisplay>> {
@@ -3403,6 +3571,21 @@ mod capture_tests {
 				.chain(self.window_present.then_some(&self.window))
 				.cloned()
 				.collect())
+		}
+
+		fn minimized_root(
+			&mut self,
+			id: &str,
+			retained: Option<&AxHandle>,
+		) -> CoreResult<Option<ax::WindowRoot>> {
+			Ok(retained
+				.filter(|_| self.minimized_id == Some(id))
+				.map(|element| ax::WindowRoot {
+					id:      id.to_owned(),
+					app:     self.window.app.clone(),
+					state:   ax::RootState::Minimized,
+					element: element.clone(),
+				}))
 		}
 
 		#[cfg(target_os = "macos")]
@@ -3428,6 +3611,10 @@ mod capture_tests {
 				.lock()
 				.push(display.map(|display| format!("{display:?}")));
 			*self.screen.lock()
+		}
+
+		fn window_covered(&mut self, id: &str) -> bool {
+			self.covered && id == self.window.id
 		}
 
 		fn hold_display_awake(&mut self) -> Option<DisplayAwakeHold> {
@@ -4073,6 +4260,38 @@ mod capture_tests {
 	}
 
 	#[test]
+	fn a_covered_window_marks_its_capture_and_tree() {
+		for covered in [true, false] {
+			let mut backend = FakeWaylandBackend::new();
+			backend.covered = covered;
+			let mut worker = worker_with(backend);
+			let token = CancellationSource::default().token();
+			let target = Target::Window(WAYLAND_ID.to_string());
+			let Ok(Response::Capture(capture)) =
+				worker.process(&capture_request(target.clone()), &token)
+			else {
+				panic!("window capture");
+			};
+			assert_eq!(capture.covered, covered);
+			let region = CaptureRegion { x: 0.0, y: 0.0, width: 8.0, height: 6.0 };
+			let Ok(Response::Capture(zoom)) =
+				worker.process(&zoom_request(target.clone(), region, CaptureCaps::default()), &token)
+			else {
+				panic!("window zoom");
+			};
+			assert_eq!(zoom.covered, covered);
+			// The desktop's tree is the focused window's: the mark follows that
+			// window, not the selector.
+			for target in [target, Target::Desktop] {
+				let tree = worker
+					.snapshot(&target, &AxSnapshotOptions::default())
+					.unwrap();
+				assert_eq!(tree.covered, covered);
+			}
+		}
+	}
+
+	#[test]
 	fn a_failure_on_one_display_reads_that_displays_sleep_state() {
 		let backend = FakeWaylandBackend::new();
 		*backend.screen.lock() = ScreenState { locked: false, display_asleep: true };
@@ -4712,6 +4931,71 @@ mod capture_tests {
 	}
 
 	#[test]
+	fn a_minimized_window_tree_is_read_only_and_never_uses_its_visible_sibling() {
+		let documents = Arc::new(Mutex::new(FakeTree {
+			titles: [(1, "Retained document"), (2, "Visible sibling")].into(),
+			roles: [(2, "window")].into(),
+			..Default::default()
+		}));
+		let roster = |minimized| {
+			let mut backend = FakeWaylandBackend::new();
+			backend.window.id = if minimized { "43" } else { "42" }.into();
+			backend.minimized_id = minimized.then_some("42");
+			backend.tree = Some(Arc::clone(&documents));
+			backend
+		};
+		let mut worker = worker_with(roster(false));
+		let target = Target::Window("42".into());
+		worker
+			.snapshot(&target, &AxSnapshotOptions::default())
+			.unwrap();
+		worker.backend = Ok(Box::new(roster(true)));
+		let tree = worker
+			.snapshot(&target, &AxSnapshotOptions::default())
+			.unwrap();
+		assert!(tree.text.contains("Retained document") && tree.text.contains("(minimized)"));
+		assert!(!tree.text.contains("Visible sibling"));
+		let menu = worker.explicit_window(&target).unwrap_err();
+		assert_eq!(menu.code, ErrorCode::WindowUnavailable);
+		assert!(menu.message.contains("'42' is minimized"));
+		let source = CancellationSource::default();
+		let focus =
+			call(&mut worker, |reply| Request::AxFocus { reference: "e1".into(), reply }, &source);
+		assert_eq!(focus.err().map(|error| error.code), Some(ErrorCode::WindowUnavailable));
+		assert_eq!(worker.window(&target).unwrap_err().code, ErrorCode::WindowNotFound);
+		let absent = Target::Window("99".into());
+		assert_eq!(
+			worker
+				.snapshot(&absent, &AxSnapshotOptions::default())
+				.unwrap_err()
+				.code,
+			ErrorCode::WindowNotFound
+		);
+		// A visible read that fails before producing a tree keeps those refs
+		// inspection-only.
+		documents.lock().destroyed.insert(1);
+		worker.backend = Ok(Box::new(roster(false)));
+		assert!(
+			worker
+				.snapshot(&target, &AxSnapshotOptions::default())
+				.is_err()
+		);
+		assert_eq!(
+			worker.registry.require_actionable("e1").unwrap_err().code,
+			ErrorCode::WindowUnavailable
+		);
+		documents.lock().destroyed.remove(&1);
+		worker.backend = Ok(Box::new(roster(false)));
+		let restored = worker
+			.snapshot(&target, &AxSnapshotOptions::default())
+			.unwrap();
+		assert!(
+			restored.text.contains("Retained document") && !restored.text.contains("(minimized)")
+		);
+		assert!(worker.registry.require_actionable("e1").is_ok());
+	}
+
+	#[test]
 	fn a_menu_read_holds_the_input_lease() {
 		let source = CancellationSource::default();
 		// Whether another call of the session could take input during the read.
@@ -4762,6 +5046,35 @@ mod capture_tests {
 			.expect("the element is gone");
 		assert_eq!(named(&error, "e2").as_deref(), Some("e4"));
 		assert!(free.load(Ordering::SeqCst), "the search held the call's input lease");
+	}
+
+	#[test]
+	fn an_element_action_waits_for_its_elements_late_input_with_input_released() {
+		let (mut worker, tree) = read_buttons(&[(2, "Go"), (3, "Stop")]);
+		tree.lock().late_input.insert(2);
+		let source = granted();
+		// Whether another call of the session could take input while the
+		// element's late input (macOS type-ahead) was awaited, and whether the
+		// user's front app was read before it.
+		let seen = Arc::new(Mutex::new(Vec::new()));
+		let (other, waits) = (source.clone(), Arc::clone(&seen));
+		tree.lock().on_settle = Some(Box::new(move || {
+			let free = InputLease::acquire(&other.token(), false).is_ok();
+			#[cfg(target_os = "macos")]
+			let pinned = macos::entry_front_pinned();
+			#[cfg(not(target_os = "macos"))]
+			let pinned = true;
+			waits.lock().push((free, pinned));
+		}));
+		call(&mut worker, press_request("e2"), &source).expect("pressed");
+		assert_eq!(
+			*seen.lock(),
+			[(true, true)],
+			"waited under the lease or with the front app unread"
+		);
+		// An element with nothing pending does not wait.
+		call(&mut worker, press_request("e3"), &source).expect("pressed");
+		assert_eq!(seen.lock().len(), 1);
 	}
 
 	#[test]
@@ -5178,6 +5491,116 @@ mod capture_tests {
 			ErrorCode::InvalidCoordinateFrame
 		);
 		assert_eq!(*captures.lock(), 1, "invalid zoom must not reach the capture backend");
+	}
+
+	/// With no input route, every pointer and keyboard call, element clicks
+	/// included, is refused at once: before it waits for control another session
+	/// holds or resolves a frame or a window, so none of them asks for a
+	/// screenshot first or opens a capture to refresh the display layout.
+	#[test]
+	fn every_input_call_is_refused_before_its_frame_when_input_is_unavailable() {
+		let mut backend = FakeWaylandBackend::new();
+		backend.no_input = true;
+		let captures = Arc::clone(&backend.captures);
+		let layout_reads = Arc::clone(&backend.window_queries);
+		let clicks = Arc::clone(&backend.clicks);
+		let mut worker = worker_with(backend);
+		let token = CancellationSource::default().token();
+		// Another session holds control, which input would otherwise wait for.
+		let other = CancellationSource::default();
+		control::grant_for_test(&other);
+		let window = Target::Window(WAYLAND_ID.to_string());
+		let pointer = || ParsedPointerOptions::parse(None).unwrap();
+		let takeover = Takeover::new(None, None);
+		let reply = || flume::unbounded().0;
+		let requests = [
+			Request::Click {
+				target:  Target::Desktop,
+				x:       1.0,
+				y:       1.0,
+				options: pointer(),
+				reply:   reply(),
+			},
+			Request::MoveMouse { target: window.clone(), x: 1.0, y: 1.0, takeover, reply: reply() },
+			Request::Drag {
+				target:  Target::Desktop,
+				path:    vec![(1.0, 1.0), (2.0, 2.0)],
+				options: pointer(),
+				reply:   reply(),
+			},
+			Request::Scroll {
+				target: window.clone(),
+				x: 1.0,
+				y: 1.0,
+				dx: 0.0,
+				dy: 3.0,
+				takeover,
+				reply: reply(),
+			},
+			Request::HoldMouse {
+				target: Target::Desktop,
+				x: 1.0,
+				y: 1.0,
+				button: MouseButton::Left,
+				keys: Vec::new(),
+				duration: Duration::ZERO,
+				takeover,
+				refuse_menu: false,
+				reply: reply(),
+			},
+			Request::TypeText { target: Target::Desktop, text: "x".into(), takeover, reply: reply() },
+			Request::KeyChord {
+				target: window.clone(),
+				keys: vec![KeyName::Enter],
+				takeover,
+				reply: reply(),
+			},
+			Request::HoldKeys {
+				target: window,
+				keys: vec![KeyName::Enter],
+				duration: Duration::ZERO,
+				takeover,
+				reply: reply(),
+			},
+			Request::AxClick { reference: "e1".into(), options: pointer(), reply: reply() },
+		];
+		for request in &requests {
+			let error = worker
+				.execute(request, &token)
+				.err()
+				.expect("input is refused");
+			assert_eq!(error.code, ErrorCode::PermissionDenied, "{}", error.message);
+		}
+		assert_eq!(*captures.lock(), 0);
+		assert_eq!(*layout_reads.lock(), 0, "no window was looked up");
+		assert!(clicks.lock().is_empty());
+	}
+
+	/// Without a backend there is nothing to ask about an input route, so a
+	/// coordinate call still fails on its missing frame first.
+	#[test]
+	fn input_without_a_backend_still_asks_for_its_frame() {
+		let mut worker = worker_with(FakeWaylandBackend::new());
+		worker.backend = Err(DesktopError::capture_failed("no display server"));
+		// The user-input watch would ask the missing backend for the window's
+		// app first, so it stays off.
+		#[cfg(target_os = "macos")]
+		{
+			worker.listener = control::intervention::Listener::off();
+		}
+		let token = CancellationSource::default().token();
+		let click = Request::Click {
+			target:  Target::Window(WAYLAND_ID.to_string()),
+			x:       1.0,
+			y:       1.0,
+			options: ParsedPointerOptions::parse(None).unwrap(),
+			reply:   flume::unbounded().0,
+		};
+		let error = worker
+			.execute(&click, &token)
+			.err()
+			.expect("the click fails");
+		assert_eq!(error.code, ErrorCode::InvalidCoordinateFrame, "{}", error.message);
 	}
 
 	#[test]

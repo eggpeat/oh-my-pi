@@ -246,6 +246,15 @@ thread_local! {
 	static CLEANUP: Cell<bool> = const { Cell::new(false) };
 	static FOCUS_RETURN: Cell<Option<DesktopFocusReturn>> = const { Cell::new(None) };
 	static TEXT_UNCONFIRMED: RefCell<Option<String>> = const { RefCell::new(None) };
+	/// Whether an operation on this thread holds the input lease ([`InputLease`]).
+	static INPUT_HELD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the operation running on this thread holds the input lease, which
+/// keeps every other session's input out: nothing it does then may wait.
+#[cfg(target_os = "macos")]
+pub(crate) fn input_held() -> bool {
+	INPUT_HELD.get()
 }
 
 /// Records where the current operation's takeover left focus.
@@ -322,6 +331,19 @@ pub(crate) fn check() -> CoreResult<()> {
 		return Ok(());
 	}
 	CURRENT.with_borrow(|token| token.as_ref().map_or(Ok(()), OperationToken::check))
+}
+
+/// Time the current operation has left before it must answer, less
+/// [`DEADLINE_MARGIN`] for the reply; `None` when it has no deadline.
+#[cfg(target_os = "windows")]
+pub(crate) fn time_left() -> Option<Duration> {
+	CURRENT
+		.with_borrow(|token| token.as_ref().and_then(OperationToken::deadline))
+		.map(|deadline| {
+			deadline
+				.saturating_duration_since(Instant::now())
+				.saturating_sub(DEADLINE_MARGIN)
+		})
 }
 
 /// [`check`] for a step that would send new input from inside [`cleanup`],
@@ -980,6 +1002,7 @@ impl InputLease {
 			.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
 			.map_err(|_| busy())?;
 		let lease = Self { _scope: token.enter(), owner, _thread: PhantomData };
+		INPUT_HELD.set(true);
 		// Held control keeps ownership between operations, so the kernel lock
 		// a lingering helper shares does not keep the next one out.
 		if release_helper_running() {
@@ -993,6 +1016,7 @@ impl InputLease {
 impl Drop for InputLease {
 	fn drop(&mut self) {
 		self.owner.running.store(false, Ordering::Release);
+		INPUT_HELD.set(false);
 	}
 }
 

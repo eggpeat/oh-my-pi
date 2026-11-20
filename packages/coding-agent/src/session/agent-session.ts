@@ -179,6 +179,7 @@ import { createExtensionModelQuery } from "../extensibility/extensions/model-api
 import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
 import type { CustomCommandContext } from "../extensibility/custom-commands/types";
 import { SkillDescriptionCatalog } from "../extensibility/skill-descriptions";
+import type { MCPEvalNamespaceCatalog } from "../mcp/eval-namespaces";
 import {
 	type BuiltSkillPromptMessage,
 	loadSkillPrompt,
@@ -193,11 +194,16 @@ import { normalizeToolEventInput, resolveToolEventInput } from "../extensibility
 import { GoalRuntime } from "../goals/runtime";
 import type { GoalModeState, GoalTokenUsage } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
-import { InternalUrlRouter, type LocalProtocolOptions } from "../internal-urls";
+import {
+	InternalUrlRouter,
+	type LocalProtocolOptions,
+	resolveLocalRoot,
+	sessionLocalProtocolOptions,
+} from "../internal-urls";
 import { type ChainJudge, hasNativeJudge, journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { JobWidgetEntry } from "@oh-my-pi/pi-tui/tools/job-widget";
-import type { DaemonCompletionNotification } from "../launch/protocol";
+import type { DaemonCompletionEvent } from "../daemon/protocol";
 import { MEMORY_RECALL_CHANGES_MESSAGE_TYPE } from "../memory-backend/recall-entry";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
@@ -234,6 +240,7 @@ import {
 	obfuscateProviderContext,
 } from "../secrets/message-transform";
 import type { SecretObfuscator } from "../secrets/obfuscator";
+import { hasLiveOwnedService } from "../launch/services";
 import { USER_AWAIT_ID } from "../registry/agent-awaits";
 import { type AgentRef, AgentRegistry, type AgentRegistryApi } from "../registry/agent-registry";
 import { cfgSecretsEnabled } from "../secrets/settings";
@@ -287,8 +294,9 @@ import { prewarmSubagentWorker } from "../thread/subagent-worker";
 import { SubagentSpawnSignal } from "../thread/subagent-spawn-signal";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { AgentDefinition } from "../task/types";
+import type { AgentOutputManager } from "../task/output-manager";
 import type { ModelMention } from "@oh-my-pi/pi-tui/prompt/model-mention-syntax";
-import { ModelMentionRegistry, type ResolvedModelMention } from "./model-mentions";
+import { ModelMentionRegistry, type ResolvedModelMention, referencedModelAgents } from "./model-mentions";
 import { parseCommandArgs } from "../utils/command-args";
 import type { EditModeSetting } from "../edit/settings";
 import { getEditStore } from "../edit/store";
@@ -476,6 +484,8 @@ import {
 import type { SessionContext, TranscriptSessionContextOptions } from "./session-context";
 import { buildSessionContext, getRestorableSessionModels, isTranscriptEntry } from "./session-context";
 import {
+	type CacheBridgeEstimate,
+	type CacheBridgeOutcome,
 	type CacheRefreshOutcome,
 	type CacheWarmer,
 	type CacheWarmingMode,
@@ -539,6 +549,7 @@ const TITLE_FORK_TIMEOUT_MS = 15_000;
 /** Cap on the judgment that decides whether a `title.refreshAfterPrompts` check regenerates the title. */
 const TITLE_DRIFT_JUDGE_TIMEOUT_MS = 15_000;
 
+import { StallGuard, stalledWaiters } from "./stalled-waiters";
 import { LoopGuards, type StreamGuardsHost, StreamingEditGuard } from "./stream-guards";
 import { AutoParallelCoordinator } from "./auto-parallel";
 import { EAGER_TODO_PRELUDE_MESSAGE_TYPE, TodoTracker, type TodoTrackerHost } from "./todo-tracker";
@@ -1282,8 +1293,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#ircWakeHolds = 0;
 	/** IRC wakes waiting out a context replacement (see {@link #wakeForIrc}). */
 	#ircWakesAwaitingCompaction = 0;
-	/** {@link subscribeIrcWakeHolds} listeners. */
-	readonly #ircWakeHoldListeners = new Set<() => void>();
+	/** {@link subscribeWakeState} listeners. */
+	readonly #wakeStateListeners = new Set<() => void>();
+	/** Notices of agents left blocked on this one as its run settles; see {@link #continueForStalledWaiters}. */
+	readonly #stallGuard = new StallGuard();
 	/** Set while an `awaitingAssignment` session has not started its first prompt; see {@link #wakeForIrc}. */
 	#ircAwaitingAssignment = false;
 	/** The observation whose monitor is attached; at most one at a time. */
@@ -1313,6 +1326,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#reconcileBrowserMcpFilter: AgentSessionConfig["reconcileBrowserMcpFilter"];
 	#setMcpServerInstructionsSource: AgentSessionConfig["setMcpServerInstructionsSource"];
 	#skillDescriptions: SkillDescriptionCatalog;
+	#mcpNamespaces: MCPEvalNamespaceCatalog | undefined;
 	#promptSkillsSource: readonly Skill[] | undefined;
 	#promptSkills: readonly Skill[] = [];
 	/**
@@ -1855,7 +1869,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			const promptGeneration = this.#promptGeneration;
 			const sessionGeneration = this.#sessionGeneration;
 			this.#ircWakesAwaitingCompaction++;
-			this.#notifyIrcWakeHolds();
+			this.#notifyWakeState();
 			void contextReplacement
 				.then(async () => {
 					// A transition (/new, /clear, a switch) aborts long before it replaces the transcript, so
@@ -1890,7 +1904,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				.catch(error => logger.warn("IRC wake after compaction failed", { error: String(error) }))
 				.finally(() => {
 					this.#ircWakesAwaitingCompaction--;
-					this.#notifyIrcWakeHolds();
+					this.#notifyWakeState();
 				});
 			return;
 		}
@@ -2238,6 +2252,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#ownsCostGate = config.costGate === undefined;
 		this.#costGate = config.costGate ?? this.#createCostGate();
 		this.#skillDescriptions = config.skillDescriptions ?? new SkillDescriptionCatalog();
+		this.#mcpNamespaces = config.mcpNamespaces;
 		this.memoryEnabled = config.memoryEnabled ?? true;
 		this.#modelRegistry = config.modelRegistry;
 		this.#allowSessionModelFallback = config.allowSessionModelFallback === true;
@@ -2788,6 +2803,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			reconcileSettingsGatedTools: config.reconcileSettingsGatedTools,
 			rebuildSystemPrompt: config.rebuildSystemPrompt,
 			getMcpServerInstructions: config.getMcpServerInstructions,
+			bindsMcpToEval: config.bindsMcpToEval,
+			evalBoundToolNames: config.evalBoundToolNames,
 			xdev: config.xdev,
 			setActiveToolNames: config.setActiveToolNames,
 			baseSystemPrompt: this.agent.state.systemPrompt,
@@ -2890,18 +2907,19 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 		// Wake sources that change without a session event: a job settling (cancelled ones
 		// deliver nothing), a child agent's run ending, a child starting or ending a block on this
-		// agent. Each may end a paused run that no longer has anything to wait on.
+		// agent. Each may end a paused run that no longer has anything to wait on, change
+		// {@link hasPendingWake}, or leave an agent blocked on this one (the stall guard).
 		if (this.#asyncJobManager) {
-			this.#disposers.push(this.#asyncJobManager.onJobSettled(() => this.#scheduleRunCheck()));
+			this.#disposers.push(this.#asyncJobManager.onJobSettled(() => this.#notifyWakeState()));
 		}
 		const registry = this.#agentRegistry;
 		if (registry && this.#agentId) {
 			const agentId = this.#agentId;
 			this.#disposers.push(
 				registry.onChange(event => {
-					if (event.ref.parentId === agentId) this.#scheduleRunCheck();
+					if (event.ref.parentId === agentId) this.#notifyWakeState();
 				}),
-				registry.awaits.onChange(() => this.#scheduleRunCheck()),
+				registry.awaits.onChange(() => this.#notifyWakeState()),
 			);
 		}
 		this.agent.setAssistantMessageEventInterceptor((message, assistantMessageEvent) => {
@@ -3475,6 +3493,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#asyncJobManager;
 	}
 
+	/**
+	 * Allocator of the ids this session's subagents nest under in its artifacts
+	 * directory; `/tan` claims clone ids from it so a tan and a task subagent
+	 * never share an id (and so a transcript file).
+	 */
+	get agentOutputManager(): AgentOutputManager | undefined {
+		return this.#evalToolSession?.agentOutputManager;
+	}
+
 	getAgentId(): string | undefined {
 		return this.#agentId;
 	}
@@ -3792,8 +3819,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	#wakeSources(): WakeSources | undefined {
-		if (this.#clientBridge?.deferAgentInitiatedTurns) return undefined;
-		if (this.#advisors.autoResumeSuppressed && !this.#turnSettledSinceUserInterrupt) return undefined;
+		if (this.#agentInitiatedTurnsSuppressed()) return undefined;
 		const jobs = new Set<string>();
 		const manager = this.#asyncJobManager;
 		if (manager) {
@@ -3827,6 +3853,74 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#ircWakesAwaitingCompaction > 0;
 		if (jobs.size === 0 && agents.length === 0 && !queued) return undefined;
 		return { jobs: [...jobs], agents, queued };
+	}
+
+	/**
+	 * Whether nothing the session did not schedule itself may start a turn: a client deferring
+	 * agent-initiated turns, or a user interrupt that stopped the run (until a later turn ends
+	 * on its own), folds every delivery into context instead.
+	 */
+	#agentInitiatedTurnsSuppressed(): boolean {
+		if (this.#clientBridge?.deferAgentInitiatedTurns) return true;
+		return this.#advisors.autoResumeSuppressed && !this.#turnSettledSinceUserInterrupt;
+	}
+
+	/**
+	 * Whether the agent acts again without anyone messaging it: its turn is streaming or a
+	 * continuation is scheduled, or {@link hasWakeAfterTurn}. Agents waiting on this one read
+	 * it through the registry to tell whether their answer can still come.
+	 */
+	get hasPendingWake(): boolean {
+		return this.isStreaming || this.#postPromptTasks.size > 0 || this.hasWakeAfterTurn();
+	}
+
+	/**
+	 * Whether something besides the current turn starts this agent's next one: queued input
+	 * (steering, follow-up, IRC), a live service it owns, or a {@link wakeSources} entry. A
+	 * background job of a subagent that waits on this agent does not count: it cannot settle
+	 * before this agent acts. Without one, the agent stays idle once its turn ends until messaged.
+	 */
+	hasWakeAfterTurn(): boolean {
+		if (this.agent.hasQueuedMessages() || this.#irc.hasPending()) return true;
+		if (this.#evalToolSession && hasLiveOwnedService(this.#evalToolSession)) return true;
+		const sources = this.#wakeSources();
+		if (!sources) return false;
+		if (sources.queued || sources.agents.length > 0) return true;
+		const manager = this.#asyncJobManager;
+		const registry = this.#agentRegistry;
+		const agentId = this.#agentId;
+		return sources.jobs.some(id => {
+			const jobAgent = manager?.getJob(id)?.agentId;
+			return !jobAgent || !registry || !agentId || !registry.awaits.blocksOn(jobAgent, agentId, 0);
+		});
+	}
+
+	/**
+	 * The turn-end stall guard: the run is about to settle (pause or end) while agents stay
+	 * blocked on this one (see {@link stalledWaiters}) and nothing will wake it, so continue it
+	 * once with a notice naming them, at most once per (waiter, ask) pair. Suppressed like
+	 * every automatic continuation: aborts, a successful `yield`, disposal, and suppressed
+	 * agent-initiated turns. Returns whether the notice turn was scheduled.
+	 */
+	#continueForStalledWaiters(): boolean {
+		const registry = this.#agentRegistry;
+		const agentId = this.#agentId;
+		if (!registry || !agentId || this.#isDisposed || this.#abortInProgress || this.#yieldTerminationPending) {
+			return false;
+		}
+		if (this.#agentInitiatedTurnsSuppressed()) return false;
+		const waiters = stalledWaiters(registry, agentId);
+		if (waiters.length === 0 || this.hasWakeAfterTurn()) return false;
+		const notice = this.#stallGuard.take(waiters);
+		if (!notice) return false;
+		this.agent.appendMessage({
+			role: "developer",
+			content: [{ type: "text", text: notice }],
+			attribution: "agent",
+			timestamp: Date.now(),
+		});
+		this.#scheduleAgentContinue({ source: "stalled-waiters", generation: this.#promptGeneration });
+		return true;
 	}
 
 	/** A run is open: from its first `agent_start` until its `agent_end`, paused stretches included. */
@@ -5566,6 +5660,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					endLoop({ continuing: true });
 					return;
 				}
+				// Ahead of the wake-source pause and the stop hooks: agents blocked on this one stay
+				// blocked once nothing wakes it (a subagent's job that waits on it included).
+				if (this.#continueForStalledWaiters()) {
+					maintenanceRoute("stalled-waiters-notice");
+					endLoop({ continuing: true });
+					return;
+				}
 			}
 			// Something outside the model will resume the run (a background job, a child agent, a
 			// queued peer message): the run pauses until it does, so stop hooks wait for a loop that
@@ -6150,12 +6251,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/**
 	 * Decide the open run's fate once the session is quiet — no loop or prompt in
 	 * flight, no post-prompt work (routing, scheduled continuations, idle flushes),
-	 * no abort unwinding, no admitted submission: pause it while
+	 * no abort unwinding, no admitted submission: continue it once with the
+	 * stall guard's notice while agents stay blocked on this one with nothing to
+	 * wake it ({@link #continueForStalledWaiters}), pause it while
 	 * {@link wakeSources} can resume it, otherwise end it.
 	 *
 	 * Runs after every change that can leave the session quiet: a loop end, the
 	 * in-flight bracket or post-prompt work draining, an abort, a job settling or
-	 * its delivery resolving, a child agent's status or blocks changing, an IRC
+	 * its delivery resolving, a child agent's status or any block changing, an IRC
 	 * wake hold or compaction wait ending, the agent reconnecting. A source that
 	 * goes away without waking the run (a cancelled job, a child that finished
 	 * without writing) therefore ends it here.
@@ -6174,6 +6277,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			yielded: true,
 			paused: false,
 		};
+		// An agent may start blocking on this one after its loop stopped (a paused run): the
+		// stall guard's notice turn then continues the run, as at the loop's end.
+		if (this.#lastTurnSettledCleanly() && this.#continueForStalledWaiters()) {
+			// A stop-time notice, not outside work, resumes the run.
+			if (!this.#loopEnd.paused) this.#loopEnd = { ...this.#loopEnd, yielded: false };
+			this.#pauseLoop(this.#loopEnd);
+			return;
+		}
 		if (this.#wakeSources()) {
 			this.#pauseLoop(this.#loopEnd, true);
 			return;
@@ -6187,6 +6298,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// the settle): nothing polls the queue any more, so it starts the next run.
 		this.#drainStrandedQueuedMessages();
 		void this.#notifyExtensionsLoopEnd(end.activeMessages);
+	}
+
+	/** Whether the latest model turn ended on its own with an answer: no error, abort, or stop mid-tool-use. */
+	#lastTurnSettledCleanly(): boolean {
+		const last = this.getLastAssistantMessage();
+		if (!last || last.stopReason === "error" || last.stopReason === "aborted") return false;
+		return !last.content.some(content => content.type === "toolCall");
 	}
 
 	/** Close the open run; without a following `agent_end`, a transition or dispose abandons it. */
@@ -6552,6 +6670,24 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				return message.usage.input + message.usage.cacheRead + message.usage.cacheWrite;
 		}
 		return 0;
+	}
+
+	/**
+	 * What bridging a long tool call with compaction would produce for a
+	 * `promptTokens` prompt, or undefined when no bridge-capable compaction
+	 * method can run now (the cache warmer's buy-out pricing input).
+	 */
+	bridgeCompactionEstimate(promptTokens: number): CacheBridgeEstimate | undefined {
+		return this.#maintenance.bridgeCompactionEstimate(promptTokens);
+	}
+
+	/**
+	 * Compact the history behind the pending tool call in the background, for
+	 * the cache warmer's buy-out. The result replaces the history at the tool's
+	 * turn end; resolves once the compaction settles.
+	 */
+	startBridgeCompaction(): Promise<CacheBridgeOutcome> {
+		return this.#maintenance.startBridgeCompaction();
 	}
 
 	/** Persist a completed warm request as off-transcript usage so session totals include its cost. */
@@ -7176,7 +7312,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		for (const dispose of this.#disposers.splice(0)) dispose();
 		this.#eventListeners = [];
 		this.#runStateListeners.clear();
-		this.#ircWakeHoldListeners.clear();
+		this.#wakeStateListeners.clear();
 		this.#sessionChangeCallbacks.clear();
 
 		// Event handlers can reopen the append writer while they persist their
@@ -7750,6 +7886,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Names currently authorized through the eval bridge. */
 	getEvalBridgeToolNames(): string[] {
 		return this.#tools.getEvalBridgeToolNames();
+	}
+
+	/** Enabled MCP tools presented as eval namespace methods (see {@link SessionTools.getEvalBoundToolNames}). */
+	getEvalBoundToolNames(): string[] {
+		return this.#tools.getEvalBoundToolNames();
 	}
 
 	/** Eval tool names frozen into the provider-visible eval description (see {@link SessionTools.advertisedEvalToolNames}). */
@@ -8360,6 +8501,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Current session ID */
 	get sessionId(): string {
 		return this.#activeProviderSessionId();
+	}
+
+	/**
+	 * Absolute path of the session's `local://` directory, which exists only once something is written there.
+	 * Follows the tools' mapping, which an SDK host or a parent session may have pinned elsewhere.
+	 */
+	get localRoot(): string {
+		const tools = this.#evalToolSession;
+		return resolveLocalRoot(tools ? sessionLocalProtocolOptions(tools) : this.#localProtocolOptions());
 	}
 	getEvalSessionId(): string {
 		return this.#eval.getSessionId();
@@ -9146,8 +9296,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// A `^` mention in a non-synthetic prompt mints a new alias. The hidden
 		// session-agent notice (which tells the model about the alias) must ride
 		// with the message via prependMessages — not as a separate steer — so the
-		// model sees both in the same turn (#14093).
-		const sessionAgentNotice = options?.synthetic ? undefined : this.#tools.takeSessionAgentNotice();
+		// model sees both in the same turn (#14093). A queued prompt announces only
+		// the aliases it references and nothing queued ahead of it announces.
+		const sessionAgentNotice = options?.synthetic
+			? undefined
+			: this.isStreaming
+				? this.#takeQueuedSessionAgentNotice(expandedText, options?.streamingBehavior)
+				: this.#tools.takeSessionAgentNotice();
 		const prependNotices = sessionAgentNotice ? [...keywordNotices, sessionAgentNotice] : keywordNotices;
 
 		// Agent-initiated synthetic prompts (auto-continue, plan, reminders) are not user turns.
@@ -9454,7 +9609,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				skillArgs = details.args;
 			}
 			keywordNotices = this.#createMagicKeywordNotices(skillArgs);
-			const sessionAgentNotice = this.#tools.takeSessionAgentNotice();
+			const sessionAgentNotice =
+				options?.queueOnly || this.isStreaming
+					? this.#takeQueuedSessionAgentNotice(textContent, options?.streamingBehavior)
+					: this.#tools.takeSessionAgentNotice();
 			queuedNotices = sessionAgentNotice ? [...keywordNotices, sessionAgentNotice] : keywordNotices;
 		}
 
@@ -9579,20 +9737,34 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			queue === "followUp" && userMessages.some(message => this.#isUserTask(message))
 				? this.#prepareQueuedUserTask(first, promptText, preparationImages, signal)
 				: this.#prepareAgentStart(first, promptText, preparationImages, this.#promptGeneration, signal, "queued");
-		return this.#relaxOnDelivery(preparation, promptText);
+		return this.#commitOnDelivery(preparation, messages, promptText);
 	};
 
-	/** Apply `chillax` when the batch is delivered, so a steer relaxes the running turn from its next request. */
-	async #relaxOnDelivery(
+	/**
+	 * Finish a queued batch when it is delivered: apply `chillax`, so a steer relaxes the running
+	 * turn from its next request, and announce any `m<N>` agent the batch's text references
+	 * that no notice reaching the model first announces. Queued messages skip a notice queued
+	 * ahead of them; when that message was withdrawn or reordered behind this batch, the
+	 * reference is announced here instead.
+	 */
+	async #commitOnDelivery(
 		pending: Promise<QueuedMessagePreparation>,
+		messages: readonly AgentMessage[],
 		promptText: string,
 	): Promise<QueuedMessagePreparation> {
+		const referenced = referencedModelAgents(promptText);
 		const preparation = await pending;
 		return {
 			commit: () => {
 				const additional = preparation.commit();
-				if (additional !== undefined) this.#models.applyChillax(promptText);
-				return additional;
+				if (additional === undefined) return undefined;
+				this.#models.applyChillax(promptText);
+				if (referenced.size === 0) return additional;
+				const notice = this.#tools.takeSessionAgentNotice(
+					[...this.agent.peekUndeliveredQueuedMessages(), ...messages, ...additional],
+					referenced,
+				);
+				return notice ? [...additional, notice] : additional;
 			},
 		};
 	}
@@ -10240,16 +10412,65 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#throwIfExtensionCommand(text);
 		}
 
-		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
+		const queued = this.#expandQueuedMentions(
+			expandPromptTemplate(text, [...this.#promptTemplates]),
+			"steer",
+			options?.attribution,
+		);
 		// Stamp before image preprocessing so a queued image steer measures from
 		// the operator's submission, not after the vision-model description.
 		const submittedAt = Date.now();
-		await this.#queueUserMessage(expandedText, images, "steer", {
+		await this.#queueUserMessage(queued.text, images, "steer", {
 			timestamp: submittedAt,
 			attribution: options?.attribution,
+			prependMessages: queued.prependMessages,
 			rawText: text,
 			onPromptQueued: options?.onPromptQueued,
 		});
+	}
+
+	/**
+	 * Expand `^model` mentions in a user-authored queued message and take the
+	 * session-agent notice to ride with it, as #dispatchPrompt does for a typed
+	 * prompt (#14093). Agent-attributed messages pass through: a mention is the user's tag.
+	 */
+	#expandQueuedMentions(
+		text: string,
+		mode: "steer" | "followUp" | "aside",
+		attribution: MessageAttribution = "user",
+	): { text: string; prependMessages: CustomMessage[] } {
+		if (attribution !== "user") return { text, prependMessages: [] };
+		const expandedText = this.#modelMentions.expandMentions(text);
+		const sessionAgentNotice = this.#takeQueuedSessionAgentNotice(expandedText, mode);
+		return { text: expandedText, prependMessages: sessionAgentNotice ? [sessionAgentNotice] : [] };
+	}
+
+	/**
+	 * The session-agent notice for a user message queued now in `mode`: the `m<N>` agents its
+	 * expanded `text` references that no notice in context or queued ahead of it announces.
+	 * Other roster changes ride the next direct prompt, so a message queued in another queue
+	 * never repeats them.
+	 */
+	#takeQueuedSessionAgentNotice(
+		text: string,
+		mode: "steer" | "followUp" | "aside" | undefined,
+	): CustomMessage | undefined {
+		const referenced = referencedModelAgents(text);
+		if (referenced.size === 0) return undefined;
+		return this.#tools.takeSessionAgentNotice(this.#queuedAhead(mode), referenced);
+	}
+
+	/**
+	 * Queued messages that reach the model before one queued now in `mode`: batches
+	 * already being delivered, the steering queue, and for a follow-up the follow-up
+	 * queue. Asides fold in on their own schedule, so nothing counts as ahead of them.
+	 */
+	#queuedAhead(mode: "steer" | "followUp" | "aside" | undefined): AgentMessage[] {
+		if (mode !== "steer" && mode !== "followUp") return [];
+		const ahead = this.agent.peekUndeliveredQueuedMessages();
+		ahead.push(...this.agent.peekSteeringQueue());
+		if (mode === "followUp") ahead.push(...this.agent.peekFollowUpQueue());
+		return ahead;
 	}
 
 	/**
@@ -10270,9 +10491,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// from the operator's submission, not after the vision-model description.
 		const submittedAt = Date.now();
 		if (!options?.synthetic) {
-			await this.#queueUserMessage(expandedText, images, "followUp", {
+			const queued = this.#expandQueuedMentions(expandedText, "followUp", options?.attribution);
+			await this.#queueUserMessage(queued.text, images, "followUp", {
 				timestamp: submittedAt,
 				attribution: options?.attribution,
+				prependMessages: queued.prependMessages,
 				rawText: text,
 				onPromptQueued: options?.onPromptQueued,
 			});
@@ -10387,9 +10610,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 		}
 		const mode = options?.queue === "followUp" ? "followUp" : "steer";
-		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
-		return await this.#queueUserMessage(expandedText, images, mode, {
+		const queued = this.#expandQueuedMentions(expandPromptTemplate(text, [...this.#promptTemplates]), mode);
+		return await this.#queueUserMessage(queued.text, images, mode, {
 			timestamp: Date.now(),
+			prependMessages: queued.prependMessages,
 			rawText: text,
 			requireActiveRun: true,
 			skipIdleDrain: true,
@@ -10544,8 +10768,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#resumeStrandedIrcAsides();
 			return true;
 		}
-		// The session-agent notice rides via prependMessages (from prompt()),
-		// so it arrives alongside the user message in the same turn (#14093).
+		// The session-agent notice rides in prependMessages (from prompt() or
+		// #expandQueuedMentions), so it arrives alongside the user message in the same turn (#14093).
 		const queued = this.#pushQueuedUserMessage(
 			mode,
 			[...prependMessages, ...attachmentSourceNotices, ...(imageDescriptionNotice ? [imageDescriptionNotice] : [])],
@@ -10603,8 +10827,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#queueFollowUpTexts(texts: readonly string[]): void {
 		this.#advisors.autoResumeSuppressed = false;
 		for (const text of texts) {
-			const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
-			this.#pushQueuedUserMessage("followUp", [], [{ type: "text", text: expandedText }], "user", Date.now(), text);
+			const queued = this.#expandQueuedMentions(expandPromptTemplate(text, [...this.#promptTemplates]), "followUp");
+			const content: TextContent[] = [{ type: "text", text: queued.text }];
+			this.#pushQueuedUserMessage("followUp", queued.prependMessages, content, "user", Date.now(), text);
 		}
 		this.#scheduleIdleQueueDrain();
 	}
@@ -10892,7 +11117,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.yieldQueue.enqueue<AsyncNotifyEntry>(ASYNC_NOTIFY_MESSAGE_TYPE, entry);
 	}
 
-	queueLaunchCompletion(notification: DaemonCompletionNotification): Promise<void> {
+	queueLaunchCompletion(notification: DaemonCompletionEvent): Promise<void> {
 		if (this.#isDisposed) return Promise.reject(new Error("Session disposed before launch completion delivery"));
 		const delivered = this.yieldQueue.enqueueWithReceipt<LaunchCompletionEntry>(
 			LAUNCH_COMPLETION_MESSAGE_TYPE,
@@ -11437,28 +11662,23 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (images.length === 0) images = undefined;
 		}
 
-		let deliveredAsAside = false;
-		if (options?.deliverAs === "aside") {
-			if (this.isStreaming) {
-				if (!(await this.#queueUserMessage(text, images, "aside", { attribution: options.attribution }))) {
-					throw new PromptDroppedError();
-				}
-				return;
-			}
-			// Idle: fall through to the prompt flow below (starts a turn, like an omitted
-			// deliverAs) — there is no live run to inject an aside into.
-			deliveredAsAside = true;
-		} else if (options?.deliverAs === "followUp") {
-			if (!(await this.#queueUserMessage(text, images, "followUp", { attribution: options.attribution }))) {
-				throw new PromptDroppedError();
-			}
-			return;
-		} else if (options?.deliverAs === "steer") {
-			if (!(await this.#queueUserMessage(text, images, "steer", { attribution: options.attribution }))) {
+		const queueMode = options?.deliverAs;
+		if (queueMode === "followUp" || queueMode === "steer" || (queueMode === "aside" && this.isStreaming)) {
+			const queued = this.#expandQueuedMentions(text, queueMode, options?.attribution);
+			if (
+				!(await this.#queueUserMessage(queued.text, images, queueMode, {
+					attribution: options?.attribution,
+					prependMessages: queued.prependMessages,
+					rawText: text,
+				}))
+			) {
 				throw new PromptDroppedError();
 			}
 			return;
 		}
+		// Idle aside: fall through to the prompt flow below (starts a turn, like an omitted
+		// deliverAs) — there is no live run to inject an aside into.
+		const deliveredAsAside = queueMode === "aside";
 
 		// Use prompt() with expandPromptTemplates: false to skip command handling and template
 		// expansion. prompt() awaits manual-compaction cleanup and (on the non-streaming path)
@@ -11831,9 +12051,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#promptSkills;
 	}
 
-	/** Start skill-description compression held by `deferSkillDescriptionCompression` (see `createAgentSession`). */
-	startSkillDescriptionCompression(): void {
+	/** Start skill and MCP namespace hint compression held by `deferHintCompression` (see `createAgentSession`). */
+	startHintCompression(): void {
 		this.#skillDescriptions.startCompression();
+		this.#mcpNamespaces?.startCompression();
 	}
 
 	/** Frozen skill-URI hint visibility snapshot (see {@link SessionTools.skillHintVisible}). */
@@ -13949,29 +14170,31 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	holdIrcWakes(): () => void {
 		this.#ircWakeHolds++;
-		this.#notifyIrcWakeHolds();
+		this.#notifyWakeState();
 		let released = false;
 		return () => {
 			if (released) return;
 			released = true;
 			this.#ircWakeHolds--;
 			this.#resumeStrandedIrcAsides();
-			this.#notifyIrcWakeHolds();
+			this.#notifyWakeState();
 		};
 	}
 
 	/**
-	 * Observe changes of {@link ircWakesPending} that no session event carries: an IRC wake
-	 * hold taken or released, an idle compaction's waiting wakes settling. A worker-homed
-	 * session's publisher republishes on them, so main's lifecycle parks it once it may.
+	 * Observe changes of {@link ircWakesPending} and {@link hasPendingWake} that no session
+	 * event carries: an IRC wake hold taken or released, an idle compaction's waiting wakes
+	 * settling, an owned job settling, a child agent's status or any block changing. A
+	 * worker-homed session's publisher republishes on them, so main's lifecycle parks it once
+	 * it may and agents waiting on it read a current {@link hasPendingWake}.
 	 */
-	subscribeIrcWakeHolds(listener: () => void): () => void {
-		this.#ircWakeHoldListeners.add(listener);
-		return () => this.#ircWakeHoldListeners.delete(listener);
+	subscribeWakeState(listener: () => void): () => void {
+		this.#wakeStateListeners.add(listener);
+		return () => this.#wakeStateListeners.delete(listener);
 	}
 
-	#notifyIrcWakeHolds(): void {
-		for (const listener of this.#ircWakeHoldListeners) listener();
+	#notifyWakeState(): void {
+		for (const listener of this.#wakeStateListeners) listener();
 		this.#scheduleRunCheck();
 	}
 

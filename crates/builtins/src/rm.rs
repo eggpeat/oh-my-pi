@@ -20,7 +20,7 @@ use clap::{
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle, TermLike};
 use parking_lot::Mutex;
 use crate::openfile::OpenFile;
-use omp_vfs::{Metadata, child_path, is_virtual_path, normalize_lexically, parent_path};
+use omp_vfs::{FileType, Metadata, child_path, is_virtual_path, normalize_lexically, parent_path};
 use thiserror::Error;
 use uucore::{display::Quotable, parser::shortcut_value_parser::ShortcutValueParser};
 
@@ -189,6 +189,8 @@ pub fn safe_remove_file(host: &mut Host,
 ) -> Option<bool> {
 	let (parent, file_name) = native_entry(host, path)?;
 	let dir_fd = DirFd::open(&parent, SymlinkBehavior::Follow).ok()?;
+	// The unlink below bypasses the filesystem facade.
+	host.fs().note_change(parent.join(&file_name));
 
 	match dir_fd.unlink_at(&file_name, false) {
 		Ok(_) => {
@@ -315,6 +317,9 @@ pub fn safe_remove_dir_recursive(host: &mut Host,
 			return show_removal_error(host, e, path);
 		},
 	};
+
+	// The traversal below unlinks by descriptor, bypassing the filesystem facade.
+	host.fs().note_change(&path_fs);
 
 	// Try to open the directory using DirFd for secure traversal
 	let dir_fd = match DirFd::open(&path_fs, SymlinkBehavior::Follow) {
@@ -1218,7 +1223,7 @@ fn count_files(host: &mut Host, paths: &[&OsStr], recursive: bool) -> u64 {
 		}
 		let path = Path::new(p);
 		if let Ok(md) = host.fs().symlink_metadata(&host.resolve(path)) {
-			if md.is_dir() && !is_symlink_dir(&md) {
+			if md.is_dir() && !is_symlink_dir(&md.file_type()) {
 				if recursive {
 					total += count_files_in_directory(host, path);
 				}
@@ -1313,7 +1318,7 @@ pub fn remove(host: &mut Host, files: &[&OsStr], options: &Options) -> bool {
 				any_files_processed = true;
 				if metadata.is_dir() {
 					handle_dir(host, file, options, progress_bar.as_ref())
-				} else if is_symlink_dir(&metadata) {
+				} else if is_symlink_dir(&metadata.file_type()) {
 					remove_dir(host, file, options, progress_bar.as_ref())
 				} else {
 					remove_file(host, file, options, progress_bar.as_ref())
@@ -1498,6 +1503,7 @@ fn remove_dir_recursive_with_provider(
 				// or junction to one; an entry of unknown type is looked up.
 				error |= match entry.file_type() {
 					Ok(file_type) if file_type.is_dir() => remove_dir_tree(host, &child, options, progress_bar),
+					Ok(file_type) if is_symlink_dir(&file_type) => remove_dir(host, &child, options, progress_bar),
 					Ok(_) => remove_file(host, &child, options, progress_bar),
 					Err(_) => remove_dir_recursive(host, &child, options, progress_bar),
 				};
@@ -1861,13 +1867,13 @@ fn prompt_descend(host: &mut Host, path: &Path) -> bool {
 }
 
 #[cfg(not(windows))]
-fn is_symlink_dir(_metadata: &Metadata) -> bool {
+fn is_symlink_dir(_file_type: &FileType) -> bool {
 	false
 }
 
 #[cfg(windows)]
-fn is_symlink_dir(metadata: &Metadata) -> bool {
-	metadata.file_type().is_symlink_dir()
+fn is_symlink_dir(file_type: &FileType) -> bool {
+	file_type.is_symlink_dir()
 }
 
 #[cfg(test)]
@@ -2241,6 +2247,30 @@ mod tests {
 		// Without -f (and without a terminal to prompt on) the removal must
 		// report exactly the same.
 		assert_eq!(run("-r"), Some((code, err)));
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn removes_a_junction_inside_a_tree_without_following_it() {
+		let cwd = tempdir().unwrap();
+		let target = cwd.path().join("target");
+		std::fs::create_dir(&target).unwrap();
+		std::fs::write(target.join("keep"), b"data").unwrap();
+		let tree = cwd.path().join("ws");
+		std::fs::create_dir(&tree).unwrap();
+		let linked = std::process::Command::new("cmd")
+			.args(["/c", "mklink", "/J"])
+			.arg(tree.join("junction"))
+			.arg(&target)
+			.output()
+			.unwrap();
+		assert!(linked.status.success(), "mklink /J failed: {linked:?}");
+
+		let (code, capture) = run_util::<Rm>(&["-rf", "ws"], "", cwd.path());
+
+		assert_eq!(code, 0, "{}", capture.err());
+		assert!(!tree.exists());
+		assert_eq!(std::fs::read(target.join("keep")).unwrap(), b"data");
 	}
 
 	#[cfg(windows)]

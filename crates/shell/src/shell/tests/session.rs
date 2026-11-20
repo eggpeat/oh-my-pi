@@ -73,7 +73,6 @@ async fn brace_limit_reports_oversized_expansions() {
 	assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn uutils_diff_reads_process_substitution_fds() {
 	let (result, output) = run_command_capture_within(
@@ -88,6 +87,23 @@ async fn uutils_diff_reads_process_substitution_fds() {
 
 	assert_eq!(result.exit_code, Some(1));
 	assert!(output.contains("< a\n---\n> b\n"), "diff output missing changed lines: {output:?}");
+}
+
+/// `cat`, `grep` and `comm` open `/dev/fd/N` through the same descriptor mount
+/// as `diff`, on Windows as on Unix.
+#[tokio::test(flavor = "multi_thread")]
+async fn builtins_read_process_substitution_fds() {
+	let (result, output) = run_command_capture_within(
+		Duration::from_secs(5),
+		"cat <(echo x); grep -c x <(echo x); comm -12 <(printf 'a\\nb\\n') <(printf 'b\\n')",
+		None,
+		None,
+		CancelToken::default(),
+	)
+	.await
+	.expect("process substitution should not hang");
+
+	assert_eq!((result.exit_code, output.as_str()), (Some(0), "x\n1\nb\n"));
 }
 
 /// Every run reads through a cancellable filesystem, and its redirects must
@@ -522,7 +538,6 @@ async fn descriptor_paths_never_reach_host_only_descriptors() {
 /// `<(…)` operands resolve through the shell's descriptor table, so
 /// utilities report the name the shell passed and script-file options read
 /// them too.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn process_substitution_operands_keep_the_shell_fd_name() {
 	let command = "wc -l <(printf 'a\\nb\\n'); ls <(true); sed -n -f <(echo p) <<< from-sed";
@@ -2612,6 +2627,51 @@ async fn pipe_tap_forwards_every_byte_and_counts_them() {
 	assert_eq!(read.data.len(), written.min(1 << 20));
 	assert!(read.data.ends_with(format!("\n{LAST}\n").as_bytes()));
 	assert!(!read.open);
+}
+
+/// A command whose output is redirected prints nothing: its file is a stream,
+/// under the path the shell resolved in the directory it had moved to, and
+/// reads what the command wrote so far while it still runs.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn pipe_tap_lists_the_file_a_command_redirects_into() {
+	let _guard = shell_test_lock().lock().await;
+	let root = tempfile::tempdir().expect("output directory");
+	let mut cancel = CancelToken::default();
+	let abort = cancel.emplace_abort_token();
+	let command = format!(
+		"cd {} && {{ printf 'a\\nb\\n'; sleep 30; }} > run.log 2>/dev/null",
+		quote_arg(&root.path().to_string_lossy()),
+	);
+	let (taps, run, rx) = run_tapped(&command, cancel);
+
+	let seen = time::timeout(Duration::from_secs(10), async {
+		loop {
+			if let Some(read) = taps.read(1, None)
+				&& read.data == b"a\nb\n"
+			{
+				return read;
+			}
+			time::sleep(Duration::from_millis(20)).await;
+		}
+	})
+	.await
+	.expect("the redirected output never became stream 1");
+	assert!(seen.open);
+	assert!(rx.try_recv().is_err(), "redirected output reached the run's own");
+	// `/dev/null` is no file to read back.
+	let [stream] = taps.list().try_into().expect("one stream");
+	assert!(stream.file);
+	assert_eq!(std::path::Path::new(&stream.consumer), root.path().join("run.log"));
+	assert!(stream.producer.contains("printf"), "command text: {}", stream.producer);
+
+	abort.abort(AbortReason::Signal);
+	time::timeout(Duration::from_secs(10), run)
+		.await
+		.expect("run did not stop after abort")
+		.expect("run task panicked")
+		.expect("run");
+	assert!(!taps.read(1, None).expect("stream 1").open);
 }
 
 /// A process's own shell ([`Shell::for_process`]) is the bash tool's shell on

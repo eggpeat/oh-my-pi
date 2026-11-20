@@ -258,6 +258,15 @@ pub trait Backend: Send {
 	fn capabilities(&mut self) -> DesktopCapabilities;
 	fn displays(&mut self) -> CoreResult<Vec<DesktopDisplay>>;
 	fn windows(&mut self) -> CoreResult<Vec<DesktopWindow>>;
+	/// A minimized window's exact accessibility root, for inspection only.
+	/// This never adds a window to the roster used for input or menu dispatch.
+	fn minimized_root(
+		&mut self,
+		_id: &str,
+		_retained: Option<&AxHandle>,
+	) -> CoreResult<Option<super::ax::WindowRoot>> {
+		Ok(None)
+	}
 	/// The process owning window `id`, found even when the window is off the
 	/// current Space, without listing every window.
 	#[cfg(target_os = "macos")]
@@ -276,6 +285,12 @@ pub trait Backend: Send {
 	/// tell report both as false.
 	fn screen_state(&mut self, _display: Option<&DisplaySelector>) -> ScreenState {
 		ScreenState::default()
+	}
+	/// Whether window `id` appears fully covered and its app can stop drawing
+	/// and updating its tree while covered, so both may be stale. Backends
+	/// that do not detect it report false.
+	fn window_covered(&mut self, _id: &str) -> bool {
+		false
 	}
 	/// Waits, before a window or element takeover takes the input lease,
 	/// until the backend lets it start: X11 and macOS wait for the user to
@@ -309,6 +324,13 @@ pub trait Backend: Send {
 			.ok_or_else(|| {
 				DesktopError::invalid_target("no focused window was found for display keyboard input")
 			})
+	}
+	/// Refuses every pointer and keyboard input call when this desktop has no
+	/// input route at all. Callers ask before waiting for the input lease or
+	/// resolving the call's target or frame, which would otherwise refuse with
+	/// a step the call can never get past, such as taking a screenshot first.
+	fn refuse_input(&mut self) -> CoreResult<()> {
+		Ok(())
 	}
 	fn validate_frame_layout(&mut self, frame: &FrameGeometry) -> CoreResult<()> {
 		let displays = self.displays().map_err(|error| {
@@ -514,5 +536,14 @@ pub trait AxBackend {
 	/// `None` when it gave no answer or the backend cannot ask.
 	fn value_settable(&mut self, _h: &AxHandle) -> Option<bool> {
 		None
+	}
+	/// Whether input already sent to `h` may not show yet (on macOS, letters
+	/// typed on a popup button), so a read of it would wait ([`Self::settle`]).
+	fn pending(&mut self, _h: &AxHandle) -> bool {
+		false
+	}
+	/// Waits until a read of `h` would show the input [`Self::pending`] names.
+	fn settle(&mut self, _h: &AxHandle) -> CoreResult<()> {
+		Ok(())
 	}
 }
