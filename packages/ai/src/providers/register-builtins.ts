@@ -101,6 +101,9 @@ function forwardStream<TApi extends Api>(
 	abortTracker: AbortSourceTracker,
 	limits?: StreamLimits,
 ): void {
+	// Captured once, in the same tick the tracker read it: a caller that later
+	// swaps `options.signal` for another request must not change this stream.
+	const callerSignal = options.signal;
 	(async () => {
 		try {
 			const providerHandlesStreamTimeouts = limits?.providerHandlesStreamTimeouts === true;
@@ -141,7 +144,7 @@ function forwardStream<TApi extends Api>(
 				onIdle: () => abortTracker.abortLocally(new AIError.StreamTimeoutError(STREAM_IDLE_TIMEOUT_ERROR)),
 				onFirstItemTimeout: () =>
 					abortTracker.abortLocally(new AIError.StreamTimeoutError(STREAM_FIRST_EVENT_TIMEOUT_ERROR)),
-				abortSignal: options.signal,
+				abortSignal: callerSignal,
 				// The synthetic `start` event is yielded immediately by every provider before
 				// the upstream model has emitted any tokens. Treating it as the first "real"
 				// item would flip the watchdog from `firstItemTimeoutMs` to the much shorter
@@ -161,7 +164,7 @@ function forwardStream<TApi extends Api>(
 			}
 		} catch (error) {
 			const stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-			const message = createProviderStreamError(model, error, stopReason, abortTracker, options.signal);
+			const message = createProviderStreamError(model, error, stopReason, abortTracker, callerSignal);
 			target.push({ type: "error", reason: stopReason, error: message });
 			target.end(message);
 		}
@@ -194,7 +197,7 @@ function createProviderStreamError<TApi extends Api>(
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason,
-		errorId: providerStreamErrorId(model.api, error, stopReason, callerAbortReason, callerSignal),
+		errorId: providerStreamErrorId(model.api, error, stopReason, callerSignal),
 		errorMessage:
 			stopReason === "aborted"
 				? (callerAbortReason ?? "Request was aborted")
@@ -209,16 +212,17 @@ function providerStreamErrorId(
 	api: Api,
 	error: unknown,
 	stopReason: Extract<AssistantMessage["stopReason"], "aborted" | "error">,
-	callerAbortReason: string | undefined,
 	callerSignal: AbortSignal | undefined,
 ): number | undefined {
 	if (stopReason === "error") return AIError.classify(error, api) || undefined;
 	// A string reason is rethrown as AbortError, which always carries Flag.Abort.
 	// That flag means a reasonless transport abort, so a labeled cancel must not
-	// inherit it. Keep a classification only when the caller passed a reason that
-	// itself classifies (a user-interrupt or silent-abort error, for example).
-	if (callerAbortReason === undefined) return undefined;
-	return AIError.classify(callerSignal?.reason, api) || undefined;
+	// inherit it. Keep only a mark the caller's own reason object carries (a
+	// user-interrupt or silent-abort error, for example), even when that object
+	// is itself an AbortError with no text of its own.
+	const reason = callerSignal?.reason;
+	if (typeof reason !== "object" || reason === null) return undefined;
+	return AIError.classify(reason, api) || undefined;
 }
 
 // ---------------------------------------------------------------------------

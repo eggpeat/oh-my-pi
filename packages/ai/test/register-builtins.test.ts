@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import * as BedrockProvider from "@oh-my-pi/pi-ai/providers/amazon-bedrock";
 import { setBedrockProviderModule, streamBedrock } from "@oh-my-pi/pi-ai/providers/register-builtins";
-import type { AssistantMessage, Context, Model } from "@oh-my-pi/pi-ai/types";
+import type { AssistantMessage, Context, Model, OptionsForApi } from "@oh-my-pi/pi-ai/types";
 import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
@@ -336,9 +336,38 @@ describe("register-builtins lazy streams", () => {
 		expect(AIError.is(result.errorId, AIError.Flag.SilentAbort)).toBe(true);
 		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(false);
 	});
+
+	it("keeps the mark of a caller AbortError that carries no reason text", async () => {
+		const reason = new Error("quiet plan switch");
+		reason.name = "AbortError";
+		AIError.attach(reason, AIError.create(AIError.Flag.SilentAbort));
+		const result = await abortForwardedBedrockStream(controller => controller.abort(reason));
+		// An AbortError reason gives no caller text, so the generic message stays,
+		// but the quiet-cancel mark must survive so it is neither shown nor retried.
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("Request was aborted");
+		expect(AIError.is(result.errorId, AIError.Flag.SilentAbort)).toBe(true);
+	});
+
+	it("reads the abort reason and its mark from the signal the stream started with", async () => {
+		const replacement = new AbortController();
+		const other = new Error("Interrupted by user");
+		AIError.attach(other, AIError.create(AIError.Flag.UserInterrupt));
+		replacement.abort(other);
+		const result = await abortForwardedBedrockStream((controller, options) => {
+			// The caller reuses its options object for another request.
+			options.signal = replacement.signal;
+			controller.abort("planner cancelled");
+		});
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("planner cancelled");
+		expect(result.errorId).toBeUndefined();
+	});
 });
 
-async function abortForwardedBedrockStream(abort: (controller: AbortController) => void): Promise<AssistantMessage> {
+async function abortForwardedBedrockStream(
+	abort: (controller: AbortController, options: { signal?: AbortSignal }) => void,
+): Promise<AssistantMessage> {
 	const abortController = new AbortController();
 	const partialMessage = createAssistantMessage("stop");
 	let providerSignal: AbortSignal | undefined;
@@ -361,14 +390,15 @@ async function abortForwardedBedrockStream(abort: (controller: AbortController) 
 		},
 	});
 
-	const stream = streamBedrock(createModel(), baseContext, {
+	const options: OptionsForApi<"bedrock-converse-stream"> = {
 		signal: abortController.signal,
 		// The abort itself must end the stream; a watchdog timeout would hide a missed reason.
 		streamFirstEventTimeoutMs: 0,
 		streamIdleTimeoutMs: 60_000,
-	});
+	};
+	const stream = streamBedrock(createModel(), baseContext, options);
 	const firstEvent = await stream[Symbol.asyncIterator]().next();
 	expect(firstEvent.value?.type).toBe("start");
-	abort(abortController);
+	abort(abortController, options);
 	return stream.result();
 }
