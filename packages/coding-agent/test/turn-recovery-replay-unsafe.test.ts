@@ -14,6 +14,7 @@ import {
 	TurnRecovery,
 	type TurnRecoveryHost,
 } from "@oh-my-pi/pi-coding-agent/session/turn-recovery";
+import { SILENT_ABORT_MARKER, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createProviderErrorMessage } from "../../ai/src/providers/error-message";
 import { streamFactoryDroidGemini } from "../../ai/src/providers/factory-droid/gemini";
@@ -1618,6 +1619,60 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 				{ type: "text", text: "Partial answer" },
 			]);
 			expect(new TurnRecovery(createHost(model, modelRegistry)).isRetryableReasonlessAbort(withOutput)).toBe(false);
+		});
+
+		it("never retries user-interrupt or silent aborts even when Flag.Abort is attached", () => {
+			const recovery = new TurnRecovery(createHost(model, modelRegistry));
+
+			const userInterruptWithAbortFlag = abortedTurn([]);
+			userInterruptWithAbortFlag.errorMessage = USER_INTERRUPT_LABEL;
+			userInterruptWithAbortFlag.errorId = AIError.create(AIError.Flag.Abort);
+			expect(recovery.isRetryableReasonlessAbort(userInterruptWithAbortFlag)).toBe(false);
+
+			const userInterruptWithBothFlags = abortedTurn([]);
+			userInterruptWithBothFlags.errorMessage = "Custom cancel";
+			userInterruptWithBothFlags.errorId = AIError.create(AIError.Flag.Abort, AIError.Flag.UserInterrupt);
+			expect(recovery.isRetryableReasonlessAbort(userInterruptWithBothFlags)).toBe(false);
+
+			const silentWithAbortFlag = abortedTurn([]);
+			silentWithAbortFlag.errorMessage = SILENT_ABORT_MARKER;
+			silentWithAbortFlag.errorId = AIError.create(AIError.Flag.Abort);
+			expect(recovery.isRetryableReasonlessAbort(silentWithAbortFlag)).toBe(false);
+
+			const silentWithBothFlags = abortedTurn([]);
+			silentWithBothFlags.errorMessage = "TTSR rule";
+			silentWithBothFlags.errorId = AIError.create(AIError.Flag.Abort, AIError.Flag.SilentAbort);
+			expect(recovery.isRetryableReasonlessAbort(silentWithBothFlags)).toBe(false);
+
+			const resolvedCall: AssistantMessage["content"][number] = {
+				type: "toolCall",
+				id: "call-1",
+				name: "read",
+				arguments: { path: "a.ts" },
+			};
+			const toolResult: ToolResultMessage = {
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "read",
+				content: [{ type: "text", text: "ok" }],
+				isError: false,
+				timestamp: Date.now(),
+			};
+			const interruptedToolTurn = abortedTurn([resolvedCall]);
+			interruptedToolTurn.errorMessage = USER_INTERRUPT_LABEL;
+			interruptedToolTurn.errorId = AIError.create(AIError.Flag.Abort);
+			const toolRecovery = new TurnRecovery(
+				createHost(model, modelRegistry, { messages: [interruptedToolTurn as AgentMessage, toolResult] }),
+			);
+			expect(toolRecovery.classifyResolvedInterruptedToolTurn(interruptedToolTurn)).toBeUndefined();
+
+			const silentToolTurn = abortedTurn([resolvedCall]);
+			silentToolTurn.errorMessage = SILENT_ABORT_MARKER;
+			silentToolTurn.errorId = AIError.create(AIError.Flag.Abort);
+			const silentToolRecovery = new TurnRecovery(
+				createHost(model, modelRegistry, { messages: [silentToolTurn as AgentMessage, toolResult] }),
+			);
+			expect(silentToolRecovery.classifyResolvedInterruptedToolTurn(silentToolTurn)).toBeUndefined();
 		});
 	});
 });

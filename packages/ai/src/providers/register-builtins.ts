@@ -161,7 +161,7 @@ function forwardStream<TApi extends Api>(
 			}
 		} catch (error) {
 			const stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-			const message = createProviderStreamError(model, error, stopReason);
+			const message = createProviderStreamError(model, error, stopReason, abortTracker, options.signal?.reason);
 			target.push({ type: "error", reason: stopReason, error: message });
 			target.end(message);
 		}
@@ -172,7 +172,20 @@ function createProviderStreamError<TApi extends Api>(
 	model: Model<TApi>,
 	error: unknown,
 	stopReason: Extract<AssistantMessage["stopReason"], "aborted" | "error"> = "error",
+	abortTracker?: AbortSourceTracker,
+	callerSignalReason?: unknown,
 ): AssistantMessage {
+	const callerAbortReason = stopReason === "aborted" ? abortTracker?.getCallerAbortReason() : undefined;
+	// Keep caller-supplied classification (e.g. UserInterrupt, SilentAbort, AbortError)
+	// while shielding caller aborts from racing local timeout/transport errors.
+	const classificationTarget =
+		stopReason === "aborted"
+			? callerSignalReason instanceof Error
+				? callerSignalReason
+				: error instanceof AIError.AbortError
+					? error
+					: callerSignalReason
+			: error;
 	return {
 		role: "assistant",
 		content: [],
@@ -188,9 +201,13 @@ function createProviderStreamError<TApi extends Api>(
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason,
-		errorId: stopReason === "error" ? AIError.classify(error, model.api) || undefined : undefined,
+		errorId: AIError.classify(classificationTarget, model.api) || undefined,
 		errorMessage:
-			stopReason === "aborted" ? "Request was aborted" : error instanceof Error ? error.message : String(error),
+			stopReason === "aborted"
+				? (callerAbortReason ?? "Request was aborted")
+				: error instanceof Error
+					? error.message
+					: String(error),
 		timestamp: Date.now(),
 	};
 }
@@ -214,20 +231,26 @@ function createLazyProviderStream<TModule, TApi extends Api>(
 	return (model, context, options) => {
 		const outer = new EventStreamImpl();
 		const streamOptions: OptionsForApi<TApi> = options ?? {};
+		const abortTracker = createAbortSourceTracker(streamOptions.signal);
+		const providerOptions: OptionsForApi<TApi> = { ...streamOptions, signal: abortTracker.requestSignal };
 
 		load()
 			.then(mod => {
-				const abortTracker = createAbortSourceTracker(streamOptions.signal);
-				const providerOptions: OptionsForApi<TApi> = { ...streamOptions, signal: abortTracker.requestSignal };
 				const inner = pick(mod)(model, context, providerOptions);
 				forwardStream(outer, inner, model, streamOptions, abortTracker, limits);
 			})
 			.catch(error => {
-				const message = createProviderStreamError(model, error);
-				outer.push({ type: "error", reason: "error", error: message });
+				const stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
+				const message = createProviderStreamError(
+					model,
+					error,
+					stopReason,
+					abortTracker,
+					streamOptions.signal?.reason,
+				);
+				outer.push({ type: "error", reason: stopReason, error: message });
 				outer.end(message);
 			});
-
 		return outer;
 	};
 }

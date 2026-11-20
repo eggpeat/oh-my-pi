@@ -60,7 +60,9 @@ import {
 	assistantTurnProducedOutput,
 	isEmptyAssistantStop,
 	isEmptyErrorTurn,
+	isSilentAbort,
 	isUserAuthoredMessage,
+	isUserInterruptAbort,
 	operatorTitleText,
 } from "./messages";
 import {
@@ -1588,11 +1590,12 @@ export class TurnRecovery {
 			message.content.some(block => block.type !== "fallback") ||
 			this.#host.abortInProgress() ||
 			this.#host.isDisposed() ||
-			this.#host.streamingEditAbortTriggered()
+			this.#host.streamingEditAbortTriggered() ||
+			isUserInterruptAbort(message) ||
+			isSilentAbort(message)
 		) {
 			return false;
 		}
-
 		const id = this.#classifyRetryMessage(message);
 		if (message.stopReason === "aborted" && AIError.is(id, AIError.Flag.Abort)) return true;
 		if (message.errorMessage === undefined || !Object.hasOwn(GENERIC_ABORT_MESSAGES, message.errorMessage)) {
@@ -1755,6 +1758,8 @@ export class TurnRecovery {
 			!this.#host.abortInProgress() &&
 			!this.#host.isDisposed() &&
 			!this.#host.streamingEditAbortTriggered() &&
+			!isUserInterruptAbort(message) &&
+			!isSilentAbort(message) &&
 			((message.stopReason === "aborted" && AIError.is(id, AIError.Flag.Abort)) || genericAbort);
 		if (!reasonlessAbort && !this.#isMidStreamTransportFailure(message, id)) return undefined;
 		if (reasonlessAbort && genericAbort) message.errorId = AIError.create(AIError.Flag.Abort);

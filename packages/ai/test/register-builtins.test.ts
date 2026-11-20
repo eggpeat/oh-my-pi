@@ -316,4 +316,104 @@ describe("register-builtins lazy streams", () => {
 		expect(result.stopReason).toBe("aborted");
 		expect(result.errorMessage).toBe("Request was aborted");
 	});
+
+	it("preserves caller abort reason and error classification on forwarded streams", async () => {
+		// String abort reason (e.g. "Interrupted by user"): iterateWithIdleTimeout throws
+		// AIError.AbortError(reason) and forwardStream must surface the caller's text.
+		const stringAbort = new AbortController();
+		const partialMessage = createAssistantMessage("stop");
+		setBedrockProviderModule({
+			streamBedrock: (_model, _context, options) =>
+				({
+					async *[Symbol.asyncIterator]() {
+						yield { type: "start", partial: partialMessage } as const;
+						const { promise } = Promise.withResolvers<never>();
+						options.signal?.addEventListener("abort", () => {}, { once: true });
+						await promise;
+					},
+				}) as unknown as AssistantMessageEventStream,
+		});
+
+		const stream = streamBedrock(createModel(), baseContext, {
+			signal: stringAbort.signal,
+			streamIdleTimeoutMs: 500,
+		});
+		const iterator = stream[Symbol.asyncIterator]();
+		const firstEvent = await iterator.next();
+		expect(firstEvent.value?.type).toBe("start");
+
+		stringAbort.abort("Interrupted by user");
+		const stringResult = await stream.result();
+		expect(stringResult.stopReason).toBe("aborted");
+		expect(stringResult.errorMessage).toBe("Interrupted by user");
+		expect(AIError.is(stringResult.errorId, AIError.Flag.Abort)).toBe(true);
+
+		// Classified Error abort reason: preserves both the error message and its flags.
+		const classifiedAbort = new AbortController();
+		const classifiedReason = AIError.attach(
+			new Error("Cancelled by operator"),
+			AIError.create(AIError.Flag.UserInterrupt),
+		);
+		const classifiedStream = streamBedrock(createModel(), baseContext, {
+			signal: classifiedAbort.signal,
+			streamIdleTimeoutMs: 500,
+		});
+		const classifiedIter = classifiedStream[Symbol.asyncIterator]();
+		await classifiedIter.next();
+		classifiedAbort.abort(classifiedReason);
+		const classifiedResult = await classifiedStream.result();
+		expect(classifiedResult.stopReason).toBe("aborted");
+		expect(classifiedResult.errorMessage).toBe("Cancelled by operator");
+		expect(AIError.is(classifiedResult.errorId, AIError.Flag.UserInterrupt)).toBe(true);
+	});
+
+	it("shields caller aborts from racing local stream timeouts and pre-stream throws", async () => {
+		// If the provider throws synchronously while the caller signal is already aborted
+		// with a reason, the lazy-load catch must still report an aborted result with the reason.
+		const preAborted = new AbortController();
+		preAborted.abort("Interrupted by user");
+		setBedrockProviderModule({
+			streamBedrock: () => {
+				throw new Error("boom before stream");
+			},
+		});
+		const preAbortedResult = await streamBedrock(createModel(), baseContext, {
+			signal: preAborted.signal,
+		}).result();
+		expect(preAbortedResult.stopReason).toBe("aborted");
+		expect(preAbortedResult.errorMessage).toBe("Interrupted by user");
+		expect(AIError.is(preAbortedResult.errorId, AIError.Flag.Transient)).toBe(false);
+
+		// If a local idle timeout fires right as the caller aborts, caller intent wins
+		// and Transient/Timeout flags must not leak onto the aborted message.
+		const racingAbort = new AbortController();
+		const partialMessage = createAssistantMessage("stop");
+		setBedrockProviderModule({
+			streamBedrock: (_model, _context, options) =>
+				({
+					async *[Symbol.asyncIterator]() {
+						yield { type: "start", partial: partialMessage } as const;
+						yield { type: "text_delta", contentIndex: 0, delta: "hello", partial: partialMessage } as const;
+						const { promise, reject } = Promise.withResolvers<void>();
+						options.signal?.addEventListener(
+							"abort",
+							() => {
+								racingAbort.abort("Interrupted by user");
+								reject(new AIError.StreamTimeoutError("Provider stream stalled"));
+							},
+							{ once: true },
+						);
+						await promise;
+					},
+				}) as unknown as AssistantMessageEventStream,
+		});
+		const racingResult = await streamBedrock(createModel(), baseContext, {
+			signal: racingAbort.signal,
+			streamIdleTimeoutMs: 10,
+		}).result();
+		expect(racingResult.stopReason).toBe("aborted");
+		expect(racingResult.errorMessage).toBe("Interrupted by user");
+		expect(AIError.is(racingResult.errorId, AIError.Flag.Transient)).toBe(false);
+		expect(AIError.is(racingResult.errorId, AIError.Flag.Timeout)).toBe(false);
+	});
 });
