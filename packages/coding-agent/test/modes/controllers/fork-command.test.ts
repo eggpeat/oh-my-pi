@@ -380,6 +380,26 @@ describe("/fork terminal placement", () => {
 		expect(launchTerminal).not.toHaveBeenCalled();
 	});
 
+	it("preserves boolean --plan across terminal forks while still blocking a following --api-key", async () => {
+		const secret = "do-not-include-this-key";
+		const blocked = createContext({
+			argv: ["--plan", "--api-key", secret, "prompt"],
+		});
+		await blocked.controller.handleForkCommand("pane");
+		expect(blocked.showError.mock.calls[0]?.[0]).toContain("--api-key");
+		expect(blocked.showError.mock.calls[0]?.[0]).not.toContain(secret);
+		expect(blocked.launchTerminal).not.toHaveBeenCalled();
+
+		const forked = createContext({
+			argv: ["--plan", "--model", "old-provider/model-a", "prompt"],
+		});
+		await forked.controller.handleForkCommand("pane");
+		const command = forked.launchTerminal.mock.calls[0]?.[0].command ?? [];
+		const appArgs = command.slice(command.indexOf("omp-entry") + 1);
+		expect(appArgs.slice(0, 5)).toEqual(["--plan", "--profile", "active-profile", "--model", "provider/model"]);
+		expect(appArgs).not.toContain("old-provider/model-a");
+	});
+
 	it("rejects placement forks without a persisted transcript", async () => {
 		const { controller, ctx, launchTerminal, flush } = createContext({ persisted: false });
 		await controller.handleForkCommand("window");

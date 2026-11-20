@@ -91,4 +91,12 @@ describe("resolveCliArgv strips launch-global flags before non-launch subcommand
 	test("launch-shaped `acp` still receives forwarded launch-global flags", () => {
 		expect(resolveCliArgv(["--cwd", "/x", "acp"])).toEqual({ argv: ["acp", "--cwd", "/x"] });
 	});
+
+	test("extension-shadowable `--plan` before another flag does not hide a trailing subcommand", () => {
+		expect(resolveCliArgv(["--plan", "--cwd", "/tmp", "update"])).toEqual({ argv: ["update"] });
+		expect(resolveCliArgv(["--plan", "--model", "opus", "acp"])).toEqual({
+			argv: ["acp", "--plan", "--model", "opus"],
+		});
+		expect(resolveCliArgv(["--plan", "acp"])).toEqual({ argv: ["launch", "--plan", "acp"] });
+	});
 });

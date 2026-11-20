@@ -291,6 +291,21 @@ describe("restartArgv (/restart relaunch argv)", () => {
 	it("omits --restore for a session that never materialized on disk", () => {
 		expect(restartArgv(["--no-session", "hello"], undefined)).toEqual(["--no-session"]);
 	});
+
+	it("treats --plan before another flag as boolean while keeping a value-like --plan model", () => {
+		const booleanPlan = restartArgv(["--plan", "--continue", "fix the bug"], "sid");
+		expect(booleanPlan).toEqual(["--plan", "--restore", "sid"]);
+		expect(() =>
+			validateRestoreLaunch(parseArgs(booleanPlan, new Map([["plan", { type: "boolean" }]])), true),
+		).not.toThrow();
+
+		expect(restartArgv(["--plan", "opus", "--continue", "fix the bug"], "sid")).toEqual([
+			"--plan",
+			"opus",
+			"--restore",
+			"sid",
+		]);
+	});
 });
 describe("--restore", () => {
 	it("selects its session as --resume does, and a relaunch restores only the current one", () => {
