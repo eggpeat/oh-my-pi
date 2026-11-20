@@ -36,6 +36,80 @@ use crate::bash::{
 	StdioSpec, Vpid,
 };
 
+/// One word inside an `env -S` / `--split-string` argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvSplitWord {
+	/// Decoded (unexpanded) word text for URL detection and resolution.
+	pub text:  String,
+	/// Byte range `[start, end)` inside [`EnvSplitPlan::raw`].
+	pub start: usize,
+	pub end:   usize,
+	/// True when this word belongs to `omp` (or an unknown command) and stays
+	/// literal.
+	pub keep:  bool,
+}
+
+/// Word-level URL rewrite plan for one `env -S` / `--split-string` argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvSplitPlan {
+	/// Index of this argument in `argv`.
+	pub index:  usize,
+	/// Prefix before the split string (`""`, `"--split-string="`, `"-iS"`, …).
+	pub prefix: String,
+	/// Raw split string (the slice of `argv[index]` after `prefix`).
+	pub raw:    String,
+	/// Parsed words within `raw`, in source order.
+	pub words:  Vec<EnvSplitWord>,
+}
+
+/// URL rewrite ownership for one external command's `argv`, shared between the
+/// embedded shell and the client-terminal rewriter (`bash-host-urls.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UrlArgPlan {
+	/// `keep[i]` is `true` when `argv[i]` must not be URL-rewritten. Empty when
+	/// no argument had a URL candidate.
+	pub keep:       Vec<bool>,
+	/// True when the child's environment belongs to `omp` (or an unknown
+	/// program).
+	pub keep_env:   bool,
+	/// Per-word rewrite plans for `env -S` / `--split-string` arguments.
+	pub env_splits: Vec<EnvSplitPlan>,
+}
+
+impl UrlArgPlan {
+	fn keep_arg(&self, index: usize) -> bool {
+		self.keep.get(index).copied().unwrap_or(false)
+	}
+
+	fn env_split_at(&self, index: usize) -> Option<&EnvSplitPlan> {
+		self.env_splits.iter().find(|plan| plan.index == index)
+	}
+}
+
+/// Classify a command's `argv` for internal URL rewriting using the embedded
+/// shell's canonical launcher, `env -S`, `find`, and `ssh` rules.
+///
+/// When `env_complete` is `false` (client-terminal rewriting where inherited
+/// environment variables are not all visible), an unexpanded `${VAR}` at
+/// command position inside `env -S` conservatively preserves following
+/// arguments.
+pub fn classify_url_args(
+	argv: &[String],
+	env: Option<&[(String, String)]>,
+	env_complete: bool,
+) -> UrlArgPlan {
+	let vwords: Vec<VWord<'_>> = argv
+		.iter()
+		.enumerate()
+		.map(|(origin, word)| VWord::plain(word.as_bytes(), origin))
+		.collect();
+	let base = match env {
+		Some(pairs) => EnvBase::Pairs(pairs),
+		None => EnvBase::None,
+	};
+	classify_vwords(argv.len(), vwords, EnvContext::new(base, env_complete))
+}
+
 /// What a spawn hands the OS in place of the URLs it names; before
 /// [`resolve`], what the command wrote.
 pub(super) struct Names {
@@ -47,8 +121,8 @@ pub(super) struct Names {
 	pub env:  EnvView,
 	/// The working directory.
 	pub cwd:  BString,
-	/// Which arguments and environment belong to `omp` and stay literal.
-	owned:    OmpOwned,
+	/// Ownership plan computed once by [`plan`] and reused by [`resolve`].
+	owned:    UrlArgPlan,
 }
 
 /// The parts of a [`SpawnSpec`] URL resolution does not touch, owned.
@@ -104,25 +178,9 @@ impl Rest {
 	}
 }
 
-/// Arguments `omp` itself reads, and whether the environment reaches `omp`.
-pub(super) struct OmpOwned {
-	/// `args[i]` is a word `omp` reads (an argument passed to `omp`, or an
-	/// assignment a wrapper puts in `omp`'s environment). Empty when no
-	/// argument had a URL candidate.
-	args: Vec<bool>,
-	/// The spawned environment is handed to `omp`, so its URLs stay as written.
-	env:  bool,
-}
-
-impl OmpOwned {
-	fn arg(&self, index: usize) -> bool {
-		self.args.get(index).copied().unwrap_or(false)
-	}
-}
-
 /// Plan URL resolution for `spec`, returning `None` (with no allocation or
 /// launcher walk when no candidate URL is present) when `spec` can spawn as-is.
-pub(super) fn plan(spec: &SpawnSpec<'_>) -> Option<OmpOwned> {
+pub(super) fn plan(spec: &SpawnSpec<'_>) -> Option<UrlArgPlan> {
 	let path_or_cwd_url = is_url(spec.path) || is_url(spec.cwd);
 	let arg_has_url = spec.argv.iter().skip(1).any(|arg| arg.contains_str("://"));
 	let env_has_url = spec.env.iter().any(|(name, value)| env_url(name, value));
@@ -130,17 +188,21 @@ pub(super) fn plan(spec: &SpawnSpec<'_>) -> Option<OmpOwned> {
 		return None;
 	}
 	if !arg_has_url && !env_has_url {
-		return Some(OmpOwned { args: Vec::new(), env: true });
+		return Some(UrlArgPlan { keep: Vec::new(), keep_env: true, env_splits: Vec::new() });
 	}
-	let owned = omp_owned(spec.argv);
+	let owned = omp_owned(spec.argv, Some(spec.env));
 	let needs_arg = arg_has_url
-		&& spec
-			.argv
-			.iter()
-			.enumerate()
-			.skip(1)
-			.any(|(index, arg)| !owned.arg(index) && arg.contains_str("://"));
-	let needs_env = env_has_url && !owned.env;
+		&& spec.argv.iter().enumerate().skip(1).any(|(index, arg)| {
+			if let Some(split) = owned.env_split_at(index) {
+				split
+					.words
+					.iter()
+					.any(|word| !word.keep && word.text.contains("://"))
+			} else {
+				!owned.keep_arg(index) && arg.contains_str("://")
+			}
+		});
+	let needs_env = env_has_url && !owned.keep_env;
 	if !path_or_cwd_url && !needs_arg && !needs_env {
 		return None;
 	}
@@ -149,7 +211,7 @@ pub(super) fn plan(spec: &SpawnSpec<'_>) -> Option<OmpOwned> {
 
 /// Take `spec` apart for a spawn that waits on the provider, carrying `owned`
 /// forward so [`resolve`] does not walk `argv` a second time.
-pub(super) fn split(spec: SpawnSpec<'_>, owned: OmpOwned) -> (Names, Rest) {
+pub(super) fn split(spec: SpawnSpec<'_>, owned: UrlArgPlan) -> (Names, Rest) {
 	let SpawnSpec {
 		path,
 		argv,
@@ -190,45 +252,17 @@ pub(super) fn split(spec: SpawnSpec<'_>, owned: OmpOwned) -> (Names, Rest) {
 	(names, rest)
 }
 
-/// `omp` as the program, or as the command a known wrapper runs. An argument
-/// merely spelled `omp` (`grep omp local://out.txt`, `ls ./omp local://dir`)
-/// does not count. The same walk the client terminal applies
-/// (`bash-host-urls.ts`).
-fn omp_owned(argv: &[BString]) -> OmpOwned {
-	let mut args = vec![false; argv.len()];
-	if argv.is_empty() {
-		return OmpOwned { args, env: false };
-	}
+fn omp_owned(argv: &[BString], env: Option<&EnvView>) -> UrlArgPlan {
 	let vwords: Vec<VWord<'_>> = argv
 		.iter()
 		.enumerate()
-		.map(|(origin, word)| VWord { text: Cow::Borrowed(word.as_slice()), origin })
+		.map(|(origin, word)| VWord::plain(word.as_slice(), origin))
 		.collect();
-	let launch = launch_of(vwords);
-	if launch.aborted || launch.at >= launch.words.len() {
-		return OmpOwned { args, env: false };
-	}
-	let cmd = launch.words[launch.at].text.as_ref();
-	if program_is(cmd, b"ssh") {
-		mark_ssh(&mut args, &launch.words[launch.at..]);
-		return OmpOwned { args, env: false };
-	}
-	if program_is(cmd, b"find") {
-		let env = mark_find(&mut args, &launch.words[launch.at..]);
-		if env {
-			for &passed in &launch.passed {
-				if passed < args.len() {
-					args[passed] = true;
-				}
-			}
-		}
-		return OmpOwned { args, env };
-	}
-	if !is_omp(cmd) {
-		return OmpOwned { args, env: false };
-	}
-	mark_omp_args(&mut args, &launch.words, launch.at, &launch.passed, false);
-	OmpOwned { args, env: true }
+	let (base, complete) = match env {
+		Some(view) => (EnvBase::View(view), true),
+		None => (EnvBase::None, false),
+	};
+	classify_vwords(argv.len(), vwords, EnvContext::new(base, complete))
 }
 
 /// Whether `word` names the `omp` program, by any path.
@@ -312,7 +346,11 @@ pub(super) async fn resolve(fs: &omp_vfs::Fs, names: &Names) -> io::Result<Names
 	};
 	let mut argv = Vec::with_capacity(names.argv.len());
 	for (i, arg) in names.argv.iter().enumerate() {
-		let host = if i == 0 || names.owned.arg(i) {
+		let host = if i == 0 {
+			None
+		} else if let Some(split) = names.owned.env_split_at(i) {
+			resolve_env_split(fs, split).await
+		} else if names.owned.keep_arg(i) {
 			None
 		} else {
 			host_arg(fs, arg.as_bstr()).await
@@ -321,7 +359,7 @@ pub(super) async fn resolve(fs: &omp_vfs::Fs, names: &Names) -> io::Result<Names
 	}
 	// What the child's environment says differently from the shell's.
 	let mut hosted: Vec<(BString, BString)> = Vec::new();
-	if !names.owned.env {
+	if !names.owned.keep_env {
 		for (name, value) in names.env.iter() {
 			if env_url(name, value)
 				&& let Some(host) = host_arg(fs, value).await
@@ -352,7 +390,64 @@ pub(super) async fn resolve(fs: &omp_vfs::Fs, names: &Names) -> io::Result<Names
 		pairs.append(&mut hosted);
 		EnvView::new(pairs)
 	};
-	Ok(Names { path, argv, env, cwd, owned: OmpOwned { args: Vec::new(), env: names.owned.env } })
+	Ok(Names {
+		path,
+		argv,
+		env,
+		cwd,
+		owned: UrlArgPlan {
+			keep:       Vec::new(),
+			keep_env:   names.owned.keep_env,
+			env_splits: Vec::new(),
+		},
+	})
+}
+
+/// Resolve unprotected URL words inside one `env -S` / `--split-string` string,
+/// quoting each replacement for `env -S` and preserving untouched spans
+/// verbatim.
+async fn resolve_env_split(fs: &omp_vfs::Fs, split: &EnvSplitPlan) -> Option<BString> {
+	let raw = split.raw.as_bytes();
+	let mut out = Vec::with_capacity(split.prefix.len() + raw.len());
+	out.extend_from_slice(split.prefix.as_bytes());
+	let mut cursor = 0usize;
+	let mut changed = false;
+	for word in &split.words {
+		if word.keep || !word.text.contains("://") {
+			continue;
+		}
+		if let Some(host) = host_arg(fs, BStr::new(word.text.as_bytes())).await {
+			out.extend_from_slice(&raw[cursor..word.start]);
+			append_env_s_word(&mut out, host.as_slice());
+			cursor = word.end;
+			changed = true;
+		}
+	}
+	if !changed {
+		return None;
+	}
+	out.extend_from_slice(&raw[cursor..]);
+	Some(BString::from(out))
+}
+
+/// Append `word` encoded as one literal word for `env -S`.
+fn append_env_s_word(out: &mut Vec<u8>, word: &[u8]) {
+	let safe = !word.is_empty()
+		&& word
+			.iter()
+			.all(|&b| (0x21..=0x7e).contains(&b) && !matches!(b, b'\'' | b'"' | b'\\' | b'#' | b'$'));
+	if safe {
+		out.extend_from_slice(word);
+		return;
+	}
+	out.push(b'\'');
+	for &b in word {
+		if b == b'\'' || b == b'\\' {
+			out.push(b'\\');
+		}
+		out.push(b);
+	}
+	out.push(b'\'');
 }
 
 /// The host path `path` aliases, if it is a URL the filesystem backs.
@@ -435,23 +530,93 @@ fn names_nothing(text: &str) -> bool {
 	})
 }
 
-/// One logical word in a command walk, and the `argv` slot it came from.
-#[derive(Clone)]
-struct VWord<'a> {
-	text:   Cow<'a, [u8]>,
+// ── Shared launcher, `env -S`, `find`, and `ssh` classification ──
+
+/// Where a logical word came from: an `argv` slot, or one word inside an
+/// `env -S` split plan.
+#[derive(Clone, Copy)]
+struct SourceRef {
 	origin: usize,
+	split:  Option<(usize, usize)>,
+}
+
+/// One logical word in a command walk.
+struct VWord<'a> {
+	text:            Cow<'a, [u8]>,
+	src:             SourceRef,
+	has_unknown_var: bool,
+}
+
+impl<'a> VWord<'a> {
+	const fn plain(text: &'a [u8], origin: usize) -> Self {
+		Self {
+			text:            Cow::Borrowed(text),
+			src:             SourceRef { origin, split: None },
+			has_unknown_var: false,
+		}
+	}
+}
+
+enum EnvBase<'a> {
+	None,
+	View(&'a EnvView),
+	Pairs(&'a [(String, String)]),
+}
+
+struct EnvContext<'a> {
+	base:      EnvBase<'a>,
+	complete:  bool,
+	overrides: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl<'a> EnvContext<'a> {
+	const fn new(base: EnvBase<'a>, complete: bool) -> Self {
+		Self { base, complete, overrides: Vec::new() }
+	}
+
+	fn get(&self, name: &[u8]) -> Option<&[u8]> {
+		for (k, v) in self.overrides.iter().rev() {
+			if k.as_slice() == name {
+				return Some(v.as_slice());
+			}
+		}
+		match self.base {
+			EnvBase::None => None,
+			EnvBase::View(view) => {
+				let mut found = None;
+				for (k, v) in view.iter() {
+					if k.as_bytes() == name {
+						found = Some(v.as_bytes());
+					}
+				}
+				found
+			},
+			EnvBase::Pairs(pairs) => pairs
+				.iter()
+				.rev()
+				.find(|(k, _)| k.as_bytes() == name)
+				.map(|(_, v)| v.as_bytes()),
+		}
+	}
+
+	fn record_assignment(&mut self, word: &[u8]) {
+		if let Some((name, Some(val))) = Some(split_eq(word))
+			&& !name.is_empty()
+		{
+			self.overrides.push((name.to_vec(), val.to_vec()));
+		}
+	}
 }
 
 /// Result of walking past launchers (`env`, `sudo`, `npx`, `uv run`, …).
 struct Launch<'a> {
 	words:   Vec<VWord<'a>>,
 	at:      usize,
-	passed:  Vec<usize>,
+	passed:  Vec<SourceRef>,
 	aborted: bool,
 }
 
-/// Options a launcher takes before the command it runs. Shared 1-for-1 with
-/// `bash-host-urls.ts`.
+/// Options a launcher takes before the command it runs.
 struct OptSet {
 	/// Short letters whose value is the next word when last in a cluster.
 	short_val:  &'static [u8],
@@ -470,6 +635,51 @@ enum ShortStep {
 }
 
 const MAX_ENV_SPLITS: usize = 64;
+
+fn classify_vwords(argc: usize, vwords: Vec<VWord<'_>>, mut env: EnvContext<'_>) -> UrlArgPlan {
+	let mut keep = vec![false; argc];
+	let mut env_splits = Vec::new();
+	if argc == 0 {
+		return UrlArgPlan { keep, keep_env: false, env_splits };
+	}
+	let launch = launch_of_from(vwords, 0, &mut env, &mut env_splits);
+	if launch.aborted || launch.at >= launch.words.len() {
+		return UrlArgPlan { keep, keep_env: false, env_splits };
+	}
+	let first = &launch.words[launch.at];
+	let cmd = first.text.as_ref();
+	if program_is(cmd, b"ssh") {
+		mark_ssh(&mut keep, &mut env_splits, &launch.words[launch.at..], &mut env);
+		return UrlArgPlan { keep, keep_env: false, env_splits };
+	}
+	if program_is(cmd, b"find") {
+		let keep_env = mark_find(&mut keep, &mut env_splits, &launch.words[launch.at..], &mut env);
+		if keep_env {
+			for &src in &launch.passed {
+				mark_source(&mut keep, &mut env_splits, src);
+			}
+		}
+		return UrlArgPlan { keep, keep_env, env_splits };
+	}
+	if is_omp(cmd) || first.has_unknown_var {
+		mark_omp_args(&mut keep, &mut env_splits, &launch.words, launch.at, &launch.passed, false);
+		return UrlArgPlan { keep, keep_env: true, env_splits };
+	}
+	UrlArgPlan { keep, keep_env: false, env_splits }
+}
+
+fn mark_source(keep: &mut [bool], env_splits: &mut [EnvSplitPlan], src: SourceRef) {
+	if let Some((group, word)) = src.split {
+		if let Some(slot) = env_splits
+			.get_mut(group)
+			.and_then(|g| g.words.get_mut(word))
+		{
+			slot.keep = true;
+		}
+	} else if src.origin < keep.len() {
+		keep[src.origin] = true;
+	}
+}
 
 fn program_name(word: &[u8]) -> &[u8] {
 	let name = word
@@ -499,17 +709,31 @@ const fn shell_keyword(word: &[u8]) -> bool {
 	)
 }
 
-fn ident_assignment(word: &[u8]) -> bool {
-	let Some(eq) = word.iter().position(|byte| *byte == b'=') else {
-		return false;
-	};
-	let Some((&first, rest)) = word[..eq].split_first() else {
+fn is_ident(name: &[u8]) -> bool {
+	let Some((&first, rest)) = name.split_first() else {
 		return false;
 	};
 	(first.is_ascii_alphabetic() || first == b'_')
 		&& rest
 			.iter()
 			.all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+}
+
+/// `NAME=VALUE` (as accepted by `sudo`).
+fn ident_assignment(word: &[u8]) -> bool {
+	word
+		.iter()
+		.position(|byte| *byte == b'=')
+		.is_some_and(|eq| is_ident(&word[..eq]))
+}
+
+/// `NAME=VALUE` or `NAME+=VALUE` (as accepted by Bash/sh before a command).
+fn shell_assignment(word: &[u8]) -> bool {
+	let Some(eq) = word.iter().position(|byte| *byte == b'=') else {
+		return false;
+	};
+	let name = word[..eq].strip_suffix(b"+").unwrap_or(&word[..eq]);
+	is_ident(name)
 }
 
 fn split_eq(word: &[u8]) -> (&[u8], Option<&[u8]>) {
@@ -527,34 +751,38 @@ fn listed(name: &[u8], names: &[&str]) -> bool {
 /// spawns resolve the executable at `omp_at` itself (`env local://bin/omp …`);
 /// remote SSH commands keep the whole `omp` command untouched.
 fn mark_omp_args(
-	args: &mut [bool],
+	keep: &mut [bool],
+	env_splits: &mut [EnvSplitPlan],
 	words: &[VWord<'_>],
 	omp_at: usize,
-	passed: &[usize],
+	passed: &[SourceRef],
 	include_exec: bool,
 ) {
 	let from = if include_exec { omp_at } else { omp_at + 1 };
 	for word in words.iter().skip(from) {
-		if word.origin < args.len() {
-			args[word.origin] = true;
-		}
+		mark_source(keep, env_splits, word.src);
 	}
-	for &origin in passed {
-		if origin < args.len() {
-			args[origin] = true;
-		}
+	for &src in passed {
+		mark_source(keep, env_splits, src);
 	}
 }
 
-/// Iterative walk past launchers (`while` loop: constant stack depth).
-fn launch_of(mut words: Vec<VWord<'_>>) -> Launch<'_> {
-	let mut at = 0;
+/// Iterative walk past launchers starting at `start` (`while` loop: constant
+/// stack depth).
+fn launch_of_from<'a>(
+	mut words: Vec<VWord<'a>>,
+	start: usize,
+	env: &mut EnvContext<'_>,
+	env_splits: &mut Vec<EnvSplitPlan>,
+) -> Launch<'a> {
+	let mut at = start;
 	let mut passed = Vec::new();
 	let mut splits = 0usize;
 	while at < words.len() {
 		let word = words[at].text.as_ref();
 		if program_is(word, b"env") {
-			let Some(next) = step_env(&mut words, at, &mut passed, &mut splits) else {
+			let Some(next) = step_env(&mut words, at, &mut passed, &mut splits, env, env_splits)
+			else {
 				return Launch { words, at, passed, aborted: true };
 			};
 			at = next;
@@ -565,7 +793,8 @@ fn launch_of(mut words: Vec<VWord<'_>>) -> Launch<'_> {
 				return Launch { words, at, passed, aborted: true };
 			};
 			while next < words.len() && ident_assignment(words[next].text.as_ref()) {
-				passed.push(words[next].origin);
+				env.record_assignment(words[next].text.as_ref());
+				passed.push(words[next].src);
 				next += 1;
 			}
 			at = next;
@@ -651,6 +880,19 @@ fn launch_of(mut words: Vec<VWord<'_>>) -> Launch<'_> {
 			at = next;
 			continue;
 		}
+		if program_is(word, b"builtin") {
+			let mut next = at + 1;
+			if next < words.len() && words[next].text.as_ref() == b"--" {
+				next += 1;
+			}
+			if next < words.len()
+				&& matches!(words[next].text.as_ref(), b"command" | b"exec" | b"builtin")
+			{
+				at = next;
+				continue;
+			}
+			break;
+		}
 		if program_is(word, b"npx") {
 			let Some(next) = skip_opts(&words, at + 1, &NPX) else {
 				return Launch { words, at, passed, aborted: true };
@@ -726,12 +968,15 @@ fn launch_of(mut words: Vec<VWord<'_>>) -> Launch<'_> {
 	Launch { words, at, passed, aborted: false }
 }
 
-/// Step past `env` at `env_at`, expanding `-S` / `--split-string` in place.
+/// Step past `env` at `env_at`, expanding `-S` / `--split-string` in place and
+/// recording word-level split plans so individual URLs inside `-S` can resolve.
 fn step_env(
 	words: &mut Vec<VWord<'_>>,
 	env_at: usize,
-	passed: &mut Vec<usize>,
+	passed: &mut Vec<SourceRef>,
 	splits: &mut usize,
+	env: &mut EnvContext<'_>,
+	env_splits: &mut Vec<EnvSplitPlan>,
 ) -> Option<usize> {
 	let mut at = env_at + 1;
 	while at < words.len() {
@@ -754,12 +999,14 @@ fn step_env(
 				}
 				*splits += 1;
 				if let Some(raw) = attached {
-					let origin = words[at].origin;
-					let extra = split_env_s(raw, origin);
+					let src = words[at].src;
+					let prefix = &words[at].text[..words[at].text.len() - raw.len()];
+					let extra = expand_env_s(src, prefix, raw, env, env_splits);
 					words.splice(at..=at, extra);
 				} else if at + 1 < words.len() {
-					let origin = words[at + 1].origin;
-					let extra = split_env_s(words[at + 1].text.as_ref(), origin);
+					let src = words[at + 1].src;
+					let raw = words[at + 1].text.as_ref();
+					let extra = expand_env_s(src, b"", raw, env, env_splits);
 					words.splice(at..=at + 1, extra);
 				} else {
 					return None;
@@ -807,12 +1054,16 @@ fn step_env(
 				}
 				*splits += 1;
 				if offset + 1 < letters.len() {
-					let origin = words[at].origin;
-					let extra = split_env_s(&letters[offset + 1..], origin);
+					let src = words[at].src;
+					let split_pos = 1 + offset + 1;
+					let prefix = &words[at].text[..split_pos];
+					let raw = &words[at].text[split_pos..];
+					let extra = expand_env_s(src, prefix, raw, env, env_splits);
 					words.splice(at..=at, extra);
 				} else if at + 1 < words.len() {
-					let origin = words[at + 1].origin;
-					let extra = split_env_s(words[at + 1].text.as_ref(), origin);
+					let src = words[at + 1].src;
+					let raw = words[at + 1].text.as_ref();
+					let extra = expand_env_s(src, b"", raw, env, env_splits);
 					words.splice(at..=at + 1, extra);
 				} else {
 					return None;
@@ -824,32 +1075,93 @@ fn step_env(
 		at += 1;
 	}
 	while at < words.len() && words[at].text.contains(&b'=') {
-		passed.push(words[at].origin);
+		env.record_assignment(words[at].text.as_ref());
+		passed.push(words[at].src);
 		at += 1;
 	}
 	Some(at)
 }
 
+fn expand_env_s(
+	src: SourceRef,
+	prefix: &[u8],
+	raw: &[u8],
+	env: &EnvContext<'_>,
+	env_splits: &mut Vec<EnvSplitPlan>,
+) -> Vec<VWord<'static>> {
+	let track_plan = src.split.is_none()
+		&& !env_splits.iter().any(|plan| plan.index == src.origin)
+		&& std::str::from_utf8(prefix).is_ok()
+		&& std::str::from_utf8(raw).is_ok();
+	let group_idx = track_plan.then_some(env_splits.len());
+	let (vwords, plan_words) = split_env_s(raw, src, group_idx, env);
+	if track_plan {
+		env_splits.push(EnvSplitPlan {
+			index:  src.origin,
+			prefix: String::from_utf8_lossy(prefix).into_owned(),
+			raw:    String::from_utf8_lossy(raw).into_owned(),
+			words:  plan_words,
+		});
+	}
+	vwords
+}
+
 /// Split an `env -S` string into words (`'…'`, `"…"`, `\` escapes, `#`
-/// comments).
-fn split_env_s(raw: &[u8], origin: usize) -> Vec<VWord<'static>> {
-	let mut out = Vec::new();
-	let mut current = Vec::new();
+/// comments, `${VAR}` / `$VAR` expansions) and record each word's byte span in
+/// `raw`.
+fn split_env_s(
+	raw: &[u8],
+	base_src: SourceRef,
+	group_idx: Option<usize>,
+	env: &EnvContext<'_>,
+) -> (Vec<VWord<'static>>, Vec<EnvSplitWord>) {
+	let mut vwords = Vec::new();
+	let mut plan_words = Vec::new();
+	let mut expanded = Vec::new();
+	let mut decoded = Vec::new();
+	let mut has_unknown_var = false;
 	let mut in_word = false;
+	let mut word_start = 0usize;
 	let mut quote = 0u8;
-	let mut i = 0;
+	let mut i = 0usize;
+
+	let finish_word = |vwords: &mut Vec<VWord<'static>>,
+	                   plan_words: &mut Vec<EnvSplitWord>,
+	                   expanded: &mut Vec<u8>,
+	                   decoded: &mut Vec<u8>,
+	                   has_unknown_var: &mut bool,
+	                   start: usize,
+	                   end: usize| {
+		let word_idx = plan_words.len();
+		let src = match group_idx {
+			Some(group) => SourceRef { origin: base_src.origin, split: Some((group, word_idx)) },
+			None => base_src,
+		};
+		let raw_text = String::from_utf8_lossy(decoded).into_owned();
+		decoded.clear();
+		plan_words.push(EnvSplitWord { text: raw_text, start, end, keep: false });
+		vwords.push(VWord {
+			text: Cow::Owned(std::mem::take(expanded)),
+			src,
+			has_unknown_var: *has_unknown_var,
+		});
+		*has_unknown_var = false;
+	};
+
 	while i < raw.len() {
 		let ch = raw[i];
 		if quote == b'\'' {
 			if ch == b'\\' && i + 1 < raw.len() && matches!(raw[i + 1], b'\'' | b'\\') {
-				current.push(raw[i + 1]);
+				expanded.push(raw[i + 1]);
+				decoded.push(raw[i + 1]);
 				i += 2;
 				continue;
 			}
 			if ch == b'\'' {
 				quote = 0;
 			} else {
-				current.push(ch);
+				expanded.push(ch);
+				decoded.push(ch);
 			}
 			i += 1;
 			continue;
@@ -860,21 +1172,36 @@ fn split_env_s(raw: &[u8], origin: usize) -> Vec<VWord<'static>> {
 				if esc == b'c' {
 					break;
 				}
-				current.push(unescape_env_s(esc));
+				let b = unescape_env_s(esc);
+				expanded.push(b);
+				decoded.push(b);
 				i += 2;
+				continue;
+			}
+			if ch == b'$' {
+				i = expand_env_s_var(raw, i, env, &mut expanded, &mut decoded, &mut has_unknown_var);
 				continue;
 			}
 			if ch == b'"' {
 				quote = 0;
 			} else {
-				current.push(ch);
+				expanded.push(ch);
+				decoded.push(ch);
 			}
 			i += 1;
 			continue;
 		}
 		if ch.is_ascii_whitespace() {
 			if in_word {
-				out.push(VWord { text: Cow::Owned(std::mem::take(&mut current)), origin });
+				finish_word(
+					&mut vwords,
+					&mut plan_words,
+					&mut expanded,
+					&mut decoded,
+					&mut has_unknown_var,
+					word_start,
+					i,
+				);
 				in_word = false;
 			}
 			i += 1;
@@ -887,8 +1214,11 @@ fn split_env_s(raw: &[u8], origin: usize) -> Vec<VWord<'static>> {
 			continue;
 		}
 		if ch == b'\'' || ch == b'"' {
+			if !in_word {
+				in_word = true;
+				word_start = i;
+			}
 			quote = ch;
-			in_word = true;
 			i += 1;
 			continue;
 		}
@@ -899,25 +1229,118 @@ fn split_env_s(raw: &[u8], origin: usize) -> Vec<VWord<'static>> {
 			}
 			if esc == b'_' {
 				if in_word {
-					out.push(VWord { text: Cow::Owned(std::mem::take(&mut current)), origin });
+					finish_word(
+						&mut vwords,
+						&mut plan_words,
+						&mut expanded,
+						&mut decoded,
+						&mut has_unknown_var,
+						word_start,
+						i,
+					);
 					in_word = false;
 				}
 				i += 2;
 				continue;
 			}
-			in_word = true;
-			current.push(unescape_env_s(esc));
+			if !in_word {
+				in_word = true;
+				word_start = i;
+			}
+			let b = unescape_env_s(esc);
+			expanded.push(b);
+			decoded.push(b);
 			i += 2;
 			continue;
 		}
-		in_word = true;
-		current.push(ch);
+		if ch == b'$' {
+			if !in_word {
+				in_word = true;
+				word_start = i;
+			}
+			i = expand_env_s_var(raw, i, env, &mut expanded, &mut decoded, &mut has_unknown_var);
+			continue;
+		}
+		if !in_word {
+			in_word = true;
+			word_start = i;
+		}
+		expanded.push(ch);
+		decoded.push(ch);
 		i += 1;
 	}
 	if in_word {
-		out.push(VWord { text: Cow::Owned(current), origin });
+		finish_word(
+			&mut vwords,
+			&mut plan_words,
+			&mut expanded,
+			&mut decoded,
+			&mut has_unknown_var,
+			word_start,
+			i,
+		);
 	}
-	out
+	(vwords, plan_words)
+}
+
+/// Expand `${VAR}` (GNU/uutils/BSD) or `$VAR` (BSD) inside `env -S` at `start`.
+fn expand_env_s_var(
+	raw: &[u8],
+	start: usize,
+	env: &EnvContext<'_>,
+	expanded: &mut Vec<u8>,
+	decoded: &mut Vec<u8>,
+	has_unknown_var: &mut bool,
+) -> usize {
+	if raw.get(start + 1) == Some(&b'{') {
+		if let Some(rel) = raw[start + 2..].iter().position(|&b| b == b'}') {
+			let close = start + 2 + rel;
+			let name = &raw[start + 2..close];
+			let token = &raw[start..=close];
+			decoded.extend_from_slice(token);
+			if is_ident(name) {
+				if let Some(val) = env.get(name) {
+					expanded.extend_from_slice(val);
+				} else if !env.complete {
+					*has_unknown_var = true;
+					expanded.extend_from_slice(token);
+				}
+			} else {
+				if !env.complete {
+					*has_unknown_var = true;
+				}
+				expanded.extend_from_slice(token);
+			}
+			return close + 1;
+		}
+		if !env.complete {
+			*has_unknown_var = true;
+		}
+		expanded.push(b'$');
+		decoded.push(b'$');
+		return start + 1;
+	}
+	if let Some(&first) = raw.get(start + 1)
+		&& (first.is_ascii_alphabetic() || first == b'_')
+	{
+		let mut end = start + 2;
+		while end < raw.len() && (raw[end].is_ascii_alphanumeric() || raw[end] == b'_') {
+			end += 1;
+		}
+		let name = &raw[start + 1..end];
+		let token = &raw[start..end];
+		decoded.extend_from_slice(token);
+		if let Some(val) = env.get(name) {
+			expanded.extend_from_slice(val);
+		} else if !env.complete {
+			*has_unknown_var = true;
+			expanded.extend_from_slice(token);
+		}
+		return end;
+	}
+	expanded.push(b'$');
+	decoded.push(b'$');
+	start + 1
 }
 
 const fn unescape_env_s(byte: u8) -> u8 {
@@ -983,6 +1406,36 @@ fn short_step(letters: &[u8], opts: &OptSet) -> ShortStep {
 	ShortStep::One
 }
 
+/// Find the start of the remote command in `ssh_words` (where `ssh_words[0]` is
+/// `ssh`). OpenSSH accepts options before the destination and also after the
+/// destination until the first remote command word (unless `--` preceded the
+/// destination).
+fn ssh_remote_start(ssh_words: &[VWord<'_>]) -> Option<usize> {
+	let mut at = 1;
+	while at < ssh_words.len() {
+		let word = ssh_words[at].text.as_ref();
+		if word == b"--" {
+			let remote = at + 2;
+			return (remote < ssh_words.len()).then_some(remote);
+		}
+		if word == b"-" || !word.starts_with(b"-") {
+			break;
+		}
+		match short_step(&word[1..], &SSH) {
+			ShortStep::Stop => return None,
+			ShortStep::Next => at += if at + 1 < ssh_words.len() { 2 } else { 1 },
+			ShortStep::One => at += 1,
+		}
+	}
+	if at >= ssh_words.len() {
+		return None;
+	}
+	// `ssh_words[at]` is the destination; consume any post-destination SSH
+	// options.
+	let remote = skip_opts(ssh_words, at + 1, &SSH)?;
+	(remote < ssh_words.len()).then_some(remote)
+}
+
 enum RemoteTok {
 	Sep,
 	Redir { has_target: bool },
@@ -991,79 +1444,109 @@ enum RemoteTok {
 
 /// Separate local `SSH` options and destination from the remote shell command,
 /// then protect remote `omp` (and ambiguous) simple commands.
-fn mark_ssh(args: &mut [bool], ssh_words: &[VWord<'_>]) {
-	let Some(host) = skip_opts(ssh_words, 1, &SSH) else {
+fn mark_ssh(
+	keep: &mut [bool],
+	env_splits: &mut Vec<EnvSplitPlan>,
+	ssh_words: &[VWord<'_>],
+	env: &mut EnvContext<'_>,
+) {
+	let Some(remote) = ssh_remote_start(ssh_words) else {
 		return;
 	};
-	let remote = host + 1;
-	if remote >= ssh_words.len() {
+	// Skip lexing the remote script altogether when only local options carry
+	// URLs.
+	if !ssh_words[remote..]
+		.iter()
+		.any(|word| word.text.contains_str("://"))
+	{
 		return;
 	}
 	let Some(tokens) = lex_remote(&ssh_words[remote..]) else {
 		for word in &ssh_words[remote..] {
-			if word.origin < args.len() {
-				args[word.origin] = true;
-			}
+			mark_source(keep, env_splits, word.src);
 		}
 		return;
 	};
-	let mut i = 0;
-	while i < tokens.len() {
-		if matches!(tokens[i], RemoteTok::Sep) {
-			i += 1;
+	let mut iter = tokens.into_iter().peekable();
+	while let Some(tok) = iter.next() {
+		if matches!(tok, RemoteTok::Sep) {
 			continue;
 		}
-		let mut cmd_words: Vec<VWord<'_>> = Vec::new();
-		let mut all_origins: Vec<usize> = Vec::new();
-		while i < tokens.len() && !matches!(tokens[i], RemoteTok::Sep) {
-			match &tokens[i] {
+		let mut cmd_words: Vec<VWord<'static>> = Vec::new();
+		let mut all_sources: Vec<SourceRef> = Vec::new();
+		let mut current = Some(tok);
+		while let Some(item) = current {
+			match item {
 				RemoteTok::Sep => break,
 				RemoteTok::Redir { has_target } => {
-					i += 1;
-					if !has_target && let Some(RemoteTok::Word(target)) = tokens.get(i) {
-						all_origins.push(target.origin);
-						i += 1;
+					if !has_target && let Some(RemoteTok::Word(target)) = iter.next() {
+						all_sources.push(target.src);
 					}
 				},
 				RemoteTok::Word(word) => {
-					all_origins.push(word.origin);
-					cmd_words.push(word.clone());
-					i += 1;
+					all_sources.push(word.src);
+					cmd_words.push(word);
 				},
 			}
+			current = match iter.peek() {
+				Some(RemoteTok::Sep) | None => None,
+				Some(_) => iter.next(),
+			};
 		}
-		let mut start = 0;
-		while start < cmd_words.len() && shell_keyword(cmd_words[start].text.as_ref()) {
-			start += 1;
-		}
+		let mut start = skip_remote_prefix(&cmd_words);
 		let mut lead_assigns = Vec::new();
-		while start < cmd_words.len() && ident_assignment(cmd_words[start].text.as_ref()) {
-			lead_assigns.push(cmd_words[start].origin);
+		while start < cmd_words.len() && shell_assignment(cmd_words[start].text.as_ref()) {
+			lead_assigns.push(cmd_words[start].src);
 			start += 1;
 		}
 		if start >= cmd_words.len() {
 			continue;
 		}
-		let launch = launch_of(cmd_words[start..].to_vec());
+		let launch = launch_of_from(cmd_words, start, env, env_splits);
 		if launch.aborted || launch.at >= launch.words.len() {
 			continue;
 		}
-		let cmd = launch.words[launch.at].text.as_ref();
+		let first = &launch.words[launch.at];
+		let cmd = first.text.as_ref();
 		if is_omp(cmd) {
-			mark_omp_args(args, &launch.words, launch.at, &launch.passed, true);
-			for origin in lead_assigns {
-				if origin < args.len() {
-					args[origin] = true;
-				}
+			mark_omp_args(keep, env_splits, &launch.words, launch.at, &launch.passed, true);
+			for src in lead_assigns {
+				mark_source(keep, env_splits, src);
 			}
-		} else if ambiguous_remote_cmd(&launch.words[launch.at..]) {
-			for origin in all_origins {
-				if origin < args.len() {
-					args[origin] = true;
-				}
+		} else if first.has_unknown_var || ambiguous_remote_cmd(&launch.words[launch.at..]) {
+			for src in all_sources {
+				mark_source(keep, env_splits, src);
 			}
 		}
 	}
+}
+
+/// Skip shell keywords and Bash's `time [-p] [--]` prefix before assignments in
+/// a remote command.
+fn skip_remote_prefix(words: &[VWord<'_>]) -> usize {
+	let mut i = 0;
+	while i < words.len() {
+		let w = words[i].text.as_ref();
+		if shell_keyword(w) {
+			i += 1;
+			continue;
+		}
+		if w == b"time" {
+			let mut next = i + 1;
+			if next < words.len() && words[next].text.as_ref() == b"-p" {
+				next += 1;
+			}
+			if next < words.len() && words[next].text.as_ref() == b"--" {
+				next += 1;
+			}
+			if next >= words.len() || !words[next].text.starts_with(b"-") {
+				i = next;
+				continue;
+			}
+		}
+		break;
+	}
+	i
 }
 
 fn ambiguous_remote_cmd(words: &[VWord<'_>]) -> bool {
@@ -1091,12 +1574,13 @@ fn ambiguous_remote_cmd(words: &[VWord<'_>]) -> bool {
 }
 
 /// Tokenize the remote command arguments `ssh` joins for the remote shell.
-/// Returns `None` if quoting is unclosed/ambiguous across arguments.
+/// Returns `None` if quoting or a command substitution is unclosed across
+/// arguments.
 fn lex_remote(remote_words: &[VWord<'_>]) -> Option<Vec<RemoteTok>> {
 	let mut out = Vec::new();
 	for item in remote_words {
 		let bytes = item.text.as_ref();
-		let origin = item.origin;
+		let src = item.src;
 		let mut i = 0;
 		while i < bytes.len() {
 			let ch = bytes[i];
@@ -1144,7 +1628,7 @@ fn lex_remote(remote_words: &[VWord<'_>]) -> Option<Vec<RemoteTok>> {
 				continue;
 			}
 			let (word, next) = read_remote_word(bytes, i)?;
-			out.push(RemoteTok::Word(VWord { text: Cow::Owned(word), origin }));
+			out.push(RemoteTok::Word(VWord { text: Cow::Owned(word), src, has_unknown_var: false }));
 			i = next;
 		}
 	}
@@ -1196,6 +1680,121 @@ fn remote_redir_at(bytes: &[u8], start: usize) -> Option<(usize, u8)> {
 	Some((j + len, first))
 }
 
+/// Find the closing `)` of `$(` opened just before `start`, respecting quotes
+/// and nested parentheses.
+fn remote_subst_end(bytes: &[u8], start: usize) -> Option<usize> {
+	let mut depth = 1usize;
+	let mut quote = 0u8;
+	let mut i = start;
+	while i < bytes.len() {
+		let ch = bytes[i];
+		if quote == b'\'' {
+			if ch == b'\'' {
+				quote = 0;
+			}
+			i += 1;
+			continue;
+		}
+		if ch == b'\\' {
+			i += 2;
+			continue;
+		}
+		if quote == b'"' {
+			if ch == b'"' {
+				quote = 0;
+				i += 1;
+				continue;
+			}
+			if ch == b'$' && bytes.get(i + 1) == Some(&b'(') {
+				i = remote_subst_end(bytes, i + 2)? + 1;
+				continue;
+			}
+			if ch == b'`' {
+				i = remote_backtick_end(bytes, i + 1)? + 1;
+				continue;
+			}
+			i += 1;
+			continue;
+		}
+		if ch == b'\'' || ch == b'"' {
+			quote = ch;
+			i += 1;
+			continue;
+		}
+		if ch == b'`' {
+			i = remote_backtick_end(bytes, i + 1)? + 1;
+			continue;
+		}
+		if ch == b'(' {
+			depth += 1;
+		} else if ch == b')' {
+			depth -= 1;
+			if depth == 0 {
+				return Some(i);
+			}
+		}
+		i += 1;
+	}
+	None
+}
+
+const fn remote_backtick_end(bytes: &[u8], start: usize) -> Option<usize> {
+	let mut i = start;
+	while i < bytes.len() {
+		if bytes[i] == b'\\' {
+			i += 2;
+			continue;
+		}
+		if bytes[i] == b'`' {
+			return Some(i);
+		}
+		i += 1;
+	}
+	None
+}
+
+const fn remote_brace_end(bytes: &[u8], start: usize) -> Option<usize> {
+	let mut depth = 1usize;
+	let mut quote = 0u8;
+	let mut i = start;
+	while i < bytes.len() {
+		let ch = bytes[i];
+		if quote == b'\'' {
+			if ch == b'\'' {
+				quote = 0;
+			}
+			i += 1;
+			continue;
+		}
+		if ch == b'\\' {
+			i += 2;
+			continue;
+		}
+		if quote == b'"' {
+			if ch == b'"' {
+				quote = 0;
+			}
+			i += 1;
+			continue;
+		}
+		if ch == b'\'' || ch == b'"' {
+			quote = ch;
+			i += 1;
+			continue;
+		}
+		if ch == b'{' {
+			depth += 1;
+		} else if ch == b'}' {
+			depth -= 1;
+			if depth == 0 {
+				return Some(i);
+			}
+		}
+		i += 1;
+	}
+	None
+}
+
 fn read_remote_word(bytes: &[u8], start: usize) -> Option<(Vec<u8>, usize)> {
 	let mut value = Vec::new();
 	let mut i = start;
@@ -1224,6 +1823,24 @@ fn read_remote_word(bytes: &[u8], start: usize) -> Option<(Vec<u8>, usize)> {
 					i += 2;
 					continue;
 				}
+				if bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'(') {
+					let end = remote_subst_end(bytes, i + 2)?;
+					value.extend_from_slice(&bytes[i..=end]);
+					i = end + 1;
+					continue;
+				}
+				if bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'{') {
+					let end = remote_brace_end(bytes, i + 2)?;
+					value.extend_from_slice(&bytes[i..=end]);
+					i = end + 1;
+					continue;
+				}
+				if bytes[i] == b'`' {
+					let end = remote_backtick_end(bytes, i + 1)?;
+					value.extend_from_slice(&bytes[i..=end]);
+					i = end + 1;
+					continue;
+				}
 				value.push(bytes[i]);
 				i += 1;
 			}
@@ -1241,13 +1858,36 @@ fn read_remote_word(bytes: &[u8], start: usize) -> Option<(Vec<u8>, usize)> {
 			i += 2;
 			continue;
 		}
+		if ch == b'$' && bytes.get(i + 1) == Some(&b'(') {
+			let end = remote_subst_end(bytes, i + 2)?;
+			value.extend_from_slice(&bytes[i..=end]);
+			i = end + 1;
+			continue;
+		}
+		if ch == b'$' && bytes.get(i + 1) == Some(&b'{') {
+			let end = remote_brace_end(bytes, i + 2)?;
+			value.extend_from_slice(&bytes[i..=end]);
+			i = end + 1;
+			continue;
+		}
+		if ch == b'`' {
+			let end = remote_backtick_end(bytes, i + 1)?;
+			value.extend_from_slice(&bytes[i..=end]);
+			i = end + 1;
+			continue;
+		}
 		value.push(ch);
 		i += 1;
 	}
 	Some((value, i))
 }
 
-fn mark_find(args: &mut [bool], find_words: &[VWord<'_>]) -> bool {
+fn mark_find(
+	keep: &mut [bool],
+	env_splits: &mut Vec<EnvSplitPlan>,
+	find_words: &[VWord<'_>],
+	env: &mut EnvContext<'_>,
+) -> bool {
 	let mut index = 1;
 	let mut reaches = false;
 	while index < find_words.len() {
@@ -1259,13 +1899,21 @@ fn mark_find(args: &mut [bool], find_words: &[VWord<'_>]) -> bool {
 				end += 1;
 			}
 			if start < end {
-				let launch = launch_of(find_words[start..end].to_vec());
-				if !launch.aborted
-					&& launch.at < launch.words.len()
-					&& is_omp(launch.words[launch.at].text.as_ref())
-				{
-					reaches = true;
-					mark_omp_args(args, &launch.words, launch.at, &launch.passed, false);
+				let slice: Vec<VWord<'_>> = find_words[start..end]
+					.iter()
+					.map(|w| VWord {
+						text:            Cow::Borrowed(w.text.as_ref()),
+						src:             w.src,
+						has_unknown_var: w.has_unknown_var,
+					})
+					.collect();
+				let launch = launch_of_from(slice, 0, env, env_splits);
+				if !launch.aborted && launch.at < launch.words.len() {
+					let first = &launch.words[launch.at];
+					if is_omp(first.text.as_ref()) || first.has_unknown_var {
+						reaches = true;
+						mark_omp_args(keep, env_splits, &launch.words, launch.at, &launch.passed, false);
+					}
 				}
 			}
 			index = end + 1;
@@ -1276,14 +1924,14 @@ fn mark_find(args: &mut [bool], find_words: &[VWord<'_>]) -> bool {
 	reaches
 }
 
-// ── Launcher option tables (identical to
-// packages/coding-agent/src/tools/bash-host-urls.ts) ──
+// ── Canonical launcher option tables (shared with client via
+// `classify_url_args`) ──
 
 const ENV: OptSet = OptSet {
 	short_val:  b"CPafu",
 	long_val:   &["argv0", "chdir", "env0-from", "file", "unset"],
 	stop_short: b"0",
-	stop_long:  &["help", "list-signal-handling", "null", "version"],
+	stop_long:  &["help", "null", "version"],
 };
 
 const SUDO: OptSet = OptSet {
@@ -1623,19 +2271,28 @@ const SSH: OptSet = OptSet {
 mod tests {
 	use bstr::BString;
 
-	use super::omp_owned;
+	use super::{EnvSplitPlan, UrlArgPlan, classify_url_args, omp_owned};
 
 	fn owned(words: &[&str]) -> (Vec<usize>, bool) {
 		let argv: Vec<BString> = words.iter().copied().map(BString::from).collect();
-		let owned = omp_owned(&argv);
-		let indexes = owned
-			.args
+		let plan = omp_owned(&argv, None);
+		let indexes = plan
+			.keep
 			.iter()
 			.enumerate()
 			.filter(|(_, keep)| **keep)
 			.map(|(index, _)| index)
 			.collect();
-		(indexes, owned.env)
+		(indexes, plan.keep_env)
+	}
+
+	fn classify_with_env(words: &[&str], env: &[(&str, &str)], complete: bool) -> UrlArgPlan {
+		let argv: Vec<String> = words.iter().copied().map(str::to_owned).collect();
+		let pairs: Vec<(String, String)> = env
+			.iter()
+			.map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+			.collect();
+		classify_url_args(&argv, Some(&pairs), complete)
 	}
 
 	fn is_omp_word(word: &[u8]) -> bool {
@@ -1655,8 +2312,6 @@ mod tests {
 		assert_eq!(owned(&["omp", "read", "local://x"]), (vec![1, 2], true));
 		assert_eq!(owned(&["/usr/local/bin/omp", "read", "local://x"]), (vec![1, 2], true));
 		assert_eq!(owned(&["nice", "omp", "read", "local://x"]), (vec![2, 3], true));
-		// `env local://bin/omp`: index 1 is resolved for `env`; `read` and
-		// `local://doc` stay omp's.
 		assert_eq!(owned(&["env", "local://bin/omp", "read", "local://doc"]), (vec![2, 3], true));
 		assert_eq!(owned(&["/usr/bin/env", "-", "omp", "read", "local://x"]), (vec![3, 4], true));
 		assert_eq!(owned(&["env", "-u", "FOO", "-", "omp", "read", "local://x"]), (vec![5, 6], true));
@@ -1671,7 +2326,7 @@ mod tests {
 	}
 
 	#[test]
-	fn env_settings_split_strings_and_attached_only_flags_work() {
+	fn env_settings_split_strings_and_variable_expansion_work() {
 		assert_eq!(
 			owned(&["env", "--", "-flag=/opt/omp", "grep", "x", "local://file"]),
 			(vec![], false)
@@ -1691,11 +2346,6 @@ mod tests {
 		assert_eq!(owned(&["env", "-", "-u", "FOO", "omp"]), (vec![], false));
 		assert_eq!(owned(&["env", "-S", "cat", "omp", "local://in"]), (vec![], false));
 		assert_eq!(owned(&["env", "-S", "omp", "read", "local://in"]), (vec![3, 4], true));
-		assert_eq!(owned(&["env", "-S", "omp read", "local://in"]), (vec![2, 3], true));
-		assert_eq!(
-			owned(&["env", "-S", "local://bin/omp", "read", "local://in"]),
-			(vec![3, 4], true)
-		);
 		assert_eq!(
 			owned(&["env", "--default-signal", "omp", "read", "local://x"]),
 			(vec![3, 4], true)
@@ -1704,6 +2354,38 @@ mod tests {
 			owned(&["env", "--default-signal=PIPE", "omp", "read", "local://x"]),
 			(vec![3, 4], true)
 		);
+		assert_eq!(
+			owned(&["env", "--list-signal-handling", "omp", "read", "local://x"]),
+			(vec![3, 4], true)
+		);
+
+		// Per-word split plan: executable inside `-S` stays rewritable while
+		// `read` and outer file are kept.
+		let split_plan =
+			classify_with_env(&["env", "-S", "local://bin/omp read", "local://file"], &[], false);
+		assert_eq!(split_plan.keep, vec![false, false, false, true]);
+		assert!(split_plan.keep_env);
+		assert_eq!(split_plan.env_splits.len(), 1);
+		let EnvSplitPlan { index, words, .. } = &split_plan.env_splits[0];
+		assert_eq!(*index, 2);
+		assert!(!words[0].keep && words[0].text == "local://bin/omp");
+		assert!(words[1].keep && words[1].text == "read");
+
+		// `${RUN}` expands from known env, and preserves arguments when unknown.
+		let known_omp =
+			classify_with_env(&["env", "-S", "${RUN}", "read", "local://in"], &[("RUN", "omp")], true);
+		assert_eq!(known_omp.keep, vec![false, false, false, true, true]);
+		assert!(known_omp.keep_env);
+
+		let known_cat =
+			classify_with_env(&["env", "-S", "${RUN}", "omp", "local://in"], &[("RUN", "cat")], true);
+		assert_eq!(known_cat.keep, vec![false, false, false, false, false]);
+		assert!(!known_cat.keep_env);
+
+		let unknown_var =
+			classify_with_env(&["env", "-S", "${RUN}", "read", "local://in"], &[], false);
+		assert_eq!(unknown_var.keep, vec![false, false, false, true, true]);
+		assert!(unknown_var.keep_env);
 	}
 
 	#[test]
@@ -1735,10 +2417,6 @@ mod tests {
 			(vec![5, 6], true)
 		);
 		assert_eq!(
-			owned(&["uv", "run", "--with", "requests", "omp", "read", "local://book"]),
-			(vec![5, 6], true)
-		);
-		assert_eq!(
 			owned(&["uv", "run", "--resolution", "lowest", "omp", "read", "local://book"]),
 			(vec![5, 6], true)
 		);
@@ -1747,6 +2425,8 @@ mod tests {
 		assert_eq!(owned(&["command", "-V", "omp", "local://file"]), (vec![], false));
 		assert_eq!(owned(&["command", "-p", "omp", "read", "local://x"]), (vec![3, 4], true));
 		assert_eq!(owned(&["builtin", "omp", "local://file"]), (vec![], false));
+		assert_eq!(owned(&["builtin", "command", "omp", "read", "local://x"]), (vec![3, 4], true));
+		assert_eq!(owned(&["builtin", "exec", "omp", "read", "local://x"]), (vec![3, 4], true));
 		assert_eq!(owned(&["uv", "run", "--module", "omp", "local://file"]), (vec![], false));
 		assert_eq!(owned(&["uv", "run", "-m", "omp", "local://file"]), (vec![], false));
 		assert_eq!(owned(&["uv", "run", "--script", "omp", "local://file"]), (vec![], false));
@@ -1780,11 +2460,30 @@ mod tests {
 			owned(&["ssh", "-F", "local://config", "server", "omp", "read", "skill://x"]),
 			(vec![4, 5, 6], false)
 		);
+		// OpenSSH accepts options such as `-p` after the destination.
+		assert_eq!(
+			owned(&["ssh", "host", "-p", "2223", "omp", "read", "local://x"]),
+			(vec![4, 5, 6], false)
+		);
+		assert_eq!(
+			owned(&["ssh", "host", "-F", "local://cfg", "omp", "read", "local://x"]),
+			(vec![4, 5, 6], false)
+		);
 		assert_eq!(
 			owned(&["ssh", "host", "LANG=C", "omp", "read", "local://in"]),
 			(vec![2, 3, 4, 5], false)
 		);
+		assert_eq!(
+			owned(&["ssh", "host", "time", "FOO=x", "omp", "read", "local://in"]),
+			(vec![3, 4, 5, 6], false)
+		);
+		assert_eq!(
+			owned(&["ssh", "host", "TAG+=extra", "omp", "read", "local://in"]),
+			(vec![2, 3, 4, 5], false)
+		);
 		assert_eq!(owned(&["ssh", "host", "LANG=C omp read", "local://in"]), (vec![2, 3], false));
+		assert_eq!(owned(&["ssh", "host", "$(command -v omp)", "local://in"]), (vec![2, 3], false));
+		assert_eq!(owned(&["ssh", "host", "cat \"$HOME/note\"", "local://in"]), (vec![], false));
 		assert_eq!(owned(&["ssh", "host", "$RUNNER", "local://in"]), (vec![2, 3], false));
 		assert_eq!(
 			owned(&["ssh", "server", "omp", "read", "local://book", "|", "cat", "local://other"]),

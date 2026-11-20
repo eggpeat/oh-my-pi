@@ -62,6 +62,7 @@ pub mod taps;
 pub mod windows;
 
 pub use child_session::{ChildSessionAction, child_session_action};
+pub use host::urls::{EnvSplitPlan, EnvSplitWord, UrlArgPlan, classify_url_args};
 // Re-exported for `omp-natives`: the builtins live in `omp-builtins`,
 // but the native layer only ever depends on the shell.
 pub use omp_builtins::{

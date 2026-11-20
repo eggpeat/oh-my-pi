@@ -30,6 +30,7 @@ const backing: UrlBacking = async url => {
 };
 
 const host = (command: string, shell?: string) => hostCommandUrls(command, backing, shell);
+const hasBash = process.platform !== "win32" && fs.existsSync("/bin/bash");
 
 describe("hostCommandUrls", () => {
 	it("names the file behind a URL argument, bare or attached to an option", async () => {
@@ -132,10 +133,17 @@ describe("hostCommandUrls", () => {
 		expect(await host("env --default-signal=PIPE omp read local://x")).toBe(
 			"env --default-signal=PIPE omp read local://x",
 		);
+		expect(await host("env --list-signal-handling omp read local://x")).toBe(
+			"env --list-signal-handling omp read local://x",
+		);
 		expect(await host("env -S cat omp local://in")).toBe("env -S cat omp /host/in");
 		expect(await host("env -S omp read local://in")).toBe("env -S omp read local://in");
 		expect(await host("env -S 'omp read' local://in")).toBe("env -S 'omp read' local://in");
 		expect(await host("env -S local://bin/omp read local://in")).toBe("env -S /host/bin/omp read local://in");
+		expect(await host("env -S 'local://bin/omp read' local://file")).toBe("env -S '/host/bin/omp read' local://file");
+		expect(await host(`RUN=omp env -S '\${RUN}' read local://in`)).toBe(`RUN=omp env -S '\${RUN}' read local://in`);
+		expect(await host(`env -S '\${RUN}' read local://in`)).toBe(`env -S '\${RUN}' read local://in`);
+		expect(await host(`RUN=cat env -S '\${RUN}' omp local://in`)).toBe(`RUN=cat env -S '\${RUN}' omp /host/in`);
 		expect(await host("env tool.name=/opt/omp grep x local://file")).toBe("env tool.name=/opt/omp grep x /host/file");
 		expect(await host("setsid omp read local://x:1")).toBe("setsid omp read local://x:1");
 		expect(await host("setsid grep omp local://x")).toBe("setsid grep omp /host/x");
@@ -158,10 +166,13 @@ describe("hostCommandUrls", () => {
 		expect(
 			await host("env -C local://dir FOO=local://var find local://docs -exec local://bin/omp read local://doc \\;"),
 		).toBe("env -C /host/dir FOO=local://var find /host/docs -exec /host/bin/omp read local://doc \\;");
-		// Lookup, module, script and edit modes do not run the omp binary.
+		// Lookup, module, script and edit modes do not run the omp binary; builtin follows command/exec.
 		expect(await host("command -v omp local://file")).toBe("command -v omp /host/file");
 		expect(await host("command -V omp local://file")).toBe("command -V omp /host/file");
 		expect(await host("command -p omp read local://file")).toBe("command -p omp read local://file");
+		expect(await host("builtin command omp read local://file")).toBe("builtin command omp read local://file");
+		expect(await host("builtin exec omp read local://file")).toBe("builtin exec omp read local://file");
+		expect(await host("builtin omp local://file")).toBe("builtin omp /host/file");
 		expect(await host("uv run --module omp local://file")).toBe("uv run --module omp /host/file");
 		expect(await host("uv run -m omp local://file")).toBe("uv run -m omp /host/file");
 		expect(await host("uv run --script omp local://file")).toBe("uv run --script omp /host/file");
@@ -176,6 +187,9 @@ describe("hostCommandUrls", () => {
 		expect(await host("if omp read local://in; then cat local://out; fi")).toBe(
 			"if omp read local://in; then cat /host/out; fi",
 		);
+		expect(await host("time FOO=x omp read local://in")).toBe("time FOO=x omp read local://in");
+		expect(await host("time -p FOO=local://a omp read local://in")).toBe("time -p FOO=local://a omp read local://in");
+		expect(await host("TAG+=extra omp read local://in")).toBe("TAG+=extra omp read local://in");
 		expect(await host("<local://in omp read local://doc")).toBe("</host/in omp read local://doc");
 		expect(await host("< local://in omp read local://doc")).toBe("< /host/in omp read local://doc");
 		expect(await host('cat "<<<" local://in')).toBe('cat "<<<" /host/in');
@@ -183,12 +197,20 @@ describe("hostCommandUrls", () => {
 		expect(await host("omp read local://a &> local://log local://b")).toBe(
 			"omp read local://a &> /host/log local://b",
 		);
+		expect(await host("cat >&local://log")).toBe("cat >&/host/log");
+		expect(await host("cat >&2")).toBe("cat >&2");
+		expect(await host("findstr # local://in", "C:\\Windows\\System32\\cmd.exe")).toBe("findstr # /host/in");
+		expect(await host("findstr # local://in")).toBe("findstr # local://in");
 	});
 
 	it("keeps each remote omp command's URLs and rewrites local ssh options", async () => {
 		expect(await host("ssh server omp read local://book")).toBe("ssh server omp read local://book");
+		expect(await host("ssh host -p 2223 omp read local://x")).toBe("ssh host -p 2223 omp read local://x");
+		expect(await host("ssh host -F local://cfg omp read local://x")).toBe("ssh host -F /host/cfg omp read local://x");
 		expect(await host("ssh host LANG=C omp read local://in")).toBe("ssh host LANG=C omp read local://in");
 		expect(await host("ssh host 'LANG=C omp read' local://in")).toBe("ssh host 'LANG=C omp read' local://in");
+		expect(await host("ssh host '$(command -v omp)' local://in")).toBe("ssh host '$(command -v omp)' local://in");
+		expect(await host("ssh host 'cat \"$HOME/note\"' local://in")).toBe("ssh host 'cat \"$HOME/note\"' /host/in");
 		expect(await host("ssh host '$RUNNER' local://in")).toBe("ssh host '$RUNNER' local://in");
 		expect(await host(`ssh host sh -c 'omp read "$1"' _ local://in`)).toBe(
 			`ssh host sh -c 'omp read "$1"' _ local://in`,
@@ -210,6 +232,12 @@ describe("hostCommandUrls", () => {
 		expect(await host("cat << 'local://done'\nbody\nlocal://done\necho hi")).toBe(
 			"cat << 'local://done'\nbody\nlocal://done\necho hi",
 		);
+		expect(await host("cat 0<<EOF\nlocal://body\nEOF\ncat local://after")).toBe(
+			"cat 0<<EOF\nlocal://body\nEOF\ncat /host/after",
+		);
+		expect(await host('cat <<<"$(cat <<EOF\nlocal://body\nEOF\n)" && cat local://after')).toBe(
+			'cat <<<"$(cat <<EOF\nlocal://body\nEOF\n)" && cat /host/after',
+		);
 		expect(await host("cat <<< local://text")).toBe("cat <<< local://text");
 		expect(await host("cat <<< literal\ncat local://in")).toBe("cat <<< literal\ncat /host/in");
 		expect(await host('cat <<END"MARK"\nlocal://inside\nEND\nlocal://still\nENDMARK\ncat local://done')).toBe(
@@ -217,6 +245,9 @@ describe("hostCommandUrls", () => {
 		);
 		expect(await host("echo $((1 << 2))\ncat local://file")).toBe("echo $((1 << 2))\ncat /host/file");
 		expect(await host("if ((1 << 2)); then\ncat local://in\nfi")).toBe("if ((1 << 2)); then\ncat /host/in\nfi");
+		expect(await host("for (( i=1; i < 2; i=i<<1 )); do\ncat local://in\ndone")).toBe(
+			"for (( i=1; i < 2; i=i<<1 )); do\ncat /host/in\ndone",
+		);
 	});
 
 	it("rewrites commands inside case patterns, quoted substitutions with redirects, and fd-redirection substitutions", async () => {
@@ -242,7 +273,7 @@ describe("hostCommandUrls", () => {
 			"echo `cat '/host/a\\`b/file'`; cat '/host/$dir/file'",
 		);
 		expect(await hostCommandUrls("echo `cat local://dollar", dollarBacking)).toBe("echo `cat '/host/$dir/file'");
-		if (!ptyUnavailable) {
+		if (hasBash) {
 			const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-url-bt-"));
 			try {
 				const nested = path.join(dir, "a`b");
@@ -462,4 +493,104 @@ describe("bash internal URLs outside the embedded shell", () => {
 		expect(result.exitCode).toBe(0);
 		expect(result.output).toBe(`--body-file=${data}\n${data}\n`);
 	});
+
+	it.skipIf(!hasBash)(
+		"applies the same launcher, env -S, and ssh ownership rules in both the embedded shell and hostCommandUrls",
+		async () => {
+			const binDir = path.join(tempDir, "bin");
+			const vbinDir = path.join(localRoot, "bin");
+			await fs.promises.mkdir(binDir, { recursive: true });
+			await fs.promises.mkdir(vbinDir, { recursive: true });
+			const writeBin = async (dir: string, name: string, body: string) => {
+				const target = path.join(dir, name);
+				await fs.promises.writeFile(target, `#!/bin/sh\n${body}\n`);
+				await fs.promises.chmod(target, 0o755);
+			};
+			const echoArgs = 'printf "%s\\n" "$@"';
+			await writeBin(binDir, "omp", echoArgs);
+			await writeBin(vbinDir, "omp", echoArgs);
+			await writeBin(binDir, "probe", echoArgs);
+			await writeBin(binDir, "uv", echoArgs);
+			await writeBin(binDir, "npx", echoArgs);
+			await writeBin(binDir, "npm", echoArgs);
+			await writeBin(binDir, "ssh", echoArgs);
+
+			const dataPath = path.join(localRoot, "data.txt");
+			const vOmpPath = path.join(vbinDir, "omp");
+			const localBacking: UrlBacking = async url => {
+				if (!url.startsWith("local://")) return undefined;
+				return path.join(localRoot, url.slice("local://".length));
+			};
+
+			// One table of commands exercised against BOTH `hostCommandUrls` (executed under `/bin/bash`)
+			// and the embedded shell (`runEvalShell`), asserting identical argv reaches the target program.
+			const cases: Array<{ cmd: string; expected: string[] }> = [
+				{ cmd: "probe omp local://data.txt", expected: ["omp", dataPath] },
+				{
+					cmd: "uv run --resolution lowest omp read local://data.txt",
+					expected: ["run", "--resolution", "lowest", "omp", "read", "local://data.txt"],
+				},
+				{ cmd: "uv run --module omp local://data.txt", expected: ["run", "--module", "omp", dataPath] },
+				{
+					cmd: "npx --no-audit omp read local://data.txt",
+					expected: ["--no-audit", "omp", "read", "local://data.txt"],
+				},
+				{
+					cmd: "npm --prefix local://data.txt exec -- omp read local://data.txt",
+					expected: ["--prefix", dataPath, "exec", "--", "omp", "read", "local://data.txt"],
+				},
+				{ cmd: "builtin command omp read local://data.txt", expected: ["read", "local://data.txt"] },
+				{ cmd: "time FOO=x omp read local://data.txt", expected: ["read", "local://data.txt"] },
+				{ cmd: "TAG+=extra omp read local://data.txt", expected: ["read", "local://data.txt"] },
+				{ cmd: "/usr/bin/env -S 'local://bin/omp read' local://data.txt", expected: ["read", "local://data.txt"] },
+				{ cmd: "env -S 'omp read' local://data.txt", expected: ["read", "local://data.txt"] },
+				{
+					cmd: `RUN='${vOmpPath}' /usr/bin/env -S '\${RUN}' read local://data.txt`,
+					expected: ["read", "local://data.txt"],
+				},
+				{
+					cmd: "ssh -F local://data.txt host -p 2223 LANG=C omp read local://data.txt '|' cat local://data.txt",
+					expected: [
+						"-F",
+						dataPath,
+						"host",
+						"-p",
+						"2223",
+						"LANG=C",
+						"omp",
+						"read",
+						"local://data.txt",
+						"|",
+						"cat",
+						dataPath,
+					],
+				},
+				{
+					cmd: "ssh host '$(command -v omp)' local://data.txt",
+					expected: ["host", "$(command -v omp)", "local://data.txt"],
+				},
+				{ cmd: "ssh host 'cat \"$HOME/note\"' local://data.txt", expected: ["host", 'cat "$HOME/note"', dataPath] },
+			];
+
+			for (const { cmd, expected } of cases) {
+				const embedded = await runEvalShell(
+					{ command: `TIMEFORMAT=''; PATH='${binDir}':$PATH; ${cmd}` },
+					{ session },
+				);
+				expect(embedded.exitCode, `embedded failed for: ${cmd}\n${embedded.output}`).toBe(0);
+				expect(embedded.output.trimEnd().split("\n"), `embedded mismatch for: ${cmd}`).toEqual(expected);
+
+				const rewritten = await hostCommandUrls(cmd, localBacking);
+				const client = Bun.spawnSync(["/bin/bash", "-c", `PATH='${binDir}':$PATH; ${rewritten}`]);
+				expect(
+					client.exitCode,
+					`client failed for: ${cmd}\nrewritten: ${rewritten}\n${client.stderr.toString()}`,
+				).toBe(0);
+				expect(
+					client.stdout.toString().trimEnd().split("\n"),
+					`client mismatch for: ${cmd}\nrewritten: ${rewritten}`,
+				).toEqual(expected);
+			}
+		},
+	);
 });

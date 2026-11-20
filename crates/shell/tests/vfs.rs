@@ -636,9 +636,11 @@ async fn an_argument_named_omp_does_not_keep_a_url_from_being_rewritten() {
 	let script = format!(
 		"/bin/echo omp virtual://docs/a.txt; /usr/bin/env -- -flag=/opt/omp /bin/echo \
 		 virtual://docs/a.txt; /usr/bin/env -S '/bin/echo' omp virtual://docs/a.txt; /usr/bin/env \
-		 --default-signal -C virtual://docs REF=virtual://docs/a.txt virtual://bin/omp read \
-		 virtual://docs/a.txt; PATH='{bin}':$PATH ssh -F virtual://docs/a.txt server LANG=C omp \
-		 read virtual://docs/a.txt '|' cat virtual://docs/a.txt",
+		 REF=virtual://docs/a.txt virtual://bin/omp read virtual://docs/a.txt; /usr/bin/env -S \
+		 'virtual://bin/omp read' virtual://docs/a.txt; RUN='{vomp}' /usr/bin/env -S '${{RUN}}' \
+		 read virtual://docs/a.txt; PATH='{bin}':$PATH ssh -F virtual://docs/a.txt server -p 2223 \
+		 LANG=C omp read virtual://docs/a.txt '|' cat virtual://docs/a.txt",
+		vomp = vomp.display(),
 		bin = bin.path().display(),
 	);
 	let run = run_virtual(directory.path(), &script).await;
@@ -651,9 +653,17 @@ async fn an_argument_named_omp_does_not_keep_a_url_from_being_rewritten() {
 		"read".to_owned(),
 		"virtual://docs/a.txt".to_owned(),
 		"ref=virtual://docs/a.txt".to_owned(),
+		"read".to_owned(),
+		"virtual://docs/a.txt".to_owned(),
+		"ref=".to_owned(),
+		"read".to_owned(),
+		"virtual://docs/a.txt".to_owned(),
+		"ref=".to_owned(),
 		"-F".to_owned(),
 		host.clone(),
 		"server".to_owned(),
+		"-p".to_owned(),
+		"2223".to_owned(),
 		"LANG=C".to_owned(),
 		"omp".to_owned(),
 		"read".to_owned(),
@@ -663,6 +673,30 @@ async fn an_argument_named_omp_does_not_keep_a_url_from_being_rewritten() {
 		host,
 	];
 	assert_eq!(run.stdout.lines().collect::<Vec<_>>(), expected);
+
+	// Check GNU/uutils `env` extensions (`--default-signal`,
+	// `--list-signal-handling`, `-C`) where the host `env` supports them (macOS
+	// BSD `env` does not).
+	let has_gnu_env = std::process::Command::new("/usr/bin/env")
+		.args(["--default-signal", "--list-signal-handling", "-C", "/", "/bin/sh", "-c", "exit 0"])
+		.stdout(std::process::Stdio::null())
+		.stderr(std::process::Stdio::null())
+		.status()
+		.is_ok_and(|status| status.success());
+	if has_gnu_env {
+		let gnu_run = run_virtual(
+			directory.path(),
+			"/usr/bin/env --default-signal --list-signal-handling -C virtual://docs \
+			 REF=virtual://docs/a.txt virtual://bin/omp read virtual://docs/a.txt",
+		)
+		.await;
+		assert_eq!(gnu_run.status, Some(0), "{}", gnu_run.stderr);
+		assert_eq!(gnu_run.stdout.lines().collect::<Vec<_>>(), [
+			"read",
+			"virtual://docs/a.txt",
+			"ref=virtual://docs/a.txt"
+		]);
+	}
 }
 
 /// A provider directory that aliases a real one is a usable working directory

@@ -1633,6 +1633,12 @@ export interface CaptureRegion {
   height: number
 }
 
+/**
+ * Classify a command's `argv` for internal URL rewriting using the same rules
+ * as the embedded shell.
+ */
+export declare function classifyShellUrlArgs(argv: Array<string>, env?: Record<string, string> | undefined | null): ShellUrlArgPlan
+
 /** Clipboard image payload encoded as PNG bytes. */
 export interface ClipboardImage {
   /** PNG-encoded image bytes. */
@@ -3940,6 +3946,25 @@ export declare function setHangulCompatJamoWidthOverride(value: number): void
  */
 export declare function shellBuiltins(sessionEnv?: Record<string, string>): Array<string>
 
+/** Per-word URL rewrite plan for one `env -S` / `--split-string` argument. */
+export interface ShellEnvSplitPlan {
+  index: number
+  prefix: string
+  raw: string
+  words: Array<ShellEnvSplitWord>
+}
+
+/**
+ * One word inside an `env -S` / `--split-string` argument, with UTF-16 code
+ * unit offsets into `raw` so JS callers can splice replacements safely.
+ */
+export interface ShellEnvSplitWord {
+  text: string
+  start: number
+  end: number
+  keep: boolean
+}
+
 /**
  *  Options for executing a shell command via the embedded bash engine
  * .
@@ -4433,6 +4458,16 @@ export interface ShellSpeechVoice {
   locale: string
   /** A line describing it. */
   sample: string
+}
+
+/**
+ * URL rewrite ownership for one simple command's `argv`, computed by the
+ * embedded shell's canonical launcher, `env -S`, `find`, and `ssh` rules.
+ */
+export interface ShellUrlArgPlan {
+  keep: Array<boolean>
+  keepEnv: boolean
+  envSplits: Array<ShellEnvSplitPlan>
 }
 
 /** Native non-executing visualization transformations. */

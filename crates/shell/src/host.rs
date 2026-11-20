@@ -37,7 +37,7 @@ use crate::{
 };
 
 mod loopback;
-mod urls;
+pub(crate) mod urls;
 
 /// Time between TERM and KILL when a running external is abandoned (a cancel
 /// unwinds the command that waits for it): pi's `TERM_GRACE`.

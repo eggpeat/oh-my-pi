@@ -178,6 +178,74 @@ pub fn shell_builtins(session_env: Option<Object<'_>>) -> Vec<&'static str> {
 	omp_shell::tools::builtins(|name| omp_shell::git::flag_on(var(name).as_deref()))
 }
 
+/// One word inside an `env -S` / `--split-string` argument, with UTF-16 code
+/// unit offsets into `raw` so JS callers can splice replacements safely.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct ShellEnvSplitWord {
+	pub text:  String,
+	pub start: u32,
+	pub end:   u32,
+	pub keep:  bool,
+}
+
+/// Per-word URL rewrite plan for one `env -S` / `--split-string` argument.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct ShellEnvSplitPlan {
+	pub index:  u32,
+	pub prefix: String,
+	pub raw:    String,
+	pub words:  Vec<ShellEnvSplitWord>,
+}
+
+/// URL rewrite ownership for one simple command's `argv`, computed by the
+/// embedded shell's canonical launcher, `env -S`, `find`, and `ssh` rules.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct ShellUrlArgPlan {
+	pub keep:       Vec<bool>,
+	pub keep_env:   bool,
+	pub env_splits: Vec<ShellEnvSplitPlan>,
+}
+
+/// Classify a command's `argv` for internal URL rewriting using the same rules
+/// as the embedded shell.
+#[napi]
+pub fn classify_shell_url_args(
+	argv: Vec<String>,
+	env: Option<HashMap<String, String>>,
+) -> ShellUrlArgPlan {
+	let pairs: Option<Vec<(String, String)>> = env.map(|map| map.into_iter().collect());
+	let plan = omp_shell::classify_url_args(&argv, pairs.as_deref(), false);
+	ShellUrlArgPlan {
+		keep:       plan.keep,
+		keep_env:   plan.keep_env,
+		env_splits: plan
+			.env_splits
+			.into_iter()
+			.map(|split| {
+				let words = split
+					.words
+					.into_iter()
+					.map(|word| ShellEnvSplitWord {
+						start: split.raw[..word.start].encode_utf16().count() as u32,
+						end:   split.raw[..word.end].encode_utf16().count() as u32,
+						text:  word.text,
+						keep:  word.keep,
+					})
+					.collect();
+				ShellEnvSplitPlan {
+					index: split.index as u32,
+					prefix: split.prefix,
+					raw: split.raw,
+					words,
+				}
+			})
+			.collect(),
+	}
+}
+
 /// N-API opt-in handle for the minimizer.
 #[napi(object)]
 #[derive(Debug, Clone, Default)]

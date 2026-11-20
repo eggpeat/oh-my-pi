@@ -66,6 +66,7 @@ export const astEdit = nativeBindings.astEdit ?? missingNativeExport("astEdit");
 export const astGrep = nativeBindings.astGrep ?? missingNativeExport("astGrep");
 export const astMatch = nativeBindings.astMatch ?? missingNativeExport("astMatch");
 export const blockRangeAt = nativeBindings.blockRangeAt ?? missingNativeExport("blockRangeAt");
+export const classifyShellUrlArgs = nativeBindings.classifyShellUrlArgs ?? missingNativeExport("classifyShellUrlArgs");
 export const closeDesktopEventTaps = nativeBindings.closeDesktopEventTaps ?? missingNativeExport("closeDesktopEventTaps");
 export const copyToClipboard = nativeBindings.copyToClipboard ?? missingNativeExport("copyToClipboard");
 export const cosineSimilarityPairs = nativeBindings.cosineSimilarityPairs ?? missingNativeExport("cosineSimilarityPairs");
