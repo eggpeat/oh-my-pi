@@ -13,20 +13,18 @@ interface Edit {
 	actor: string;
 	before: string | null;
 	after: string | null;
-	gapHint?: string;
 }
 
 /** Content committed when only `scope`'s preselected ops are applied, plus the per-op verdicts. */
-function commitFor(head: string | null, edits: Edit[], work: string | null, scope: string[], tailHint?: string) {
+function commitFor(head: string | null, edits: Edit[], work: string | null, scope: string[], headMoved = false) {
 	const recorded: RecordedEdit[] = edits.map(edit => ({
 		actor: edit.actor,
 		before: toLines(edit.before),
 		after: toLines(edit.after),
-		gapHint: edit.gapHint,
 	}));
 	const headLines = toLines(head);
 	const workLines = toLines(work);
-	const attribution = attribute(headLines, historySteps(headLines, recorded, workLines, tailHint), workLines);
+	const attribution = attribute(headLines, historySteps(headLines, recorded, workLines), workLines, headMoved);
 	const { status, reasons } = classify(attribution, new Set(scope));
 	const selected = new Set(attribution.ops.filter(op => status[op.id] === "own").map(op => op.id));
 	const verdicts = attribution.ops.map(op => `${status[op.id]} ${op.kind}${op.text}`);
@@ -116,7 +114,7 @@ describe("selective commit attribution", () => {
 		const head = "old";
 		const after = "first\nsecond";
 		const work = "first\ninserted\nsecond";
-		const { content } = commitFor(head, [{ actor: "Main", before: head, after }], work, ["Main"], "Main");
+		const { content } = commitFor(head, [{ actor: "Main", before: head, after }], work, ["Main"]);
 		expect(content).toBe(after);
 	});
 
@@ -140,15 +138,6 @@ describe("selective commit attribution", () => {
 		expect(verdicts).toContain("review -    return 1");
 		expect(verdicts).toContain("review +    return 10 ");
 		expect(content).toBe(CODE.replace("def b():\n    return 2", "def b():\n    log()\n    return 2"));
-	});
-
-	it("counts an unrecorded rewrite of the agent's lines as its own when its shell call explains it", () => {
-		const after = CODE.replace("return 1", "return  10");
-		const work = CODE.replace("return 1", "return 10");
-
-		const { content } = commitFor(CODE, [{ actor: "Main", before: CODE, after }], work, ["Main"], "Main");
-
-		expect(content).toBe(work);
 	});
 
 	describe("history that predates HEAD", () => {
@@ -244,6 +233,84 @@ describe("selective commit attribution", () => {
 		const { content } = commitFor("x\n", [{ actor: "Main", before: "x\n", after: null }], null, ["Main"]);
 
 		expect(content).toBeNull();
+	});
+
+	// HEAD advanced on its own, then writers reordered lines. Each case once preselected an
+	// insertion whose matching deletion went elsewhere, committing a second `A`.
+	for (const [head, steps] of [
+		["x B x D A", ["B x x A", "Main: B A x x C", "Other: A x x C D B", "Main: A x C D B x"]],
+		["D B x x A", ["A B x x", "Main: B A x x", "Other: B A D x x", "Main: B D A x"]],
+	] as const) {
+		it(`never preselects a line the net change would then hold twice (HEAD ${head})`, () => {
+			const lines = (text: string) => text.split(" ").join("\n");
+			const edits: Edit[] = [];
+			let before = lines(steps[0]);
+			for (const step of steps.slice(1)) {
+				const [actor, after] = step.split(": ");
+				edits.push({ actor, before, after: lines(after) });
+				before = lines(after);
+			}
+			const tally = (text: string | null) => {
+				const counts = new Map<string, number>();
+				for (const line of toLines(text)) counts.set(line, (counts.get(line) ?? 0) + 1);
+				return counts;
+			};
+			const headCounts = tally(lines(head));
+			const workCounts = tally(before);
+
+			const committed = tally(commitFor(lines(head), edits, before, ["Main"], true).content);
+
+			for (const [line, count] of committed) {
+				expect(count).toBeLessThanOrEqual(Math.max(headCounts.get(line) ?? 0, workCounts.get(line) ?? 0));
+			}
+		});
+	}
+
+	it("keeps an unrelated insertion preselected when only a reviewed reorder also adds its text", () => {
+		const lines = (text: string) => text.split(" ").join("\n");
+		const snapshots = [
+			"B x x A q q q q",
+			"Main: B A x x C q q q q",
+			"Other: A x x C D B q q q q",
+			"Main: A x C D B x q q q q",
+			// Unrelated to the reorder, though the reviewed hunks add a `C` as well.
+			"Main: A x C D B x q q C q q",
+		];
+		const edits: Edit[] = [];
+		let before = lines(snapshots[0]);
+		for (const step of snapshots.slice(1)) {
+			const [actor, after] = step.split(": ");
+			edits.push({ actor, before, after: lines(after) });
+			before = lines(after);
+		}
+
+		const { verdicts } = commitFor(lines("x B x D A q q q q"), edits, before, ["Main"], true);
+
+		expect(verdicts.at(-1)).toBe("own +C");
+		expect(verdicts.slice(0, -1).every(verdict => verdict.startsWith("review"))).toBe(true);
+	});
+
+	it("keeps the agent's lines selectable in a file that was only dirty before recording began", () => {
+		// The user dropped `}` and added `u` before any record; Main then added a `}` of its own.
+		const head = "\nc\n}";
+		const before = "\nc\nu";
+		const work = "\n}\nc\nu";
+		const edits = [{ actor: "Main", before, after: work }];
+
+		const { verdicts, content } = commitFor(head, edits, work, ["Main"]);
+
+		expect(verdicts).toEqual(["own +}", "other -}", "other +u"]);
+		expect(content).toBe("\n}\nc\n}");
+	});
+
+	it("never preselects a line already committed when its twin shares one hunk", () => {
+		// Main wrote `B`; a commit took it after recording began; Other then rewrote the rest.
+		const edits = [
+			{ actor: "Main", before: "A", after: "A\nB" },
+			{ actor: "Other", before: "A\nB", after: "B\nx" },
+		];
+
+		expect(commitFor("B", edits, "B\nx", ["Main"], true).content).toBe("B");
 	});
 
 	describe("subagents", () => {
