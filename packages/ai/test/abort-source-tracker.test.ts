@@ -44,6 +44,11 @@ describe("createAbortSourceTracker", () => {
 		defaultAbortError.abort(new AIError.AbortError());
 		expect(defaultTracker.getCallerAbortReason()).toBeUndefined();
 
+		const chromiumBare = new AbortController();
+		const chromiumTracker = createAbortSourceTracker(chromiumBare.signal);
+		chromiumBare.abort(new DOMException("signal is aborted without reason", "AbortError"));
+		expect(chromiumTracker.getCallerAbortReason()).toBeUndefined();
+
 		const bare = new AbortController();
 		const untold = createAbortSourceTracker(bare.signal);
 		bare.abort();

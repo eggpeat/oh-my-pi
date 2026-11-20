@@ -8,8 +8,8 @@
  *       → `updateContent` receives a message with `stopReason: "stop"`;
  *         `errorMessage` is NOT overwritten.
  *   C2  errorMessage = undefined (no threaded reason) + aborted + no TTSR flag
- *       → `streamingMessage.errorMessage` is set to the generic "Operation
- *         aborted"; `updateContent` receives the original message ref.
+ *       → `updateContent` receives a display copy labeled "Operation aborted"
+ *         while the persisted `message.errorMessage` stays untouched for retry.
  *   C2b errorMessage = USER_INTERRUPT_LABEL (threaded via AbortController) + aborted
  *       → the threaded reason is preserved verbatim, NOT replaced by the generic.
  *   C3  isTtsrAbortPending = true + aborted + SilentAbort flag + rule reason
@@ -26,6 +26,7 @@ import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { resolveAssistantErrorPresentation } from "@oh-my-pi/pi-tui/chat/transcript-render-helpers";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SILENT_ABORT_MARKER, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { TurnRecovery, type TurnRecoveryHost } from "@oh-my-pi/pi-coding-agent/session/turn-recovery";
 import { createInteractiveModeContext } from "./helpers/interactive-mode-context";
 
 function makeAssistantMessage(overrides: Partial<AssistantMessage> = {}): AssistantMessage {
@@ -66,7 +67,7 @@ function createFixture(opts: {
 	});
 
 	const controller = new EventController(ctx);
-	return { controller, ctx, updateContent };
+	return { controller, ctx, streamingComponent, updateContent };
 }
 
 describe("EventController #handleMessageEnd abort labeling", () => {
@@ -126,7 +127,7 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		expect(arg.errorMessage).toBeUndefined();
 	});
 
-	it("C2: errorMessage undefined (no threaded reason) + aborted + no TTSR -> errorMessage='Operation aborted', updateContent receives original ref", async () => {
+	it("C2: errorMessage undefined (no threaded reason) + aborted + no TTSR -> display copy gets 'Operation aborted', persisted message untouched", async () => {
 		const message = makeAssistantMessage({ stopReason: "aborted", errorMessage: undefined });
 		const { controller, updateContent } = createFixture({
 			streamingMessage: message,
@@ -135,13 +136,12 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 
 		await controller.handleEvent({ type: "message_end", message });
 
-		// No threaded reason -> generic operator-facing label stamped in-place.
-		expect(message.errorMessage).toBe("Operation aborted");
+		// Persisted message keeps its original undefined errorMessage so agent_end recovery can classify it.
+		expect(message.errorMessage).toBeUndefined();
 
-		// `updateContent` saw the original streaming message ref (no `{...streamingMessage, stopReason:"stop"}` spread).
 		expect(updateContent).toHaveBeenCalledTimes(1);
 		const arg = updateContent.mock.calls[0]![0];
-		expect(arg).toBe(message);
+		expect(arg).not.toBe(message);
 		expect(arg.stopReason).toBe("aborted");
 		expect(arg.errorMessage).toBe("Operation aborted");
 	});
@@ -196,6 +196,35 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		});
 		const genericRendered = Bun.stripANSI(new AssistantMessageComponent(genericFlagged).render(120).join("\n"));
 		expect(genericRendered).toContain("Operation aborted");
+	});
+
+	it("C2d: rendering a generic flagged abort in the terminal keeps it retryable in TurnRecovery", async () => {
+		const message = makeAssistantMessage({
+			content: [],
+			stopReason: "aborted",
+			errorMessage: "Request was aborted",
+			errorId: AIError.create(AIError.Flag.Abort),
+		});
+		const { controller, streamingComponent } = createFixture({
+			streamingMessage: message,
+			isTtsrAbortPending: false,
+		});
+
+		await controller.handleEvent({ type: "message_end", message });
+
+		const rendered = Bun.stripANSI(streamingComponent.render(120).join("\n"));
+		expect(rendered).toContain("Operation aborted");
+		expect(message.errorMessage).toBe("Request was aborted");
+
+		const recovery = new TurnRecovery({
+			settings: Settings.isolated(),
+			configWarnings: [],
+			model: () => undefined,
+			abortInProgress: () => false,
+			isDisposed: () => false,
+			streamingEditAbortTriggered: () => false,
+		} as unknown as TurnRecoveryHost);
+		expect(recovery.isRetryableReasonlessAbort(message)).toBe(true);
 	});
 
 	it("C3: a TTSR abort (SilentAbort flag + rule reason) is suppressed live and on rebuild", async () => {

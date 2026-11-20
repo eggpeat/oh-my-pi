@@ -24,7 +24,21 @@ const GENERIC_ABORT_MESSAGES = new Set([
 	"The operation was aborted.",
 	"This operation was aborted",
 	"This operation was aborted.",
+	"signal is aborted without reason",
+	"signal is aborted without reason.",
 ]);
+
+const runtimeBareAbortReason = (() => {
+	const controller = new AbortController();
+	controller.abort();
+	const reason: unknown = controller.signal.reason;
+	return typeof reason === "object" && reason !== null && "message" in reason && typeof reason.message === "string"
+		? reason.message.trim()
+		: undefined;
+})();
+if (runtimeBareAbortReason) {
+	GENERIC_ABORT_MESSAGES.add(runtimeBareAbortReason);
+}
 
 /**
  * Whether an error message is one of the default runtime or transport abort

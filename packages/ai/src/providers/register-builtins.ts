@@ -93,13 +93,18 @@ const OPENAI_IDLE_FLOORED_STREAM_LIMITS: StreamLimits = {
 	openAIIdleEnvFloorsFirstEvent: true,
 };
 
+interface CapturedStreamControls {
+	signal: AbortSignal | undefined;
+	streamIdleTimeoutMs: number | undefined;
+	streamFirstEventTimeoutMs: number | undefined;
+}
+
 function forwardStream<TApi extends Api>(
 	target: EventStreamImpl,
 	source: AsyncIterable<AssistantMessageEvent>,
 	model: Model<TApi>,
-	options: OptionsForApi<TApi>,
+	controls: CapturedStreamControls,
 	abortTracker: AbortSourceTracker,
-	callerSignal: AbortSignal | undefined,
 	limits?: StreamLimits,
 ): void {
 	(async () => {
@@ -119,14 +124,14 @@ function forwardStream<TApi extends Api>(
 			const idleTimeoutFallbackMs = compatIdleTimeoutMs ?? limits?.defaultIdleTimeoutMs;
 			const idleTimeoutMs = providerHandlesStreamTimeouts
 				? undefined
-				: (options.streamIdleTimeoutMs ??
+				: (controls.streamIdleTimeoutMs ??
 					(limits?.openAIIdleEnvFloorsFirstEvent
 						? getOpenAIStreamIdleTimeoutMs(idleTimeoutFallbackMs)
 						: getStreamIdleTimeoutMs(idleTimeoutFallbackMs)));
 			const firstItemTimeoutMs =
 				providerHandlesStreamTimeouts || providerHandlesFirstEventTimeouts
 					? 0
-					: (options.streamFirstEventTimeoutMs ??
+					: (controls.streamFirstEventTimeoutMs ??
 						(limits?.openAIIdleEnvFloorsFirstEvent
 							? getOpenAIStreamFirstEventTimeoutMs(idleTimeoutMs, limits.defaultFirstEventTimeoutMs)
 							: getStreamFirstEventTimeoutMs(idleTimeoutMs, limits?.defaultFirstEventTimeoutMs)));
@@ -142,7 +147,7 @@ function forwardStream<TApi extends Api>(
 				onIdle: () => abortTracker.abortLocally(new AIError.StreamTimeoutError(STREAM_IDLE_TIMEOUT_ERROR)),
 				onFirstItemTimeout: () =>
 					abortTracker.abortLocally(new AIError.StreamTimeoutError(STREAM_FIRST_EVENT_TIMEOUT_ERROR)),
-				abortSignal: callerSignal,
+				abortSignal: controls.signal,
 				// The synthetic `start` event is yielded immediately by every provider before
 				// the upstream model has emitted any tokens. Treating it as the first "real"
 				// item would flip the watchdog from `firstItemTimeoutMs` to the much shorter
@@ -162,7 +167,7 @@ function forwardStream<TApi extends Api>(
 			}
 		} catch (error) {
 			const stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-			const message = createProviderStreamError(model, error, stopReason, abortTracker, callerSignal);
+			const message = createProviderStreamError(model, error, stopReason, abortTracker, controls.signal);
 			target.push({ type: "error", reason: stopReason, error: message });
 			target.end(message);
 		}
@@ -223,20 +228,32 @@ function createLazyProviderStream<TModule, TApi extends Api>(
 ): (model: Model<TApi>, context: Context, options: OptionsForApi<TApi>) => EventStreamImpl {
 	return (model, context, options) => {
 		const outer = new EventStreamImpl();
-		const rawOptions: OptionsForApi<TApi> = options ?? {};
-		const callerSignal = rawOptions.signal;
-		const streamOptions: OptionsForApi<TApi> = { ...rawOptions, signal: callerSignal };
-		const abortTracker = createAbortSourceTracker(callerSignal);
-		const providerOptions: OptionsForApi<TApi> = { ...streamOptions, signal: abortTracker.requestSignal };
+		const streamOptions: OptionsForApi<TApi> = options ?? {};
+		const controls: CapturedStreamControls = {
+			signal: streamOptions.signal,
+			streamIdleTimeoutMs: streamOptions.streamIdleTimeoutMs,
+			streamFirstEventTimeoutMs: streamOptions.streamFirstEventTimeoutMs,
+		};
+		const abortTracker = createAbortSourceTracker(controls.signal);
+		const providerOptions: OptionsForApi<TApi> = {
+			...streamOptions,
+			signal: abortTracker.requestSignal,
+			...(controls.streamIdleTimeoutMs !== undefined
+				? { streamIdleTimeoutMs: controls.streamIdleTimeoutMs }
+				: undefined),
+			...(controls.streamFirstEventTimeoutMs !== undefined
+				? { streamFirstEventTimeoutMs: controls.streamFirstEventTimeoutMs }
+				: undefined),
+		};
 
 		load()
 			.then(mod => {
 				const inner = pick(mod)(model, context, providerOptions);
-				forwardStream(outer, inner, model, streamOptions, abortTracker, callerSignal, limits);
+				forwardStream(outer, inner, model, controls, abortTracker, limits);
 			})
 			.catch(error => {
 				const stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-				const message = createProviderStreamError(model, error, stopReason, abortTracker, callerSignal);
+				const message = createProviderStreamError(model, error, stopReason, abortTracker, controls.signal);
 				outer.push({ type: "error", reason: stopReason, error: message });
 				outer.end(message);
 			});

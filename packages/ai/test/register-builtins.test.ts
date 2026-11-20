@@ -371,6 +371,19 @@ describe("register-builtins lazy streams", () => {
 		expect(bareAbortErrorResult.errorMessage).toBe("Request was aborted");
 		expect(AIError.is(bareAbortErrorResult.errorId, AIError.Flag.Abort)).toBe(true);
 
+		// Chromium's bare abort DOMException ("signal is aborted without reason") also falls back.
+		const browserBareAbort = new AbortController();
+		const browserBareStream = streamBedrock(createModel(), baseContext, {
+			signal: browserBareAbort.signal,
+			streamIdleTimeoutMs: 500,
+		});
+		await browserBareStream[Symbol.asyncIterator]().next();
+		browserBareAbort.abort(new DOMException("signal is aborted without reason", "AbortError"));
+		const browserBareResult = await browserBareStream.result();
+		expect(browserBareResult.stopReason).toBe("aborted");
+		expect(browserBareResult.errorMessage).toBe("Request was aborted");
+		expect(browserBareResult.errorId).toBeUndefined();
+
 		// Classified Error and plain-object abort reasons preserve both message and flags.
 		const classifiedAbort = new AbortController();
 		const classifiedReason = AIError.attach(
@@ -403,13 +416,15 @@ describe("register-builtins lazy streams", () => {
 		expect(AIError.is(objectResult.errorId, AIError.Flag.Abort)).toBe(false);
 	});
 
-	it("shields caller aborts from competing timeout errors and pre-stream throws", async () => {
-		// Pre-stream synchronous throw while caller signal is already aborted.
+	it("shields caller aborts from competing wrapped timeout errors in both catch paths", async () => {
+		// Pre-aborted synchronous provider throw: lazy-load catch receives the wrapped AbortError directly.
 		const preAborted = new AbortController();
 		preAborted.abort("Interrupted by user");
 		setBedrockProviderModule({
 			streamBedrock: () => {
-				throw new Error("boom before stream");
+				throw new AIError.AbortError("Provider timed out", {
+					cause: new AIError.StreamTimeoutError("Provider stream stalled"),
+				});
 			},
 		});
 		const preAbortedResult = await streamBedrock(createModel(), baseContext, {
@@ -417,41 +432,113 @@ describe("register-builtins lazy streams", () => {
 		}).result();
 		expect(preAbortedResult.stopReason).toBe("aborted");
 		expect(preAbortedResult.errorMessage).toBe("Interrupted by user");
+		expect(preAbortedResult.errorId).toBeUndefined();
+		expect(AIError.is(preAbortedResult.errorId, AIError.Flag.Abort)).toBe(false);
+		expect(AIError.is(preAbortedResult.errorId, AIError.Flag.Timeout)).toBe(false);
 		expect(AIError.is(preAbortedResult.errorId, AIError.Flag.Transient)).toBe(false);
 
-		// A competing provider AbortError caused by a timeout must not taint a string caller abort.
-		const racingAbort = new AbortController();
+		// Post-iteration result() throw: forwardStream catch receives the wrapped AbortError directly.
+		const postStreamAbort = new AbortController();
 		const partialMessage = createAssistantMessage("stop");
 		setBedrockProviderModule({
-			streamBedrock: (_model, _context, options) =>
+			streamBedrock: () =>
 				({
 					async *[Symbol.asyncIterator]() {
 						yield { type: "start", partial: partialMessage } as const;
-						yield { type: "text_delta", contentIndex: 0, delta: "hello", partial: partialMessage } as const;
-						const { promise, reject } = Promise.withResolvers<void>();
-						options.signal?.addEventListener(
-							"abort",
-							() => {
-								racingAbort.abort("Interrupted by user");
-								reject(
-									new AIError.AbortError("Provider timed out", {
-										cause: new AIError.StreamTimeoutError("Provider stream stalled"),
-									}),
-								);
-							},
-							{ once: true },
-						);
-						await promise;
+					},
+					result: async () => {
+						postStreamAbort.abort("Interrupted by user");
+						throw new AIError.AbortError("Provider timed out", {
+							cause: new AIError.StreamTimeoutError("Provider stream stalled"),
+						});
 					},
 				}) as unknown as AssistantMessageEventStream,
 		});
-		const racingResult = await streamBedrock(createModel(), baseContext, {
-			signal: racingAbort.signal,
-			streamIdleTimeoutMs: 10,
+		const postStreamResult = await streamBedrock(createModel(), baseContext, {
+			signal: postStreamAbort.signal,
+			streamIdleTimeoutMs: 500,
 		}).result();
-		expect(racingResult.stopReason).toBe("aborted");
-		expect(racingResult.errorMessage).toBe("Interrupted by user");
-		expect(racingResult.errorId).toBeUndefined();
+		expect(postStreamResult.stopReason).toBe("aborted");
+		expect(postStreamResult.errorMessage).toBe("Interrupted by user");
+		expect(postStreamResult.errorId).toBeUndefined();
+		expect(AIError.is(postStreamResult.errorId, AIError.Flag.Abort)).toBe(false);
+		expect(AIError.is(postStreamResult.errorId, AIError.Flag.Timeout)).toBe(false);
+		expect(AIError.is(postStreamResult.errorId, AIError.Flag.Transient)).toBe(false);
+	});
+
+	it("preserves timeout and signal settings supplied by class getters", async () => {
+		vi.useFakeTimers();
+		try {
+			const partialMessage = createAssistantMessage("stop");
+			let observedProviderIdleMs: number | undefined;
+			let observedProviderFirstEventMs: number | undefined;
+			let emitProgress = false;
+			let parked = false;
+			setBedrockProviderModule({
+				streamBedrock: (_model, _context, options) => {
+					observedProviderIdleMs = options.streamIdleTimeoutMs;
+					observedProviderFirstEventMs = options.streamFirstEventTimeoutMs;
+					return {
+						async *[Symbol.asyncIterator]() {
+							yield { type: "start", partial: partialMessage } as const;
+							if (emitProgress) {
+								yield { type: "text_delta", contentIndex: 0, delta: "hi", partial: partialMessage } as const;
+							}
+							parked = true;
+							const { promise, reject } = Promise.withResolvers<never>();
+							options.signal?.addEventListener("abort", () => reject(new Error("Request was aborted")), {
+								once: true,
+							});
+							await promise;
+						},
+					} as unknown as AssistantMessageEventStream;
+				},
+			});
+
+			class GetterStreamOptions {
+				readonly #signal: AbortSignal;
+				constructor(signal: AbortSignal) {
+					this.#signal = signal;
+				}
+				get signal(): AbortSignal {
+					return this.#signal;
+				}
+				get streamIdleTimeoutMs(): number {
+					return 1_000;
+				}
+				get streamFirstEventTimeoutMs(): number {
+					return 1_000;
+				}
+			}
+
+			const firstEventPromise = streamBedrock(
+				createModel(),
+				baseContext,
+				new GetterStreamOptions(new AbortController().signal),
+			).result();
+			await drainMicrotasksUntil(() => parked, "first-event getter stream did not reach parked wait");
+			expect(observedProviderIdleMs).toBe(1_000);
+			expect(observedProviderFirstEventMs).toBe(1_000);
+			vi.advanceTimersByTime(1_000);
+			const firstEventResult = await firstEventPromise;
+			expect(firstEventResult.stopReason).toBe("error");
+			expect(firstEventResult.errorMessage).toBe("Provider stream timed out while waiting for the first event");
+
+			parked = false;
+			emitProgress = true;
+			const idlePromise = streamBedrock(
+				createModel(),
+				baseContext,
+				new GetterStreamOptions(new AbortController().signal),
+			).result();
+			await drainMicrotasksUntil(() => parked, "idle getter stream did not reach parked wait");
+			vi.advanceTimersByTime(1_000);
+			const idleResult = await idlePromise;
+			expect(idleResult.stopReason).toBe("error");
+			expect(idleResult.errorMessage).toBe("Provider stream stalled while waiting for the next event");
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("isolates each stream from mutations to a reused options object while lazy loading", async () => {

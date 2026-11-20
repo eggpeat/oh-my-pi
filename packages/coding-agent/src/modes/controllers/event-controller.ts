@@ -1922,30 +1922,28 @@ export class EventController {
 			this.ctx.streamingMessage = event.message;
 			this.#streamingReveal.stop();
 			this.#toolArgsReveal.flushAll();
-			let errorMessage: string | undefined;
 			const aborted = this.ctx.streamingMessage.stopReason === "aborted";
 			const silentlyAborted = aborted && isSilentAbort(this.ctx.streamingMessage);
-			if (aborted && !silentlyAborted) {
-				// Resolve the operator-facing label: a user-interrupt (Esc) abort
-				// carries USER_INTERRUPT_LABEL on errorMessage (threaded through the
-				// AbortController), which is preserved verbatim; any other abort with
-				// no threaded reason falls back to the retry-aware generic label.
-				// AgentSession.#handleAgentEvent already stamped the SilentAbort flag
-				// for expected internal transitions (plan-compact, TTSR rule
-				// interruption) before this controller ran, so reaching this branch
-				// implies the abort was NOT a silent internal transition.
-				errorMessage = resolveAbortLabel(this.ctx.streamingMessage, this.ctx.viewSession.retryAttempt);
-				this.ctx.streamingMessage.errorMessage = errorMessage;
+			let displayMessage: AssistantMessage = this.ctx.streamingMessage;
+			if (silentlyAborted) {
+				// Silence the streaming render by downgrading stopReason to "stop" for
+				// display only — does NOT mutate the persisted message's stopReason
+				// (the structural SilentAbort flag drives replay-side suppression).
+				displayMessage = {
+					...this.ctx.streamingMessage,
+					stopReason: "stop",
+				};
+			} else if (aborted) {
+				// Resolve the operator-facing label onto a display copy rather than
+				// mutating `event.message` in place: `TurnRecovery` reads the original
+				// message at `agent_end` to distinguish generic/reasonless aborts from
+				// custom cancellation reasons.
+				const errorMessage = resolveAbortLabel(this.ctx.streamingMessage, this.ctx.viewSession.retryAttempt);
+				displayMessage =
+					errorMessage === this.ctx.streamingMessage.errorMessage
+						? this.ctx.streamingMessage
+						: { ...this.ctx.streamingMessage, errorMessage };
 			}
-			const displayMessage: AssistantMessage = silentlyAborted
-				? {
-						// Silence the streaming render by downgrading stopReason to "stop" for
-						// display only — does NOT mutate the persisted message's stopReason
-						// (the structural SilentAbort flag drives replay-side suppression).
-						...this.ctx.streamingMessage,
-						stopReason: "stop",
-					}
-				: this.ctx.streamingMessage;
 			const displayTimeline = splitAssistantMessageToolTimeline(displayMessage);
 			const linkTargets = await refreshAssistantMessageLinkTargets(this.ctx, [displayMessage]);
 			if (generation !== this.#dispatchGeneration || !this.ctx.streamingComponent) return;
@@ -2061,7 +2059,7 @@ export class EventController {
 					);
 				}
 			}
-			if (displayMessage === event.message) {
+			if (!silentlyAborted) {
 				this.ctx.transcriptMessageComponents.set(event.message, this.ctx.streamingComponent);
 			}
 			this.ctx.streamingComponent = undefined;
