@@ -2106,6 +2106,9 @@ export class Agent {
 			onAssistantMessageEvent: this.#onAssistantMessageEvent,
 			onHarmonyLeak: this.#onHarmonyLeak,
 			onTurnEnd: (messages, signal, context) => this.#onTurnEnd?.(messages, signal, context),
+			onTurnEndEmitted: () => {
+				requestModel = undefined;
+			},
 			onPauseChange: paused => {
 				if (this.#isPaused === paused) return;
 				this.#isPaused = paused;
@@ -2173,10 +2176,7 @@ export class Agent {
 					if (messages.length < event.messages.length) event = { ...event, messages };
 				}
 				if (event.type === "turn_start") turnOpen = true;
-				if (event.type === "turn_end") {
-					turnOpen = false;
-					requestModel = undefined;
-				}
+				if (event.type === "turn_end") turnOpen = false;
 				// Update internal state based on events
 				switch (event.type) {
 					case "message_start":

@@ -884,18 +884,23 @@ describe("Agent", () => {
 					callCount += 1;
 					const stream = new AssistantMessageEventStream();
 					if (callCount === 1) {
-						const firstTurn = createAssistantMessage(
-							[{ type: "toolCall", id: "call-switch", name: "switch_model", arguments: {} }],
-							"toolUse",
-						);
+						const toolCalls = Array.from({ length: 8 }, (_, index) => ({
+							type: "toolCall" as const,
+							id: `call-switch-${index}`,
+							name: "switch_model",
+							arguments: {},
+						}));
+						const firstTurn = createAssistantMessage(toolCalls, "toolUse");
 						queueMicrotask(() => {
 							stream.push({ type: "start", partial: firstTurn });
-							stream.push({
-								type: "toolcall_end",
-								contentIndex: 0,
-								toolCall: { type: "toolCall", id: "call-switch", name: "switch_model", arguments: {} },
-								partial: firstTurn,
-							});
+							for (const [index, toolCall] of toolCalls.entries()) {
+								stream.push({
+									type: "toolcall_end",
+									contentIndex: index,
+									toolCall,
+									partial: firstTurn,
+								});
+							}
 							stream.push({ type: "done", reason: "toolUse", message: firstTurn });
 						});
 					} else {
@@ -903,9 +908,7 @@ describe("Agent", () => {
 						if (switchBackInFlight) {
 							agentRef.current.setModel(mock.model);
 						}
-						queueMicrotask(() => {
-							stream.fail(new Error(`code=${AIError.CODEX_NATIVE_LANE_STEER_REJECTED_CODE}`));
-						});
+						stream.fail(new Error(`code=${AIError.CODEX_NATIVE_LANE_STEER_REJECTED_CODE}`));
 					}
 					return stream;
 				},
@@ -926,6 +929,32 @@ describe("Agent", () => {
 
 		await runWithMidRunSwitch(false);
 		await runWithMidRunSwitch(true);
+
+		const mock = createMockModel({ responses: [{ content: ["finished"] }] });
+		const codexModel: Model = {
+			...mock.model,
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			id: "gpt-5.4",
+		};
+		const postTurnAgent = new Agent({
+			initialState: { model: codexModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		postTurnAgent.transformAssistantMessage = () => {
+			postTurnAgent.setModel(mock.model);
+			postTurnAgent.abort("switched after reply");
+		};
+		postTurnAgent.setOnBeforeYield(() => {
+			throw new Error("yield failure");
+		});
+		await postTurnAgent.prompt("finish then switch");
+		const postTurnTerminal = postTurnAgent.state.messages.at(-1);
+		if (postTurnTerminal?.role !== "assistant") throw new Error("Expected aborted assistant boundary");
+		expect(postTurnTerminal.stopReason).toBe("aborted");
+		expect(postTurnTerminal.api).toBe(mock.model.api);
+		expect(postTurnTerminal.provider).toBe(mock.model.provider);
+		expect(postTurnTerminal.model).toBe(mock.model.id);
 	});
 
 	it("preserves errorStatus and errorId when a partial stream rejects mid-response", async () => {
