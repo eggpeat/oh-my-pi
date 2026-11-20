@@ -19,7 +19,7 @@
 - `TtyWriter` turns Windows console VT processing back on when it finds it off, instead of printing escape sequences as text
 
 ### Fixed
-
+- The shell now rewrites a URL argument of a command that only mentions omp, such as `grep omp local://file`, to the real file, and still leaves the URLs of a command that actually runs omp as written ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 - The `sed` shell builtin accepts grouped scripts such as `1{h;d};2{G}` without a semicolon before the closing brace.
 - Fixed the native addon failing to load when HOME, PI_NATIVES_DIR or the install directory contains `?` ([#19763](https://github.com/can1357/oh-my-pi/pull/19763) by [@sjawhar](https://github.com/sjawhar))
 - `commitCreate()` now reports a HEAD that moves after the expected-HEAD check, such as from a `commit-msg` hook, as a `HeadMoved` error instead of a generic `Backend` failure ([#19393](https://github.com/can1357/oh-my-pi/pull/19393) by [@eggpeat](https://github.com/eggpeat))

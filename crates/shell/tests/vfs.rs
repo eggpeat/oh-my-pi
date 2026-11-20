@@ -607,6 +607,49 @@ async fn omp_receives_its_url_arguments_as_written() {
 	assert_eq!(run.stdout.lines().collect::<Vec<_>>(), expected);
 }
 
+/// An argument spelled `omp` is not a command that runs `omp`: `echo omp
+/// virtual://…` receives the host file, and so does `echo` after an `env`
+/// setting whose value only looks like `omp`. A wrapper's own file is
+/// rewritten even when the command it runs is `omp`.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_argument_named_omp_does_not_keep_a_url_from_being_rewritten() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let directory = tempfile::tempdir().expect("isolated provider filesystem");
+	let docs = directory.path().join("docs");
+	fs::create_dir(&docs).expect("provider directory");
+	fs::write(docs.join("a.txt"), b"alpha\n").expect("document");
+	let bin = tempfile::tempdir().expect("program directory");
+	let ssh = bin.path().join("ssh");
+	fs::write(&ssh, b"#!/bin/sh\nprintf '%s\\n' \"$@\"\n").expect("stand-in ssh");
+	fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).expect("executable stand-in");
+	let file = docs.join("a.txt");
+	let script = format!(
+		"/bin/echo omp virtual://docs/a.txt; /usr/bin/env -- -flag=/opt/omp /bin/echo \
+		 virtual://docs/a.txt; PATH='{bin}':$PATH ssh -F virtual://docs/a.txt server omp read \
+		 virtual://docs/a.txt '|' cat virtual://docs/a.txt",
+		bin = bin.path().display(),
+	);
+	let run = run_virtual(directory.path(), &script).await;
+	assert_eq!(run.status, Some(0), "{}", run.stderr);
+	let host = file.display().to_string();
+	let expected = [
+		format!("omp {host}"),
+		host.clone(),
+		"-F".to_owned(),
+		host.clone(),
+		"server".to_owned(),
+		"omp".to_owned(),
+		"read".to_owned(),
+		"virtual://docs/a.txt".to_owned(),
+		"|".to_owned(),
+		"cat".to_owned(),
+		host,
+	];
+	assert_eq!(run.stdout.lines().collect::<Vec<_>>(), expected);
+}
+
 /// A provider directory that aliases a real one is a usable working directory
 /// for a child process, and the `PWD` the child inherits names that same host
 /// directory rather than the URL it cannot open; one that aliases nothing is

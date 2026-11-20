@@ -108,6 +108,93 @@ describe("hostCommandUrls", () => {
 			].join("\n"),
 		);
 	});
+
+	it("rewrites a URL when omp is only an argument", async () => {
+		expect(await host("grep omp local://out.txt")).toBe("grep omp /host/out.txt");
+		expect(await host("ls ./omp local://dir")).toBe("ls ./omp /host/dir");
+		expect(await host("rg -n omp local://out.txt")).toBe("rg -n omp /host/out.txt");
+	});
+
+	it("keeps a real omp command's URLs and still rewrites a wrapper's files", async () => {
+		expect(await host("nice omp read local://x")).toBe("nice omp read local://x");
+		expect(await host("npx --loglevel warn omp read local://x:1")).toBe("npx --loglevel warn omp read local://x:1");
+		expect(await host("npx --cache omp eslint local://app.ts")).toBe("npx --cache omp eslint /host/app.ts");
+		expect(await host("npm exec -p omp read local://x")).toBe("npm exec -p omp read local://x");
+		expect(await host("npm --prefix local://tools exec -- omp read local://book:1")).toBe(
+			"npm --prefix /host/tools exec -- omp read local://book:1",
+		);
+		expect(await host("env -- -flag=/opt/omp grep x local://file")).toBe("env -- -flag=/opt/omp grep x /host/file");
+		expect(await host("env -u FOO - omp read local://x")).toBe("env -u FOO - omp read local://x");
+		expect(await host("env tool.name=/opt/omp grep x local://file")).toBe(
+			"env tool.name=/opt/omp grep x /host/file",
+		);
+		expect(await host("setsid omp read local://x:1")).toBe("setsid omp read local://x:1");
+		expect(await host("setsid grep omp local://x")).toBe("setsid grep omp /host/x");
+		expect(await host("xargs omp read local://x")).toBe("xargs omp read local://x");
+		expect(await host("ifne grep local://x")).toBe("ifne grep /host/x");
+		expect(await host("uv run -w requests omp read local://book:1")).toBe(
+			"uv run -w requests omp read local://book:1",
+		);
+		expect(await host("bunx --minimum-release-age 86400 omp read local://book:1")).toBe(
+			"bunx --minimum-release-age 86400 omp read local://book:1",
+		);
+		expect(await host("bunx --registry https://example omp read local://book:1")).toBe(
+			"bunx --registry https://example omp read local://book:1",
+		);
+		expect(await host("REF=local://a omp read local://x")).toBe("REF=local://a omp read local://x");
+	});
+
+	it("keeps each remote omp command's URLs and rewrites local ssh options", async () => {
+		expect(await host("ssh server omp read local://book")).toBe("ssh server omp read local://book");
+		expect(await host("ssh -F local://config server omp read local://book")).toBe(
+			"ssh -F /host/config server omp read local://book",
+		);
+		expect(await host('ssh server omp read local://book "|" cat')).toBe('ssh server omp read local://book "|" cat');
+		expect(await host('ssh server omp read local://book "|" cat local://other')).toBe(
+			'ssh server omp read local://book "|" cat /host/other',
+		);
+		expect(await host("ssh server omp read local://book 2>&1")).toBe("ssh server omp read local://book 2>&1");
+		expect(await host('ssh server omp read local://book "|" cat local://other "2>&1"')).toBe(
+			'ssh server omp read local://book "|" cat /host/other "2>&1"',
+		);
+	});
+
+	it("rewrites file targets, not here-document markers, here-strings or arithmetic shifts", async () => {
+		expect(await host("cat << 'local://done'\nbody\nlocal://done\necho hi")).toBe(
+			"cat << 'local://done'\nbody\nlocal://done\necho hi",
+		);
+		expect(await host("cat <<< local://text")).toBe("cat <<< local://text");
+		expect(await host('cat <<END"MARK"\nlocal://inside\nEND\nlocal://still\nENDMARK\ncat local://done')).toBe(
+			'cat <<END"MARK"\nlocal://inside\nEND\nlocal://still\nENDMARK\ncat /host/done',
+		);
+		expect(await host("echo $((1 << 2))\ncat local://file")).toBe("echo $((1 << 2))\ncat /host/file");
+	});
+
+	it("rewrites commands inside case patterns and fd-redirection substitutions", async () => {
+		expect(await host("case x in x) cat local://a;; esac")).toBe("case x in x) cat /host/a;; esac");
+		expect(await host('echo "$(case x in x) cat local://a;; esac)"')).toBe(
+			'echo "$(case x in x) cat /host/a;; esac)"',
+		);
+		expect(await host("2>&$(cat local://fd)")).toBe("2>&$(cat /host/fd)");
+		expect(await host("2>& $(cat local://fd)")).toBe("2>& $(cat /host/fd)");
+	});
+
+	it("escapes a backtick in a rewritten path inside a backtick command", async () => {
+		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-url-bt-"));
+		try {
+			const nested = path.join(dir, "a`b");
+			await fs.promises.mkdir(nested);
+			const file = path.join(nested, "file");
+			await fs.promises.writeFile(file, "ok\n");
+			const tickBacking: UrlBacking = async url => (url === "local://file" ? file : undefined);
+			const command = await hostCommandUrls('printf %s "`cat local://file`"', tickBacking);
+			const result = Bun.spawnSync(["bash", "-c", command]);
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout.toString()).toBe("ok");
+		} finally {
+			await fs.promises.rm(dir, { recursive: true, force: true });
+		}
+	});
 });
 
 type InteractiveUi = Pick<NonNullable<AgentToolContext["ui"]>, "custom">;
