@@ -15,8 +15,7 @@ import * as fs from "node:fs/promises";
 import { ShellFsOp } from "@oh-my-pi/pi-natives";
 import { isCmdShell } from "@oh-my-pi/pi-utils/procmgr";
 import type { InternalUrlFilesystem } from "../internal-urls/url-filesystem";
-import { lexShellCommand, type ShellToken } from "./shell-tokenize";
-import { ompCommand } from "./shell-launch";
+import { ompLaunch } from "./shell-launch";
 
 /** The host path backing `url`, or `undefined` when nothing backs it or it cannot be resolved. */
 export type UrlBacking = (url: string) => Promise<string | undefined>;
@@ -31,8 +30,12 @@ export function urlBacking(filesystem: InternalUrlFilesystem): UrlBacking {
 
 /** `scheme://`, as the shell's filesystem spells a URL path (a drive letter is no scheme). */
 const URL_ROOT = /^[A-Za-z][A-Za-z0-9+.-]+:\/\//;
-/** An unquoted redirection operator attached to its target (`<local://in`, `2>>local://log`). */
-const REDIRECT = /^\d*(?:<>|>>|<|>)/;
+/** An unquoted redirection operator attached to its target (`<local://in`, `2>>local://log`, `&>local://all`). */
+const REDIRECT = /^(?:&>>|&>|(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:<>|>>|>\||<|>))/;
+/** A standalone unquoted redirection operator whose target is the next word. */
+const STANDALONE_REDIRECT = /^(?:&>>|&>|(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:<<<|<<-|<<|<>|>>|>\||>&|<&|<|>))$/;
+/** An unquoted redirection operator attached to its target in the same word. */
+const ATTACHED_REDIRECT = /^(?:&>>|&>|(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:<<<|<<-|<<|<>|>>|>\||>&|<&|<|>))./;
 /** `<<WORD`, `<<-WORD`, `<<'WORD'`, `<<"WORD"`: a here-document and its delimiter. */
 const HEREDOC = /(?<!<)<<(-?)[ \t]*(?:'([^'\n]+)'|"([^"\n]+)"|\\?([A-Za-z_][A-Za-z0-9_]*))/g;
 const WORD_SAFE = /^[A-Za-z0-9_./:@%+=,-]+$/;
@@ -80,35 +83,42 @@ function spellWord(lead: string, host: string, url: string, cmd: boolean, live: 
 	return quoteWord(lead + host.slice(0, host.length - pattern.length), cmd) + spelled;
 }
 
-/** Reserved words that introduce the simple command which follows them. */
-const COMMAND_PREFIX = new Set(["if", "then", "elif", "else", "while", "until", "do", "!", "{", "}"]);
+interface HostToken {
+	kind: "word" | "separator";
+	raw: string;
+	value: string;
+	splits: boolean;
+}
 
-/** Word tokens that belong to omp rather than to a launcher ahead of it. */
-function ompArguments(tokens: ShellToken[]): Set<number> {
-	const literal = new Set<number>();
-	const segment: number[] = [];
-	const words: string[] = [];
-	const finish = () => {
-		const command = ompCommand(words);
-		if (command !== undefined) {
-			for (let i = command + 1; i < segment.length; i++) literal.add(segment[i]!);
-		}
-		segment.length = 0;
-		words.length = 0;
-	};
-	for (let i = 0; i < tokens.length; i++) {
-		const token = tokens[i]!;
-		if (token.kind === "word") {
-			if (words.length === 0 && COMMAND_PREFIX.has(token.value)) {
-				finish();
-				continue;
-			}
-			segment.push(i);
-			words.push(token.value);
-		} else if (/[\n;&|()]/.test(token.raw)) finish();
+interface CaseFrame {
+	depth: number;
+	phase: "word" | "in" | "pattern" | "body";
+	seenWord: boolean;
+	patternStart: boolean;
+}
+
+const CASE_WORD_END = /[\s;&|()<>]/;
+const CASE_KEYWORD = /[a-z]+/y;
+const COMMAND_INTRO = new Set(["if", "then", "do", "else", "elif", "while", "until"]);
+
+/** Whole lowercase keyword at `index` if terminated by a shell word boundary (not `=`, `-`, etc.). */
+function readKeyword(text: string, index: number): string | undefined {
+	CASE_KEYWORD.lastIndex = index;
+	const word = CASE_KEYWORD.exec(text)?.[0];
+	if (!word) return undefined;
+	const after = index + word.length;
+	return after >= text.length || CASE_WORD_END.test(text[after]!) ? word : undefined;
+}
+
+/** The end of the `$((` arithmetic expansion opened just before `start` in `text`: the index of its closing `)`, or -1. */
+function arithmeticEnd(text: string, start: number): number {
+	let depth = 2;
+	for (let i = start; i < text.length; i++) {
+		const ch = text[i]!;
+		if (ch === "(") depth++;
+		else if (ch === ")" && --depth === 0) return i;
 	}
-	finish();
-	return literal;
+	return -1;
 }
 
 /** The end of the `$(` substitution opened just before `start` in `text`: the index of its `)`, or -1. */
@@ -116,38 +126,130 @@ function substitutionEnd(text: string, start: number): number {
 	let depth = 1;
 	let quote = "";
 	let commandStart = true;
-	// A case pattern's `)` does not close the substitution containing the case.
-	const cases: number[] = [];
-	const reserved = /(?:case|esac|if|then|do|else|elif|while|until)\b/y;
+	// Track POSIX case grammar so pattern `)` does not close the substitution
+	// and words like `case=ok` or a pattern named `case` do not open a case block.
+	const cases: CaseFrame[] = [];
 	for (let i = start; i < text.length; i++) {
 		const ch = text[i]!;
+		const top = cases.at(-1);
+		const atCase = top !== undefined && top.depth === depth;
+		if (quote === "'") {
+			if (ch === "'") quote = "";
+			continue;
+		}
 		if (ch === "\\") {
-			commandStart = false;
+			if (!quote) {
+				commandStart = false;
+				if (atCase) {
+					if (top.phase === "word") top.seenWord = true;
+					else if (top.phase === "pattern") top.patternStart = false;
+				}
+			}
 			i++;
-		} else if (quote) {
-			if (ch === quote) quote = "";
-		} else if (ch === "'" || ch === '"') {
+			continue;
+		}
+		if (quote === '"') {
+			if (ch === '"') quote = "";
+			else if (ch === "$" && text[i + 1] === "(" && text[i + 2] !== "(") {
+				const nested = substitutionEnd(text, i + 2);
+				if (nested >= 0) i = nested;
+			}
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
 			quote = ch;
 			commandStart = false;
-		} else if (/[\s;&|]/.test(ch)) {
-			if (ch === "\n" || !/\s/.test(ch)) commandStart = true;
-		} else if (ch === "(") {
+			if (atCase) {
+				if (top.phase === "word") top.seenWord = true;
+				else if (top.phase === "pattern") top.patternStart = false;
+			}
+			continue;
+		}
+		if (ch === " " || ch === "\t" || ch === "\r" || ch === "\n") {
+			if (atCase && top.phase === "word" && top.seenWord) top.phase = "in";
+			if (ch === "\n") commandStart = true;
+			continue;
+		}
+		if (ch === ";") {
+			if (atCase && top.phase === "body" && (text[i + 1] === ";" || text[i + 1] === "&")) {
+				const second = text[++i];
+				if (second === ";" && text[i + 1] === "&") i++;
+				top.phase = "pattern";
+				top.patternStart = true;
+				commandStart = true;
+				continue;
+			}
+			commandStart = true;
+			continue;
+		}
+		if (ch === "&" || ch === "|") {
+			if (atCase && top.phase === "pattern") {
+				top.patternStart = false;
+				continue;
+			}
+			commandStart = true;
+			continue;
+		}
+		if (ch === "(") {
+			if (atCase && top.phase === "pattern" && top.patternStart) {
+				// Optional leading `(` before a POSIX case pattern: `case x in (a) ...`
+				top.patternStart = false;
+				continue;
+			}
+			if (atCase && top.phase === "word") top.seenWord = true;
+			else if (atCase && top.phase === "pattern") top.patternStart = false;
 			depth++;
 			commandStart = true;
-		} else if (ch === ")") {
-			if (cases.at(-1) === depth) {
+			continue;
+		}
+		if (ch === ")") {
+			if (atCase && top.phase === "pattern") {
+				top.phase = "body";
 				commandStart = true;
 				continue;
 			}
 			if (--depth === 0) return i;
 			commandStart = true;
-		} else if (commandStart) {
-			reserved.lastIndex = i;
-			const word = reserved.exec(text)?.[0];
-			if (word) {
-				if (word === "case") cases.push(depth);
-				else if (word === "esac" && cases.at(-1) === depth) cases.pop();
-				commandStart = word !== "case" && word !== "esac";
+			continue;
+		}
+		if (atCase && top.phase === "word") {
+			top.seenWord = true;
+			commandStart = false;
+			continue;
+		}
+		if (atCase && top.phase === "in") {
+			if (readKeyword(text, i) === "in") {
+				top.phase = "pattern";
+				top.patternStart = true;
+				i += 1;
+				continue;
+			}
+			commandStart = false;
+			continue;
+		}
+		if (atCase && top.phase === "pattern") {
+			if (top.patternStart && readKeyword(text, i) === "esac") {
+				cases.pop();
+				i += 3;
+				commandStart = false;
+				continue;
+			}
+			top.patternStart = false;
+			commandStart = false;
+			continue;
+		}
+		if (commandStart) {
+			const word = readKeyword(text, i);
+			if (word === "case") {
+				cases.push({ depth, phase: "word", seenWord: false, patternStart: false });
+				commandStart = false;
+				i += 3;
+			} else if (word === "esac" && atCase && top.phase === "body") {
+				cases.pop();
+				commandStart = false;
+				i += 3;
+			} else if (word && COMMAND_INTRO.has(word)) {
+				commandStart = true;
 				i += word.length - 1;
 			} else {
 				commandStart = false;
@@ -157,14 +259,218 @@ function substitutionEnd(text: string, start: number): number {
 	return -1;
 }
 
+/**
+ * Lex shell command text into words and separators while keeping `$(…)` / `$((…))`
+ * intact inside words, honoring `\`-newline continuations without splitting commands,
+ * and keeping redirect tokens (`2>&1`, `&>file`, `>|file`) intact.
+ */
+function lexHostCommand(command: string, cmd: boolean): HostToken[] {
+	const tokens: HostToken[] = [];
+	let value = "";
+	let wordStart = -1;
+	let sepStart = -1;
+	let sepSplits = false;
+	let inSingle = false;
+	let inDouble = false;
+	let lastUnquotedRedir = false;
+	const startWord = (index: number) => {
+		if (wordStart >= 0) return;
+		if (sepStart >= 0) {
+			tokens.push({ kind: "separator", raw: command.slice(sepStart, index), value: "", splits: sepSplits });
+			sepStart = -1;
+			sepSplits = false;
+		}
+		wordStart = index;
+	};
+	const endWord = (index: number) => {
+		if (wordStart < 0) return;
+		tokens.push({ kind: "word", raw: command.slice(wordStart, index), value, splits: false });
+		value = "";
+		wordStart = -1;
+		lastUnquotedRedir = false;
+	};
+	const pushSep = (index: number, splits: boolean) => {
+		endWord(index);
+		if (sepStart < 0) sepStart = index;
+		if (splits) sepSplits = true;
+	};
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i]!;
+		if (inSingle) {
+			if (ch === "'") inSingle = false;
+			else value += ch;
+			continue;
+		}
+		if (inDouble) {
+			if (!cmd && ch === "\\" && i + 1 < command.length) {
+				const next = command[i + 1]!;
+				if (next === "\n") {
+					i++;
+					continue;
+				}
+				if (next === "\r" && command[i + 2] === "\n") {
+					i += 2;
+					continue;
+				}
+				if (next === '"' || next === "\\" || next === "$" || next === "`") {
+					value += next;
+					i++;
+					continue;
+				}
+			}
+			if (ch === '"') {
+				inDouble = false;
+				continue;
+			}
+			if (!cmd && ch === "$" && command[i + 1] === "(") {
+				const end = command[i + 2] === "(" ? arithmeticEnd(command, i + 3) : substitutionEnd(command, i + 2);
+				if (end >= 0) {
+					value += command.slice(i, end + 1);
+					i = end;
+					continue;
+				}
+			}
+			value += ch;
+			continue;
+		}
+		if (!cmd && ch === "\\") {
+			const step = command[i + 1] === "\n" ? 1 : command[i + 1] === "\r" && command[i + 2] === "\n" ? 2 : 0;
+			if (step > 0) {
+				if (wordStart < 0 && sepStart < 0) sepStart = i;
+				i += step;
+				continue;
+			}
+		}
+		if (ch === " " || ch === "\t") {
+			pushSep(i, false);
+			continue;
+		}
+		if (ch === "\n" || ch === ";" || ch === "(" || ch === ")") {
+			pushSep(i, true);
+			continue;
+		}
+		if (ch === "&") {
+			if (lastUnquotedRedir) {
+				value += ch;
+				lastUnquotedRedir = false;
+				continue;
+			}
+			if (command[i + 1] === ">" && (i === 0 || command[i - 1] !== "&")) {
+				endWord(i);
+				startWord(i);
+				value += ch;
+				lastUnquotedRedir = false;
+				continue;
+			}
+			pushSep(i, true);
+			continue;
+		}
+		if (ch === "|") {
+			if (lastUnquotedRedir && command[i - 1] === ">") {
+				value += ch;
+				lastUnquotedRedir = false;
+				continue;
+			}
+			pushSep(i, true);
+			continue;
+		}
+		startWord(i);
+		if (!cmd && ch === "'") {
+			inSingle = true;
+			lastUnquotedRedir = false;
+		} else if (ch === '"') {
+			inDouble = true;
+			lastUnquotedRedir = false;
+		} else if (!cmd && ch === "\\" && i + 1 < command.length) {
+			value += command[i + 1]!;
+			i++;
+			lastUnquotedRedir = false;
+		} else if (!cmd && ch === "$" && command[i + 1] === "(") {
+			lastUnquotedRedir = false;
+			const end = command[i + 2] === "(" ? arithmeticEnd(command, i + 3) : substitutionEnd(command, i + 2);
+			if (end >= 0) {
+				value += command.slice(i, end + 1);
+				i = end;
+			} else {
+				value += ch;
+			}
+		} else {
+			value += ch;
+			lastUnquotedRedir = ch === "<" || ch === ">";
+		}
+	}
+	endWord(command.length);
+	if (sepStart >= 0) {
+		tokens.push({ kind: "separator", raw: command.slice(sepStart), value: "", splits: sepSplits });
+	}
+	return tokens;
+}
+
+/** Reserved words that introduce the simple command which follows them. */
+const COMMAND_PREFIX = new Set(["if", "then", "elif", "else", "while", "until", "do", "!", "{", "}"]);
+
+/** Word tokens that belong to omp (its own args and inherited env settings), excluding redirects. */
+function ompArguments(tokens: HostToken[], windows: boolean): Set<number> {
+	const literal = new Set<number>();
+	const segment: number[] = [];
+	const words: string[] = [];
+	const finish = () => {
+		const omp = ompLaunch(words, windows);
+		if (omp !== undefined) {
+			for (let i = omp.literalFrom; i < segment.length; i++) literal.add(segment[i]!);
+			for (const idx of omp.envIndices) literal.add(segment[idx]!);
+		}
+		segment.length = 0;
+		words.length = 0;
+	};
+	let expectRedirectTarget = false;
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i]!;
+		if (token.kind === "separator") {
+			if (token.splits) {
+				finish();
+				expectRedirectTarget = false;
+			}
+			continue;
+		}
+		if (expectRedirectTarget) {
+			expectRedirectTarget = false;
+			continue;
+		}
+		if (STANDALONE_REDIRECT.test(token.raw)) {
+			expectRedirectTarget = true;
+			continue;
+		}
+		if (ATTACHED_REDIRECT.test(token.raw)) {
+			continue;
+		}
+		if (words.length === 0 && COMMAND_PREFIX.has(token.value)) {
+			finish();
+			continue;
+		}
+		segment.push(i);
+		words.push(token.value);
+	}
+	finish();
+	return literal;
+}
+
+function isWindowsShell(shell: string | undefined): boolean {
+	if (process.platform === "win32") return true;
+	if (shell === undefined) return false;
+	return isCmdShell(shell) || shell.includes("\\") || /(?:^|\/)(?:powershell|pwsh|cmd)(?:\.exe)?$/i.test(shell);
+}
+
 class HostUrls {
 	readonly #backing: UrlBacking;
 	readonly #cmd: boolean;
+	readonly #windows: boolean;
 	readonly #resolved = new Map<string, Promise<string | undefined>>();
 
-	constructor(backing: UrlBacking, cmd: boolean) {
+	constructor(backing: UrlBacking, cmd: boolean, windows: boolean) {
 		this.#backing = backing;
 		this.#cmd = cmd;
+		this.#windows = windows;
 	}
 
 	/** `command` with here-document bodies, which are input rather than command text, left alone. */
@@ -198,14 +504,19 @@ class HostUrls {
 	async #code(text: string): Promise<string> {
 		if (!text.includes("://")) return text;
 		let out = "";
-		const tokens = lexShellCommand(text);
-		// omp resolves its own URLs. A launcher's options still belong to the
-		// launcher, so only words after the actual omp command stay literal.
-		const literal = ompArguments(tokens);
+		const tokens = lexHostCommand(text, this.#cmd);
+		// omp resolves its own URLs. Launcher options and redirects still belong
+		// to the launcher/shell, and command substitutions inside omp's arguments
+		// run as independent commands before omp receives their output.
+		const literal = ompArguments(tokens, this.#windows);
 		for (let i = 0; i < tokens.length; i++) {
 			const token = tokens[i]!;
-			if (token.kind === "separator" || !token.value.includes("://") || literal.has(i)) {
+			if (token.kind === "separator" || (!token.value.includes("://") && !token.raw.includes("://"))) {
 				out += token.raw;
+				continue;
+			}
+			if (literal.has(i)) {
+				out += !this.#cmd && token.raw.includes("$(") ? await this.#substitutions(token.raw) : token.raw;
 				continue;
 			}
 			out += await this.#word(token.raw, token.value);
@@ -276,5 +587,5 @@ class HostUrls {
  * `omp`'s own arguments, here-document bodies, message text, and URLs nothing backs stay as written.
  */
 export function hostCommandUrls(command: string, backing: UrlBacking, shell?: string): Promise<string> {
-	return new HostUrls(backing, shell !== undefined && isCmdShell(shell)).command(command);
+	return new HostUrls(backing, shell !== undefined && isCmdShell(shell), isWindowsShell(shell)).command(command);
 }

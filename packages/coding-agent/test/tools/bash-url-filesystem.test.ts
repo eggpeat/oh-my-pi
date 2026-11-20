@@ -173,9 +173,14 @@ describe("bash internal URLs through the shell filesystem", () => {
 			await fs.writeFile(path.join(localRoot, "data.txt"), "payload\n");
 			await fs.mkdir(path.join(localRoot, "tools"));
 			const printArgs = "#!/bin/sh\nprintf '%s\\n' \"$@\"\n";
-			for (const name of ["grep", "npm", "npx", "bunx", "uv", "setsid"]) {
+			for (const name of ["grep", "npm", "npx", "bun", "bunx", "uv", "setsid", "sudo", "ssh", "xargs"]) {
 				await fs.writeFile(path.join(tempDir, name), printArgs, { mode: 0o755 });
 			}
+			await fs.writeFile(
+				path.join(tempDir, "omp"),
+				'#!/bin/sh\nprintf \'PWD=%s\\nSOURCE=%s\\n\' "$PWD" "$SOURCE"\nprintf \'%s\\n\' "$@"\n',
+				{ mode: 0o755 },
+			);
 			const data = path.join(localRoot, "data.txt");
 			const tools = path.join(localRoot, "tools");
 			const cases: [command: string, expected: string[]][] = [
@@ -193,15 +198,41 @@ describe("bash internal URLs through the shell filesystem", () => {
 					["--minimum-release-age", "86400", "omp", "read", "local://data.txt:1", "--from=local://data.txt"],
 				],
 				[
+					"bunx -p @oh-my-pi/pi-coding-agent omp read local://data.txt:1 --from=local://data.txt",
+					["-p", "@oh-my-pi/pi-coding-agent", "omp", "read", "local://data.txt:1", "--from=local://data.txt"],
+				],
+				["bunx --package omp prettier local://data.txt", ["--package", "omp", "prettier", data]],
+				[
+					"bun x -p @oh-my-pi/pi-coding-agent omp read local://data.txt:1 --from=local://data.txt",
+					["x", "-p", "@oh-my-pi/pi-coding-agent", "omp", "read", "local://data.txt:1", "--from=local://data.txt"],
+				],
+				["bun x --package omp prettier local://data.txt", ["x", "--package", "omp", "prettier", data]],
+				[
 					"uv run -w requests omp read local://data.txt:1 --from=local://data.txt",
 					["run", "-w", "requests", "omp", "read", "local://data.txt:1", "--from=local://data.txt"],
 				],
+				["uv run -m omp local://data.txt", ["run", "-m", "omp", data]],
+				["sudo -e omp local://data.txt", ["-e", "omp", data]],
+				[
+					"ssh -F local://data.txt server omp read local://data.txt:1 --from=local://data.txt",
+					["-F", data, "server", "omp", "read", "local://data.txt:1", "--from=local://data.txt"],
+				],
+				[
+					'"$PWD/xargs" -0n 1 omp read local://data.txt:1 --from=local://data.txt',
+					["-0n", "1", "omp", "read", "local://data.txt:1", "--from=local://data.txt"],
+				],
+				['"$PWD/xargs" --replace grep omp local://data.txt', ["--replace", "grep", "omp", data]],
 				["setsid grep omp local://data.txt", ["grep", "omp", data]],
 				[
 					"setsid omp read local://data.txt:1 --from=local://data.txt",
 					["omp", "read", "local://data.txt:1", "--from=local://data.txt"],
 				],
 				["/usr/bin/env -u FOO -- -flag=/opt/omp grep x local://data.txt", ["x", data]],
+				["/usr/bin/env -S grep omp local://data.txt", ["omp", data]],
+				[
+					"/usr/bin/env -C local://tools SOURCE=local://data.txt omp read local://data.txt:1 --from=local://data.txt",
+					[`PWD=${tools}`, "SOURCE=local://data.txt", "read", "local://data.txt:1", "--from=local://data.txt"],
+				],
 			];
 			for (const [command, expected] of cases) {
 				const { text, isError } = await run(`PATH="$PWD:$PATH" ${command}`);
