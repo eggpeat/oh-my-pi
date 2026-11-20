@@ -6,6 +6,10 @@
 
 - `Agent.setStandbyTools()` and `AgentContext.standbyTools` name inactive tools that may activate later; they reach the provider as `inactiveTools` until a request declares tools ([#19826](https://github.com/can1357/oh-my-pi/issues/19826))
 
+### Fixed
+
+- Preserved `errorId` and `errorStatus` on assistant error and abort messages when a provider stream rejects, so gateway HTTP errors and stream timeouts retain their retry and status classification ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+
 ## [19.0.0] - 2026-11-18
 
 ### Added

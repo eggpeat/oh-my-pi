@@ -23,6 +23,7 @@ import {
 	type ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
 import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -2244,6 +2245,12 @@ export class Agent {
 				: err instanceof Error
 					? err.message
 					: String(err);
+			const errorStatus = stoppedForAbort ? undefined : AIError.status(err);
+			const errorId = stoppedForAbort
+				? errorMessage === "Request was aborted"
+					? AIError.create(AIError.Flag.Abort)
+					: AIError.classify(loopSignal.reason) || undefined
+				: AIError.classify(err, model.api) || undefined;
 			const shouldEmitVisibleError = !stoppedForAbort;
 			const assistantPartial = partial?.role === "assistant" ? partial : undefined;
 			const hadAssistantStart = assistantPartial !== undefined;
@@ -2271,6 +2278,8 @@ export class Agent {
 							),
 							stopReason: "error",
 							errorMessage,
+							errorStatus,
+							errorId,
 						}
 					: {
 							role: "assistant",
@@ -2288,6 +2297,8 @@ export class Agent {
 							},
 							stopReason: stoppedForAbort ? "aborted" : "error",
 							errorMessage,
+							errorStatus,
+							errorId,
 							timestamp: Date.now(),
 						};
 
