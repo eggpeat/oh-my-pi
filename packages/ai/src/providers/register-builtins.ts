@@ -4,7 +4,15 @@
 
 import type { CompatOf } from "@oh-my-pi/pi-catalog/types";
 import * as AIError from "../error";
-import type { Api, AssistantMessage, AssistantMessageEvent, Context, Model, OptionsForApi } from "../types";
+import type {
+	Api,
+	AssistantMessage,
+	AssistantMessageEvent,
+	Context,
+	Model,
+	OptionsForApi,
+	StreamOptions,
+} from "../types";
 import { type AbortSourceTracker, createAbortSourceTracker } from "../utils/abort";
 import { AssistantMessageEventStream as EventStreamImpl } from "../utils/event-stream";
 import {
@@ -97,7 +105,7 @@ function forwardStream<TApi extends Api>(
 	target: EventStreamImpl,
 	source: AsyncIterable<AssistantMessageEvent>,
 	model: Model<TApi>,
-	options: OptionsForApi<TApi>,
+	options: Pick<StreamOptions, "signal" | "streamIdleTimeoutMs" | "streamFirstEventTimeoutMs">,
 	abortTracker: AbortSourceTracker,
 	limits?: StreamLimits,
 ): void {
@@ -161,7 +169,7 @@ function forwardStream<TApi extends Api>(
 			}
 		} catch (error) {
 			const stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-			const message = createProviderStreamError(model, error, stopReason);
+			const message = createProviderStreamError(model, error, stopReason, options.signal);
 			target.push({ type: "error", reason: stopReason, error: message });
 			target.end(message);
 		}
@@ -172,7 +180,26 @@ function createProviderStreamError<TApi extends Api>(
 	model: Model<TApi>,
 	error: unknown,
 	stopReason: Extract<AssistantMessage["stopReason"], "aborted" | "error"> = "error",
+	callerSignal?: AbortSignal,
 ): AssistantMessage {
+	// A bare abort() supplies no caller reason. That is the only case that wears
+	// Flag.Abort, which turn recovery retries. Any supplied reason is classified
+	// from the signal's own value, not from its text: a StreamTimeoutError keeps
+	// Timeout even when its message is "Request was aborted", and a label such as
+	// "Interrupted by user" does not gain Flag.Abort.
+	let errorMessage: string;
+	let errorId: number | undefined;
+	if (stopReason === "aborted") {
+		const suppliedReason = AIError.callerAbortReason(callerSignal);
+		errorMessage = suppliedReason ?? "Request was aborted";
+		errorId =
+			suppliedReason === undefined
+				? AIError.create(AIError.Flag.Abort)
+				: AIError.classify(callerSignal?.reason, model.api) || undefined;
+	} else {
+		errorMessage = error instanceof Error ? error.message : String(error);
+		errorId = AIError.classify(error, model.api) || undefined;
+	}
 	return {
 		role: "assistant",
 		content: [],
@@ -188,11 +215,41 @@ function createProviderStreamError<TApi extends Api>(
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason,
-		errorId: stopReason === "error" ? AIError.classify(error, model.api) || undefined : undefined,
-		errorMessage:
-			stopReason === "aborted" ? "Request was aborted" : error instanceof Error ? error.message : String(error),
+		errorId,
+		errorMessage,
 		timestamp: Date.now(),
 	};
+}
+
+/**
+ * Read the caller signal and both timeout overrides once, then copy every other
+ * field. Spreading `options` would invoke those getters again, so a later read
+ * can hand the provider a timeout the wrapper did not use.
+ */
+function snapshotCallerStreamControl<TApi extends Api>(
+	options: OptionsForApi<TApi> | undefined,
+): {
+	signal: AbortSignal | undefined;
+	streamIdleTimeoutMs: number | undefined;
+	streamFirstEventTimeoutMs: number | undefined;
+	providerOptions: OptionsForApi<TApi>;
+} {
+	const source = (options ?? {}) as OptionsForApi<TApi>;
+	const signal = source.signal;
+	const streamIdleTimeoutMs = source.streamIdleTimeoutMs;
+	const streamFirstEventTimeoutMs = source.streamFirstEventTimeoutMs;
+	const providerOptions = {} as OptionsForApi<TApi>;
+	const sourceRecord = source as Record<string, unknown>;
+	const providerRecord = providerOptions as Record<string, unknown>;
+	for (const key of Object.keys(sourceRecord)) {
+		if (key === "signal" || key === "streamIdleTimeoutMs" || key === "streamFirstEventTimeoutMs") continue;
+		providerRecord[key] = sourceRecord[key];
+	}
+	if (streamIdleTimeoutMs !== undefined) providerOptions.streamIdleTimeoutMs = streamIdleTimeoutMs;
+	if (streamFirstEventTimeoutMs !== undefined) {
+		providerOptions.streamFirstEventTimeoutMs = streamFirstEventTimeoutMs;
+	}
+	return { signal, streamIdleTimeoutMs, streamFirstEventTimeoutMs, providerOptions };
 }
 
 // ---------------------------------------------------------------------------
@@ -213,14 +270,25 @@ function createLazyProviderStream<TModule, TApi extends Api>(
 ): (model: Model<TApi>, context: Context, options: OptionsForApi<TApi>) => EventStreamImpl {
 	return (model, context, options) => {
 		const outer = new EventStreamImpl();
-		const streamOptions: OptionsForApi<TApi> = options ?? {};
+		const caller = snapshotCallerStreamControl(options);
 
 		load()
 			.then(mod => {
-				const abortTracker = createAbortSourceTracker(streamOptions.signal);
-				const providerOptions: OptionsForApi<TApi> = { ...streamOptions, signal: abortTracker.requestSignal };
-				const inner = pick(mod)(model, context, providerOptions);
-				forwardStream(outer, inner, model, streamOptions, abortTracker, limits);
+				const abortTracker = createAbortSourceTracker(caller.signal);
+				caller.providerOptions.signal = abortTracker.requestSignal;
+				const inner = pick(mod)(model, context, caller.providerOptions);
+				forwardStream(
+					outer,
+					inner,
+					model,
+					{
+						signal: caller.signal,
+						streamIdleTimeoutMs: caller.streamIdleTimeoutMs,
+						streamFirstEventTimeoutMs: caller.streamFirstEventTimeoutMs,
+					},
+					abortTracker,
+					limits,
+				);
 			})
 			.catch(error => {
 				const message = createProviderStreamError(model, error);
