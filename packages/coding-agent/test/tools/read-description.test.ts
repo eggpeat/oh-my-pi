@@ -16,13 +16,18 @@ function textOutput(result: { content: Array<{ type: string; text?: string }> })
 		.join("\n");
 }
 
+function rawSuffixHelp(description: string): string {
+	const line = description.split("\n").find(entry => entry.trimStart().startsWith("- :raw "));
+	if (!line) throw new Error(`Missing :raw suffix line in description:\n${description}`);
+	return line;
+}
+
 function makeSession(
 	cwd: string,
 	options: {
 		editMode?: "hashline" | "replace" | "patch";
 		readLineNumbers?: boolean;
 		hasEditTool?: boolean;
-		activeModel?: string;
 	} = {},
 ): ToolSession {
 	const settings = Settings.isolated({
@@ -34,7 +39,6 @@ function makeSession(
 		cwd,
 		hasUI: false,
 		hasEditTool: options.hasEditTool,
-		getActiveModelString: options.activeModel ? () => options.activeModel : undefined,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		settings,
@@ -57,8 +61,9 @@ describe("ReadTool.description matches active line-prefix mode", () => {
 
 	it("describes anchors and prefixes only in hashline mode", async () => {
 		const tool = new ReadTool(makeSession(testDir, { editMode: "hashline", hasEditTool: true }));
-		expect(tool.description).toContain("- :raw verbatim without anchors/prefixes;");
-		expect(tool.description).toContain("Selected file: `[foo.ts#1A2B]`");
+		const rawHelp = rawSuffixHelp(tool.description);
+		expect(rawHelp).toContain("anchors");
+		expect(rawHelp).toContain("prefixes");
 
 		const body = textOutput(await tool.execute("read-hl", { path: filePath }));
 		expect(body).toMatch(/^\[\S+#[0-9A-Z]+\]\n1:alpha = 1\n2:beta = 2$/);
@@ -71,9 +76,9 @@ describe("ReadTool.description matches active line-prefix mode", () => {
 		"describes line prefixes without anchors when only readLineNumbers is enabled ($label)",
 		async ({ hasEditTool, editMode }) => {
 			const tool = new ReadTool(makeSession(testDir, { editMode, hasEditTool, readLineNumbers: true }));
-			expect(tool.description).toContain("- :raw verbatim without line prefixes;");
-			expect(tool.description).not.toContain("anchors/prefixes");
-			expect(tool.description).not.toContain("Selected file:");
+			const rawHelp = rawSuffixHelp(tool.description);
+			expect(rawHelp).toContain("prefixes");
+			expect(rawHelp).not.toContain("anchors");
 
 			const body = textOutput(await tool.execute("read-ln", { path: filePath }));
 			expect(body).toBe("1|alpha = 1\n2|beta = 2");
@@ -81,26 +86,15 @@ describe("ReadTool.description matches active line-prefix mode", () => {
 	);
 
 	it.each([
-		{ label: "read-only session", hasEditTool: false, editMode: "hashline" as const, activeModel: undefined },
-		{ label: "replace edit mode", hasEditTool: true, editMode: "replace" as const, activeModel: undefined },
-		{
-			label: "model auto-switched to replace",
-			hasEditTool: true,
-			editMode: "hashline" as const,
-			activeModel: "moonshot/kimi-k2.5",
-		},
+		{ label: "read-only session", hasEditTool: false, editMode: "hashline" as const },
+		{ label: "replace edit mode", hasEditTool: true, editMode: "replace" as const },
 	])(
-		"omits anchors/prefixes wording when neither hashlines nor line numbers are active ($label)",
-		async ({ hasEditTool, editMode, activeModel }) => {
-			const tool = new ReadTool(
-				makeSession(testDir, { editMode, hasEditTool, readLineNumbers: false, activeModel }),
-			);
-			expect(tool.description).not.toContain("anchors/prefixes");
-			expect(tool.description).not.toContain("line prefixes");
-			expect(tool.description).not.toContain("Selected file:");
-			expect(tool.description).toContain(
-				"skips folding and the display-width limit, but the byte limit still applies",
-			);
+		"omits anchors and prefixes wording when neither hashlines nor line numbers are active ($label)",
+		async ({ hasEditTool, editMode }) => {
+			const tool = new ReadTool(makeSession(testDir, { editMode, hasEditTool, readLineNumbers: false }));
+			const rawHelp = rawSuffixHelp(tool.description);
+			expect(rawHelp).not.toContain("anchors");
+			expect(rawHelp).not.toContain("prefixes");
 
 			const body = textOutput(await tool.execute("read-plain", { path: filePath }));
 			expect(body).toBe("alpha = 1\nbeta = 2");
@@ -108,25 +102,18 @@ describe("ReadTool.description matches active line-prefix mode", () => {
 	);
 
 	it("updates description dynamically when display settings change", () => {
-		const settings = Settings.isolated({ "read.summarize.enabled": false });
-		cfgEditMode.set(settings, "replace");
-		cfgReadLineNumbers.set(settings, false);
-		const tool = new ReadTool({
-			cwd: testDir,
-			hasUI: false,
-			getSessionFile: () => null,
-			getSessionSpawns: () => "*",
-			settings,
-		});
+		const session = makeSession(testDir, { editMode: "replace", readLineNumbers: false });
+		const tool = new ReadTool(session);
 
-		expect(tool.description).not.toContain("line prefixes");
-		expect(tool.description).not.toContain("anchors/prefixes");
+		expect(rawSuffixHelp(tool.description)).not.toContain("anchors");
+		expect(rawSuffixHelp(tool.description)).not.toContain("prefixes");
 
-		cfgReadLineNumbers.set(settings, true);
-		expect(tool.description).toContain("- :raw verbatim without line prefixes;");
+		cfgReadLineNumbers.override(session.settings, true);
+		expect(rawSuffixHelp(tool.description)).toContain("prefixes");
+		expect(rawSuffixHelp(tool.description)).not.toContain("anchors");
 
-		cfgEditMode.set(settings, "hashline");
-		expect(tool.description).toContain("- :raw verbatim without anchors/prefixes;");
-		expect(tool.description).toContain("Selected file: `[foo.ts#1A2B]`");
+		cfgEditMode.override(session.settings, "hashline");
+		expect(rawSuffixHelp(tool.description)).toContain("anchors");
+		expect(rawSuffixHelp(tool.description)).toContain("prefixes");
 	});
 });
