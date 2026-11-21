@@ -1297,7 +1297,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	};
 	readonly label = "Read";
 	readonly loadMode = "essential";
-	/** Rendered per access so guidance follows live display-mode and disassembler changes. */
+	/** Rendered per access so the hashline guidance follows a live `edit.mode` change. */
 	get description(): string {
 		const displayMode = resolveFileDisplayMode(this.session);
 		return prompt.render(readDescription, {
