@@ -1,15 +1,16 @@
 import { getMCPConfigPath, logger } from "@oh-my-pi/pi-utils";
 import { connectToServer, disconnectServer, listPrompts, listResources, listTools } from "../../mcp/client";
+import { resolveMcpServerForToggle } from "../../mcp/config";
 import {
 	addMCPServer,
-	isMcpServerEffectivelyEnabled,
+	canSkipMcpServerToggle,
 	readDisabledServers,
-	readEnabledServers,
 	readMCPConfigFile,
 	removeMCPServer,
 	setMcpServerEnabled,
 } from "../../mcp/config-writer";
 import { cfgMcpEnableProjectConfig } from "../../mcp/settings";
+import { resolveMCPTransformContext } from "../../mcp/transforms";
 import { MCPManager } from "../../mcp/manager";
 import {
 	findMcpServerForAuth,
@@ -328,54 +329,61 @@ async function handleEnableDisableCommand(
 	rest: string,
 	runtime: SlashCommandRuntime,
 ): Promise<SlashCommandResult> {
-	const name = rest.split(/\s+/)[0] ?? "";
+	// `enable` and `disable` take no flags, so the entire rest is the server
+	// name — `validateServerName` permits spaces (e.g. "MaaS Slack").
+	const name = rest.trim();
 	if (!name) return usage(`Usage: /mcp ${verb} <name>`, runtime);
 	const enabled = verb === "enable";
 	try {
 		const enableProjectConfig = cfgMcpEnableProjectConfig.get(runtime.settings);
-		const userPath = getMCPConfigPath("user", runtime.cwd);
-		const projectPath = getMCPConfigPath("project", runtime.cwd);
-		const [found, disabledList, enabledList] = await Promise.all([
-			findMcpServerForAuth(name, runtime.cwd, runtime.mcpManager, { enableProjectConfig }),
-			readDisabledServers(userPath),
-			readEnabledServers(userPath),
-		]);
-		const denied = disabledList.includes(name);
-		const forced = enabledList.includes(name);
-		const dropped = runtime.mcpManager?.getBuiltinDrops()?.get(name);
-		const discoveredSource = runtime.mcpManager?.getSource(name) ?? dropped?.source;
-		const known = found !== null || discoveredSource !== undefined || dropped !== undefined || denied || forced;
+		const evalActive =
+			typeof runtime.session?.getActiveToolNames === "function" &&
+			runtime.session.getActiveToolNames().includes("eval");
+		const resolved = await resolveMcpServerForToggle(name, {
+			cwd: runtime.cwd,
+			enableProjectConfig,
+			mcpManager: runtime.mcpManager,
+			extensionRoots: runtime.session?.effectiveExtensionRoots,
+			builtinTransforms: resolveMCPTransformContext(runtime.settings, { evalActive }),
+		});
+		if (resolved.acpOwned) {
+			return usage(
+				`Server "${name}" is supplied by the ACP client (editor) for this session; enable or disable it in your editor's MCP settings instead.`,
+				runtime,
+			);
+		}
 		// Disable of an unknown name still records a denylist entry so a
 		// discovered server that is not loaded yet can be suppressed by name.
 		// Enable of an unknown name is an error.
-		if (!known && enabled) {
+		if (!resolved.known && enabled) {
 			return usage(`Server "${name}" not found in user or project config.`, runtime);
 		}
 
-		// Discovered rows must not be copied into user mcp.json. `filePath` on
-		// those rows is the user config, not a file this codebase owns.
-		const writableSource = found !== null && !found.discovered ? found : undefined;
-		const effectivelyEnabled = isMcpServerEffectivelyEnabled({
-			hasConfig: found !== null || discoveredSource !== undefined,
-			enabledFlag: found?.config.enabled,
-			denied,
-			forced,
-			builtinDropped: dropped !== undefined,
-		});
-		if (known && effectivelyEnabled === enabled) {
+		if (
+			resolved.known &&
+			canSkipMcpServerToggle({
+				targetEnabled: enabled,
+				hasConfig: resolved.hasConfig,
+				hasWritableSource: resolved.writableSource !== undefined,
+				enabledFlag: resolved.enabledFlag,
+				denied: resolved.denied,
+				forced: resolved.forced,
+				builtinDropped: resolved.builtinDropped,
+			})
+		) {
 			await runtime.output(`Server "${name}" is already ${enabled ? "enabled" : "disabled"}.`);
 			return commandConsumed();
 		}
 
 		await setMcpServerEnabled({
-			userPath,
-			projectPath,
+			userPath: resolved.userPath,
+			projectPath: resolved.projectPath,
 			enableProjectConfig,
-			sourcePath: writableSource?.filePath,
+			sourcePath: resolved.writableSource?.filePath,
 			name,
 			enabled,
 		});
-		const scopeNote = writableSource ? ` (${writableSource.scope} config)` : "";
+		const scopeNote = resolved.writableSource ? ` (${resolved.writableSource.scope} config)` : "";
 		await runtime.output(`Server "${name}" ${enabled ? "enabled" : "disabled"}${scopeNote}.`);
 		return commandConsumed();
 	} catch (err) {

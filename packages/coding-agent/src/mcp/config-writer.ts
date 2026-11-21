@@ -397,19 +397,32 @@ export async function setMcpServerEnabled(options: SetMcpServerEnabledOptions): 
 }
 
 /**
+ * Interpret a raw `enabled` field the same way native MCP config discovery
+ * (`discovery/builtin.ts`) does: booleans directly, and string `"false"`/`"0"`
+ * or `"true"`/`"1"` case-insensitively.
+ */
+export function parseNativeMcpEnabled(value: unknown): boolean | undefined {
+	if (typeof value === "boolean") return value;
+	if (typeof value === "string") {
+		const lower = value.toLowerCase();
+		if (lower === "false" || lower === "0") return false;
+		if (lower === "true" || lower === "1") return true;
+	}
+	return undefined;
+}
+
+/**
  * Whether a server would be connected on the next load.
  *
  * Precedence matches `loadAllMCPConfigs`: the user `disabledServers` denylist
  * wins, the user `enabledServers` allowlist overrides `enabled: false` and a
  * built-in transform drop, and an explicit `enabled: true` also outranks a drop.
- * `/mcp enable` / `/mcp disable` use this so "already enabled" does not skip a
- * toggle that a stale list would still suppress or force.
  */
 export function isMcpServerEffectivelyEnabled(options: {
 	/** A definition was resolved (writable file, manager, or discovery). */
 	hasConfig: boolean;
 	/** Definition `enabled` flag. Omit when unknown; the default is enabled. */
-	enabledFlag?: boolean;
+	enabledFlag?: unknown;
 	denied: boolean;
 	forced: boolean;
 	builtinDropped?: boolean;
@@ -417,7 +430,46 @@ export function isMcpServerEffectivelyEnabled(options: {
 	if (options.denied) return false;
 	if (options.forced) return true;
 	if (!options.hasConfig) return false;
-	if (options.enabledFlag === false) return false;
-	if (options.builtinDropped === true && options.enabledFlag !== true) return false;
+	const flag = parseNativeMcpEnabled(options.enabledFlag);
+	if (flag === false) return false;
+	if (options.builtinDropped === true && flag !== true) return false;
 	return true;
+}
+
+/**
+ * Whether `/mcp enable` or `/mcp disable` can report "already enabled/disabled"
+ * without writing config.
+ *
+ * Skips the write only when the server is already in `targetEnabled` state AND
+ * no conflicting override or writable-file flag needs clearing — e.g. when a
+ * name is in both `disabledServers` and `enabledServers`, `disable` must still
+ * clear `enabledServers` so removing `disabledServers` later does not turn the
+ * server back on.
+ */
+export function canSkipMcpServerToggle(options: {
+	targetEnabled: boolean;
+	hasConfig: boolean;
+	hasWritableSource: boolean;
+	enabledFlag?: unknown;
+	denied: boolean;
+	forced: boolean;
+	builtinDropped?: boolean;
+}): boolean {
+	const flag = parseNativeMcpEnabled(options.enabledFlag);
+	const effectivelyEnabled = isMcpServerEffectivelyEnabled({
+		hasConfig: options.hasConfig,
+		enabledFlag: flag,
+		denied: options.denied,
+		forced: options.forced,
+		builtinDropped: options.builtinDropped,
+	});
+	if (effectivelyEnabled !== options.targetEnabled) return false;
+	if (options.targetEnabled) {
+		return !(
+			options.denied ||
+			(options.hasWritableSource &&
+				(flag === false || options.forced || (options.builtinDropped === true && flag !== true)))
+		);
+	}
+	return !(options.forced || (options.hasWritableSource && flag !== false));
 }

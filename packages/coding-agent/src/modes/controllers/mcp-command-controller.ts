@@ -16,6 +16,7 @@ import {
 	MCPManager,
 	OAuthIssuerMismatchError,
 	reconnectMCPServers,
+	resolveMcpServerForToggle,
 	resolveMCPTransformContext,
 } from "../../mcp";
 import {
@@ -35,9 +36,7 @@ import { connectToServer, disconnectServer, listTools } from "../../mcp/client";
 import type { McpUpstreamStatus } from "../../mcp/host/contract";
 import {
 	addMCPServer,
-	isMcpServerEffectivelyEnabled,
-	readDisabledServers,
-	readEnabledServers,
+	canSkipMcpServerToggle,
 	readMCPConfigFile,
 	removeMCPServer,
 	setMcpServerEnabled,
@@ -1418,39 +1417,38 @@ export class MCPCommandController {
 		}
 
 		try {
-			// A server a built-in transform dropped counts as disabled: enabling it
-			// records an explicit enable, which outranks the transform.
-			const dropped = this.ctx.mcpManager?.getBuiltinDrops()?.get(name);
 			const enableProjectConfig = cfgMcpEnableProjectConfig.get(this.ctx.settings);
-			const projectDir = getProjectDir();
-			const userPath = getMCPConfigPath("user", projectDir);
-			const projectPath = getMCPConfigPath("project", projectDir);
-			const [found, disabledServers, enabledServers] = await Promise.all([
-				findMcpServerForAuth(name, projectDir, this.ctx.mcpManager, { enableProjectConfig }),
-				readDisabledServers(userPath),
-				readEnabledServers(userPath),
-			]);
-			const denied = disabledServers.includes(name);
-			const forced = enabledServers.includes(name);
-			// Manager fallback marks tool-owned rows `discovered` and points
-			// `filePath` at the user mcp.json. Writing that path clones the
-			// definition (including runtime fields such as envPolicy) into a
-			// native file that then shadows the upstream source.
-			const writableSource = found !== null && !found.discovered ? found : undefined;
-			const discoveredSource = this.ctx.mcpManager?.getSource(name) ?? dropped?.source;
-			if (!found && discoveredSource === undefined && dropped === undefined && !denied) {
+			const resolved = await resolveMcpServerForToggle(name, {
+				cwd: getProjectDir(),
+				enableProjectConfig,
+				mcpManager: this.ctx.mcpManager,
+				extensionRoots: this.ctx.session.effectiveExtensionRoots,
+				builtinTransforms: resolveMCPTransformContext(this.ctx.settings, {
+					evalActive: this.ctx.session.getActiveToolNames().includes("eval"),
+				}),
+			});
+			if (resolved.acpOwned) {
+				this.ctx.showError(
+					`Server "${name}" is supplied by the ACP client (editor) for this session; enable or disable it in your editor's MCP settings instead.`,
+				);
+				return;
+			}
+			if (!resolved.known) {
 				this.ctx.showError(`Server "${name}" not found.`);
 				return;
 			}
 
-			const effectivelyEnabled = isMcpServerEffectivelyEnabled({
-				hasConfig: found !== null || discoveredSource !== undefined,
-				enabledFlag: found?.config.enabled,
-				denied,
-				forced,
-				builtinDropped: dropped !== undefined,
-			});
-			if (effectivelyEnabled === enabled) {
+			if (
+				canSkipMcpServerToggle({
+					targetEnabled: enabled,
+					hasConfig: resolved.hasConfig,
+					hasWritableSource: resolved.writableSource !== undefined,
+					enabledFlag: resolved.enabledFlag,
+					denied: resolved.denied,
+					forced: resolved.forced,
+					builtinDropped: resolved.builtinDropped,
+				})
+			) {
 				this.#showMessage(
 					["", theme.fg("muted", `Server "${name}" is already ${enabled ? "enabled" : "disabled"}.`), ""].join(
 						"\n",
@@ -1460,10 +1458,10 @@ export class MCPCommandController {
 			}
 
 			await setMcpServerEnabled({
-				userPath,
-				projectPath,
+				userPath: resolved.userPath,
+				projectPath: resolved.projectPath,
 				enableProjectConfig,
-				sourcePath: writableSource?.filePath,
+				sourcePath: resolved.writableSource?.filePath,
 				name,
 				enabled,
 			});
@@ -1486,7 +1484,7 @@ export class MCPCommandController {
 							: theme.fg("warning", "Not connected yet");
 			}
 
-			const scopeSuffix = writableSource ? ` (${writableSource.scope} config)` : "";
+			const scopeSuffix = resolved.writableSource ? ` (${resolved.writableSource.scope} config)` : "";
 			const lines = [
 				"",
 				enabled
@@ -1725,6 +1723,7 @@ export class MCPCommandController {
 		}
 
 		const { configs, sources } = await loadAllMCPConfigs(getProjectDir(), {
+			enableProjectConfig: cfgMcpEnableProjectConfig.get(this.ctx.settings),
 			extensionRoots: this.ctx.session.effectiveExtensionRoots,
 		});
 		const config = configs[name];
