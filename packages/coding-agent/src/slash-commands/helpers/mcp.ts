@@ -2,11 +2,12 @@ import { getMCPConfigPath, logger } from "@oh-my-pi/pi-utils";
 import { connectToServer, disconnectServer, listPrompts, listResources, listTools } from "../../mcp/client";
 import {
 	addMCPServer,
+	isMcpServerEffectivelyEnabled,
 	readDisabledServers,
+	readEnabledServers,
 	readMCPConfigFile,
 	removeMCPServer,
-	setServerDisabled,
-	updateMCPServer,
+	setMcpServerEnabled,
 } from "../../mcp/config-writer";
 import { cfgMcpEnableProjectConfig } from "../../mcp/settings";
 import { MCPManager } from "../../mcp/manager";
@@ -331,29 +332,52 @@ async function handleEnableDisableCommand(
 	if (!name) return usage(`Usage: /mcp ${verb} <name>`, runtime);
 	const enabled = verb === "enable";
 	try {
+		const enableProjectConfig = cfgMcpEnableProjectConfig.get(runtime.settings);
 		const userPath = getMCPConfigPath("user", runtime.cwd);
 		const projectPath = getMCPConfigPath("project", runtime.cwd);
-		const [userConfig, projectConfig] = await Promise.all([
-			readMCPConfigFile(userPath),
-			readMCPConfigFile(projectPath),
+		const [found, disabledList, enabledList] = await Promise.all([
+			findMcpServerForAuth(name, runtime.cwd, runtime.mcpManager, { enableProjectConfig }),
+			readDisabledServers(userPath),
+			readEnabledServers(userPath),
 		]);
-		if (projectConfig.mcpServers?.[name] !== undefined) {
-			await updateMCPServer(projectPath, name, { ...projectConfig.mcpServers[name], enabled } as MCPServerConfig);
-			await runtime.output(`Server "${name}" ${enabled ? "enabled" : "disabled"} (project config).`);
+		const denied = disabledList.includes(name);
+		const forced = enabledList.includes(name);
+		const dropped = runtime.mcpManager?.getBuiltinDrops()?.get(name);
+		const discoveredSource = runtime.mcpManager?.getSource(name) ?? dropped?.source;
+		const known = found !== null || discoveredSource !== undefined || dropped !== undefined || denied || forced;
+		// Disable of an unknown name still records a denylist entry so a
+		// discovered server that is not loaded yet can be suppressed by name.
+		// Enable of an unknown name is an error.
+		if (!known && enabled) {
+			return usage(`Server "${name}" not found in user or project config.`, runtime);
+		}
+
+		// Discovered rows must not be copied into user mcp.json. `filePath` on
+		// those rows is the user config, not a file this codebase owns.
+		const writableSource = found !== null && !found.discovered ? found : undefined;
+		const effectivelyEnabled = isMcpServerEffectivelyEnabled({
+			hasConfig: found !== null || discoveredSource !== undefined,
+			enabledFlag: found?.config.enabled,
+			denied,
+			forced,
+			builtinDropped: dropped !== undefined,
+		});
+		if (known && effectivelyEnabled === enabled) {
+			await runtime.output(`Server "${name}" is already ${enabled ? "enabled" : "disabled"}.`);
 			return commandConsumed();
 		}
-		if (userConfig.mcpServers?.[name] !== undefined) {
-			await updateMCPServer(userPath, name, { ...userConfig.mcpServers[name], enabled } as MCPServerConfig);
-			await runtime.output(`Server "${name}" ${enabled ? "enabled" : "disabled"} (user config).`);
-			return commandConsumed();
-		}
-		const disabledList = await readDisabledServers(userPath);
-		if (!enabled || disabledList.includes(name)) {
-			await setServerDisabled(userPath, name, !enabled);
-			await runtime.output(`Server "${name}" ${enabled ? "enabled" : "disabled"}.`);
-			return commandConsumed();
-		}
-		return usage(`Server "${name}" not found in user or project config.`, runtime);
+
+		await setMcpServerEnabled({
+			userPath,
+			projectPath,
+			enableProjectConfig,
+			sourcePath: writableSource?.filePath,
+			name,
+			enabled,
+		});
+		const scopeNote = writableSource ? ` (${writableSource.scope} config)` : "";
+		await runtime.output(`Server "${name}" ${enabled ? "enabled" : "disabled"}${scopeNote}.`);
+		return commandConsumed();
 	} catch (err) {
 		return usage(`Failed to ${verb} MCP server: ${errorMessage(err)}`, runtime);
 	}
