@@ -129,7 +129,9 @@ _OUTPUT_FILENAME = "omp.txt"
 _SERVICE_GRACE_ENV = {"OMP_DAEMON_IDLE_GRACE_MS": str(24 * 60 * 60 * 1000)}
 
 # Provider → host env vars used in --no-gateway (direct-auth) mode only.
-_PROVIDER_KEYS: dict[str, list[str]] = {
+# Tuple entries are ordered fallbacks: only the first nonblank variable is
+# forwarded (matching omp's $pickenv) so unused tokens stay on the host.
+_PROVIDER_KEYS: dict[str, list[str | tuple[str, ...]]] = {
     "amazon-bedrock": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"],
     "anthropic": ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"],
     "github-copilot": ["COPILOT_GITHUB_TOKEN"],
@@ -143,7 +145,7 @@ _PROVIDER_KEYS: dict[str, list[str]] = {
         "GOOGLE_GENAI_USE_VERTEXAI",
     ],
     "groq": ["GROQ_API_KEY"],
-    "huggingface": ["HUGGINGFACE_HUB_TOKEN", "HF_TOKEN"],
+    "huggingface": [("HUGGINGFACE_HUB_TOKEN", "HF_TOKEN")],
     "mistral": ["MISTRAL_API_KEY"],
     "openai": ["OPENAI_API_KEY"],
     "openrouter": ["OPENROUTER_API_KEY"],
@@ -561,10 +563,17 @@ class OmpLocal(BaseInstalledAgent):
     def _collect_provider_keys(self, provider: str) -> dict[str, str]:
         """Host env vars for the primary model's provider (direct-auth mode only)."""
         env: dict[str, str] = {}
-        for key in _PROVIDER_KEYS.get(provider, []):
-            value = os.environ.get(key)
-            if value:
-                env[key] = value
+        for entry in _PROVIDER_KEYS.get(provider, []):
+            if isinstance(entry, tuple):
+                for key in entry:
+                    value = os.environ.get(key)
+                    if value and value.strip():
+                        env[key] = value
+                        break
+            else:
+                value = os.environ.get(entry)
+                if value:
+                    env[entry] = value
         return env
 
     # ---------------------------------------------------------------------- run
