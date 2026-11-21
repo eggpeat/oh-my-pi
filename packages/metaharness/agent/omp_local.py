@@ -132,7 +132,7 @@ _SERVICE_GRACE_ENV = {"OMP_DAEMON_IDLE_GRACE_MS": str(24 * 60 * 60 * 1000)}
 _PROVIDER_KEYS: dict[str, list[str]] = {
     "amazon-bedrock": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"],
     "anthropic": ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"],
-    "github-copilot": ["GITHUB_TOKEN"],
+    "github-copilot": ["COPILOT_GITHUB_TOKEN"],
     "google": [
         "GEMINI_API_KEY",
         "GOOGLE_GENERATIVE_AI_API_KEY",
@@ -143,7 +143,7 @@ _PROVIDER_KEYS: dict[str, list[str]] = {
         "GOOGLE_GENAI_USE_VERTEXAI",
     ],
     "groq": ["GROQ_API_KEY"],
-    "huggingface": ["HF_TOKEN"],
+    "huggingface": ["HUGGINGFACE_HUB_TOKEN", "HF_TOKEN"],
     "mistral": ["MISTRAL_API_KEY"],
     "openai": ["OPENAI_API_KEY"],
     "openrouter": ["OPENROUTER_API_KEY"],
