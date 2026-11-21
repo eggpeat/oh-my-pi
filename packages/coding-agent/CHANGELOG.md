@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the `read` tool description claiming `:raw` omits anchors or line prefixes when neither is enabled ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+
 ## [19.1.0] - 2026-11-21
 
 ### Breaking Changes

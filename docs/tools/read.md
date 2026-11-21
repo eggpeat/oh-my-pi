@@ -25,7 +25,7 @@
 ## Registration / Visibility
 
 - Metadata: `strict = true`, `loadMode = "essential"`. Approval normally uses the internal scheme's read tier; PDF page screenshots require `"exec"`.
-- The model-facing prompt renders hashline guidance from the live display mode; it names the special sources and links `help://read/sources` for their selectors, which lists executable analysis views only when a disassembler backend resolves (`disassembler.backend`).
+- The model-facing prompt renders line-prefix and hashline guidance from the live display mode; it names the special sources and links `help://read/sources` for their selectors, which lists executable analysis views only when a disassembler backend resolves (`disassembler.backend`).
 
 ## Inputs
 
