@@ -204,7 +204,10 @@ describe("/mcp enable and disable", () => {
 	function acpRuntime(mcpManager?: SlashCommandRuntime["mcpManager"], settings = Settings.isolated()) {
 		const outputs: string[] = [];
 		const runtime = {
-			session: {},
+			session: {
+				getActiveToolNames: () => [] as string[],
+				effectiveExtensionRoots: { explicit: [], mode: "merge", configured: [], configuredLevel: "user" },
+			},
 			sessionManager: {},
 			settings,
 			cwd: projectDir,

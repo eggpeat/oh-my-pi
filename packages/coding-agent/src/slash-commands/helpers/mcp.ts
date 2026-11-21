@@ -336,14 +336,12 @@ async function handleEnableDisableCommand(
 	const enabled = verb === "enable";
 	try {
 		const enableProjectConfig = cfgMcpEnableProjectConfig.get(runtime.settings);
-		const evalActive =
-			typeof runtime.session?.getActiveToolNames === "function" &&
-			runtime.session.getActiveToolNames().includes("eval");
+		const evalActive = runtime.session.getActiveToolNames().includes("eval");
 		const resolved = await resolveMcpServerForToggle(name, {
 			cwd: runtime.cwd,
 			enableProjectConfig,
 			mcpManager: runtime.mcpManager,
-			extensionRoots: runtime.session?.effectiveExtensionRoots,
+			extensionRoots: runtime.session.effectiveExtensionRoots,
 			builtinTransforms: resolveMCPTransformContext(runtime.settings, { evalActive }),
 		});
 		if (resolved.acpOwned) {
