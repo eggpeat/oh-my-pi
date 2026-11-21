@@ -1619,55 +1619,5 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 			]);
 			expect(new TurnRecovery(createHost(model, modelRegistry)).isRetryableReasonlessAbort(withOutput)).toBe(false);
 		});
-
-		it("does not retry a labelled abort carrying Flag.Abort, while still retrying a bare one", () => {
-			const labelled = makeMessage([], model);
-			labelled.stopReason = "aborted";
-			labelled.errorMessage = "Interrupted by user";
-			labelled.errorId = AIError.create(AIError.Flag.Abort);
-			expect(new TurnRecovery(createHost(model, modelRegistry)).isRetryableReasonlessAbort(labelled)).toBe(false);
-
-			const bare = makeMessage([], model);
-			bare.stopReason = "aborted";
-			bare.errorMessage = "Request was aborted";
-			bare.errorId = AIError.create(AIError.Flag.Abort);
-			expect(new TurnRecovery(createHost(model, modelRegistry)).isRetryableReasonlessAbort(bare)).toBe(true);
-
-			const toolCall: AssistantMessage["content"][number] = {
-				type: "toolCall",
-				id: "call-1",
-				name: "bash",
-				arguments: { command: "pwd" },
-			};
-			const syntheticResult: ToolResultMessage<SyntheticToolResultDetails> = {
-				role: "toolResult",
-				toolCallId: "call-1",
-				toolName: "bash",
-				content: [{ type: "text", text: "Tool call was not executed." }],
-				isError: true,
-				details: { __synthetic: true, source: "assistant_stop_error", executed: false },
-				timestamp: Date.now(),
-			};
-
-			const labelledToolTurn = makeMessage([toolCall], model);
-			labelledToolTurn.stopReason = "aborted";
-			labelledToolTurn.errorMessage = "Interrupted by user";
-			labelledToolTurn.errorId = AIError.create(AIError.Flag.Abort);
-			expect(
-				new TurnRecovery(
-					createHost(model, modelRegistry, { messages: [labelledToolTurn, syntheticResult] }),
-				).classifyResolvedInterruptedToolTurn(labelledToolTurn),
-			).toBeUndefined();
-
-			const bareToolTurn = makeMessage([toolCall], model);
-			bareToolTurn.stopReason = "aborted";
-			bareToolTurn.errorMessage = "Request was aborted";
-			bareToolTurn.errorId = AIError.create(AIError.Flag.Abort);
-			expect(
-				new TurnRecovery(
-					createHost(model, modelRegistry, { messages: [bareToolTurn, syntheticResult] }),
-				).classifyResolvedInterruptedToolTurn(bareToolTurn),
-			).toBe("reasonless-abort");
-		});
 	});
 });

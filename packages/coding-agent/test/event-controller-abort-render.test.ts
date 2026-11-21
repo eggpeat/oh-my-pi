@@ -163,29 +163,6 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		expect(arg.stopReason).toBe("aborted");
 	});
 
-	it("C2c: custom abort reason carrying Flag.Abort is preserved verbatim rather than replaced with 'Operation aborted'", async () => {
-		const message = makeAssistantMessage({
-			stopReason: "aborted",
-			errorMessage: "stop now",
-			errorId: AIError.create(AIError.Flag.Abort),
-		});
-		const { controller, updateContent } = createFixture({
-			streamingMessage: message,
-			isTtsrAbortPending: false,
-		});
-
-		await controller.handleEvent({ type: "message_end", message });
-
-		expect(message.errorMessage).toBe("stop now");
-		const arg = updateContent.mock.calls[0]![0];
-		expect(arg.errorMessage).toBe("stop now");
-		expect(resolveAssistantErrorPresentation(message)).toEqual({
-			kind: "full",
-			text: "stop now",
-			isError: true,
-		});
-	});
-
 	it("C3: a TTSR abort (SilentAbort flag + rule reason) is suppressed live and on rebuild", async () => {
 		// AgentSession stamps the SilentAbort flag on TTSR aborts while keeping the
 		// rule reason text on the message. The controller must downgrade the display

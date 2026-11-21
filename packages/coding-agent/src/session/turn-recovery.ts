@@ -141,14 +141,6 @@ const GENERIC_ABORT_MESSAGES: Record<string, true> = {
 	"The operation was aborted.": true,
 };
 
-function isGenericAbortMessage(errorMessage: string | undefined): boolean {
-	return errorMessage !== undefined && Object.hasOwn(GENERIC_ABORT_MESSAGES, errorMessage);
-}
-
-function isReasonlessAbortText(errorMessage: string | undefined): boolean {
-	return errorMessage === undefined || !hasNonWhitespace(errorMessage) || isGenericAbortMessage(errorMessage);
-}
-
 function hasNonWhitespace(value: string): boolean {
 	return NON_WHITESPACE_RE.test(value);
 }
@@ -1602,14 +1594,8 @@ export class TurnRecovery {
 		}
 
 		const id = this.#classifyRetryMessage(message);
-		if (AIError.is(id, AIError.Flag.UserInterrupt) || AIError.is(id, AIError.Flag.SilentAbort)) {
-			return false;
-		}
-		const genericAbort = isGenericAbortMessage(message.errorMessage);
-		if (message.stopReason === "aborted" && AIError.is(id, AIError.Flag.Abort)) {
-			return isReasonlessAbortText(message.errorMessage);
-		}
-		if (!genericAbort) {
+		if (message.stopReason === "aborted" && AIError.is(id, AIError.Flag.Abort)) return true;
+		if (message.errorMessage === undefined || !Object.hasOwn(GENERIC_ABORT_MESSAGES, message.errorMessage)) {
 			return false;
 		}
 
@@ -1762,18 +1748,14 @@ export class TurnRecovery {
 	 */
 	classifyResolvedInterruptedToolTurn(message: AssistantMessage): "reasonless-abort" | "stream-stall" | undefined {
 		const id = this.#classifyRetryMessage(message);
-		const genericAbort = isGenericAbortMessage(message.errorMessage);
-		const deliberateAbort = AIError.is(id, AIError.Flag.UserInterrupt) || AIError.is(id, AIError.Flag.SilentAbort);
+		const genericAbort =
+			message.errorMessage !== undefined && Object.hasOwn(GENERIC_ABORT_MESSAGES, message.errorMessage);
 		const reasonlessAbort =
 			(message.stopReason === "aborted" || message.stopReason === "error") &&
 			!this.#host.abortInProgress() &&
 			!this.#host.isDisposed() &&
 			!this.#host.streamingEditAbortTriggered() &&
-			!deliberateAbort &&
-			((message.stopReason === "aborted" &&
-				AIError.is(id, AIError.Flag.Abort) &&
-				isReasonlessAbortText(message.errorMessage)) ||
-				genericAbort);
+			((message.stopReason === "aborted" && AIError.is(id, AIError.Flag.Abort)) || genericAbort);
 		if (!reasonlessAbort && !this.#isMidStreamTransportFailure(message, id)) return undefined;
 		if (reasonlessAbort && genericAbort) message.errorId = AIError.create(AIError.Flag.Abort);
 
@@ -3115,16 +3097,10 @@ export class TurnRecovery {
 		// by the stated wait so an unrelated large backoff cannot sneak
 		// through.
 		const maxDelayMs = retrySettings.maxDelayMs;
-		// An account out of money has no reset to wait for: the QUOTA_EXHAUSTED
-		// heuristic backoff is a guess at a clock that does not exist, and a
-		// `retry.maxDelayMs` set at or above it (the 30-minute default ceiling
-		// users raise) would sleep through the whole guess. Surface the provider
-		// error instead, so the user tops up and the error frame's Retry
-		// re-attempts at once rather than idling in a retry the session cannot
-		// finish.
-		const billingCap = isBillingCapUsageLimit(message.errorStatus, errorMessage);
+		// An out-of-credit account has no reset to wait for. Even when the
+		// 30-minute quota heuristic fits the cap, only a fallback can recover it.
+		const billingCap = !staleUsageLimit && isBillingCapUsageLimit(message.errorStatus, errorMessage);
 		const exceedsDelayCap = (waitMs: number): boolean => {
-			if (billingCap && !staleUsageLimit) return true;
 			const waitForUsageReset =
 				retrySettings.waitForUsageReset === true &&
 				recordedUsageLimitOutcome !== undefined &&
@@ -3208,7 +3184,7 @@ export class TurnRecovery {
 				!staleUsageLimit &&
 				!thinkingLoop &&
 				!sameModelSteerReplay &&
-				!waitForSiblingCredential &&
+				(!waitForSiblingCredential || billingCap) &&
 				!refusalWalkRepeats &&
 				!this.#isFirstAttemptMidStreamSocketDrop(message, id, retryBudgetExhausted)
 			) {
@@ -3245,6 +3221,7 @@ export class TurnRecovery {
 							(options?.fireworksFastFallback || options?.hardErrorFallback) &&
 							!this.isRetryableError(message)
 						) &&
+						!billingCap &&
 						!exceedsDelayCap(
 							usageLimitWaitMs === undefined && parsedRetryAfterMs && parsedRetryAfterMs > delayMs
 								? parsedRetryAfterMs
@@ -3337,7 +3314,7 @@ export class TurnRecovery {
 		}
 
 		// The fail-fast cap (`exceedsDelayCap`, defined above the chain consult).
-		if (exceedsDelayCap(delayMs) && !switchedCredential && !switchedModel) {
+		if (!switchedCredential && !switchedModel && (billingCap || exceedsDelayCap(delayMs))) {
 			const attempt = this.#retryAttempt;
 			this.#retryAttempt = 0;
 			await this.#closeRetrySaga(
@@ -3348,7 +3325,7 @@ export class TurnRecovery {
 					// money — so the message the user acts on is the provider's own.
 					finalError: billingCap
 						? errorMessage
-						: `Provider requested ${Math.ceil(delayMs)}ms wait, exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${errorMessage}`,
+						: `${delayMs === parsedRetryAfterMs ? "Provider requested" : "Retry requires"} ${Math.ceil(delayMs)}ms wait, exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${errorMessage}`,
 				},
 				{ terminalTurn: message },
 			);

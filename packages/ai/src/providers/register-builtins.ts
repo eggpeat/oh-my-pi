@@ -174,6 +174,13 @@ function createProviderStreamError<TApi extends Api>(
 	stopReason: Extract<AssistantMessage["stopReason"], "aborted" | "error"> = "error",
 	abortTracker?: AbortSourceTracker,
 ): AssistantMessage {
+	const callerReason = abortTracker?.getCallerAbortReason();
+	const errorMessage =
+		stopReason === "aborted"
+			? (callerReason ?? "Request was aborted")
+			: error instanceof Error
+				? error.message
+				: String(error);
 	return {
 		role: "assistant",
 		content: [],
@@ -189,22 +196,21 @@ function createProviderStreamError<TApi extends Api>(
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason,
-		errorId:
-			AIError.classify(
-				stopReason === "aborted" ? (abortTracker?.getCallerAbortError() ?? error) : error,
-				model.api,
-			) || undefined,
 		// A caller abort carries the reason passed to `abort()` (non-whitespace
 		// string or non-`AbortError` `Error`, e.g. the user-interrupt label),
 		// matching `AIError.finalize`; a bare `abort()`, blank reason, or an
 		// `Error` named `"AbortError"` falls back to the generic sentinel
 		// downstream code treats as "no specific reason".
-		errorMessage:
+		// Only reasonless caller aborts get the structural Abort flag; labelled
+		// stops classify the reason itself (matching agent-loop) so downstream
+		// retry/render logic does not mistake them for generic aborts.
+		errorId:
 			stopReason === "aborted"
-				? (abortTracker?.getCallerAbortReason() ?? "Request was aborted")
-				: error instanceof Error
-					? error.message
-					: String(error),
+				? callerReason
+					? AIError.classify(callerReason, model.api) || undefined
+					: AIError.create(AIError.Flag.Abort)
+				: AIError.classify(error, model.api) || undefined,
+		errorMessage,
 		timestamp: Date.now(),
 	};
 }

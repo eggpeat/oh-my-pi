@@ -358,7 +358,7 @@ describe("register-builtins lazy streams", () => {
 		// deliberate interrupt from a reasonless transport abort.
 		expect(result.stopReason).toBe("aborted");
 		expect(result.errorMessage).toBe("Interrupted by user");
-		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(true);
+		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(false);
 	});
 
 	it("classifies the caller's abort reason instead of a raced timeout when cancellation wins", async () => {
@@ -405,7 +405,7 @@ describe("register-builtins lazy streams", () => {
 		}
 		expect(result.stopReason).toBe("aborted");
 		expect(result.errorMessage).toBe("Interrupted by user");
-		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(true);
+		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(false);
 		expect(AIError.is(result.errorId, AIError.Flag.Timeout)).toBe(false);
 		expect(AIError.is(result.errorId, AIError.Flag.Transient)).toBe(false);
 		expect(AIError.retriable(result.errorId)).toBe(false);
