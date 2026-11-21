@@ -4,12 +4,15 @@
  * Uses the capability system to load MCP servers from multiple sources.
  */
 
+import { getEnvApiKey } from "@oh-my-pi/pi-ai";
 import { getMCPConfigPath, logger } from "@oh-my-pi/pi-utils";
 import { mcpCapability } from "../capability/mcp";
 import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
-import { settings } from "../config/settings";
+import { type Settings, settings } from "../config/settings";
 import type { MCPServer } from "../discovery";
 import { loadCapability } from "../discovery";
+import type { AuthStorage } from "../session/auth-storage";
+import { cfgProvidersWebKeyless } from "../session/settings";
 import { cfgExaEnabled } from "../web/settings";
 import { readMCPConfigFile } from "./config-writer";
 import { builtinDropFor, type MCPDroppedServer, type MCPTransformContext } from "./transforms";
@@ -21,6 +24,10 @@ export interface LoadMCPConfigsOptions {
 	enableProjectConfig?: boolean;
 	/** Whether to filter out Exa MCP servers (default: true) */
 	filterExa?: boolean;
+	/** Settings instance for the owning session; falls back to global settings when omitted. */
+	settings?: Settings;
+	/** Auth storage for the owning session, used to check whether native Exa has a credential. */
+	authStorage?: AuthStorage;
 	/** Whether to filter out browser MCP servers when the built-in browser capability is enabled (default: false) */
 	filterBrowser?: boolean;
 	/** Session-local extension roots for post-startup rediscovery (explicit + mode + configured). */
@@ -112,14 +119,8 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
  */
 export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOptions): Promise<LoadMCPConfigsResult> {
 	const enableProjectConfig = options?.enableProjectConfig ?? true;
-	let filterExa = options?.filterExa ?? true;
-	if (filterExa) {
-		try {
-			filterExa = cfgExaEnabled.get(settings) !== false;
-		} catch {
-			// Settings may be unavailable before CLI initialization; retain the default folding behavior.
-		}
-	}
+	const filterExa = options?.filterExa ?? true;
+	const exaFolding = filterExa ? resolveNativeExaFolding(options?.settings, options?.authStorage) : undefined;
 	const filterBrowser = options?.filterBrowser ?? false;
 
 	// Load user-level disable/force-enable lists. The denylist always wins; the
@@ -202,8 +203,8 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 
 	let exaApiKeys: string[] = [];
 
-	if (filterExa) {
-		const exaResult = filterExaMCPServers(configs, sources);
+	if (exaFolding?.enabled) {
+		const exaResult = filterExaMCPServers(configs, sources, { allowKeyless: exaFolding.allowKeyless });
 		configs = exaResult.configs;
 		sources = exaResult.sources;
 		exaApiKeys = exaResult.exaApiKeys;
@@ -324,6 +325,35 @@ function getRequestedExaMcpTools(config: MCPServerConfig): string[] | null {
 	return tools.length > 0 ? tools : null;
 }
 
+/** Options for filtering Exa MCP servers */
+export interface ExaFilterOptions {
+	/** Whether Exa MCP servers without an embedded API key can be folded into native Exa (default: true) */
+	allowKeyless?: boolean;
+}
+
+/**
+ * Resolve whether native Exa can replace configured Exa MCP servers.
+ * Keyless MCP servers fold only when keyless native search is allowed or a credential exists.
+ */
+function resolveNativeExaFolding(
+	activeSettings?: Settings,
+	authStorage?: AuthStorage,
+): { enabled: boolean; allowKeyless: boolean } {
+	let enabled = true;
+	let webKeyless = true;
+	try {
+		const target = activeSettings ?? settings;
+		enabled = cfgExaEnabled.get(target) !== false;
+		webKeyless = cfgProvidersWebKeyless.get(target) !== false;
+	} catch {
+		// Settings may be unavailable before CLI initialization; retain the default folding behavior.
+	}
+	if (!enabled) return { enabled: false, allowKeyless: false };
+	if (webKeyless) return { enabled: true, allowKeyless: true };
+	const hasCredential = authStorage ? authStorage.keys.source("exa") !== undefined : Boolean(getEnvApiKey("exa"));
+	return { enabled: true, allowKeyless: hasCredential };
+}
+
 /** Result of filtering Exa MCP servers */
 export interface ExaFilterResult {
 	/** Configs with Exa servers removed */
@@ -343,7 +373,9 @@ export interface ExaFilterResult {
 export function filterExaMCPServers(
 	configs: Record<string, MCPServerConfig>,
 	sources: Record<string, SourceMeta>,
+	options?: ExaFilterOptions,
 ): ExaFilterResult {
+	const allowKeyless = options?.allowKeyless ?? true;
 	const filtered: Record<string, MCPServerConfig> = {};
 	const filteredSources: Record<string, SourceMeta> = {};
 	const exaApiKeys: string[] = [];
@@ -358,7 +390,7 @@ export function filterExaMCPServers(
 			}
 			const requested = getRequestedExaMcpTools(config);
 			const hasExtraTools = requested?.some(tool => !NATIVE_EXA_MCP_TOOLS[tool.toLowerCase()]) ?? false;
-			if (!hasExtraTools) {
+			if (!hasExtraTools && (allowKeyless || Boolean(apiKey))) {
 				continue;
 			}
 		}

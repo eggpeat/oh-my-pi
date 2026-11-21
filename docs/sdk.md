@@ -76,7 +76,7 @@ If omitted, it resolves:
 - `sessionManager`: `SessionManager.create(cwd, SessionManager.getDefaultSessionDir(cwd, agentDir))` (file-backed)
 - skills/rules/context files/prompt templates/slash commands/extensions/custom TS commands
 - built-in tools via `createTools(...)`
-- MCP tools (enabled by default; Exa MCP servers are folded into native Exa integration unless native Exa is disabled, and browser automation MCP servers are filtered when the built-in Eval browser prelude is enabled)
+- MCP tools (enabled by default; Exa MCP servers are folded into native Exa integration unless native Exa is disabled or keyless web search is off without an Exa key, and browser automation MCP servers are filtered when the built-in Eval browser prelude is enabled)
 - LSP integration (enabled by default)
 - `eventBus`: new `EventBus()` unless supplied
 

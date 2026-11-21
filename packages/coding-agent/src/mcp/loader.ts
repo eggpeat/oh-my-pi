@@ -3,6 +3,7 @@
  *
  * Integrates MCP tool discovery with the custom tools system.
  */
+import type { Settings } from "../config/settings";
 import type { LoadedCustomTool } from "../extensibility/custom-tools/types";
 import type { AuthStorage } from "../session/auth-storage";
 import { type MCPLoadResult, MCPManager } from "./manager";
@@ -33,6 +34,8 @@ export interface MCPToolsLoadOptions {
 	enableProjectConfig?: boolean;
 	/** Whether to filter out Exa MCP servers (default: true) */
 	filterExa?: boolean;
+	/** Settings instance for the owning session; falls back to global settings when omitted. */
+	settings?: Settings;
 	/** Whether to filter out browser MCP servers when the built-in browser capability is enabled (default: false) */
 	filterBrowser?: boolean;
 	/** What the session offers natively, for built-in transforms; omitted: none applies. */
@@ -63,6 +66,7 @@ export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoa
 			startupTimeoutMs: options?.startupTimeoutMs,
 			enableProjectConfig: options?.enableProjectConfig,
 			filterExa: options?.filterExa,
+			settings: options?.settings,
 			filterBrowser: options?.filterBrowser,
 			builtinTransforms: options?.builtinTransforms,
 		});

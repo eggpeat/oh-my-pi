@@ -8,6 +8,7 @@ import type { TSchema } from "@oh-my-pi/pi-ai";
 import { logger, untilAborted } from "@oh-my-pi/pi-utils";
 import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
 import { invalidateCommandConfig, isCommandConfigValue, resolveConfigValue } from "../config/resolve-config-value";
+import type { Settings } from "../config/settings";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { AuthStorage } from "../session/auth-storage";
 import {
@@ -210,6 +211,10 @@ export interface MCPDiscoverOptions {
 	enableProjectConfig?: boolean;
 	/** Whether to filter out Exa MCP servers (default: true) */
 	filterExa?: boolean;
+	/** Settings instance for the owning session; falls back to global settings when omitted. */
+	settings?: Settings;
+	/** Auth storage for the owning session; falls back to the manager's auth storage when omitted. */
+	authStorage?: AuthStorage;
 	/** Whether to filter out browser MCP servers when the built-in browser capability is enabled (default: false) */
 	filterBrowser?: boolean;
 	/** Session-local extension roots for post-startup rediscovery (explicit + mode + configured). */
@@ -742,6 +747,11 @@ export class MCPManager implements MCPManagerApi {
 		this.#authStorage = authStorage;
 	}
 
+	/** Return the auth storage bound to this manager, if any. */
+	getAuthStorage(): AuthStorage | null {
+		return this.#authStorage;
+	}
+
 	/** Set the callback used to complete OAuth after a tool-level auth challenge. */
 	setAuthHandler(handler: MCPAuthHandler | undefined): void {
 		this.#authHandler = handler;
@@ -783,7 +793,13 @@ export class MCPManager implements MCPManagerApi {
 
 	/** Load configs and remember which servers built-in transforms dropped. */
 	async #discoverConfigs(options: LoadMCPConfigsOptions): Promise<LoadMCPConfigsResult> {
-		const loaded = await this.loadConfigs(this.cwd, options);
+		const sessionSettings = options.settings ?? this.#discoverOptions?.settings;
+		const authStorage = options.authStorage ?? this.#discoverOptions?.authStorage ?? this.#authStorage ?? undefined;
+		const loaded = await this.loadConfigs(this.cwd, {
+			...options,
+			...(sessionSettings ? { settings: sessionSettings } : {}),
+			...(authStorage ? { authStorage } : {}),
+		});
 		this.#builtinDrops.clear();
 		const dropped = loaded.dropped ?? {};
 		for (const name in dropped) {

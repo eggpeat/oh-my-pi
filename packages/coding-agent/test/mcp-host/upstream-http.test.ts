@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { MCPTransportError } from "@oh-my-pi/pi-coding-agent/mcp/errors";
 import type { McpRemoteSpec } from "@oh-my-pi/pi-coding-agent/mcp/host/contract";
 import { encodeMcpHeaderValue, HttpUpstream } from "@oh-my-pi/pi-coding-agent/mcp/host/http-upstream";
@@ -11,7 +11,7 @@ import {
 	MCPMeta,
 	requestMeta,
 } from "@oh-my-pi/pi-coding-agent/mcp/protocol";
-import { postmortem, withTimeout } from "@oh-my-pi/pi-utils";
+import { logger, postmortem, withTimeout } from "@oh-my-pi/pi-utils";
 import { rejectionOf, trackUnhandled } from "../helpers/rejection";
 import { httpSpec, realDeps } from "./upstream-support";
 
@@ -36,6 +36,7 @@ afterEach(async () => {
 	for (const peer of peers.splice(0)) await peer.close("test over");
 	for (const upstream of upstreams.splice(0)) await upstream.close();
 	for (const server of servers.splice(0)) await server.stop(true);
+	vi.restoreAllMocks();
 });
 
 /** An MCP endpoint whose every request is recorded and answered by `respond`. */
@@ -1094,5 +1095,81 @@ describe("handshake-era Streamable HTTP resumption", () => {
 
 		expect(methods).toEqual(["notifications/first", "notifications/second"]);
 		expect(seen.map(entry => entry.headers.get("Last-Event-ID"))).toEqual([null, "poll-1"]);
+	});
+
+	it("redacts sensitive query parameters in debug logs without altering the request URL", async () => {
+		const secret = "exa-redaction-test-key";
+		const receivedKeys: Array<string | null> = [];
+		const debugEntries: Array<{ message: string; data?: Record<string, unknown> }> = [];
+		const debugSpy = vi.spyOn(logger, "debug").mockImplementation((message, data) => {
+			debugEntries.push({ message, data });
+		});
+
+		let listenerGets = 0;
+		const listenerDone = Promise.withResolvers<void>();
+		const notifyDrainDone = Promise.withResolvers<void>();
+		const { url: baseUrl } = serve((entry, request) => {
+			receivedKeys.push(new URL(request.url).searchParams.get("exaApiKey"));
+			if (entry.method === "GET") {
+				if (entry.headers.get("Last-Event-ID") === "resp-1") {
+					return new Response('data: {"jsonrpc":"2.0","id":1,"result":{"tools":[]}}\n\n', SSE);
+				}
+				listenerGets++;
+				if (listenerGets === 1) {
+					return new Response("id: evt-1\nretry: 0\ndata: {broken\n\n", SSE);
+				}
+				return new Response("resume unavailable", { status: 500 });
+			}
+			if (entry.body.method === "notifications/test") {
+				return new Response("data: {broken\n\n", SSE);
+			}
+			if (entry.body.method === "tools/list") {
+				return new Response("id: resp-1\nretry: 0\ndata: {broken\n\n", SSE);
+			}
+			return Response.json({ jsonrpc: "2.0", id: entry.body.id, result: {} });
+		});
+
+		const urlWithKey = `${baseUrl}?exaApiKey=${secret}&tools=web_search_exa`;
+		const expectedRedactedUrl = `${baseUrl}?exaApiKey=%5Bredacted%5D&tools=web_search_exa`;
+		const upstream = await legacyUpstream(urlWithKey, { timeoutMs: 0 });
+
+		// 1. GET listener stream error + resume failure + background drain failure (from onClose throwing).
+		upstream.onClose = () => {
+			listenerDone.resolve();
+			throw new Error("listener close boom");
+		};
+		await upstream.startSSEListener();
+		await withTimeout(listenerDone.promise, SETTLE_MS, "listener never unwound");
+
+		// 2. Notification SSE stream error (#readSSEStream).
+		upstream.onError = () => notifyDrainDone.resolve();
+		await upstream.notify("notifications/test");
+		await withTimeout(notifyDrainDone.promise, SETTLE_MS, "notification stream never failed");
+
+		// 3. POST SSE response stream drop + resume.
+		expect(await upstream.request<{ tools: unknown[] }>("tools/list")).toEqual({ tools: [] });
+
+		// 4. Teardown onClose failure (#closeTransport).
+		upstream.onClose = () => {
+			throw new Error("teardown close boom");
+		};
+		await upstream.close();
+		debugSpy.mockRestore();
+
+		expect(receivedKeys.length).toBeGreaterThanOrEqual(4);
+		expect(receivedKeys.every(value => value === secret)).toBe(true);
+
+		const urlLogs = debugEntries.filter(entry => typeof entry.data?.url === "string");
+		const messages = urlLogs.map(entry => entry.message);
+		expect(messages).toContain("HTTP SSE stream error");
+		expect(messages.filter(message => message === "HTTP SSE stream error").length).toBeGreaterThanOrEqual(2);
+		expect(messages).toContain("HTTP SSE listener resume failed");
+		expect(messages).toContain("MCP HTTP background drain failed");
+		expect(messages).toContain("MCP SSE response stream dropped; resuming");
+		expect(messages).toContain("MCP HTTP onClose callback failed during teardown");
+		for (const entry of urlLogs) {
+			expect(entry.data?.url).toBe(expectedRedactedUrl);
+			expect(JSON.stringify(entry)).not.toContain(secret);
+		}
 	});
 });

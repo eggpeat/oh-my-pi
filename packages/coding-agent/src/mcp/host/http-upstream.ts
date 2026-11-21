@@ -27,6 +27,7 @@ import { MCP_PROTOCOL_VERSION, MCPMeta } from "../protocol";
 import { RequestIdAllocator } from "../request-id";
 import type { JsonRpcError, JsonRpcMessage, MCPRequestOptions, MCPTransport } from "../types";
 import { toJsonRpcError } from "../types";
+import { redactUrlForLog } from "../../utils/redact-url";
 import type { McpRemoteSpec } from "./contract";
 import { type MCPFetchInit, mcpFetch, withoutHeader } from "./header-policy";
 import { jsonRpcErrorOf } from "./stdio-upstream";
@@ -98,6 +99,7 @@ function resumeError(message: string): MCPTransportError {
 /** One remote MCP endpoint reached by POST, with optional SSE responses. */
 export class HttpUpstream implements MCPTransport {
 	readonly #spec: McpRemoteSpec;
+	readonly #logUrl: string;
 	readonly #mode: HttpUpstreamMode;
 	#connected = false;
 	#sessionId: string | null = null;
@@ -130,6 +132,7 @@ export class HttpUpstream implements MCPTransport {
 
 	constructor(spec: McpRemoteSpec, mode: HttpUpstreamMode) {
 		this.#spec = spec;
+		this.#logUrl = redactUrlForLog(spec.url);
 		this.#mode = mode;
 	}
 
@@ -213,7 +216,7 @@ export class HttpUpstream implements MCPTransport {
 		const handled = drain.catch(error => {
 			if (error instanceof Error && error.name === "AbortError") return;
 			logger.debug("MCP HTTP background drain failed", {
-				url: this.#spec.url,
+				url: this.#logUrl,
 				error: error instanceof Error ? error.message : String(error),
 			});
 		});
@@ -324,7 +327,7 @@ export class HttpUpstream implements MCPTransport {
 			}
 		} catch (error) {
 			if (error instanceof Error && error.name !== "AbortError") {
-				logger.debug("HTTP SSE stream error", { url: this.#spec.url, error: error.message });
+				logger.debug("HTTP SSE stream error", { url: this.#logUrl, error: error.message });
 				this.onError?.(error);
 			}
 		}
@@ -354,7 +357,7 @@ export class HttpUpstream implements MCPTransport {
 			} catch (error) {
 				if (signal.aborted) return;
 				logger.debug("HTTP SSE stream error", {
-					url: this.#spec.url,
+					url: this.#logUrl,
 					error: error instanceof Error ? error.message : String(error),
 				});
 				if (resume.lastEventId === null) {
@@ -369,7 +372,7 @@ export class HttpUpstream implements MCPTransport {
 			} catch (error) {
 				if (!signal.aborted) {
 					logger.debug("HTTP SSE listener resume failed", {
-						url: this.#spec.url,
+						url: this.#logUrl,
 						error: error instanceof Error ? error.message : String(error),
 					});
 				}
@@ -720,7 +723,7 @@ export class HttpUpstream implements MCPTransport {
 						if (captured) return;
 						if (signal.aborted || resume.lastEventId === null) throw error;
 						logger.debug("MCP SSE response stream dropped; resuming", {
-							url: this.#spec.url,
+							url: this.#logUrl,
 							error: error instanceof Error ? error.message : String(error),
 						});
 					}
@@ -907,7 +910,7 @@ export class HttpUpstream implements MCPTransport {
 			onClose?.();
 		} catch (error) {
 			logger.debug("MCP HTTP onClose callback failed during teardown", {
-				url: this.#spec.url,
+				url: this.#logUrl,
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}

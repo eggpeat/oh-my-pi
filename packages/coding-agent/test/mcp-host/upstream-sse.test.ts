@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { MCPTransportError } from "@oh-my-pi/pi-coding-agent/mcp/errors";
 import type { McpRemoteSpec } from "@oh-my-pi/pi-coding-agent/mcp/host/contract";
 import type { McpPeer } from "@oh-my-pi/pi-coding-agent/mcp/host/peer";
@@ -7,7 +7,7 @@ import { SseUpstream } from "@oh-my-pi/pi-coding-agent/mcp/host/sse-upstream";
 import { MCP_LEGACY_TTL_MS } from "@oh-my-pi/pi-coding-agent/mcp/host/store";
 import { requestMeta } from "@oh-my-pi/pi-coding-agent/mcp/protocol";
 import { isRetriableConnectionError } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
-import { withTimeout } from "@oh-my-pi/pi-utils";
+import { logger, withTimeout } from "@oh-my-pi/pi-utils";
 import { rejectionOf } from "../helpers/rejection";
 import { httpSpec, realDeps } from "./upstream-support";
 
@@ -26,6 +26,7 @@ afterEach(async () => {
 	for (const peer of peers.splice(0)) await peer.close("test over");
 	for (const upstream of upstreams.splice(0)) await upstream.close();
 	for (const server of servers.splice(0)) await server.stop(true);
+	vi.restoreAllMocks();
 });
 
 function sseSpec(url: string, overrides: Partial<McpRemoteSpec> = {}): McpRemoteSpec {
@@ -334,5 +335,42 @@ describe("HTTP+SSE upstream (2024-11-05)", () => {
 		expect(await withTimeout(requested, SETTLE_MS, "the request outlived close()")).toMatchObject({
 			name: "AbortError",
 		});
+	});
+
+	it("redacts sensitive query parameters in debug logs without altering the request URL", async () => {
+		const secret = "exa-sse-redaction-test-key";
+		const receivedKeys: Array<string | null> = [];
+		const debugEntries: Array<{ message: string; data?: Record<string, unknown> }> = [];
+		const debugSpy = vi.spyOn(logger, "debug").mockImplementation((message, data) => {
+			debugEntries.push({ message, data });
+		});
+
+		const baseUrl = serveStream(request => {
+			receivedKeys.push(new URL(request.url).searchParams.get("exaApiKey"));
+			return new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(encoder.encode("event: endpoint\ndata: /messages\n\n"));
+						controller.enqueue(encoder.encode("data: {broken\n\n"));
+						controller.close();
+					},
+				}),
+				SSE,
+			);
+		});
+		const urlWithKey = `${baseUrl}?exaApiKey=${secret}&tools=web_search_exa`;
+		const expectedRedactedUrl = `${baseUrl}?exaApiKey=%5Bredacted%5D&tools=web_search_exa`;
+		const upstream = upstreamOf(sseSpec(urlWithKey));
+		const errored = Promise.withResolvers<Error>();
+		upstream.onError = error => errored.resolve(error);
+
+		await upstream.connect();
+		await withTimeout(errored.promise, SETTLE_MS, "legacy SSE stream error never fired");
+		debugSpy.mockRestore();
+
+		expect(receivedKeys).toEqual([secret]);
+		const entry = debugEntries.find(item => item.message === "Legacy SSE stream error");
+		expect(entry?.data?.url).toBe(expectedRedactedUrl);
+		expect(JSON.stringify(entry)).not.toContain(secret);
 	});
 });

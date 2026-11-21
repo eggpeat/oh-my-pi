@@ -1736,6 +1736,8 @@ export class MCPCommandController {
 		}
 
 		const { configs, sources } = await loadAllMCPConfigs(getProjectDir(), {
+			settings: this.ctx.settings,
+			authStorage: this.ctx.session.modelRegistry?.authStorage,
 			extensionRoots: this.ctx.session.effectiveExtensionRoots,
 		});
 		const config = configs[name];
@@ -1784,6 +1786,8 @@ export class MCPCommandController {
 		const result = await reconnectMCPServers(this.ctx.mcpManager, this.ctx.session, {
 			enableProjectConfig: cfgMcpEnableProjectConfig.get(this.ctx.settings),
 			filterExa: true,
+			settings: this.ctx.settings,
+			authStorage: this.ctx.session.modelRegistry?.authStorage,
 			filterBrowser: this.ctx.session.getEvalPreludes().some(definition => definition.name === "browser"),
 			builtinTransforms: resolveMCPTransformContext(this.ctx.settings, {
 				evalActive: this.ctx.session.getActiveToolNames().includes("eval"),

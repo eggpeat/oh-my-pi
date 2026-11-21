@@ -15,6 +15,7 @@ import { routeProgressNotification, withProgressToken } from "../progress";
 import { RequestIdAllocator } from "../request-id";
 import type { MCPRequestOptions, MCPTransport } from "../types";
 import { toJsonRpcError } from "../types";
+import { redactUrlForLog } from "../../utils/redact-url";
 import type { McpRemoteSpec } from "./contract";
 import { mcpFetch } from "./header-policy";
 import { jsonRpcErrorOf } from "./stdio-upstream";
@@ -199,7 +200,7 @@ export class SseUpstream implements MCPTransport {
 				const failure = nonRetryableMCPTransportError(
 					normalizeMCPTransportError(error, { transport: "http", stage: "receive" }),
 				);
-				logger.debug("Legacy SSE stream error", { url: this.#spec.url, error: failure.message });
+				logger.debug("Legacy SSE stream error", { url: redactUrlForLog(this.#spec.url), error: failure.message });
 				this.onError?.(failure);
 				this.#rejectPending(failure);
 			}
