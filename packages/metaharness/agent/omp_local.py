@@ -562,11 +562,12 @@ class OmpLocal(BaseInstalledAgent):
 
     def _collect_provider_keys(self, provider: str) -> dict[str, str]:
         """Host env vars for the primary model's provider (direct-auth mode only)."""
+        effective_env = {**os.environ, **self._forward_env}
         env: dict[str, str] = {}
         for entry in _PROVIDER_KEYS.get(provider, []):
             if isinstance(entry, tuple):
                 for key in entry:
-                    value = os.environ.get(key)
+                    value = effective_env.get(key)
                     if value and value.strip():
                         env[key] = value
                         break
