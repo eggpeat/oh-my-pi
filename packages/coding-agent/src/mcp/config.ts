@@ -7,8 +7,10 @@
 import { getMCPConfigPath, logger } from "@oh-my-pi/pi-utils";
 import { mcpCapability } from "../capability/mcp";
 import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
+import { settings } from "../config/settings";
 import type { MCPServer } from "../discovery";
 import { loadCapability } from "../discovery";
+import { cfgExaEnabled } from "../web/settings";
 import { readMCPConfigFile } from "./config-writer";
 import { builtinDropFor, type MCPDroppedServer, type MCPTransformContext } from "./transforms";
 import type { MCPConfigFile, MCPServerConfig } from "./types";
@@ -110,7 +112,14 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
  */
 export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOptions): Promise<LoadMCPConfigsResult> {
 	const enableProjectConfig = options?.enableProjectConfig ?? true;
-	const filterExa = options?.filterExa ?? true;
+	let filterExa = options?.filterExa ?? true;
+	if (filterExa) {
+		try {
+			filterExa = cfgExaEnabled.get(settings) !== false;
+		} catch {
+			// Settings may be unavailable before CLI initialization; retain the default folding behavior.
+		}
+	}
 	const filterBrowser = options?.filterBrowser ?? false;
 
 	// Load user-level disable/force-enable lists. The denylist always wins; the

@@ -15,6 +15,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { loadAllMCPConfigs } from "@oh-my-pi/pi-coding-agent/mcp/config";
 import { getConfigRootDir, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import "@oh-my-pi/pi-coding-agent/discovery";
@@ -50,6 +51,7 @@ describe("MCP scope filtering precedes connection-equivalence deduplication", ()
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		resetSettingsForTest();
 		clearFsCache();
 		if (originalAgentDirEnv) {
 			setAgentDir(originalAgentDirEnv);
@@ -128,6 +130,17 @@ describe("MCP scope filtering precedes connection-equivalence deduplication", ()
 			expect(Object.keys(result.configs)).toEqual(["projcontext"]);
 			expect(result.sources.projcontext?.level).toBe("project");
 		}
+	});
+
+	test("keeps a keyless Exa MCP server when native Exa is disabled", async () => {
+		await Settings.init({ inMemory: true, overrides: { "exa.enabled": false } });
+		const exa = { type: "http", url: "https://mcp.exa.ai/mcp" } as const;
+		await writeMcpJson(path.join(projectDir, ".omp"), { exa });
+
+		const result = await loadAllMCPConfigs(projectDir);
+
+		expect(result.configs.exa).toEqual(exa);
+		expect(result.sources.exa?.level).toBe("project");
 	});
 
 	test("effective extension roots survive scopeless MCP rediscovery", async () => {
