@@ -10,183 +10,16 @@ import {
 	DAEMON_TCP_ENV,
 	DAEMON_WORKER_ARG,
 } from "../../src/daemon/protocol";
+import type { DaemonClockCommand, DaemonClockEvent } from "../fixtures/daemon-clock-preload";
 import { DaemonConn } from "../fixtures/daemon-proc-harness";
 
 const PACKAGE_ROOT = path.resolve(import.meta.dir, "..", "..");
 const CLI_ENTRY = path.join(PACKAGE_ROOT, "src", "cli.ts");
+const CLOCK_PRELOAD = path.resolve(import.meta.dir, "..", "fixtures", "daemon-clock-preload.ts");
+const PRELOAD_ACTIVE_ENV = "OMP_TEST_CLOCK_PRELOAD";
 const IDLE_GRACE_ENV = "OMP_DAEMON_IDLE_GRACE_MS";
 const MAX_I32_TIMEOUT_MS = 0x7fff_ffff;
 const TEST_TIMEOUT_MS = 30_000;
-
-/**
- * Preloaded only inside the spawned daemon child process so the test runner's
- * own process name, environment, and timers are never touched.
- *
- * Hooks `performance.now`, `Date.now`, `node:timers/promises` `scheduler.wait`,
- * and `setTimeout`/`clearTimeout` onto one IPC-driven monotonic clock while
- * reproducing the 32-bit signed-integer timer ceiling (`> 0x7fffffff` clamps to
- * `1` ms). Unref'd background timers (such as file-logger batching) do not emit
- * `armed` events.
- */
-const CHILD_CLOCK_PRELOAD = `
-import * as fs from "node:fs/promises";
-import { scheduler } from "node:timers/promises";
-
-const MAX_I32 = 0x7fffffff;
-const epochBase = Date.now();
-let now = 1_000;
-let nextId = 1;
-let armedEpoch = 0;
-const timers = new Map();
-
-function clampWait(delayMs) {
-	const numeric = delayMs === undefined ? 0 : Number(delayMs);
-	if (!Number.isFinite(numeric) || numeric > MAX_I32) return 1;
-	return numeric < 0 ? 0 : Math.trunc(numeric);
-}
-
-function notifyIfStillRefed(id, waitMs) {
-	queueMicrotask(() => {
-		const entry = timers.get(id);
-		if (entry && entry.refed) {
-			armedEpoch++;
-			process.send?.({ type: "armed", epoch: armedEpoch, waitMs });
-		}
-	});
-}
-
-performance.now = () => now;
-Date.now = () => epochBase + now;
-
-scheduler.wait = (delayMs, options) => {
-	options?.signal?.throwIfAborted();
-	const { promise, resolve, reject } = Promise.withResolvers();
-	const id = nextId++;
-	const waitMs = clampWait(delayMs);
-	const onAbort = () => {
-		timers.delete(id);
-		reject(options?.signal?.reason ?? new DOMException("The operation was aborted.", "AbortError"));
-	};
-	options?.signal?.addEventListener("abort", onAbort, { once: true });
-	timers.set(id, {
-		id,
-		dueAt: now + waitMs,
-		refed: true,
-		fire: () => {
-			options?.signal?.removeEventListener("abort", onAbort);
-			resolve();
-		},
-	});
-	notifyIfStillRefed(id, waitMs);
-	return promise;
-};
-
-globalThis.setTimeout = (callback, delayMs, ...args) => {
-	const id = nextId++;
-	const waitMs = clampWait(delayMs);
-	const entry = {
-		id,
-		dueAt: now + waitMs,
-		refed: true,
-		fire: () => callback(...args),
-	};
-	timers.set(id, entry);
-	notifyIfStillRefed(id, waitMs);
-	const handle = {
-		[Symbol.toPrimitive]: () => id,
-		ref: () => {
-			entry.refed = true;
-			return handle;
-		},
-		unref: () => {
-			entry.refed = false;
-			return handle;
-		},
-		hasRef: () => entry.refed,
-		refresh: () => {
-			entry.dueAt = now + waitMs;
-			return handle;
-		},
-		close: () => {
-			timers.delete(id);
-		},
-	};
-	return handle;
-};
-
-globalThis.clearTimeout = handle => {
-	if (handle === undefined || handle === null) return;
-	const id = typeof handle === "number" ? handle : Number(handle);
-	timers.delete(id);
-};
-
-async function flushMicrotasks() {
-	for (let i = 0; i < 6; i++) await Promise.resolve();
-}
-
-async function flushIo() {
-	const dir = process.env.OMP_DAEMON_DIR;
-	if (!dir) return;
-	for (let i = 0; i < 20; i++) {
-		try {
-			await fs.stat(dir);
-		} catch {
-			break;
-		}
-	}
-}
-
-function nextDueTimer(maxDueAt) {
-	let chosen;
-	for (const entry of timers.values()) {
-		if (maxDueAt !== undefined && entry.dueAt > maxDueAt) continue;
-		if (!chosen || entry.dueAt < chosen.dueAt || (entry.dueAt === chosen.dueAt && entry.id < chosen.id)) {
-			chosen = entry;
-		}
-	}
-	return chosen;
-}
-
-let queue = Promise.resolve();
-process.on("message", msg => {
-	queue = queue.then(async () => {
-		if (msg.type === "advance") {
-			const target = now + msg.ms;
-			for (;;) {
-				const entry = nextDueTimer(target);
-				if (!entry) break;
-				timers.delete(entry.id);
-				now = entry.dueAt;
-				entry.fire();
-				await flushMicrotasks();
-			}
-			now = target;
-			await flushMicrotasks();
-			await flushIo();
-			process.send?.({ type: "ack", id: msg.id });
-		} else if (msg.type === "fireNextLate") {
-			let chosen;
-			for (const entry of timers.values()) {
-				if (!entry.refed) continue;
-				if (!chosen || entry.dueAt < chosen.dueAt || (entry.dueAt === chosen.dueAt && entry.id < chosen.id)) {
-					chosen = entry;
-				}
-			}
-			if (chosen) {
-				timers.delete(chosen.id);
-				now += msg.elapsedMs;
-				chosen.fire();
-			}
-			await flushMicrotasks();
-			await flushIo();
-			process.send?.({ type: "ack", id: msg.id });
-		}
-	});
-});
-process.channel?.unref?.();
-`;
-
-type ChildMessage = { type: "armed"; epoch: number; waitMs: number } | { type: "ack"; id: number };
 
 class ControlledDaemon {
 	readonly root: string;
@@ -198,13 +31,14 @@ class ControlledDaemon {
 	readonly #acks = new Map<number, () => void>();
 	readonly #armedWaiters = new Set<() => void>();
 	#armedEpoch = 0;
+	#refedTimers = 0;
 	#nextReqId = 1;
 
 	constructor(
 		root: string,
 		dir: string,
 		proc: Bun.Subprocess,
-		onReady: { register: (fn: (msg: ChildMessage) => void) => void },
+		onReady: { register: (fn: (msg: DaemonClockEvent) => void) => void },
 	) {
 		this.root = root;
 		this.dir = dir;
@@ -213,6 +47,7 @@ class ControlledDaemon {
 		this.#proc = proc;
 		onReady.register(msg => this.#onMessage(msg));
 		void proc.exited.then(() => {
+			this.#refedTimers = 0;
 			for (const waiter of this.#armedWaiters) waiter();
 			this.#armedWaiters.clear();
 			for (const resolve of this.#acks.values()) resolve();
@@ -222,12 +57,17 @@ class ControlledDaemon {
 
 	static async spawn(
 		idleGrace: string | undefined,
-		track?: (daemon: ControlledDaemon) => void,
+		track: (daemon: ControlledDaemon) => void,
 	): Promise<ControlledDaemon> {
-		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "omp-dig-")));
+		const rawRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-dig-"));
+		let root = rawRoot;
+		try {
+			root = await fs.realpath(rawRoot);
+		} catch (error) {
+			await fs.rm(rawRoot, { recursive: true, force: true });
+			throw error;
+		}
 		const dir = path.join(root, "daemon");
-		const preloadPath = path.join(root, "clock-preload.mjs");
-		await fs.writeFile(preloadPath, CHILD_CLOCK_PRELOAD, "utf8");
 
 		const env: Record<string, string> = {};
 		for (const name in process.env) {
@@ -237,25 +77,32 @@ class ControlledDaemon {
 		delete env[DAEMON_TCP_ENV];
 		delete env[DAEMON_RESUME_ENV];
 		env[DAEMON_DIR_ENV] = dir;
+		env[PRELOAD_ACTIVE_ENV] = "1";
 		env.PI_TEST_RUNTIME = "1";
 		env.PI_CODING_AGENT_DIR = path.join(root, "agent");
 		if (idleGrace === undefined) delete env[IDLE_GRACE_ENV];
 		else env[IDLE_GRACE_ENV] = idleGrace;
 
-		let handler: ((msg: ChildMessage) => void) | undefined;
-		const buffered: ChildMessage[] = [];
-		const proc = Bun.spawn([process.execPath, "--preload", preloadPath, CLI_ENTRY, DAEMON_WORKER_ARG], {
-			cwd: PACKAGE_ROOT,
-			env,
-			stdin: "ignore",
-			stdout: "ignore",
-			stderr: Bun.file(path.join(root, "daemon.stderr")),
-			ipc(message) {
-				const msg = message as ChildMessage;
-				if (handler) handler(msg);
-				else buffered.push(msg);
-			},
-		});
+		let handler: ((msg: DaemonClockEvent) => void) | undefined;
+		const buffered: DaemonClockEvent[] = [];
+		let proc: Bun.Subprocess;
+		try {
+			proc = Bun.spawn([process.execPath, "--preload", CLOCK_PRELOAD, CLI_ENTRY, DAEMON_WORKER_ARG], {
+				cwd: PACKAGE_ROOT,
+				env,
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: Bun.file(path.join(root, "daemon.stderr")),
+				ipc(message) {
+					const msg = message as DaemonClockEvent;
+					if (handler) handler(msg);
+					else buffered.push(msg);
+				},
+			});
+		} catch (error) {
+			await fs.rm(root, { recursive: true, force: true });
+			throw error;
+		}
 		const instance = new ControlledDaemon(root, dir, proc, {
 			register(fn) {
 				handler = fn;
@@ -263,11 +110,13 @@ class ControlledDaemon {
 				buffered.length = 0;
 			},
 		});
-		track?.(instance);
+		track(instance);
 		try {
 			await instance.waitForIdleOrExit(0);
 			if (!instance.running) {
-				const stderr = await fs.readFile(path.join(root, "daemon.stderr"), "utf8").catch(() => "");
+				const stderr = await Bun.file(path.join(root, "daemon.stderr"))
+					.text()
+					.catch(() => "");
 				throw new Error(`Daemon exited during startup (${proc.exitCode ?? proc.signalCode}): ${stderr}`);
 			}
 			return instance;
@@ -285,6 +134,10 @@ class ControlledDaemon {
 		return this.#armedEpoch;
 	}
 
+	get refedTimers(): number {
+		return this.#refedTimers;
+	}
+
 	get running(): boolean {
 		return this.#proc.exitCode === null && this.#proc.signalCode === null;
 	}
@@ -298,7 +151,7 @@ class ControlledDaemon {
 	}
 
 	async connect(): Promise<DaemonConn> {
-		const token = (await fs.readFile(path.join(this.dir, "token"), "utf8")).trim();
+		const token = (await Bun.file(path.join(this.dir, "token")).text()).trim();
 		const conn = await DaemonConn.connect(this.endpoint, token, () => {});
 		this.#conns.add(conn);
 		void conn.closed.then(() => this.#conns.delete(conn));
@@ -314,21 +167,11 @@ class ControlledDaemon {
 	}
 
 	async advance(ms: number): Promise<void> {
-		if (!this.running) return;
-		const id = this.#nextReqId++;
-		const { promise, resolve } = Promise.withResolvers<void>();
-		this.#acks.set(id, resolve);
-		this.#proc.send({ type: "advance", id, ms });
-		await promise;
+		await this.#sendCommand(id => ({ type: "advance", id, ms }));
 	}
 
 	async fireNextLate(elapsedMs: number): Promise<void> {
-		if (!this.running) return;
-		const id = this.#nextReqId++;
-		const { promise, resolve } = Promise.withResolvers<void>();
-		this.#acks.set(id, resolve);
-		this.#proc.send({ type: "fireNextLate", id, elapsedMs });
-		await promise;
+		await this.#sendCommand(id => ({ type: "fireNextLate", id, elapsedMs }));
 	}
 
 	async dispose(): Promise<void> {
@@ -341,7 +184,17 @@ class ControlledDaemon {
 		await fs.rm(this.root, { recursive: true, force: true });
 	}
 
-	#onMessage(msg: ChildMessage): void {
+	async #sendCommand(build: (id: number) => DaemonClockCommand): Promise<void> {
+		if (!this.running) return;
+		const id = this.#nextReqId++;
+		const { promise, resolve } = Promise.withResolvers<void>();
+		this.#acks.set(id, resolve);
+		this.#proc.send(build(id));
+		await promise;
+	}
+
+	#onMessage(msg: DaemonClockEvent): void {
+		this.#refedTimers = msg.refedTimers;
 		if (msg.type === "armed") {
 			this.#armedEpoch = Math.max(this.#armedEpoch, msg.epoch);
 			for (const waiter of this.#armedWaiters) waiter();
@@ -362,6 +215,12 @@ function startControlledDaemon(idleGrace: string | undefined): Promise<Controlle
 	return ControlledDaemon.spawn(idleGrace, instance => {
 		activeDaemons.add(instance);
 	});
+}
+
+async function runAllCases<T>(items: readonly T[], run: (item: T) => Promise<void>): Promise<void> {
+	const results = await Promise.allSettled(items.map(item => run(item)));
+	const rejected = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+	if (rejected) throw rejected.reason;
 }
 
 afterEach(async () => {
@@ -425,8 +284,9 @@ describe("daemon OMP_DAEMON_IDLE_GRACE_MS", () => {
 			await daemon.waitForIdleOrExit(epochBeforeClose);
 			await daemon.advance(0);
 
-			expect(daemon.lockHeld).toBe(false);
+			expect(daemon.refedTimers).toBe(0);
 			expect(await daemon.exited).toBe(0);
+			expect(daemon.lockHeld).toBe(false);
 		},
 		TEST_TIMEOUT_MS,
 	);
@@ -434,13 +294,12 @@ describe("daemon OMP_DAEMON_IDLE_GRACE_MS", () => {
 	it(
 		"parses the base-10 parseInt prefix for unit-suffixed and fractional values",
 		async () => {
-			await Promise.all(
-				(
-					[
-						["5s", 5],
-						["2.5", 2],
-					] as const
-				).map(async ([raw, expectedMs]) => {
+			await runAllCases(
+				[
+					["5s", 5],
+					["2.5", 2],
+				] as const,
+				async ([raw, expectedMs]) => {
 					const daemon = await startControlledDaemon(raw);
 					const conn = await daemon.connect();
 					await conn.request({ op: "ping" });
@@ -449,13 +308,15 @@ describe("daemon OMP_DAEMON_IDLE_GRACE_MS", () => {
 					await daemon.waitForIdleOrExit(epochBeforeClose);
 
 					await daemon.advance(expectedMs - 1);
-					expect(daemon.lockHeld).toBe(true);
+					expect(daemon.refedTimers).toBe(1);
 					expect(daemon.running).toBe(true);
+					expect(daemon.lockHeld).toBe(true);
 
 					await daemon.advance(1);
-					expect(daemon.lockHeld).toBe(false);
+					expect(daemon.refedTimers).toBe(0);
 					expect(await daemon.exited).toBe(0);
-				}),
+					expect(daemon.lockHeld).toBe(false);
+				},
 			);
 		},
 		TEST_TIMEOUT_MS,
@@ -464,24 +325,24 @@ describe("daemon OMP_DAEMON_IDLE_GRACE_MS", () => {
 	it(
 		"falls back to the 3000ms default for empty, negative, or non-numeric values",
 		async () => {
-			await Promise.all(
-				["", "-1", "ms"].map(async invalid => {
-					const daemon = await startControlledDaemon(invalid);
-					const conn = await daemon.connect();
-					await conn.request({ op: "ping" });
-					const epochBeforeClose = daemon.armedEpoch;
-					await conn.close();
-					await daemon.waitForIdleOrExit(epochBeforeClose);
+			await runAllCases(["", "-1", "ms"], async invalid => {
+				const daemon = await startControlledDaemon(invalid);
+				const conn = await daemon.connect();
+				await conn.request({ op: "ping" });
+				const epochBeforeClose = daemon.armedEpoch;
+				await conn.close();
+				await daemon.waitForIdleOrExit(epochBeforeClose);
 
-					await daemon.advance(2_999);
-					expect(daemon.lockHeld).toBe(true);
-					expect(daemon.running).toBe(true);
+				await daemon.advance(2_999);
+				expect(daemon.refedTimers).toBe(1);
+				expect(daemon.running).toBe(true);
+				expect(daemon.lockHeld).toBe(true);
 
-					await daemon.advance(1);
-					expect(daemon.lockHeld).toBe(false);
-					expect(await daemon.exited).toBe(0);
-				}),
-			);
+				await daemon.advance(1);
+				expect(daemon.refedTimers).toBe(0);
+				expect(await daemon.exited).toBe(0);
+				expect(daemon.lockHeld).toBe(false);
+			});
 		},
 		TEST_TIMEOUT_MS,
 	);
@@ -499,8 +360,9 @@ describe("daemon OMP_DAEMON_IDLE_GRACE_MS", () => {
 			await daemon.waitForIdleOrExit(epochAfterFirst);
 
 			await daemon.advance(MAX_I32_TIMEOUT_MS);
-			expect(daemon.lockHeld).toBe(true);
+			expect(daemon.refedTimers).toBe(1);
 			expect(daemon.running).toBe(true);
+			expect(daemon.lockHeld).toBe(true);
 
 			// A returning client cancels the in-flight sleepLong; disconnecting starts a fresh grace window.
 			const second = await daemon.connect();
@@ -510,8 +372,9 @@ describe("daemon OMP_DAEMON_IDLE_GRACE_MS", () => {
 			await daemon.waitForIdleOrExit(epochAfterSecond);
 
 			await daemon.advance(graceMs - 1);
-			expect(daemon.lockHeld).toBe(true);
+			expect(daemon.refedTimers).toBe(1);
 			expect(daemon.running).toBe(true);
+			expect(daemon.lockHeld).toBe(true);
 
 			// Re-arm once more and simulate the first 32-bit timer chunk waking after the full deadline already elapsed.
 			const third = await daemon.connect();
@@ -521,8 +384,9 @@ describe("daemon OMP_DAEMON_IDLE_GRACE_MS", () => {
 			await daemon.waitForIdleOrExit(epochAfterThird);
 
 			await daemon.fireNextLate(graceMs);
-			expect(daemon.lockHeld).toBe(false);
+			expect(daemon.refedTimers).toBe(0);
 			expect(await daemon.exited).toBe(0);
+			expect(daemon.lockHeld).toBe(false);
 		},
 		TEST_TIMEOUT_MS,
 	);
