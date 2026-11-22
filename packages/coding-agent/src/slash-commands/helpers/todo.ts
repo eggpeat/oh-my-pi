@@ -1,6 +1,9 @@
 import type { Agent } from "@oh-my-pi/pi-agent-core";
-import type { TodoItem, TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
+import type { TodoItem, TodoPhase, TodoStatus } from "@oh-my-pi/pi-tui/tools/todo";
+import { prompt } from "@oh-my-pi/pi-utils";
+import userTodoEditReminderPrompt from "../../prompts/system/user-todo-edit-reminder.md" with { type: "text" };
 import type { AgentSession } from "../../session/agent-session";
+import { escapeHarnessTags } from "../../session/harness-tags";
 import type { SessionManager } from "../../session/session-manager";
 import {
 	applyOpsToPhases,
@@ -70,11 +73,13 @@ function titleCaseSentence(text: string): string {
 	return trimmed[0].toUpperCase() + trimmed.slice(1);
 }
 
-function findPhaseFuzzy(phases: TodoPhase[], query: string): TodoPhase | undefined {
-	const normalizedQuery = query.trim().toLowerCase();
+function findPhaseExact(phases: TodoPhase[], normalizedQuery: string): TodoPhase | undefined {
 	if (!normalizedQuery) return undefined;
-	const exact = phases.find(phase => phase.name.toLowerCase() === normalizedQuery);
-	if (exact) return exact;
+	return phases.find(phase => phase.name.toLowerCase() === normalizedQuery);
+}
+
+function findPhasePartial(phases: TodoPhase[], normalizedQuery: string): TodoPhase | undefined {
+	if (!normalizedQuery) return undefined;
 	const prefixMatches = phases.filter(phase => phase.name.toLowerCase().startsWith(normalizedQuery));
 	if (prefixMatches.length === 1) return prefixMatches[0];
 	const substringMatches = phases.filter(phase => phase.name.toLowerCase().includes(normalizedQuery));
@@ -82,14 +87,39 @@ function findPhaseFuzzy(phases: TodoPhase[], query: string): TodoPhase | undefin
 	return undefined;
 }
 
-function findTaskFuzzy(phases: TodoPhase[], query: string): TodoTaskMatch | undefined {
-	const normalizedQuery = query.trim().toLowerCase();
+function findPhaseFuzzy(phases: TodoPhase[], query: string): TodoPhase | undefined {
+	const rawQuery = query.trim().toLowerCase();
+	if (!rawQuery) return undefined;
+	const exactRaw = findPhaseExact(phases, rawQuery);
+	if (exactRaw) return exactRaw;
+
+	const unquotedQuery = tokenize(query).join(" ").trim().toLowerCase();
+	if (unquotedQuery && unquotedQuery !== rawQuery) {
+		const exactUnquoted = findPhaseExact(phases, unquotedQuery);
+		if (exactUnquoted) return exactUnquoted;
+	}
+
+	const partialRaw = findPhasePartial(phases, rawQuery);
+	if (partialRaw) return partialRaw;
+
+	if (unquotedQuery && unquotedQuery !== rawQuery) {
+		return findPhasePartial(phases, unquotedQuery);
+	}
+	return undefined;
+}
+
+function findTaskExact(phases: TodoPhase[], normalizedQuery: string): TodoTaskMatch | undefined {
 	if (!normalizedQuery) return undefined;
 	for (const phase of phases) {
 		for (const task of phase.tasks) {
 			if (task.content.toLowerCase() === normalizedQuery) return { task, phase };
 		}
 	}
+	return undefined;
+}
+
+function findTaskPartial(phases: TodoPhase[], normalizedQuery: string): TodoTaskMatch | undefined {
+	if (!normalizedQuery) return undefined;
 	const matches: TodoTaskMatch[] = [];
 	for (const phase of phases) {
 		for (const task of phase.tasks) {
@@ -102,6 +132,27 @@ function findTaskFuzzy(phases: TodoPhase[], query: string): TodoTaskMatch | unde
 	return undefined;
 }
 
+function findTaskFuzzy(phases: TodoPhase[], query: string): TodoTaskMatch | undefined {
+	const rawQuery = query.trim().toLowerCase();
+	if (!rawQuery) return undefined;
+	const exactRaw = findTaskExact(phases, rawQuery);
+	if (exactRaw) return exactRaw;
+
+	const unquotedQuery = tokenize(query).join(" ").trim().toLowerCase();
+	if (unquotedQuery && unquotedQuery !== rawQuery) {
+		const exactUnquoted = findTaskExact(phases, unquotedQuery);
+		if (exactUnquoted) return exactUnquoted;
+	}
+
+	const partialRaw = findTaskPartial(phases, rawQuery);
+	if (partialRaw) return partialRaw;
+
+	if (unquotedQuery && unquotedQuery !== rawQuery) {
+		return findTaskPartial(phases, unquotedQuery);
+	}
+	return undefined;
+}
+
 export function getLatestSlashTodoPhases(
 	sessionManager: Pick<SessionManager, "getBranch">,
 	session: Pick<AgentSession, "getTodoPhases">,
@@ -111,17 +162,13 @@ export function getLatestSlashTodoPhases(
 }
 
 function buildTodoSystemReminder(action: string, phases: TodoPhase[], removed = false): string {
-	const md = phases.length === 0 ? "(empty)" : phasesToMarkdown(phases).trimEnd();
-	const lines = ["<system-reminder>", `The user manually modified the todo list (${action}).`];
-	if (removed) {
-		lines.push(
-			phases.length === 0
-				? "The user intentionally cleared the todo list. Do NOT recreate or re-populate it unless the user explicitly asks; continue the current request without a todo list."
-				: "The user intentionally removed the entries no longer shown below. Do NOT re-add them unless the user explicitly asks.",
-		);
-	}
-	lines.push("Current todo list:", "", md, "</system-reminder>");
-	return lines.join("\n");
+	const checklist = phases.length === 0 ? "(empty)" : phasesToMarkdown(phases).trimEnd();
+	return prompt.render(userTodoEditReminderPrompt, {
+		action: escapeHarnessTags(action),
+		cleared: removed && phases.length === 0,
+		removed,
+		checklist: escapeHarnessTags(checklist),
+	});
 }
 
 export function commitTodoEdit(
@@ -193,8 +240,7 @@ export function planTodoAppend(current: TodoPhase[], restArgs: string): TodoComm
 export function planTodoStart(current: TodoPhase[], restArgs: string): TodoCommandMutationResult {
 	const trimmed = restArgs.trim();
 	if (!trimmed) return { ok: false, error: "Usage: /todo start <task>" };
-	const query = tokenize(trimmed).join(" ") || trimmed;
-	const hit = findTaskFuzzy(current, query);
+	const hit = findTaskFuzzy(current, trimmed);
 	if (!hit) return { ok: false, error: `No task matched "${trimmed}". Use /todo to list current tasks.` };
 	const { phases, errors } = applyOpsToPhases(current, [{ op: "start", task: hit.task.content }]);
 	if (errors.length > 0) return { ok: false, error: errors.join("; ") };
@@ -223,14 +269,14 @@ export function planTodoMutation(
 				removed: true,
 			};
 		}
-		// no-arg: apply to all. The tool refuses a bare done/drop, so every task is named.
-		const all = current.flatMap(phase => phase.tasks.map(task => task.content));
-		const { phases, errors } =
-			all.length > 0 ? applyOpsToPhases(current, [{ op: verb, task: all }]) : { phases: current, errors: [] };
-		if (errors.length > 0) return { ok: false, error: errors.join("; ") };
+		const nextStatus: TodoStatus = verb === "done" ? "completed" : "abandoned";
+		const nextPhases = current.map(phase => ({
+			name: phase.name,
+			tasks: phase.tasks.map(task => ({ content: task.content, status: nextStatus })),
+		}));
 		return {
 			ok: true,
-			nextPhases: phases,
+			nextPhases,
 			action: `/todo ${verb} (all)`,
 			status: verb === "done" ? "Marked all tasks completed." : "Marked all tasks abandoned.",
 		};
@@ -252,8 +298,10 @@ export function planTodoMutation(
 
 	const phaseHit = findPhaseFuzzy(current, trimmed);
 	if (phaseHit) {
+		const phaseIndex = current.indexOf(phaseHit);
 		const { phases, errors } = applyOpsToPhases(current, [{ op: verb, phase: phaseHit.name }]);
 		if (errors.length > 0) return { ok: false, error: errors.join("; ") };
+		const nextPhases = isRemove ? phases.filter((_, index) => index !== phaseIndex) : phases;
 		const status =
 			verb === "done"
 				? `Marked phase ${phaseHit.name} completed.`
@@ -262,7 +310,7 @@ export function planTodoMutation(
 					: `Removed phase: ${phaseHit.name}`;
 		return {
 			ok: true,
-			nextPhases: phases,
+			nextPhases,
 			action: `/todo ${verb} ${phaseHit.name}`,
 			status,
 			removed: isRemove,

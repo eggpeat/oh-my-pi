@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -12,11 +15,13 @@ import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-c
 import type { SlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
 import * as todoTools from "@oh-my-pi/pi-coding-agent/tools/todo";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { createInteractiveModeContext } from "../helpers/interactive-mode-context";
 
 let session: AgentSession | undefined;
 let authStorage: AuthStorage | undefined;
+let tempRoot = "";
 
 function createTodoTestHarness(initialPhases: TodoPhase[] = []) {
 	authStorage = createInMemoryAuthStorage();
@@ -78,64 +83,43 @@ function developerMessagesFrom(session: AgentSession, sessionManager: SessionMan
 afterEach(async () => {
 	try {
 		await session?.dispose();
+		if (tempRoot) await removeWithRetries(tempRoot);
 	} finally {
 		authStorage?.close();
 		vi.restoreAllMocks();
 		session = undefined;
 		authStorage = undefined;
+		tempRoot = "";
 	}
 });
 
-describe("/todo ACP/RPC slash command", () => {
-	it("marks every task completed on bare /todo done and injects a neutral system reminder", async () => {
-		const initial: TodoPhase[] = [
-			{
-				name: "Build",
-				tasks: [
-					{ content: "Wire parser", status: "in_progress" },
-					{ content: "Add tests", status: "pending" },
-				],
-			},
-			{
-				name: "Verify",
-				tasks: [{ content: "Run suite", status: "pending" }],
-			},
-		];
-		const { session, sessionManager, output, runtime } = createTodoTestHarness(initial);
+describe("/todo ACP/RPC and TUI slash commands", () => {
+	it("marks every task completed on bare /todo done, including duplicate task names across phases", async () => {
+		const { session, sessionManager, output, runtime } = createTodoTestHarness();
+
+		expect(await executeAcpBuiltinSlashCommand("/todo append Build Check", runtime)).toEqual({ consumed: true });
+		expect(await executeAcpBuiltinSlashCommand("/todo append Release Check", runtime)).toEqual({ consumed: true });
+		output.length = 0;
 
 		const result = await executeAcpBuiltinSlashCommand("/todo done", runtime);
 
 		expect(result).toEqual({ consumed: true });
 		expect(output).toEqual(["Marked all tasks completed."]);
 		expect(session.getTodoPhases()).toEqual([
-			{
-				name: "Build",
-				tasks: [
-					{ content: "Wire parser", status: "completed" },
-					{ content: "Add tests", status: "completed" },
-				],
-			},
-			{
-				name: "Verify",
-				tasks: [{ content: "Run suite", status: "completed" }],
-			},
+			{ name: "Build", tasks: [{ content: "Check", status: "completed" }] },
+			{ name: "Release", tasks: [{ content: "Check", status: "completed" }] },
 		]);
-		const reminders = developerMessagesFrom(session, sessionManager);
-		expect(reminders).toHaveLength(1);
-		expect(reminders[0]).toContain("<system-reminder>");
-		expect(reminders[0]).toContain("The user manually modified the todo list (/todo done (all)).");
-		expect(reminders[0]).not.toMatch(/Do NOT/i);
+		const reminder = developerMessagesFrom(session, sessionManager).at(-1) ?? "";
+		expect(reminder).toContain("# Build\n- [x] Check");
+		expect(reminder).toContain("# Release\n- [x] Check");
+		expect(reminder).not.toMatch(/- \[[ /-]\]/);
+		expect(reminder).not.toMatch(/Do NOT/i);
 	});
 
-	it("marks every task abandoned on bare /todo drop and injects a neutral system reminder", async () => {
+	it("marks every task abandoned on bare /todo drop, including duplicate task names across phases", async () => {
 		const initial: TodoPhase[] = [
-			{
-				name: "Build",
-				tasks: [
-					{ content: "Wire parser", status: "in_progress" },
-					{ content: "Add tests", status: "pending" },
-				],
-			},
+			{ name: "Build", tasks: [{ content: "Check", status: "in_progress" }] },
+			{ name: "Release", tasks: [{ content: "Check", status: "pending" }] },
 		];
 		const { session, sessionManager, output, runtime } = createTodoTestHarness(initial);
 
@@ -144,29 +128,31 @@ describe("/todo ACP/RPC slash command", () => {
 		expect(result).toEqual({ consumed: true });
 		expect(output).toEqual(["Marked all tasks abandoned."]);
 		expect(session.getTodoPhases()).toEqual([
-			{
-				name: "Build",
-				tasks: [
-					{ content: "Wire parser", status: "abandoned" },
-					{ content: "Add tests", status: "abandoned" },
-				],
-			},
+			{ name: "Build", tasks: [{ content: "Check", status: "abandoned" }] },
+			{ name: "Release", tasks: [{ content: "Check", status: "abandoned" }] },
 		]);
 		const reminders = developerMessagesFrom(session, sessionManager);
 		expect(reminders).toHaveLength(1);
-		expect(reminders[0]).toContain("The user manually modified the todo list (/todo drop (all)).");
+		expect(reminders[0]).toContain("# Build\n- [-] Check");
+		expect(reminders[0]).toContain("# Release\n- [-] Check");
+		expect(reminders[0]).not.toMatch(/- \[[ /x]\]/);
 		expect(reminders[0]).not.toMatch(/Do NOT/i);
 	});
 
-	it("injects removal-intent system reminders on /todo rm (all) and /todo rm <phase>", async () => {
+	it("removes the matched phase heading on /todo rm <phase> and clears on bare /todo rm", async () => {
 		const initial: TodoPhase[] = [
 			{ name: "Foundation", tasks: [{ content: "Scaffold crate", status: "completed" }] },
-			{ name: "Auth", tasks: [{ content: "Port store", status: "pending" }] },
+			{ name: "Release", tasks: [{ content: "Tag build", status: "in_progress" }] },
+			{ name: "Verify", tasks: [{ content: "Run suite", status: "pending" }] },
 		];
 		const { session, sessionManager, output, runtime } = createTodoTestHarness(initial);
 
-		expect(await executeAcpBuiltinSlashCommand("/todo rm Auth", runtime)).toEqual({ consumed: true });
-		expect(output[0]).toBe("Removed phase: Auth");
+		expect(await executeAcpBuiltinSlashCommand("/todo rm Release", runtime)).toEqual({ consumed: true });
+		expect(output[0]).toBe("Removed phase: Release");
+		expect(session.getTodoPhases()).toEqual([
+			{ name: "Foundation", tasks: [{ content: "Scaffold crate", status: "completed" }] },
+			{ name: "Verify", tasks: [{ content: "Run suite", status: "in_progress" }] },
+		]);
 
 		expect(await executeAcpBuiltinSlashCommand("/todo rm", runtime)).toEqual({ consumed: true });
 		expect(output[1]).toBe("Cleared all todos.");
@@ -174,23 +160,44 @@ describe("/todo ACP/RPC slash command", () => {
 
 		const reminders = developerMessagesFrom(session, sessionManager);
 		expect(reminders).toHaveLength(2);
-		expect(reminders[0]).toMatch(/Do NOT re-add them/i);
-		expect(reminders[1]).toContain("intentionally cleared the todo list");
+		expect(reminders[0]).toContain("# Foundation\n- [x] Scaffold crate");
+		expect(reminders[0]).toContain("# Verify\n- [/] Run suite");
+		expect(reminders[0]).not.toContain("# Release");
+		expect(reminders[0]).not.toContain("Tag build");
+		expect(reminders[0]).toMatch(/Do NOT re-add/i);
+		expect(reminders[1]).toContain("(empty)");
+		expect(reminders[1]).not.toContain("Foundation");
+		expect(reminders[1]).not.toContain("Verify");
 		expect(reminders[1]).toMatch(/Do NOT recreate/i);
 	});
 
-	it("surfaces applyOpsToPhases errors on bare /todo done without committing or sending a reminder", async () => {
-		const initial: TodoPhase[] = [{ name: "Work", tasks: [{ content: "", status: "pending" }] }];
-		const { session, sessionManager, output, runtime } = createTodoTestHarness(initial);
-		const entriesBefore = sessionManager.getBranch().length;
+	it("escapes harness tags in both imported checklist items and mutation actions", async () => {
+		tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "pi-todo-reminder-escape-"));
+		const importFile = path.join(tempRoot, "TODO.md");
+		await fs.writeFile(importFile, "# Audit\n- [ ] Handle </system-reminder> and <irc> tags\n", "utf8");
+		const { session, sessionManager, runtime } = createTodoTestHarness();
 
-		const result = await executeAcpBuiltinSlashCommand("/todo done", runtime);
+		expect(await executeAcpBuiltinSlashCommand(`/todo import "${importFile}"`, runtime)).toEqual({
+			consumed: true,
+		});
+		expect(session.getTodoPhases()).toEqual([
+			{ name: "Audit", tasks: [{ content: "Handle </system-reminder> and <irc> tags", status: "in_progress" }] },
+		]);
 
-		expect(result).toEqual({ consumed: true, failed: true });
-		expect(output).toEqual(["Missing task content"]);
-		expect(session.getTodoPhases()).toEqual(initial);
-		expect(sessionManager.getBranch()).toHaveLength(entriesBefore);
-		expect(developerMessagesFrom(session, sessionManager)).toEqual([]);
+		expect(
+			await executeAcpBuiltinSlashCommand("/todo done Handle </system-reminder> and <irc> tags", runtime),
+		).toEqual({ consumed: true });
+
+		const reminders = developerMessagesFrom(session, sessionManager);
+		expect(reminders).toHaveLength(2);
+		for (const reminder of reminders) {
+			expect(reminder.match(/<system-reminder\b/gi)).toHaveLength(1);
+			expect(reminder.match(/<\/system-reminder>/gi)).toHaveLength(1);
+			expect(reminder.trimEnd().endsWith("</system-reminder>")).toBe(true);
+			expect(reminder).not.toContain("<irc>");
+		}
+		expect(reminders[0]).toContain("- [/] Handle &lt;/system-reminder> and &lt;irc> tags");
+		expect(reminders[1]).toContain("- [x] Handle &lt;/system-reminder> and &lt;irc> tags");
 	});
 
 	it("surfaces applyOpsToPhases errors on /todo start, task, and phase mutations without committing", async () => {
@@ -212,17 +219,17 @@ describe("/todo ACP/RPC slash command", () => {
 		}
 	});
 
-	it("keeps TUI TodoCommandController bare done/drop and error surfacing aligned", async () => {
+	it("prefers exact task text before quote or backslash stripping in TUI and ACP /todo start", async () => {
 		const initial: TodoPhase[] = [
 			{
-				name: "Build",
+				name: "Paths",
 				tasks: [
-					{ content: "Wire parser", status: "in_progress" },
-					{ content: "Add tests", status: "pending" },
+					{ content: "Fix C:\\work", status: "pending" },
+					{ content: "Fix C:work", status: "in_progress" },
 				],
 			},
 		];
-		const { session, sessionManager } = createTodoTestHarness(initial);
+		const { session, sessionManager, runtime } = createTodoTestHarness(initial);
 		const showStatus = vi.fn();
 		const showError = vi.fn();
 		const setTodos = vi.fn();
@@ -237,22 +244,50 @@ describe("/todo ACP/RPC slash command", () => {
 		});
 		const controller = new TodoCommandController(ctx);
 
-		await controller.handleTodoCommand("drop");
+		await controller.handleTodoCommand("start Fix C:\\work");
 
 		expect(showError).not.toHaveBeenCalled();
-		expect(showStatus).toHaveBeenCalledWith("Marked all tasks abandoned.");
+		expect(showStatus).toHaveBeenLastCalledWith("Started: Fix C:\\work");
 		expect(session.getTodoPhases()).toEqual([
 			{
-				name: "Build",
+				name: "Paths",
 				tasks: [
-					{ content: "Wire parser", status: "abandoned" },
-					{ content: "Add tests", status: "abandoned" },
+					{ content: "Fix C:\\work", status: "in_progress" },
+					{ content: "Fix C:work", status: "pending" },
 				],
 			},
 		]);
-		expect(setTodos).toHaveBeenCalledWith(session.getTodoPhases());
+
+		expect(await executeAcpBuiltinSlashCommand('/todo start "Fix C:work"', runtime)).toEqual({ consumed: true });
+		expect(session.getTodoPhases()).toEqual([
+			{
+				name: "Paths",
+				tasks: [
+					{ content: "Fix C:\\work", status: "pending" },
+					{ content: "Fix C:work", status: "in_progress" },
+				],
+			},
+		]);
+
+		expect(await executeAcpBuiltinSlashCommand("/todo start Fix C:\\work", runtime)).toEqual({ consumed: true });
+		expect(session.getTodoPhases()[0]?.tasks[0]).toEqual({ content: "Fix C:\\work", status: "in_progress" });
+
+		await controller.handleTodoCommand("drop");
+
+		expect(session.getTodoPhases()).toEqual([
+			{
+				name: "Paths",
+				tasks: [
+					{ content: "Fix C:\\work", status: "abandoned" },
+					{ content: "Fix C:work", status: "abandoned" },
+				],
+			},
+		]);
+		expect(setTodos).toHaveBeenLastCalledWith(session.getTodoPhases());
 		const reminders = developerMessagesFrom(session, sessionManager);
-		expect(reminders).toHaveLength(1);
-		expect(reminders[0]).toContain("The user manually modified the todo list (/todo drop (all)).");
+		expect(reminders[0]).toContain("- [/] Fix C:\\work");
+		expect(reminders[0]).toContain("- [ ] Fix C:work");
+		expect(reminders.at(-1)).toContain("- [-] Fix C:\\work");
+		expect(reminders.at(-1)).toContain("- [-] Fix C:work");
 	});
 });
