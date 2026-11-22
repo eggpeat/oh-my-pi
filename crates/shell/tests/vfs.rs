@@ -607,6 +607,95 @@ async fn omp_receives_its_url_arguments_as_written() {
 	assert_eq!(run.stdout.lines().collect::<Vec<_>>(), expected);
 }
 
+/// Only the command word, or the command a wrapper runs, is `omp`: an
+/// argument spelled `omp` (`grep omp …`, `ls ./omp …`) or a wrapper's option
+/// value (`npx --cache omp …`) is not the program and does not stop the URL
+/// rewrite. A wrapper's own file argument still resolves, while the command
+/// it runs keeps its URLs as written.
+#[cfg(unix)]
+#[tokio::test]
+async fn only_the_command_named_omp_receives_urls_as_written() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let directory = tempfile::tempdir().expect("isolated provider filesystem");
+	let docs = directory.path().join("docs");
+	fs::create_dir(&docs).expect("provider directory");
+	fs::write(docs.join("a.txt"), b"alpha\n").expect("document");
+	let bin = tempfile::tempdir().expect("program directory");
+	for name in ["omp", "npx", "npm", "uv", "bunx", "setsid"] {
+		let path = bin.path().join(name);
+		fs::write(&path, b"#!/bin/sh\nprintf '%s\\n' \"$@\"\n").expect("stand-in program");
+		fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("executable stand-in");
+	}
+	let script = format!(
+		"PATH='{bin}':$PATH; {PROBE} omp virtual://docs/a.txt; nice {PROBE} omp \
+		 virtual://docs/a.txt; env {PROBE} omp virtual://docs/a.txt; env -u LEAF {PROBE} omp \
+		 virtual://docs/a.txt; env -- -flag=/opt/omp {PROBE} arg virtual://docs/a.txt; npx --cache \
+		 omp grep virtual://docs/a.txt; npx --loglevel warn omp read virtual://docs/a.txt; npm \
+		 --prefix tools exec -- omp read virtual://docs/a.txt; npm exec -p omp read \
+		 virtual://docs/a.txt; uv run -w requests omp read virtual://docs/a.txt; bunx \
+		 --minimum-release-age 86400 omp read virtual://docs/a.txt; setsid omp read \
+		 virtual://docs/a.txt; setsid grep virtual://docs/a.txt; npx --cache virtual://docs omp \
+		 read virtual://docs/a.txt",
+		bin = bin.path().display(),
+	);
+	let run = run_virtual(directory.path(), &script).await;
+	assert_eq!(run.status, Some(0), "{}", run.stderr);
+	let file = docs.join("a.txt").display().to_string();
+	let dir = docs.display().to_string();
+	let raw = "virtual://docs/a.txt";
+	let expected = [
+		format!("omp:{file}"),
+		format!("omp:{file}"),
+		format!("omp:{file}"),
+		format!("omp:{file}"),
+		format!("arg:{file}"),
+		"--cache".to_owned(),
+		"omp".to_owned(),
+		"grep".to_owned(),
+		file.clone(),
+		"--loglevel".to_owned(),
+		"warn".to_owned(),
+		"omp".to_owned(),
+		"read".to_owned(),
+		raw.to_owned(),
+		"--prefix".to_owned(),
+		"tools".to_owned(),
+		"exec".to_owned(),
+		"--".to_owned(),
+		"omp".to_owned(),
+		"read".to_owned(),
+		raw.to_owned(),
+		"exec".to_owned(),
+		"-p".to_owned(),
+		"omp".to_owned(),
+		"read".to_owned(),
+		raw.to_owned(),
+		"run".to_owned(),
+		"-w".to_owned(),
+		"requests".to_owned(),
+		"omp".to_owned(),
+		"read".to_owned(),
+		raw.to_owned(),
+		"--minimum-release-age".to_owned(),
+		"86400".to_owned(),
+		"omp".to_owned(),
+		"read".to_owned(),
+		raw.to_owned(),
+		"omp".to_owned(),
+		"read".to_owned(),
+		raw.to_owned(),
+		"grep".to_owned(),
+		file.clone(),
+		"--cache".to_owned(),
+		dir,
+		"omp".to_owned(),
+		"read".to_owned(),
+		raw.to_owned(),
+	];
+	assert_eq!(run.stdout.lines().collect::<Vec<_>>(), expected);
+}
+
 /// A provider directory that aliases a real one is a usable working directory
 /// for a child process, and the `PWD` the child inherits names that same host
 /// directory rather than the URL it cannot open; one that aliases nothing is

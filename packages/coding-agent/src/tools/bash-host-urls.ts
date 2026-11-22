@@ -15,7 +15,7 @@ import * as fs from "node:fs/promises";
 import { ShellFsOp } from "@oh-my-pi/pi-natives";
 import { isCmdShell } from "@oh-my-pi/pi-utils/procmgr";
 import type { InternalUrlFilesystem } from "../internal-urls/url-filesystem";
-import { lexShellCommand } from "./shell-tokenize";
+import { lexShellCommand, type ShellToken } from "./shell-tokenize";
 
 /** The host path backing `url`, or `undefined` when nothing backs it or it cannot be resolved. */
 export type UrlBacking = (url: string) => Promise<string | undefined>;
@@ -60,8 +60,251 @@ function urlStart(text: string): number | undefined {
 
 /** Whether `word` names the `omp` program, by any path. */
 function isOmp(word: string): boolean {
-	const name = word.slice(Math.max(word.lastIndexOf("/"), word.lastIndexOf("\\")) + 1).toLowerCase();
+	const name = programName(word).toLowerCase();
 	return name === "omp" || name === "omp.exe";
+}
+
+/** The last path segment of `word`: the program's name. */
+function programName(word: string): string {
+	return word.slice(Math.max(word.lastIndexOf("/"), word.lastIndexOf("\\")) + 1);
+}
+
+/** `NAME=value`, as a simple command or a wrapper's options take before the command. */
+const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+/** Options that take the next word as their value: short letters and long names. */
+interface OptionValues {
+	short: string;
+	long: readonly string[];
+}
+
+const NICE: OptionValues = { short: "n", long: ["adjustment"] };
+const NOHUP: OptionValues = { short: "", long: [] };
+const TIME: OptionValues = { short: "of", long: ["output", "format"] };
+const ENV: OptionValues = { short: "uCS", long: ["unset", "chdir", "split-string"] };
+const SUDO: OptionValues = {
+	short: "ugCDhpRrTtUa",
+	long: [
+		"user",
+		"group",
+		"close-from",
+		"chdir",
+		"host",
+		"prompt",
+		"chroot",
+		"role",
+		"type",
+		"command-timeout",
+		"other-user",
+		"auth-type",
+	],
+};
+const DOAS: OptionValues = { short: "uC", long: ["user", "config"] };
+const TIMEOUT: OptionValues = { short: "sk", long: ["signal", "kill-after"] };
+const STDBUF: OptionValues = { short: "ioe", long: ["input", "output", "error"] };
+const SETSID: OptionValues = { short: "", long: [] };
+const XARGS: OptionValues = {
+	short: "nILPsdEa",
+	long: [
+		"max-args",
+		"replace",
+		"max-lines",
+		"max-procs",
+		"max-chars",
+		"delimiter",
+		"eof",
+		"arg-file",
+		"process-slot-var",
+	],
+};
+const IFNE: OptionValues = { short: "", long: [] };
+const NPX: OptionValues = {
+	short: "pc",
+	long: [
+		"cache",
+		"prefix",
+		"registry",
+		"userconfig",
+		"package",
+		"call",
+		"node-options",
+		"shell",
+		"loglevel",
+		"log-level",
+		"npm",
+		"workspace",
+	],
+};
+const BUNX: OptionValues = {
+	short: "p",
+	long: ["package", "registry", "cache-dir", "minimum-release-age", "cwd", "env-file"],
+};
+const NPM_GLOBAL: OptionValues = {
+	short: "w",
+	long: [
+		"prefix",
+		"registry",
+		"userconfig",
+		"cache",
+		"loglevel",
+		"log-level",
+		"workspace",
+		"location",
+		"tag",
+		"otp",
+		"before",
+		"script-shell",
+	],
+};
+const NPM_EXEC: OptionValues = { short: "cw", long: ["package", "call", "workspace", "prefix"] };
+const UV_GLOBAL: OptionValues = { short: "", long: ["directory", "project", "config-file", "cache-dir"] };
+const UV_RUN: OptionValues = {
+	short: "wpif",
+	long: [
+		"with",
+		"with-editable",
+		"with-requirements",
+		"python",
+		"package",
+		"project",
+		"directory",
+		"env-file",
+		"extra",
+		"group",
+		"only-group",
+		"no-group",
+		"index",
+		"default-index",
+		"index-url",
+		"extra-index-url",
+		"find-links",
+		"config-file",
+		"cache-dir",
+	],
+};
+const SSH: OptionValues = { short: "BbcDEeFIiJLlmOoPpQRSWw", long: [] };
+const COMMAND: OptionValues = { short: "", long: [] };
+const EXEC: OptionValues = { short: "a", long: [] };
+const FIND_EXEC = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
+
+/**
+ * Index of the word naming the `omp` command, past any wrapper (`nice omp …`,
+ * `npx omp …`) and the options and assignments before it. A word spelled
+ * `omp` anywhere else (`grep omp …`) is an argument, not the program.
+ */
+function ompCommand(words: readonly string[]): number | undefined {
+	let at = 0;
+	for (;;) {
+		while (at < words.length && ASSIGNMENT.test(words[at])) at++;
+		const word = words[at];
+		if (word === undefined) return undefined;
+		if (isOmp(word)) return at;
+		const next = wrapperCommand(words, at);
+		if (next === undefined) return undefined;
+		at = next;
+	}
+}
+
+/** The index of the command word a wrapper at `at` runs, or `undefined` when it is no wrapper. */
+function wrapperCommand(words: readonly string[], at: number): number | undefined {
+	const after = (values: OptionValues) => afterOptions(words, at + 1, values);
+	const command = (next: number) => (next > at && next < words.length ? next : undefined);
+	switch (programName(words[at])) {
+		case "nice":
+			return command(after(NICE));
+		case "nohup":
+			return command(after(NOHUP));
+		case "time":
+			return command(after(TIME));
+		case "env": {
+			// `env` takes `NAME=value` settings after its options; coreutils
+			// does not validate the name, and a lone `-` is a setting too.
+			const options = afterOptions(words, at + 1, ENV, true);
+			return command(skipWords(words, options, word => word === "-" || word.includes("=")));
+		}
+		case "sudo":
+			return command(skipWords(words, after(SUDO), word => ASSIGNMENT.test(word)));
+		case "doas":
+			return command(skipWords(words, after(DOAS), word => ASSIGNMENT.test(word)));
+		case "timeout":
+		case "gtimeout":
+			return command(after(TIMEOUT) + 1);
+		case "stdbuf":
+			return command(after(STDBUF));
+		case "setsid":
+			return command(after(SETSID));
+		case "xargs":
+			return command(after(XARGS));
+		case "ifne":
+			return command(after(IFNE));
+		case "npx":
+			return command(after(NPX));
+		case "bunx":
+			return command(after(BUNX));
+		case "npm": {
+			const sub = afterOptions(words, at + 1, NPM_GLOBAL);
+			if (words[sub] !== "exec" && words[sub] !== "x") return undefined;
+			return command(afterOptions(words, sub + 1, NPM_EXEC));
+		}
+		case "uv": {
+			const sub = afterOptions(words, at + 1, UV_GLOBAL);
+			if (words[sub] !== "run") return undefined;
+			return command(afterOptions(words, sub + 1, UV_RUN));
+		}
+		case "ssh":
+			return command(after(SSH) + 1);
+		case "command": {
+			const next = after(COMMAND);
+			const namesOnly = words.slice(at + 1, next).some(word => /^-[^-]/.test(word) && /[vV]/.test(word));
+			return namesOnly ? undefined : command(next);
+		}
+		case "exec":
+			return command(after(EXEC));
+		case "find": {
+			const exec = words.findIndex((word, index) => index > at && FIND_EXEC.has(word));
+			return exec < 0 ? undefined : command(exec + 1);
+		}
+		default:
+			return undefined;
+	}
+}
+
+/** The first word from `from` on that is not an option (`--` ends them). */
+function afterOptions(words: readonly string[], from: number, values: OptionValues, dash = false): number {
+	let at = from;
+	while (at < words.length) {
+		const word = words[at];
+		if (word === "--") return at + 1;
+		if (word === "-") {
+			if (dash) {
+				at++;
+				continue;
+			}
+			return at;
+		}
+		if (!word.startsWith("-")) return at;
+		at += optionWords(word, values);
+	}
+	return at;
+}
+
+/** The words one option occupies: its own, plus the next when its value is not attached. */
+function optionWords(word: string, values: OptionValues): number {
+	if (word.startsWith("--")) {
+		if (word.includes("=")) return 1;
+		return values.long.includes(word.slice(2)) ? 2 : 1;
+	}
+	for (let i = 1; i < word.length; i++) {
+		if (values.short.includes(word[i])) return i + 1 < word.length ? 1 : 2;
+	}
+	return 1;
+}
+
+/** The first word from `from` on that `skip` rejects. */
+function skipWords(words: readonly string[], from: number, skip: (word: string) => boolean): number {
+	let at = from;
+	while (at < words.length && skip(words[at])) at++;
+	return at;
 }
 
 /** `text` as one literal shell word. */
@@ -141,27 +384,31 @@ class HostUrls {
 	/** Command text without here-document bodies, word by word. */
 	async #code(text: string): Promise<string> {
 		if (!text.includes("://")) return text;
-		let out = "";
-		// `omp` resolves the URLs it is given itself (`omp read skill://x:1-20`): once a command
-		// names it ahead of any URL, the rest of that command is its own.
-		let omp = false;
-		let sawUrl = false;
+		const segments: ShellToken[][] = [];
+		let segment: ShellToken[] = [];
 		for (const token of lexShellCommand(text)) {
-			if (token.kind === "separator") {
-				if (/[\n;&|()]/.test(token.raw)) {
-					omp = false;
-					sawUrl = false;
+			segment.push(token);
+			if (token.kind === "separator" && /[\n;&|()]/.test(token.raw)) {
+				segments.push(segment);
+				segment = [];
+			}
+		}
+		if (segment.length > 0) segments.push(segment);
+		let out = "";
+		for (const tokens of segments) {
+			// `omp` resolves the URLs it is given itself (`omp read skill://x:1-20`):
+			// its own command's arguments are its own, while a wrapper's arguments
+			// (`npx --cache local://dir omp …`) still name host files.
+			const omp = ompCommand(tokens.flatMap(token => (token.kind === "word" ? [token.value] : [])));
+			let word = 0;
+			for (const token of tokens) {
+				if (token.kind === "separator") {
+					out += token.raw;
+					continue;
 				}
-				out += token.raw;
-				continue;
+				out += omp !== undefined && word >= omp ? token.raw : await this.#word(token.raw, token.value);
+				word++;
 			}
-			if (!token.value.includes("://")) {
-				omp ||= !sawUrl && isOmp(token.value);
-				out += token.raw;
-				continue;
-			}
-			sawUrl = true;
-			out += omp ? token.raw : await this.#word(token.raw, token.value);
 		}
 		return out;
 	}

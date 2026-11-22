@@ -11,8 +11,9 @@
 //! `log.sh 'agent://A; agent://B'`) as it is handed a path. Only a program
 //! or working directory the provider rejects fails the spawn, since nothing
 //! could run there. `omp` resolves the URLs it is given itself (with their
-//! selectors: `omp read skill://x:1-20`), so its arguments and environment
-//! are never rewritten.
+//! selectors: `omp read skill://x:1-20`), so the arguments it is given are
+//! never rewritten; a wrapper's own arguments (`npx --cache local://dir omp
+//! …`) still are.
 //!
 //! A spawn that names a URL is taken apart ([`split`]) into the [`Names`] to
 //! resolve and the [`Rest`] it moves untouched; the provider is awaited
@@ -99,31 +100,316 @@ impl Rest {
 
 /// Whether `spec` names a URL (program, working directory, an argument
 /// containing `://`, or an environment value that is one): then it resolves
-/// first, else it spawns as it is.
+/// first, else it spawns as it is. A URL `omp` resolves itself is left for
+/// it, but a wrapper's own arguments (`npx --cache local://dir omp …`) still
+/// resolve.
 pub(super) fn names_url(spec: &SpawnSpec<'_>) -> bool {
+	let omp = omp_command(spec.argv);
 	is_url(spec.path)
 		|| is_url(spec.cwd)
-		|| (!runs_omp(spec.argv)
-			&& (spec.argv.iter().skip(1).any(|arg| arg.contains_str("://"))
-				|| spec.env.iter().any(|(name, value)| env_url(name, value))))
+		|| spec
+			.argv
+			.iter()
+			.enumerate()
+			.skip(1)
+			.any(|(i, arg)| arg.contains_str("://") && omp.is_none_or(|at| i < at))
+		|| (omp.is_none() && spec.env.iter().any(|(name, value)| env_url(name, value)))
 }
 
-/// Whether `argv` runs `omp`: as the program, or as the command a wrapper
-/// (`nice omp …`, `npx omp …`) is given ahead of any URL.
-fn runs_omp(argv: &[BString]) -> bool {
-	argv
-		.iter()
-		.take_while(|arg| !arg.contains_str("://"))
-		.any(|arg| is_omp(arg))
+/// The index of the word naming `omp` in `argv`: the program itself, or the
+/// command a wrapper (`nice omp …`, `npx omp …`) runs after its options and
+/// assignments. A word spelled `omp` anywhere else (`grep omp …`, `ls ./omp
+/// …`) is an argument, not the program.
+fn omp_command(argv: &[BString]) -> Option<usize> {
+	let mut at = 0;
+	loop {
+		while argv.get(at).is_some_and(|word| is_assignment(word)) {
+			at += 1;
+		}
+		let word = argv.get(at)?;
+		if is_omp(word) {
+			return Some(at);
+		}
+		at = wrapper_command(argv, at)?;
+	}
 }
 
 /// Whether `word` names the `omp` program, by any path.
 fn is_omp(word: &[u8]) -> bool {
-	let name = word
+	let name = program_name(word);
+	name == b"omp" || (cfg!(windows) && name.eq_ignore_ascii_case(b"omp.exe"))
+}
+
+/// The last path segment of `word`: the program's name.
+fn program_name(word: &[u8]) -> &[u8] {
+	word
 		.rsplit(|&b| b == b'/' || (cfg!(windows) && b == b'\\'))
 		.next()
-		.unwrap_or(word);
-	name == b"omp" || (cfg!(windows) && name.eq_ignore_ascii_case(b"omp.exe"))
+		.unwrap_or(word)
+}
+
+/// `NAME=value`, as `env` and `sudo` take before the command they run.
+fn is_assignment(word: &[u8]) -> bool {
+	word.split_once_str("=").is_some_and(|(name, _)| {
+		name
+			.first()
+			.is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+			&& name.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+	})
+}
+
+/// Options that take the next word as their value: short option letters and
+/// long option names. An attached value (`-n5`, `--name=value`) needs no
+/// separate word.
+#[derive(Clone, Copy)]
+struct OptionValues {
+	short: &'static [u8],
+	long:  &'static [&'static str],
+}
+
+const NICE: OptionValues = OptionValues { short: b"n", long: &["adjustment"] };
+const NOHUP: OptionValues = OptionValues { short: b"", long: &[] };
+const TIME: OptionValues = OptionValues { short: b"of", long: &["output", "format"] };
+const ENV: OptionValues =
+	OptionValues { short: b"uCS", long: &["unset", "chdir", "split-string"] };
+const SUDO: OptionValues = OptionValues {
+	short: b"ugCDhpRrTtUa",
+	long:  &[
+		"user",
+		"group",
+		"close-from",
+		"chdir",
+		"host",
+		"prompt",
+		"chroot",
+		"role",
+		"type",
+		"command-timeout",
+		"other-user",
+		"auth-type",
+	],
+};
+const DOAS: OptionValues = OptionValues { short: b"uC", long: &["user", "config"] };
+const TIMEOUT: OptionValues = OptionValues { short: b"sk", long: &["signal", "kill-after"] };
+const STDBUF: OptionValues = OptionValues { short: b"ioe", long: &["input", "output", "error"] };
+const SETSID: OptionValues = OptionValues { short: b"", long: &[] };
+const XARGS: OptionValues = OptionValues {
+	short: b"nILPsdEa",
+	long:  &[
+		"max-args",
+		"replace",
+		"max-lines",
+		"max-procs",
+		"max-chars",
+		"delimiter",
+		"eof",
+		"arg-file",
+		"process-slot-var",
+	],
+};
+const IFNE: OptionValues = OptionValues { short: b"", long: &[] };
+const NPX: OptionValues = OptionValues {
+	short: b"pc",
+	long:  &[
+		"cache",
+		"prefix",
+		"registry",
+		"userconfig",
+		"package",
+		"call",
+		"node-options",
+		"shell",
+		"loglevel",
+		"log-level",
+		"npm",
+		"workspace",
+	],
+};
+const BUNX: OptionValues = OptionValues {
+	short: b"p",
+	long:  &["package", "registry", "cache-dir", "minimum-release-age", "cwd", "env-file"],
+};
+const NPM_GLOBAL: OptionValues = OptionValues {
+	short: b"w",
+	long:  &[
+		"prefix",
+		"registry",
+		"userconfig",
+		"cache",
+		"loglevel",
+		"log-level",
+		"workspace",
+		"location",
+		"tag",
+		"otp",
+		"before",
+		"script-shell",
+	],
+};
+const NPM_EXEC: OptionValues =
+	OptionValues { short: b"cw", long: &["package", "call", "workspace", "prefix"] };
+const UV_GLOBAL: OptionValues =
+	OptionValues { short: b"", long: &["directory", "project", "config-file", "cache-dir"] };
+const UV_RUN: OptionValues = OptionValues {
+	short: b"wpif",
+	long:  &[
+		"with",
+		"with-editable",
+		"with-requirements",
+		"python",
+		"package",
+		"project",
+		"directory",
+		"env-file",
+		"extra",
+		"group",
+		"only-group",
+		"no-group",
+		"index",
+		"default-index",
+		"index-url",
+		"extra-index-url",
+		"find-links",
+		"config-file",
+		"cache-dir",
+	],
+};
+const SSH: OptionValues = OptionValues { short: b"BbcDEeFIiJLlmOoPpQRSWw", long: &[] };
+const COMMAND: OptionValues = OptionValues { short: b"", long: &[] };
+const EXEC: OptionValues = OptionValues { short: b"a", long: &[] };
+
+/// The index of the command word `argv[at]` runs as a wrapper, or `None`
+/// when it is not a known wrapper or names no command.
+fn wrapper_command(argv: &[BString], at: usize) -> Option<usize> {
+	let name = program_name(argv.get(at)?.as_bytes());
+	let next = match name {
+		b"nice" => after_options(argv, at + 1, NICE, false),
+		b"nohup" => after_options(argv, at + 1, NOHUP, false),
+		b"time" => after_options(argv, at + 1, TIME, false),
+		b"env" => {
+			let options = after_options(argv, at + 1, ENV, true);
+			// `env` takes `NAME=value` settings after its options; coreutils
+			// does not validate the name, and a lone `-` is a setting too.
+			skip_words(argv, options, |word| word == b"-".as_slice() || word.contains_str("="))
+		},
+		b"sudo" => {
+			let options = after_options(argv, at + 1, SUDO, false);
+			skip_words(argv, options, is_assignment)
+		},
+		b"doas" => {
+			let options = after_options(argv, at + 1, DOAS, false);
+			skip_words(argv, options, is_assignment)
+		},
+		b"timeout" | b"gtimeout" => after_options(argv, at + 1, TIMEOUT, false) + 1,
+		b"stdbuf" => after_options(argv, at + 1, STDBUF, false),
+		b"setsid" => after_options(argv, at + 1, SETSID, false),
+		b"xargs" => after_options(argv, at + 1, XARGS, false),
+		b"ifne" => after_options(argv, at + 1, IFNE, false),
+		b"npx" => after_options(argv, at + 1, NPX, false),
+		b"bunx" => after_options(argv, at + 1, BUNX, false),
+		b"npm" => npm_command(argv, at)?,
+		b"uv" => uv_command(argv, at)?,
+		b"ssh" => after_options(argv, at + 1, SSH, false) + 1,
+		b"command" => command_builtin(argv, at)?,
+		b"exec" => after_options(argv, at + 1, EXEC, false),
+		b"find" => find_command(argv, at + 1)?,
+		_ => return None,
+	};
+	(next > at && next < argv.len()).then_some(next)
+}
+
+/// The first word from `from` on that is not an option (`--` ends them); a
+/// value-taking option also skips the word after it. With `dash`, a lone `-`
+/// is an option rather than a command (`env - omp …`).
+fn after_options(argv: &[BString], mut at: usize, values: OptionValues, dash: bool) -> usize {
+	while let Some(word) = argv.get(at) {
+		let word = word.as_bytes();
+		if word == b"--" {
+			return at + 1;
+		}
+		if word == b"-" {
+			if dash {
+				at += 1;
+				continue;
+			}
+			return at;
+		}
+		if !word.starts_with(b"-") {
+			return at;
+		}
+		at += option_words(word, values);
+	}
+	at
+}
+
+/// The words one option occupies: its own, plus the next when its value is
+/// not attached (`-n 5`, `--name value`).
+fn option_words(word: &[u8], values: OptionValues) -> usize {
+	if let Some(long) = word.strip_prefix(b"--") {
+		if long.contains(&b'=') {
+			return 1;
+		}
+		return if values.long.iter().any(|name| name.as_bytes() == long) {
+			2
+		} else {
+			1
+		};
+	}
+	for (i, &letter) in word.iter().enumerate().skip(1) {
+		if values.short.contains(&letter) {
+			return if i + 1 < word.len() { 1 } else { 2 };
+		}
+	}
+	1
+}
+
+/// The first word from `from` on that `skip` rejects.
+fn skip_words(argv: &[BString], mut at: usize, mut skip: impl FnMut(&[u8]) -> bool) -> usize {
+	while argv.get(at).is_some_and(|word| skip(word.as_bytes())) {
+		at += 1;
+	}
+	at
+}
+
+/// `npm [options] exec [options] command`: only `exec`/`x` run a command.
+fn npm_command(argv: &[BString], at: usize) -> Option<usize> {
+	let sub = after_options(argv, at + 1, NPM_GLOBAL, false);
+	let word = argv.get(sub)?.as_bytes();
+	if word != b"exec" && word != b"x" {
+		return None;
+	}
+	Some(after_options(argv, sub + 1, NPM_EXEC, false))
+}
+
+/// `uv [options] run [options] command`.
+fn uv_command(argv: &[BString], at: usize) -> Option<usize> {
+	let sub = after_options(argv, at + 1, UV_GLOBAL, false);
+	if argv.get(sub)?.as_bytes() != b"run" {
+		return None;
+	}
+	Some(after_options(argv, sub + 1, UV_RUN, false))
+}
+
+/// `command [-p] [-v|-V] command`: `-v`/`-V` name a command instead of
+/// running it, so nothing is executed.
+fn command_builtin(argv: &[BString], at: usize) -> Option<usize> {
+	let next = after_options(argv, at + 1, COMMAND, false);
+	let names_only = argv.get(at + 1..next)?.iter().any(|word| {
+		let word = word.as_bytes();
+		word.starts_with(b"-") && word[1..].iter().any(|&b| b == b'v' || b == b'V')
+	});
+	(!names_only).then_some(next)
+}
+
+/// `find … -exec command …`: the first `-exec`/`-execdir`/`-ok`/`-okdir`
+/// names the command find runs.
+fn find_command(argv: &[BString], from: usize) -> Option<usize> {
+	argv
+		.iter()
+		.enumerate()
+		.skip(from)
+		.find(|(_, word)| matches!(word.as_bytes(), b"-exec" | b"-execdir" | b"-ok" | b"-okdir"))
+		.map(|(i, _)| i + 1)
 }
 
 /// Whether the environment variable `name` holds a URL to resolve. `PWD`
@@ -238,19 +524,22 @@ pub(super) async fn resolve(fs: &omp_vfs::Fs, names: &Names) -> io::Result<Names
 		},
 		_ => names.path.clone(),
 	};
-	let literal = runs_omp(&names.argv);
+	let omp = omp_command(&names.argv);
 	let mut argv = Vec::with_capacity(names.argv.len());
 	for (i, arg) in names.argv.iter().enumerate() {
-		let host = if i == 0 || literal {
+		// The program is resolved above; `omp` resolves the arguments it is
+		// given itself, while a wrapper's own arguments are still ours.
+		let host = if i == 0 || omp.is_some_and(|at| i >= at) {
 			None
 		} else {
 			host_arg(fs, arg.as_bstr()).await
 		};
 		argv.push(host.unwrap_or_else(|| arg.clone()));
 	}
-	// What the child's environment says differently from the shell's.
+	// What the child's environment says differently from the shell's. `omp`
+	// resolves the URLs in its own environment.
 	let mut hosted: Vec<(BString, BString)> = Vec::new();
-	if !literal {
+	if omp.is_none() {
 		for (name, value) in names.env.iter() {
 			if env_url(name, value)
 				&& let Some(host) = host_arg(fs, value).await

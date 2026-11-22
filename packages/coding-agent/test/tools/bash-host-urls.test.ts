@@ -86,6 +86,43 @@ describe("hostCommandUrls", () => {
 		);
 	});
 
+	it("treats omp as the program, not an argument or a wrapper's value", async () => {
+		for (const [command, expected] of [
+			["grep omp local://out.txt", "grep omp /host/out.txt"],
+			["rg -n 'omp' local://x.md", "rg -n 'omp' /host/x.md"],
+			["ls ./omp local://dir", "ls ./omp /host/dir"],
+			["omp read local://x.md", "omp read local://x.md"],
+			["nice omp read local://x.md", "nice omp read local://x.md"],
+			["sudo /usr/local/bin/omp read local://x.md", "sudo /usr/local/bin/omp read local://x.md"],
+			["nice env omp read local://x.md", "nice env omp read local://x.md"],
+			["time omp read local://x.md", "time omp read local://x.md"],
+			["command omp read local://x.md", "command omp read local://x.md"],
+			["npx --cache omp eslint local://app.ts", "npx --cache omp eslint /host/app.ts"],
+			["npx --loglevel warn omp read local://x:1", "npx --loglevel warn omp read local://x:1"],
+			["npx -p omp eslint local://app.ts", "npx -p omp eslint /host/app.ts"],
+			["npm --prefix tools exec -- omp read local://x", "npm --prefix tools exec -- omp read local://x"],
+			["npm exec -p omp read local://x", "npm exec -p omp read local://x"],
+			["uv run -w requests omp read local://book:1", "uv run -w requests omp read local://book:1"],
+			[
+				"bunx --minimum-release-age 86400 omp read local://book:1",
+				"bunx --minimum-release-age 86400 omp read local://book:1",
+			],
+			["env - omp read local://x", "env - omp read local://x"],
+			["env -- -flag=/opt/omp grep x local://file", "env -- -flag=/opt/omp grep x /host/file"],
+			["setsid omp read local://x", "setsid omp read local://x"],
+			["setsid grep x local://file", "setsid grep x /host/file"],
+			["xargs omp read local://x", "xargs omp read local://x"],
+			["ifne omp read local://x", "ifne omp read local://x"],
+			["ssh server omp read local://x", "ssh server omp read local://x"],
+			["ssh -F local://conf server omp read local://x", "ssh -F /host/conf server omp read local://x"],
+			["find local://dir -exec omp read local://x \\;", "find /host/dir -exec omp read local://x \\;"],
+			// A wrapper's own file argument resolves; the command it runs keeps its URLs.
+			["npx --cache local://cache omp read local://book:1", "npx --cache /host/cache omp read local://book:1"],
+		] as const) {
+			expect(await host(command)).toBe(expected);
+		}
+	});
+
 	it("treats a here-document body as input, not command text", async () => {
 		const command = [
 			"python3 - local://args.json <<'PY' && cat local://after.txt",
