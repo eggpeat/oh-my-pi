@@ -3040,6 +3040,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				evalActive: toolRegistry.has("eval") && activeToolNames.has("eval"),
 			}),
 			extensionRoots: buildSessionExtensionRoots(),
+			settings,
 		};
 		if (enableMCP && !mcpManager && isMainThread()) {
 			if (deferMCPDiscoveryForUI) {

@@ -3,6 +3,7 @@
  *
  * Integrates MCP tool discovery with the custom tools system.
  */
+import type { Settings } from "../config/settings";
 import type { LoadedCustomTool } from "../extensibility/custom-tools/types";
 import type { AuthStorage } from "../session/auth-storage";
 import { type MCPLoadResult, MCPManager } from "./manager";
@@ -37,6 +38,8 @@ export interface MCPToolsLoadOptions {
 	filterBrowser?: boolean;
 	/** What the session offers natively, for built-in transforms; omitted: none applies. */
 	builtinTransforms?: MCPTransformContext;
+	/** Settings scope for the Exa fold's `providers.webKeyless` read (default: the global settings). */
+	settings?: Settings;
 	/** Linger of an unused shared server in milliseconds (`mcp.idleStopMinutes`); the manager default when absent. */
 	idleStopMs?: number;
 	/** Auth storage used to resolve OAuth credentials before initial MCP connect */
@@ -65,6 +68,7 @@ export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoa
 			filterExa: options?.filterExa,
 			filterBrowser: options?.filterBrowser,
 			builtinTransforms: options?.builtinTransforms,
+			settings: options?.settings,
 		});
 	} catch (error) {
 		// If discovery fails entirely, return empty result

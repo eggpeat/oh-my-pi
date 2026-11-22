@@ -61,6 +61,7 @@ export function createExtensionDashboardRuntime(options: {
 					enableProjectConfig: cfgMcpEnableProjectConfig.get(settings),
 					filterExa: true,
 					filterBrowser: browserMcpFilterEnabled?.() ?? false,
+					settings,
 				},
 				onStatus: event => eventBus?.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, event),
 			}),

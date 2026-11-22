@@ -7,6 +7,7 @@
 import type { TSchema } from "@oh-my-pi/pi-ai";
 import { logger, untilAborted } from "@oh-my-pi/pi-utils";
 import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
+import type { Settings } from "../config/settings";
 import { invalidateCommandConfig, isCommandConfigValue, resolveConfigValue } from "../config/resolve-config-value";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { AuthStorage } from "../session/auth-storage";
@@ -216,6 +217,8 @@ export interface MCPDiscoverOptions {
 	extensionRoots?: EffectiveExtensionRoots;
 	/** What the session offers natively, for built-in transforms; omitted: none applies. */
 	builtinTransforms?: MCPTransformContext;
+	/** Settings scope for the Exa fold's `providers.webKeyless` read (default: the global settings). */
+	settings?: Settings;
 	/** Called when MCP server connection state changes. */
 	onStatus?: (event: McpConnectionStatusEvent) => void;
 	/** Non-blocking discovery window in milliseconds; environment override wins. */
@@ -767,6 +770,7 @@ export class MCPManager implements MCPManagerApi {
 				filterBrowser: options?.filterBrowser,
 				extensionRoots: options?.extensionRoots,
 				builtinTransforms: options?.builtinTransforms,
+				settings: options?.settings,
 			});
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -783,7 +787,7 @@ export class MCPManager implements MCPManagerApi {
 
 	/** Load configs and remember which servers built-in transforms dropped. */
 	async #discoverConfigs(options: LoadMCPConfigsOptions): Promise<LoadMCPConfigsResult> {
-		const loaded = await this.loadConfigs(this.cwd, options);
+		const loaded = await this.loadConfigs(this.cwd, { authStorage: this.#authStorage ?? undefined, ...options });
 		this.#builtinDrops.clear();
 		const dropped = loaded.dropped ?? {};
 		for (const name in dropped) {
@@ -827,6 +831,7 @@ export class MCPManager implements MCPManagerApi {
 			filterBrowser: options.filterBrowser,
 			extensionRoots: options.extensionRoots,
 			builtinTransforms: options.builtinTransforms,
+			settings: options.settings,
 		});
 		// Every server whose resolution depends on the flag: project-level ones
 		// known now, plus project-level ones the enabled load resolves.
@@ -862,6 +867,7 @@ export class MCPManager implements MCPManagerApi {
 			filterBrowser: false,
 			extensionRoots: options?.extensionRoots,
 			builtinTransforms: options?.builtinTransforms,
+			settings: options?.settings,
 		});
 		const browserConfigs: Record<string, MCPServerConfig> = {};
 		const browserSources: Record<string, SourceMeta> = {};
