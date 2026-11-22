@@ -87,25 +87,10 @@ function findPhasePartial(phases: TodoPhase[], normalizedQuery: string): TodoPha
 	return undefined;
 }
 
-function findPhaseFuzzy(phases: TodoPhase[], query: string): TodoPhase | undefined {
+function findPhaseLiteral(phases: TodoPhase[], query: string): TodoPhase | undefined {
 	const rawQuery = query.trim().toLowerCase();
 	if (!rawQuery) return undefined;
-	const exactRaw = findPhaseExact(phases, rawQuery);
-	if (exactRaw) return exactRaw;
-
-	const unquotedQuery = tokenize(query).join(" ").trim().toLowerCase();
-	if (unquotedQuery && unquotedQuery !== rawQuery) {
-		const exactUnquoted = findPhaseExact(phases, unquotedQuery);
-		if (exactUnquoted) return exactUnquoted;
-	}
-
-	const partialRaw = findPhasePartial(phases, rawQuery);
-	if (partialRaw) return partialRaw;
-
-	if (unquotedQuery && unquotedQuery !== rawQuery) {
-		return findPhasePartial(phases, unquotedQuery);
-	}
-	return undefined;
+	return findPhaseExact(phases, rawQuery) ?? findPhasePartial(phases, rawQuery);
 }
 
 function findTaskExact(phases: TodoPhase[], normalizedQuery: string): TodoTaskMatch | undefined {
@@ -150,6 +135,38 @@ function findTaskFuzzy(phases: TodoPhase[], query: string): TodoTaskMatch | unde
 	if (unquotedQuery && unquotedQuery !== rawQuery) {
 		return findTaskPartial(phases, unquotedQuery);
 	}
+	return undefined;
+}
+
+type TodoMutationTarget = { kind: "task"; hit: TodoTaskMatch } | { kind: "phase"; phase: TodoPhase };
+
+function resolveMutationTarget(phases: TodoPhase[], query: string): TodoMutationTarget | undefined {
+	const rawQuery = query.trim().toLowerCase();
+	if (!rawQuery) return undefined;
+
+	const exactRawTask = findTaskExact(phases, rawQuery);
+	if (exactRawTask) return { kind: "task", hit: exactRawTask };
+	const exactRawPhase = findPhaseExact(phases, rawQuery);
+	if (exactRawPhase) return { kind: "phase", phase: exactRawPhase };
+
+	const partialRawTask = findTaskPartial(phases, rawQuery);
+	if (partialRawTask) return { kind: "task", hit: partialRawTask };
+	const partialRawPhase = findPhasePartial(phases, rawQuery);
+	if (partialRawPhase) return { kind: "phase", phase: partialRawPhase };
+
+	const unquotedQuery = tokenize(query).join(" ").trim().toLowerCase();
+	if (unquotedQuery && unquotedQuery !== rawQuery) {
+		const exactUnquotedTask = findTaskExact(phases, unquotedQuery);
+		if (exactUnquotedTask) return { kind: "task", hit: exactUnquotedTask };
+		const exactUnquotedPhase = findPhaseExact(phases, unquotedQuery);
+		if (exactUnquotedPhase) return { kind: "phase", phase: exactUnquotedPhase };
+
+		const partialUnquotedTask = findTaskPartial(phases, unquotedQuery);
+		if (partialUnquotedTask) return { kind: "task", hit: partialUnquotedTask };
+		const partialUnquotedPhase = findPhasePartial(phases, unquotedQuery);
+		if (partialUnquotedPhase) return { kind: "phase", phase: partialUnquotedPhase };
+	}
+
 	return undefined;
 }
 
@@ -217,7 +234,7 @@ export function planTodoAppend(current: TodoPhase[], restArgs: string): TodoComm
 	let targetPhase: TodoPhase;
 
 	if (phaseName) {
-		const existing = findPhaseFuzzy(next, phaseName);
+		const existing = findPhaseLiteral(next, phaseName);
 		targetPhase = existing ?? { name: titleCaseWords(phaseName), tasks: [] };
 		if (!existing) next.push(targetPhase);
 	} else if (next.length > 0) {
@@ -269,6 +286,9 @@ export function planTodoMutation(
 				removed: true,
 			};
 		}
+		if (current.some(phase => phase.tasks.some(task => !task.content.trim()))) {
+			return { ok: false, error: "Missing task content" };
+		}
 		const nextStatus: TodoStatus = verb === "done" ? "completed" : "abandoned";
 		const nextPhases = current.map(phase => ({
 			name: phase.name,
@@ -282,8 +302,9 @@ export function planTodoMutation(
 		};
 	}
 
-	const taskHit = findTaskFuzzy(current, trimmed);
-	if (taskHit) {
+	const resolvedTarget = resolveMutationTarget(current, trimmed);
+	if (resolvedTarget?.kind === "task") {
+		const taskHit = resolvedTarget.hit;
 		const { phases, errors } = applyOpsToPhases(current, [{ op: verb, task: taskHit.task.content }]);
 		if (errors.length > 0) return { ok: false, error: errors.join("; ") };
 		const label = verb === "done" ? "Marked completed" : verb === "drop" ? "Marked abandoned" : "Removed";
@@ -296,8 +317,8 @@ export function planTodoMutation(
 		};
 	}
 
-	const phaseHit = findPhaseFuzzy(current, trimmed);
-	if (phaseHit) {
+	if (resolvedTarget?.kind === "phase") {
+		const phaseHit = resolvedTarget.phase;
 		const phaseIndex = current.indexOf(phaseHit);
 		const { phases, errors } = applyOpsToPhases(current, [{ op: verb, phase: phaseHit.name }]);
 		if (errors.length > 0) return { ok: false, error: errors.join("; ") };

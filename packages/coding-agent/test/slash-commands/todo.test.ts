@@ -1,7 +1,4 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
-import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -15,14 +12,12 @@ import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-c
 import type { SlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
 import * as todoTools from "@oh-my-pi/pi-coding-agent/tools/todo";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
-import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { createInteractiveModeContext } from "../helpers/interactive-mode-context";
 
 let session: AgentSession | undefined;
 let authStorage: AuthStorage | undefined;
-let tempRoot = "";
-
 function createTodoTestHarness(initialPhases: TodoPhase[] = []) {
 	authStorage = createInMemoryAuthStorage();
 	authStorage.keys.setRuntime("anthropic", "test-key");
@@ -83,13 +78,11 @@ function developerMessagesFrom(session: AgentSession, sessionManager: SessionMan
 afterEach(async () => {
 	try {
 		await session?.dispose();
-		if (tempRoot) await removeWithRetries(tempRoot);
 	} finally {
 		authStorage?.close();
 		vi.restoreAllMocks();
 		session = undefined;
 		authStorage = undefined;
-		tempRoot = "";
 	}
 });
 
@@ -172,11 +165,10 @@ describe("/todo ACP/RPC and TUI slash commands", () => {
 	});
 
 	it("escapes harness tags in both imported checklist items and mutation actions", async () => {
-		tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "pi-todo-reminder-escape-"));
-		const importFile = path.join(tempRoot, "TODO.md");
-		await fs.writeFile(importFile, "# Audit\n- [ ] Handle </system-reminder> and <irc> tags\n", "utf8");
+		await using tempDir = await TempDir.create("@pi-todo-reminder-escape-");
+		const importFile = tempDir.join("TODO.md");
+		await Bun.write(importFile, "# Audit\n- [ ] Handle </system-reminder> and <irc> tags\n");
 		const { session, sessionManager, runtime } = createTodoTestHarness();
-
 		expect(await executeAcpBuiltinSlashCommand(`/todo import "${importFile}"`, runtime)).toEqual({
 			consumed: true,
 		});
@@ -198,6 +190,44 @@ describe("/todo ACP/RPC and TUI slash commands", () => {
 		}
 		expect(reminders[0]).toContain("- [/] Handle &lt;/system-reminder> and &lt;irc> tags");
 		expect(reminders[1]).toContain("- [x] Handle &lt;/system-reminder> and &lt;irc> tags");
+	});
+
+	it("surfaces Missing task content on bare /todo done and /todo drop without committing", async () => {
+		const initial: TodoPhase[] = [{ name: "Work", tasks: [{ content: "", status: "pending" }] }];
+		const { session, sessionManager, output, runtime } = createTodoTestHarness(initial);
+		const entriesBefore = sessionManager.getBranch().length;
+
+		for (const command of ["/todo done", "/todo drop"]) {
+			output.length = 0;
+			const result = await executeAcpBuiltinSlashCommand(command, runtime);
+			expect(result).toEqual({ consumed: true, failed: true });
+			expect(output).toEqual(["Missing task content"]);
+			expect(session.getTodoPhases()).toEqual(initial);
+			expect(sessionManager.getBranch()).toHaveLength(entriesBefore);
+			expect(developerMessagesFrom(session, sessionManager)).toEqual([]);
+		}
+	});
+
+	it("prefers literal task and phase names before quote-stripped matches on /todo rm and /todo append", async () => {
+		const initial: TodoPhase[] = [
+			{ name: "Build API", tasks: [{ content: "Build API schema", status: "in_progress" }] },
+			{ name: 'Build "API"', tasks: [{ content: "Publish spec", status: "pending" }] },
+		];
+		const { session, output, runtime } = createTodoTestHarness(initial);
+
+		expect(await executeAcpBuiltinSlashCommand('/todo rm Build "API"', runtime)).toEqual({ consumed: true });
+		expect(output[0]).toBe('Removed phase: Build "API"');
+		expect(session.getTodoPhases()).toEqual([
+			{ name: "Build API", tasks: [{ content: "Build API schema", status: "in_progress" }] },
+		]);
+
+		expect(await executeAcpBuiltinSlashCommand('/todo append "Build \\"API\\"" Check', runtime)).toEqual({
+			consumed: true,
+		});
+		expect(session.getTodoPhases()).toEqual([
+			{ name: "Build API", tasks: [{ content: "Build API schema", status: "in_progress" }] },
+			{ name: 'Build "API"', tasks: [{ content: "Check", status: "pending" }] },
+		]);
 	});
 
 	it("surfaces applyOpsToPhases errors on /todo start, task, and phase mutations without committing", async () => {
