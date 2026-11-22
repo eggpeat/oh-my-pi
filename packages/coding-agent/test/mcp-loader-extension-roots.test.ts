@@ -10,32 +10,42 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
+import { clearClaudePluginRootsCache } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import { discoverAndLoadMCPTools } from "@oh-my-pi/pi-coding-agent/mcp/loader";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
-import { getConfigRootDir, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
+import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import "@oh-my-pi/pi-coding-agent/discovery";
-
-const originalAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
-const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
+import { restoreEnvValue } from "./helpers/settings-test-state";
 
 describe("discoverAndLoadMCPTools extension roots", () => {
-	let tempHome = "";
+	let root = "";
 	let projectDir = "";
-	let userAgentDir = "";
 	let extensionDir = "";
 	let originalHome: string | undefined;
+	let originalAgentDirEnv: string | undefined;
+	let originalOmpProfileEnv: string | undefined;
+	let originalPiProfileEnv: string | undefined;
+	let originalClaudeConfigDir: string | undefined;
 
 	beforeEach(async () => {
-		originalHome = process.env.HOME;
-		tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-loader-home-"));
-		projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-loader-project-"));
-		userAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-loader-agent-"));
-		extensionDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-loader-extension-"));
-		process.env.HOME = tempHome;
-		vi.spyOn(os, "homedir").mockReturnValue(tempHome);
-		setAgentDir(userAgentDir);
+		root = "";
+		clearClaudePluginRootsCache();
 		clearFsCache();
-		await fs.writeFile(
+		originalHome = process.env.HOME;
+		originalAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
+		originalOmpProfileEnv = process.env.OMP_PROFILE;
+		originalPiProfileEnv = process.env.PI_PROFILE;
+		originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
+		restoreEnvValue("CLAUDE_CONFIG_DIR", undefined);
+		root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-loader-"));
+		const tempHome = path.join(root, "home");
+		projectDir = path.join(tempHome, "project");
+		extensionDir = path.join(root, "extension");
+		await fs.mkdir(path.join(projectDir, ".git"), { recursive: true });
+		restoreEnvValue("HOME", tempHome);
+		vi.spyOn(os, "homedir").mockReturnValue(tempHome);
+		setAgentDir(path.join(tempHome, ".omp", "agent"));
+		await Bun.write(
 			path.join(extensionDir, ".mcp.json"),
 			JSON.stringify({ mcpServers: { extensionserver: { command: "extension-mcp" } } }),
 		);
@@ -51,18 +61,14 @@ describe("discoverAndLoadMCPTools extension roots", () => {
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		clearFsCache();
-		if (originalAgentDirEnv) {
-			setAgentDir(originalAgentDirEnv);
-		} else {
-			setAgentDir(fallbackAgentDir);
-			delete process.env.PI_CODING_AGENT_DIR;
-		}
-		if (originalHome === undefined) delete process.env.HOME;
-		else process.env.HOME = originalHome;
-		await removeWithRetries(tempHome);
-		await removeWithRetries(projectDir);
-		await removeWithRetries(userAgentDir);
-		await removeWithRetries(extensionDir);
+		restoreEnvValue("HOME", originalHome);
+		restoreEnvValue("OMP_PROFILE", originalOmpProfileEnv);
+		restoreEnvValue("PI_PROFILE", originalPiProfileEnv);
+		restoreEnvValue("PI_CODING_AGENT_DIR", originalAgentDirEnv);
+		restoreEnvValue("CLAUDE_CONFIG_DIR", originalClaudeConfigDir);
+		__resetDirsFromEnvForTests();
+		clearClaudePluginRootsCache();
+		if (root) await removeWithRetries(root);
 	});
 
 	test("discovers MCP servers from session-provided extension roots", async () => {
