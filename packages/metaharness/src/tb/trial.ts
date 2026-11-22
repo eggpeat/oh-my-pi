@@ -17,10 +17,9 @@ const EMPTY_USAGE: TrialUsage = {
 };
 
 /**
- * omp's daemon broker stops the services the agent started (bash `name` + `ready`) once its last
- * client has been gone for `OMP_DAEMON_IDLE_GRACE_MS` (default 3 s). The verifier runs after omp
- * exits, in the same guest, and grades those services, so keep them alive until the guest is
- * removed. An explicit `--env` value wins.
+ * RPC mode enables `launch.persist` so bash `name` services keep holding omp's daemon after omp
+ * exits; `OMP_DAEMON_IDLE_GRACE_MS` also keeps an otherwise-idle daemon up (default 3 s) until the
+ * verifier finishes in the same guest. An explicit `--env` value wins.
  */
 const SERVICE_GRACE_ENV: Record<string, string> = { OMP_DAEMON_IDLE_GRACE_MS: String(24 * 60 * 60 * 1_000) };
 

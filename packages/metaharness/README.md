@@ -223,8 +223,9 @@ known-correct fix for a failed task), `--concurrency` (default 8).
   but **not** uncommitted Rust natives — rebuild `packages/natives` per target
   first (the version sentinel must match).
 - **Agent-started services outlive omp.** The verifier runs after omp exits,
-  in the same container or VM, so both runners set
-  `OMP_DAEMON_IDLE_GRACE_MS` to 24 h for the omp process: services the agent
-  started with the bash tool's `name` stay up until teardown instead of
-  stopping 3 s after omp exits. An explicit `--env OMP_DAEMON_IDLE_GRACE_MS=<ms>`
-  wins.
+  in the same container or VM: print and RPC modes enable `launch.persist` so
+  services started with the bash tool's `name` stay persistent, and both
+  runners set `OMP_DAEMON_IDLE_GRACE_MS` to 24 h so an otherwise-idle omp
+  daemon (and older `--install published` builds) stays up until teardown
+  instead of exiting 3 s after omp disconnects. An explicit
+  `--env OMP_DAEMON_IDLE_GRACE_MS=<ms>` wins.
