@@ -946,6 +946,19 @@ export class Settings {
 	}
 
 	/**
+	 * Resolve settings for a caller that may carry its own instance: the caller's when supplied,
+	 * else the global singleton, else unregistered in-memory defaults that stay out of
+	 * {@link liveSettingsInstances} so {@link findScopedSettings} never resolves to them.
+	 */
+	static resolve(explicit?: Settings): Settings {
+		if (explicit && explicit !== settings) return explicit;
+		if (globalInstance) return globalInstance;
+		const defaults = new Settings({ inMemory: true }, { projection: true });
+		defaults.#rebuildMerged();
+		return defaults;
+	}
+
+	/**
 	 * The operator or SDK host's authority for model grants: a read-only view of the global,
 	 * `--config` and runtime layers (an overlay's own over its parent's) without any project layer,
 	 * because repository settings files are writable by the agent. Only subagent-derived overlays
@@ -1204,6 +1217,24 @@ export class Settings {
 		if (getByPath(projectLayerForMerge(this.#project), segments) !== undefined) return "project";
 		if (getByPath(this.#global, segments) !== undefined) return "global";
 		return this.#parent?.getProvenance(setting) ?? "default";
+	}
+
+	/**
+	 * Settings instance (this or an overlay ancestor) whose own layers configure `setting`,
+	 * or `undefined` when unset across all layers.
+	 */
+	settingOwner(setting: AnySetting): Settings | undefined {
+		if (!this.isConfigured(setting)) return undefined;
+		const segments = setting.segments;
+		if (
+			getByPath(this.#overrides, segments) !== undefined ||
+			getByPath(this.#configOverlay, segments) !== undefined ||
+			getByPath(projectLayerForMerge(this.#project), segments) !== undefined ||
+			getByPath(this.#global, segments) !== undefined
+		) {
+			return this;
+		}
+		return this.#parent?.settingOwner(setting);
 	}
 
 	/**
@@ -4528,7 +4559,7 @@ export function isSettingsInitialized(): boolean {
  * one-shot callers that never initialized Settings.
  */
 export function resolveSettings(explicit?: Settings): Settings {
-	return explicit ?? globalInstance ?? Settings.isolated();
+	return Settings.resolve(explicit);
 }
 
 /**

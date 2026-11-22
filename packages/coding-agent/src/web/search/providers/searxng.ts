@@ -41,7 +41,7 @@ import type { SearchResponse, SearchSource } from "../types";
 import { SearchProviderError } from "../../../web/search/types";
 import type { StructuredQuery } from "../query";
 import { formatScraperQuery, parseSearchQuery } from "../query";
-import { clampNumResults, dateToAgeSeconds } from "../utils";
+import { clampNumResults, dateToAgeSeconds, normalizeHttpEndpoint } from "../utils";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
@@ -107,6 +107,59 @@ function findSetting(handle: Setting<string | undefined>, effectiveSettings: Set
 	return handle.get(effectiveSettings) ?? null;
 }
 
+function endpointsMatch(a: string | null | undefined, b: string | null | undefined): boolean {
+	const left = normalizeHttpEndpoint(a);
+	const right = normalizeHttpEndpoint(b);
+	return left !== null && left === right;
+}
+
+/** Whether `handle.get(effectiveSettings)` currently resolves from its environment variable fallback. */
+function isEnvSourced(handle: Setting<string | undefined>, effectiveSettings: Settings): boolean {
+	if (handle.envValue() === undefined) return false;
+	if (handle.envFallback === "blank") {
+		const layered = handle.layered(effectiveSettings);
+		return layered === undefined || layered.trim() === "";
+	}
+	if (handle.envFallback === true) {
+		return !effectiveSettings.isConfigured(handle);
+	}
+	return !effectiveSettings.hasRuntimeOverride(handle);
+}
+
+/**
+ * Resolve a SearXNG login only when `endpoint` matches the address that login was configured
+ * alongside. A project or overlay that changes only the server address must not redirect an
+ * inherited host or environment login to the new server.
+ */
+function findCredentialSetting(
+	handle: Setting<string | undefined>,
+	effectiveSettings: Settings,
+	endpoint: string,
+): string | null {
+	const value = findSetting(handle, effectiveSettings);
+	if (value === null) return null;
+
+	if (isEnvSourced(handle, effectiveSettings)) {
+		const trustedEndpoint = findSetting(cfgSearxngEndpoint, effectiveSettings.grantAuthority());
+		if (!endpointsMatch(endpoint, trustedEndpoint)) return null;
+		const envEndpoint = cfgSearxngEndpoint.envValue();
+		if (envEndpoint !== undefined && !endpointsMatch(endpoint, envEndpoint)) return null;
+		return value;
+	}
+
+	const owner = effectiveSettings.settingOwner(handle);
+	if (!owner) return null;
+	if (owner.getProvenance(handle) === "project") {
+		return endpointsMatch(endpoint, findSetting(cfgSearxngEndpoint, owner)) ? value : null;
+	}
+	const ownerSetsOwnEndpoint =
+		owner.settingOwner(cfgSearxngEndpoint) === owner && owner.getProvenance(cfgSearxngEndpoint) !== "project";
+	const trustedEndpoint = ownerSetsOwnEndpoint
+		? findSetting(cfgSearxngEndpoint, owner)
+		: findSetting(cfgSearxngEndpoint, owner.grantAuthority());
+	return endpointsMatch(endpoint, trustedEndpoint) ? value : null;
+}
+
 /** Build the RFC 7617 Basic auth credential using UTF-8 bytes. */
 function buildBasicAuthValue(username: string, password: string): string {
 	return Buffer.from(`${username}:${password}`, "utf-8").toString("base64");
@@ -118,9 +171,9 @@ function hasControlCharacters(value: string): boolean {
 }
 
 /** Find SearXNG authentication from settings or environment. Basic auth takes precedence over bearer tokens. */
-function findAuth(effectiveSettings: Settings): SearXNGAuth | null {
-	const basicUsername = findSetting(cfgSearxngBasicUsername, effectiveSettings);
-	const basicPassword = findSetting(cfgSearxngBasicPassword, effectiveSettings);
+function findAuth(effectiveSettings: Settings, endpoint: string): SearXNGAuth | null {
+	const basicUsername = findCredentialSetting(cfgSearxngBasicUsername, effectiveSettings, endpoint);
+	const basicPassword = findCredentialSetting(cfgSearxngBasicPassword, effectiveSettings, endpoint);
 	if (basicUsername !== null || basicPassword !== null) {
 		if (basicUsername === null || basicPassword === null) {
 			throw new Error(
@@ -136,8 +189,8 @@ function findAuth(effectiveSettings: Settings): SearXNGAuth | null {
 		return { type: "basic", value: buildBasicAuthValue(basicUsername, basicPassword) };
 	}
 
-	const token = findSetting(cfgSearxngToken, effectiveSettings);
-	return token ? { type: "bearer", value: token } : null;
+	const login = findCredentialSetting(cfgSearxngToken, effectiveSettings, endpoint);
+	return login ? { type: "bearer", value: login } : null;
 }
 
 /** Find configured engine names/shortcuts from settings. */
@@ -400,7 +453,7 @@ export async function searchSearXNG(params: {
 		);
 	}
 
-	const auth = findAuth(effectiveSettings);
+	const auth = findAuth(effectiveSettings, endpoint);
 
 	const categories: string | undefined = cfgSearxngCategories.get(effectiveSettings) ?? undefined;
 	let language: string | undefined = cfgSearxngLanguage.get(effectiveSettings) ?? undefined;

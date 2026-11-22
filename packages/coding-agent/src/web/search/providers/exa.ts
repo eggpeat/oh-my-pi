@@ -16,7 +16,7 @@ import {
 	withAuth,
 } from "@oh-my-pi/pi-ai";
 import { $env, asRecord } from "@oh-my-pi/pi-utils";
-import { resolveSettings, type Settings } from "../../../config/settings";
+import { isSettingsInitialized, resolveSettings, type Settings } from "../../../config/settings";
 import { normalizeMcpToolPayload } from "../../../exa/mcp-client";
 import { readMcpJsonRpcResponse } from "../../../mcp/json-rpc";
 import type { SearchResponse, SearchSource } from "../types";
@@ -34,8 +34,37 @@ const EXA_MCP_URL = "https://mcp.exa.ai/mcp";
 const EXA_MCP_SOURCE = "oh-my-pi";
 const MAX_EXA_SNIPPET_CHARS = 500;
 
-let nextExaSearchRequestAt = 0;
-let exaSearchThrottle = Promise.resolve();
+interface ExaThrottleState {
+	lastRequestAt: number;
+	queue: Promise<void>;
+}
+
+/** Shared fallback scope for uninitialized one-shot callers that pass no explicit Settings. */
+const DEFAULT_EXA_THROTTLE_SCOPE = {};
+/** Per-(settings scope, account) pacing queues so independent callers never stall one another. */
+let exaThrottles = new WeakMap<object, Map<string, ExaThrottleState>>();
+
+function exaAccountKey(apiKey: string | undefined): string {
+	return apiKey ? `key:${Bun.hash(apiKey).toString(36)}` : "mcp";
+}
+
+function exaThrottleBucket(explicitSettings: Settings | undefined, accountKey: string): ExaThrottleState {
+	const scopeKey =
+		explicitSettings !== undefined || isSettingsInitialized()
+			? resolveSettings(explicitSettings)
+			: DEFAULT_EXA_THROTTLE_SCOPE;
+	let byAccount = exaThrottles.get(scopeKey);
+	if (!byAccount) {
+		byAccount = new Map();
+		exaThrottles.set(scopeKey, byAccount);
+	}
+	let state = byAccount.get(accountKey);
+	if (!state) {
+		state = { lastRequestAt: 0, queue: Promise.resolve() };
+		byAccount.set(accountKey, state);
+	}
+	return state;
+}
 
 function configuredExaSearchDelayMs(explicit?: Settings): number {
 	const delayMs = cfgExaSearchDelayMs.get(resolveSettings(explicit));
@@ -87,28 +116,32 @@ function waitUntilDoneOrAborted<T>(promise: Promise<T>, signal: AbortSignal | un
 	});
 }
 
-async function waitForExaSearchSlot(signal: AbortSignal | undefined, explicitSettings?: Settings): Promise<void> {
+async function waitForExaSearchSlot(
+	signal: AbortSignal | undefined,
+	explicitSettings: Settings | undefined,
+	accountKey: string,
+): Promise<void> {
 	const delayMs = configuredExaSearchDelayMs(explicitSettings);
 	if (delayMs <= 0) return;
 
-	const prior = exaSearchThrottle.catch(() => {});
+	const state = exaThrottleBucket(explicitSettings, accountKey);
+	const prior = state.queue.catch(() => {});
 	const queued = prior.then(async () => {
 		signal?.throwIfAborted();
-		const waitMs = Math.max(0, nextExaSearchRequestAt - Date.now());
+		const waitMs = state.lastRequestAt > 0 ? Math.max(0, state.lastRequestAt + delayMs - Date.now()) : 0;
 		if (waitMs > 0) {
 			await abortableSleep(waitMs, signal);
 		}
 		signal?.throwIfAborted();
-		nextExaSearchRequestAt = Date.now() + delayMs;
+		state.lastRequestAt = Date.now();
 	});
-	exaSearchThrottle = queued.catch(() => {});
+	state.queue = queued.catch(() => {});
 	await waitUntilDoneOrAborted(queued, signal);
 }
 
 /** Reset Exa request pacing state for isolated provider tests. */
 export function resetExaSearchThrottleForTest(): void {
-	nextExaSearchRequestAt = 0;
-	exaSearchThrottle = Promise.resolve();
+	exaThrottles = new WeakMap();
 }
 
 type ExaSearchType = "neural" | "fast" | "auto" | "deep";
@@ -280,7 +313,7 @@ async function callExaSearch(apiKey: string, params: ExaSearchParams): Promise<E
 	const body = buildExaRequestBody(params);
 
 	const fetchImpl = params.fetch ?? fetch;
-	await waitForExaSearchSlot(params.signal, params.settings);
+	await waitForExaSearchSlot(params.signal, params.settings, exaAccountKey(apiKey));
 	const response = await fetchImpl(EXA_API_URL, {
 		method: "POST",
 		headers: {
@@ -324,7 +357,7 @@ async function callExaMcpSearch(params: ExaSearchParams): Promise<ExaSearchRespo
 	if (apiKey) query.set("exaApiKey", apiKey);
 	query.set("tools", "web_search_exa");
 	const fetchImpl = params.fetch ?? fetch;
-	await waitForExaSearchSlot(params.signal, params.settings);
+	await waitForExaSearchSlot(params.signal, params.settings, exaAccountKey(apiKey));
 	const requestId = Math.random().toString(36).slice(2);
 	const signal = withHardTimeout(params.signal, params.timeoutMs);
 	const response = await fetchImpl(`${EXA_MCP_URL}?${query.toString()}`, {

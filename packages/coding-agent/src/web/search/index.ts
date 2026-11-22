@@ -43,12 +43,14 @@ import {
 	type SearchResponse,
 	type SearchResultDetails,
 } from "./types";
+import { normalizeHttpEndpoint } from "./utils";
 
 import {
 	cfgProvidersAntigravityEndpoint,
 	cfgProvidersWebKeyless,
 	cfgProvidersWebSearchTimeoutSeconds,
 } from "../../session/settings";
+import { cfgSearxngEndpoint } from "../settings";
 
 /** Web search tool parameters schema */
 export const webSearchSchema = type({
@@ -154,6 +156,25 @@ const RATE_LIMIT_COOLDOWN_MS = 5 * 60 * 1000;
  * so retrying it on every call only adds the 429's latency before the fallback answers.
  */
 const rateLimitedUntil = new Map<string, number>();
+
+/** Reset per-engine HTTP 429 cooldown state for isolated tests. */
+export function resetWebSearchRateLimitsForTest(): void {
+	rateLimitedUntil.clear();
+}
+
+/**
+ * Cooldown bucket key for a candidate engine. SearXNG instances are user-hosted and
+ * configurable per session, so a 429 on one server must not cool down another.
+ */
+function rateLimitKey(model: Model<Api>, effectiveSettings: Settings): string {
+	const base = `${model.provider}/${model.id}`;
+	if (model.provider === "web" && model.id === "searxng") {
+		const endpoint = cfgSearxngEndpoint.get(effectiveSettings);
+		const server = normalizeHttpEndpoint(endpoint) ?? endpoint?.trim().replace(/\/+$/, "");
+		if (server) return `${base}@${server}`;
+	}
+	return base;
+}
 
 function hasRenderableSearchContent(response: SearchResponse): boolean {
 	if (response.answer?.trim()) return true;
@@ -333,7 +354,7 @@ async function executeSearch(
 		let provider: SearchProvider | undefined;
 		const candidateMeta = { id: candidate.model.id, label: candidate.model.name };
 		lastProvider = candidateMeta;
-		const engineKey = `${candidate.model.provider}/${candidate.model.id}`;
+		const engineKey = rateLimitKey(candidate.model, effectiveSettings);
 		const cooldownEnds = rateLimitedUntil.get(engineKey);
 		if (cooldownEnds !== undefined && !params.model) {
 			if (cooldownEnds > Date.now()) {

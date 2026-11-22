@@ -27,3 +27,20 @@ const RECENCY_DAYS: Record<"day" | "week" | "month" | "year", number> = {
 export function recencyAfterDate(recency: "day" | "week" | "month" | "year"): string {
 	return new Date(Date.now() - RECENCY_DAYS[recency] * 86_400_000).toISOString().slice(0, 10);
 }
+
+/**
+ * Canonical `origin + pathname` (without trailing slashes) for an HTTP(S) endpoint URL,
+ * or `null` when the value is blank or not a valid HTTP(S) URL.
+ */
+export function normalizeHttpEndpoint(raw: string | null | undefined): string | null {
+	if (!raw) return null;
+	const trimmed = raw.trim();
+	if (!trimmed) return null;
+	try {
+		const url = new URL(trimmed);
+		if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+		return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+	} catch {
+		return null;
+	}
+}
