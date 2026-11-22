@@ -16,6 +16,7 @@ const PACKAGE_ROOT = path.resolve(import.meta.dir, "..", "..");
 const CLI_ENTRY = path.join(PACKAGE_ROOT, "src", "cli.ts");
 const IDLE_GRACE_ENV = "OMP_DAEMON_IDLE_GRACE_MS";
 const MAX_I32_TIMEOUT_MS = 0x7fff_ffff;
+const TEST_TIMEOUT_MS = 30_000;
 
 /**
  * Preloaded only inside the spawned daemon child process so the test runner's
@@ -355,21 +356,18 @@ class ControlledDaemon {
 	}
 }
 
-let activeDaemon: ControlledDaemon | undefined;
+const activeDaemons = new Set<ControlledDaemon>();
 
-async function startControlledDaemon(idleGrace: string | undefined): Promise<ControlledDaemon> {
-	const previous = activeDaemon;
-	activeDaemon = undefined;
-	await previous?.dispose();
+function startControlledDaemon(idleGrace: string | undefined): Promise<ControlledDaemon> {
 	return ControlledDaemon.spawn(idleGrace, instance => {
-		activeDaemon = instance;
+		activeDaemons.add(instance);
 	});
 }
 
 afterEach(async () => {
-	const daemon = activeDaemon;
-	activeDaemon = undefined;
-	await daemon?.dispose();
+	const daemons = [...activeDaemons];
+	activeDaemons.clear();
+	await Promise.all(daemons.map(daemon => daemon.dispose()));
 });
 
 async function openAndCloseRawProbe(endpoint: string, line?: string): Promise<void> {
@@ -389,121 +387,143 @@ async function openAndCloseRawProbe(endpoint: string, line?: string): Promise<vo
 }
 
 describe("daemon OMP_DAEMON_IDLE_GRACE_MS", () => {
-	it("ignores pre-hello socket probes when set to 0, then exits at once after a signed-in client disconnects", async () => {
-		const daemon = await startControlledDaemon("0");
-		await daemon.advance(2_999);
-		expect(daemon.running).toBe(true);
-
-		// A raw readiness probe (open + close without hello) must not flip the daemon out of its startup grace.
-		const epochBeforeRawProbe = daemon.armedEpoch;
-		await openAndCloseRawProbe(daemon.endpoint);
-		await daemon.waitForIdleOrExit(epochBeforeRawProbe);
-		await daemon.advance(2_999);
-		expect(daemon.running).toBe(true);
-
-		// A connection whose hello is rejected also never signed in as a client.
-		const epochBeforeBadHello = daemon.armedEpoch;
-		await openAndCloseRawProbe(
-			daemon.endpoint,
-			JSON.stringify({
-				v: DAEMON_PROTOCOL_VERSION,
-				token: "wrong-token",
-				client: { pid: process.pid, build: "0.0.0", exe: [] },
-			}),
-		);
-		await daemon.waitForIdleOrExit(epochBeforeBadHello);
-		await daemon.advance(2_999);
-		expect(daemon.running).toBe(true);
-
-		const conn = await daemon.connect();
-		const pong = await conn.request({ op: "ping" });
-		expect(pong.pid).toBe(daemon.pid);
-		expect(pong.pid).not.toBe(process.pid);
-
-		const epochBeforeClose = daemon.armedEpoch;
-		await conn.close();
-		await daemon.waitForIdleOrExit(epochBeforeClose);
-		await daemon.advance(0);
-
-		expect(daemon.lockHeld).toBe(false);
-		expect(await daemon.exited).toBe(0);
-	});
-
-	it("parses the base-10 parseInt prefix for unit-suffixed and fractional values", async () => {
-		for (const [raw, expectedMs] of [
-			["5s", 5],
-			["2.5", 2],
-		] as const) {
-			const daemon = await startControlledDaemon(raw);
-			const conn = await daemon.connect();
-			await conn.request({ op: "ping" });
-			const epochBeforeClose = daemon.armedEpoch;
-			await conn.close();
-			await daemon.waitForIdleOrExit(epochBeforeClose);
-
-			await daemon.advance(expectedMs - 1);
-			expect(daemon.lockHeld).toBe(true);
-			expect(daemon.running).toBe(true);
-
-			await daemon.advance(1);
-			expect(daemon.lockHeld).toBe(false);
-			expect(await daemon.exited).toBe(0);
-		}
-	});
-
-	it("falls back to the 3000ms default for empty, negative, or non-numeric values", async () => {
-		for (const invalid of ["", "-1", "ms"]) {
-			const daemon = await startControlledDaemon(invalid);
-			const conn = await daemon.connect();
-			await conn.request({ op: "ping" });
-			const epochBeforeClose = daemon.armedEpoch;
-			await conn.close();
-			await daemon.waitForIdleOrExit(epochBeforeClose);
-
+	it(
+		"ignores pre-hello socket probes when set to 0, then exits at once after a signed-in client disconnects",
+		async () => {
+			const daemon = await startControlledDaemon("0");
 			await daemon.advance(2_999);
+			expect(daemon.running).toBe(true);
+
+			// A raw readiness probe (open + close without hello) must not flip the daemon out of its startup grace.
+			const epochBeforeRawProbe = daemon.armedEpoch;
+			await openAndCloseRawProbe(daemon.endpoint);
+			await daemon.waitForIdleOrExit(epochBeforeRawProbe);
+			await daemon.advance(2_999);
+			expect(daemon.running).toBe(true);
+
+			// A connection whose hello is rejected also never signed in as a client.
+			const epochBeforeBadHello = daemon.armedEpoch;
+			await openAndCloseRawProbe(
+				daemon.endpoint,
+				JSON.stringify({
+					v: DAEMON_PROTOCOL_VERSION,
+					token: "wrong-token",
+					client: { pid: process.pid, build: "0.0.0", exe: [] },
+				}),
+			);
+			await daemon.waitForIdleOrExit(epochBeforeBadHello);
+			await daemon.advance(2_999);
+			expect(daemon.running).toBe(true);
+
+			const conn = await daemon.connect();
+			const pong = await conn.request({ op: "ping" });
+			expect(pong.pid).toBe(daemon.pid);
+			expect(pong.pid).not.toBe(process.pid);
+
+			const epochBeforeClose = daemon.armedEpoch;
+			await conn.close();
+			await daemon.waitForIdleOrExit(epochBeforeClose);
+			await daemon.advance(0);
+
+			expect(daemon.lockHeld).toBe(false);
+			expect(await daemon.exited).toBe(0);
+		},
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"parses the base-10 parseInt prefix for unit-suffixed and fractional values",
+		async () => {
+			await Promise.all(
+				(
+					[
+						["5s", 5],
+						["2.5", 2],
+					] as const
+				).map(async ([raw, expectedMs]) => {
+					const daemon = await startControlledDaemon(raw);
+					const conn = await daemon.connect();
+					await conn.request({ op: "ping" });
+					const epochBeforeClose = daemon.armedEpoch;
+					await conn.close();
+					await daemon.waitForIdleOrExit(epochBeforeClose);
+
+					await daemon.advance(expectedMs - 1);
+					expect(daemon.lockHeld).toBe(true);
+					expect(daemon.running).toBe(true);
+
+					await daemon.advance(1);
+					expect(daemon.lockHeld).toBe(false);
+					expect(await daemon.exited).toBe(0);
+				}),
+			);
+		},
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"falls back to the 3000ms default for empty, negative, or non-numeric values",
+		async () => {
+			await Promise.all(
+				["", "-1", "ms"].map(async invalid => {
+					const daemon = await startControlledDaemon(invalid);
+					const conn = await daemon.connect();
+					await conn.request({ op: "ping" });
+					const epochBeforeClose = daemon.armedEpoch;
+					await conn.close();
+					await daemon.waitForIdleOrExit(epochBeforeClose);
+
+					await daemon.advance(2_999);
+					expect(daemon.lockHeld).toBe(true);
+					expect(daemon.running).toBe(true);
+
+					await daemon.advance(1);
+					expect(daemon.lockHeld).toBe(false);
+					expect(await daemon.exited).toBe(0);
+				}),
+			);
+		},
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"waits past the 32-bit timer ceiling, cancels on reconnect, and exits without extra chunks after a late timer",
+		async () => {
+			const graceMs = 3_000_000_000;
+			const daemon = await startControlledDaemon(String(graceMs));
+
+			const first = await daemon.connect();
+			await first.request({ op: "ping" });
+			const epochAfterFirst = daemon.armedEpoch;
+			await first.close();
+			await daemon.waitForIdleOrExit(epochAfterFirst);
+
+			await daemon.advance(MAX_I32_TIMEOUT_MS);
 			expect(daemon.lockHeld).toBe(true);
 			expect(daemon.running).toBe(true);
 
-			await daemon.advance(1);
+			// A returning client cancels the in-flight sleepLong; disconnecting starts a fresh grace window.
+			const second = await daemon.connect();
+			await second.request({ op: "ping" });
+			const epochAfterSecond = daemon.armedEpoch;
+			await second.close();
+			await daemon.waitForIdleOrExit(epochAfterSecond);
+
+			await daemon.advance(graceMs - 1);
+			expect(daemon.lockHeld).toBe(true);
+			expect(daemon.running).toBe(true);
+
+			// Re-arm once more and simulate the first 32-bit timer chunk waking after the full deadline already elapsed.
+			const third = await daemon.connect();
+			await third.request({ op: "ping" });
+			const epochAfterThird = daemon.armedEpoch;
+			await third.close();
+			await daemon.waitForIdleOrExit(epochAfterThird);
+
+			await daemon.fireNextLate(graceMs);
 			expect(daemon.lockHeld).toBe(false);
 			expect(await daemon.exited).toBe(0);
-		}
-	});
-
-	it("waits past the 32-bit timer ceiling, cancels on reconnect, and exits without extra chunks after a late timer", async () => {
-		const graceMs = 3_000_000_000;
-		const daemon = await startControlledDaemon(String(graceMs));
-
-		const first = await daemon.connect();
-		await first.request({ op: "ping" });
-		const epochAfterFirst = daemon.armedEpoch;
-		await first.close();
-		await daemon.waitForIdleOrExit(epochAfterFirst);
-
-		await daemon.advance(MAX_I32_TIMEOUT_MS);
-		expect(daemon.lockHeld).toBe(true);
-		expect(daemon.running).toBe(true);
-
-		// A returning client cancels the in-flight sleepLong; disconnecting starts a fresh grace window.
-		const second = await daemon.connect();
-		await second.request({ op: "ping" });
-		const epochAfterSecond = daemon.armedEpoch;
-		await second.close();
-		await daemon.waitForIdleOrExit(epochAfterSecond);
-
-		await daemon.advance(graceMs - 1);
-		expect(daemon.lockHeld).toBe(true);
-		expect(daemon.running).toBe(true);
-
-		// Re-arm once more and simulate the first 32-bit timer chunk waking after the full deadline already elapsed.
-		const third = await daemon.connect();
-		await third.request({ op: "ping" });
-		const epochAfterThird = daemon.armedEpoch;
-		await third.close();
-		await daemon.waitForIdleOrExit(epochAfterThird);
-
-		await daemon.fireNextLate(graceMs);
-		expect(daemon.lockHeld).toBe(false);
-		expect(await daemon.exited).toBe(0);
-	});
+		},
+		TEST_TIMEOUT_MS,
+	);
 });
