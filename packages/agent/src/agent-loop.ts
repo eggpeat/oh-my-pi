@@ -2893,10 +2893,14 @@ function emitAbortedAssistantMessage(
 ): AssistantMessage {
 	const model = config.getModel?.() ?? config.model;
 	const errorMessage = abortReasonText(requestSignal);
+	const reason = requestSignal?.reason;
+	const classified = AIError.classify(reason);
 	const errorId =
-		errorMessage === "Request was aborted"
-			? AIError.create(AIError.Flag.Abort)
-			: AIError.classify(requestSignal?.reason) || undefined;
+		classified !== 0
+			? classified
+			: !toolScopedAbortReason(requestSignal) && AIError.isBareAbortReason(reason)
+				? AIError.create(AIError.Flag.Abort)
+				: undefined;
 	const base: AssistantMessage = partialMessage
 		? { ...partialMessage, stopReason: "aborted", errorMessage, errorId }
 		: {

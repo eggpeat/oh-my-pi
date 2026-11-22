@@ -182,20 +182,21 @@ function createProviderStreamError<TApi extends Api>(
 	stopReason: Extract<AssistantMessage["stopReason"], "aborted" | "error"> = "error",
 	callerSignal?: AbortSignal,
 ): AssistantMessage {
-	// A bare abort() supplies no caller reason. That is the only case that wears
-	// Flag.Abort, which turn recovery retries. Any supplied reason is classified
-	// from the signal's own value, not from its text: a StreamTimeoutError keeps
-	// Timeout even when its message is "Request was aborted", and a label such as
-	// "Interrupted by user" does not gain Flag.Abort.
+	// Classify the caller signal's own reason independently of the display text
+	// so a StreamTimeoutError with empty or generic text keeps Flag.Timeout and
+	// only a bare abort() falls back to Flag.Abort.
 	let errorMessage: string;
 	let errorId: number | undefined;
 	if (stopReason === "aborted") {
-		const suppliedReason = AIError.callerAbortReason(callerSignal);
-		errorMessage = suppliedReason ?? "Request was aborted";
+		const reason = callerSignal?.reason;
+		const classified = AIError.classify(reason, model.api);
+		errorMessage = AIError.callerAbortReason(callerSignal) ?? "Request was aborted";
 		errorId =
-			suppliedReason === undefined
-				? AIError.create(AIError.Flag.Abort)
-				: AIError.classify(callerSignal?.reason, model.api) || undefined;
+			classified !== 0
+				? classified
+				: AIError.isBareAbortReason(reason)
+					? AIError.create(AIError.Flag.Abort)
+					: undefined;
 	} else {
 		errorMessage = error instanceof Error ? error.message : String(error);
 		errorId = AIError.classify(error, model.api) || undefined;
@@ -221,37 +222,6 @@ function createProviderStreamError<TApi extends Api>(
 	};
 }
 
-/**
- * Read the caller signal and both timeout overrides once, then copy every other
- * field. Spreading `options` would invoke those getters again, so a later read
- * can hand the provider a timeout the wrapper did not use.
- */
-function snapshotCallerStreamControl<TApi extends Api>(
-	options: OptionsForApi<TApi> | undefined,
-): {
-	signal: AbortSignal | undefined;
-	streamIdleTimeoutMs: number | undefined;
-	streamFirstEventTimeoutMs: number | undefined;
-	providerOptions: OptionsForApi<TApi>;
-} {
-	const source = (options ?? {}) as OptionsForApi<TApi>;
-	const signal = source.signal;
-	const streamIdleTimeoutMs = source.streamIdleTimeoutMs;
-	const streamFirstEventTimeoutMs = source.streamFirstEventTimeoutMs;
-	const providerOptions = {} as OptionsForApi<TApi>;
-	const sourceRecord = source as Record<string, unknown>;
-	const providerRecord = providerOptions as Record<string, unknown>;
-	for (const key of Object.keys(sourceRecord)) {
-		if (key === "signal" || key === "streamIdleTimeoutMs" || key === "streamFirstEventTimeoutMs") continue;
-		providerRecord[key] = sourceRecord[key];
-	}
-	if (streamIdleTimeoutMs !== undefined) providerOptions.streamIdleTimeoutMs = streamIdleTimeoutMs;
-	if (streamFirstEventTimeoutMs !== undefined) {
-		providerOptions.streamFirstEventTimeoutMs = streamFirstEventTimeoutMs;
-	}
-	return { signal, streamIdleTimeoutMs, streamFirstEventTimeoutMs, providerOptions };
-}
-
 // ---------------------------------------------------------------------------
 // Provider stream wrapper
 // ---------------------------------------------------------------------------
@@ -270,22 +240,27 @@ function createLazyProviderStream<TModule, TApi extends Api>(
 ): (model: Model<TApi>, context: Context, options: OptionsForApi<TApi>) => EventStreamImpl {
 	return (model, context, options) => {
 		const outer = new EventStreamImpl();
-		const caller = snapshotCallerStreamControl(options);
 
 		load()
 			.then(mod => {
-				const abortTracker = createAbortSourceTracker(caller.signal);
-				caller.providerOptions.signal = abortTracker.requestSignal;
-				const inner = pick(mod)(model, context, caller.providerOptions);
+				// Destructure the three stream-control fields once inside the promise
+				// handler so getter errors still route to stream.result(), getters
+				// only run once, and rest-copying preserves symbol keys and own __proto__.
+				const { signal, streamIdleTimeoutMs, streamFirstEventTimeoutMs, ...restOptions } = (options ??
+					{}) as OptionsForApi<TApi>;
+				const abortTracker = createAbortSourceTracker(signal);
+				const providerOptions = {
+					...restOptions,
+					...(streamIdleTimeoutMs !== undefined && { streamIdleTimeoutMs }),
+					...(streamFirstEventTimeoutMs !== undefined && { streamFirstEventTimeoutMs }),
+					signal: abortTracker.requestSignal,
+				} as OptionsForApi<TApi>;
+				const inner = pick(mod)(model, context, providerOptions);
 				forwardStream(
 					outer,
 					inner,
 					model,
-					{
-						signal: caller.signal,
-						streamIdleTimeoutMs: caller.streamIdleTimeoutMs,
-						streamFirstEventTimeoutMs: caller.streamFirstEventTimeoutMs,
-					},
+					{ signal, streamIdleTimeoutMs, streamFirstEventTimeoutMs },
 					abortTracker,
 					limits,
 				);

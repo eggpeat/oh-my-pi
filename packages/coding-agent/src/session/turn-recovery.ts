@@ -1594,10 +1594,14 @@ export class TurnRecovery {
 		}
 
 		const id = this.#classifyRetryMessage(message);
+		if (AIError.hasNonAbortKind(id)) return false;
+		const genericAbort =
+			message.errorMessage !== undefined && Object.hasOwn(GENERIC_ABORT_MESSAGES, message.errorMessage);
+		const hasCustomReason =
+			message.errorMessage !== undefined && message.errorMessage.trim().length > 0 && !genericAbort;
+		if (hasCustomReason) return false;
 		if (message.stopReason === "aborted" && AIError.is(id, AIError.Flag.Abort)) return true;
-		if (message.errorMessage === undefined || !Object.hasOwn(GENERIC_ABORT_MESSAGES, message.errorMessage)) {
-			return false;
-		}
+		if (!genericAbort) return false;
 
 		message.errorId = AIError.create(AIError.Flag.Abort);
 		return true;
@@ -1750,11 +1754,15 @@ export class TurnRecovery {
 		const id = this.#classifyRetryMessage(message);
 		const genericAbort =
 			message.errorMessage !== undefined && Object.hasOwn(GENERIC_ABORT_MESSAGES, message.errorMessage);
+		const hasCustomReason =
+			message.errorMessage !== undefined && message.errorMessage.trim().length > 0 && !genericAbort;
 		const reasonlessAbort =
 			(message.stopReason === "aborted" || message.stopReason === "error") &&
 			!this.#host.abortInProgress() &&
 			!this.#host.isDisposed() &&
 			!this.#host.streamingEditAbortTriggered() &&
+			!AIError.hasNonAbortKind(id) &&
+			!hasCustomReason &&
 			((message.stopReason === "aborted" && AIError.is(id, AIError.Flag.Abort)) || genericAbort);
 		if (!reasonlessAbort && !this.#isMidStreamTransportFailure(message, id)) return undefined;
 		if (reasonlessAbort && genericAbort) message.errorId = AIError.create(AIError.Flag.Abort);
@@ -2797,7 +2805,9 @@ export class TurnRecovery {
 		if (this.#retryAttempt === 0) this.#genericAbortStreak = 0;
 		this.#retryAttempt++;
 		this.#genericAbortStreak =
-			message.errorMessage !== undefined && Object.hasOwn(GENERIC_ABORT_MESSAGES, message.errorMessage)
+			!AIError.hasNonAbortKind(message.errorId) &&
+			message.errorMessage !== undefined &&
+			Object.hasOwn(GENERIC_ABORT_MESSAGES, message.errorMessage)
 				? this.#genericAbortStreak + 1
 				: 0;
 

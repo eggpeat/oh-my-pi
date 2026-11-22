@@ -513,6 +513,11 @@ export function is(id: number | undefined, flag: Flag): boolean {
 	return ((id ?? 0) & flag) !== 0;
 }
 
+/** Whether `id` carries any classified kind flag besides {@link Flag.Abort}. */
+export function hasNonAbortKind(id: number | undefined): boolean {
+	return ((id ?? 0) & (KIND_MASK & ~Flag.Abort)) !== 0;
+}
+
 export function retriable(id: number | undefined, opts?: { replayUnsafe?: boolean }): boolean {
 	if (is(id, Flag.ContentBlocked)) return false;
 	if (is(id, Flag.PayloadRejected)) return false;

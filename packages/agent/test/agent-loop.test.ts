@@ -21,6 +21,7 @@ import type {
 } from "@oh-my-pi/pi-agent-core/types";
 import { ASIDE_MESSAGE_COMMIT, ASIDE_MESSAGE_DISCARD, SPECULATIVE_STREAM_SESSION } from "@oh-my-pi/pi-agent-core/types";
 import type { AssistantMessage, AssistantMessageEvent, Context, Message, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { transformMessages } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { kCursorExecResolved, setStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
@@ -652,6 +653,42 @@ describe("agentLoop with AgentMessage", () => {
 		// The reason rides AbortController.abort(reason) onto the message verbatim,
 		// instead of the generic "Request was aborted" default.
 		expect(finalMessage.errorMessage).toBe("Interrupted by user");
+	});
+
+	it("keeps labelled AbortError messages and StreamTimeoutError flags when aborting before events", async () => {
+		const mock = createMockModel();
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const labelledController = new AbortController();
+		const labelledStream = agentLoop(
+			[createUserMessage("Hello")],
+			{ systemPrompt: ["You are helpful."], messages: [], tools: [] },
+			config,
+			labelledController.signal,
+			() => new AssistantMessageEventStream(),
+		);
+		queueMicrotask(() => labelledController.abort(new DOMException("Interrupted by user", "AbortError")));
+		const labelledMessages = await labelledStream.result();
+		const labelledFinal = labelledMessages[labelledMessages.length - 1] as AssistantMessage;
+		expect(labelledFinal.stopReason).toBe("aborted");
+		expect(labelledFinal.errorMessage).toBe("Interrupted by user");
+		expect(AIError.is(labelledFinal.errorId, AIError.Flag.Abort)).toBe(false);
+
+		const timeoutController = new AbortController();
+		const timeoutStream = agentLoop(
+			[createUserMessage("Hello")],
+			{ systemPrompt: ["You are helpful."], messages: [], tools: [] },
+			config,
+			timeoutController.signal,
+			() => new AssistantMessageEventStream(),
+		);
+		queueMicrotask(() => timeoutController.abort(new AIError.StreamTimeoutError("")));
+		const timeoutMessages = await timeoutStream.result();
+		const timeoutFinal = timeoutMessages[timeoutMessages.length - 1] as AssistantMessage;
+		expect(timeoutFinal.stopReason).toBe("aborted");
+		expect(timeoutFinal.errorMessage).toBe("Request was aborted");
+		expect(AIError.is(timeoutFinal.errorId, AIError.Flag.Timeout)).toBe(true);
+		expect(AIError.is(timeoutFinal.errorId, AIError.Flag.Abort)).toBe(false);
 	});
 
 	it("should apply transformContext before convertToLlm", async () => {

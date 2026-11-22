@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Aborted agent turns now preserve custom `AbortError` messages and keep error flags on typed abort reasons with empty text ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+
 ## [19.1.0] - 2026-11-21
 
 ### Added

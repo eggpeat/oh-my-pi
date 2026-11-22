@@ -5,7 +5,6 @@ import { setBedrockProviderModule, streamBedrock } from "@oh-my-pi/pi-ai/provide
 import type { AssistantMessage, Context, Model } from "@oh-my-pi/pi-ai/types";
 import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { TurnRecovery, type TurnRecoveryHost } from "@oh-my-pi/pi-coding-agent/session/turn-recovery";
 
 // The transport override is process-global: put the built-in back so later files stream for real.
 afterEach(() => setBedrockProviderModule(BedrockProvider));
@@ -61,18 +60,6 @@ function createAssistantMessage(
 }
 
 const baseContext: Context = { messages: [] };
-
-function reasonlessAbortRecovery(): TurnRecovery {
-	return new TurnRecovery(
-		{
-			abortInProgress: () => false,
-			isDisposed: () => false,
-			streamingEditAbortTriggered: () => false,
-			model: () => undefined,
-		} as unknown as TurnRecoveryHost,
-		{ deferFallbackChainValidation: true },
-	);
-}
 
 async function abortBedrockAfterStart(abort: (controller: AbortController) => void): Promise<AssistantMessage> {
 	const abortController = new AbortController();
@@ -371,54 +358,84 @@ describe("register-builtins lazy streams", () => {
 		expect(result.errorMessage).toBe("Request was aborted");
 		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(true);
 		expect(AIError.is(result.errorId, AIError.Flag.Timeout)).toBe(false);
-		expect(reasonlessAbortRecovery().isRetryableReasonlessAbort(result)).toBe(true);
 	});
 
-	it("keeps a labelled caller abort off the generic abort flag so the turn is not retried", async () => {
-		const result = await abortBedrockAfterStart(controller => controller.abort("Interrupted by user"));
-		expect(result.stopReason).toBe("aborted");
-		expect(result.errorMessage).toBe("Interrupted by user");
-		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(false);
-		expect(reasonlessAbortRecovery().isRetryableReasonlessAbort(result)).toBe(false);
-	});
+	it("keeps a labelled caller abort text and avoids Flag.Abort for string and DOMException reasons", async () => {
+		const stringResult = await abortBedrockAfterStart(controller => controller.abort("Interrupted by user"));
+		expect(stringResult.stopReason).toBe("aborted");
+		expect(stringResult.errorMessage).toBe("Interrupted by user");
+		expect(AIError.is(stringResult.errorId, AIError.Flag.Abort)).toBe(false);
 
-	it("keeps a caller StreamTimeoutError timeout flag and does not retry that stop", async () => {
-		const result = await abortBedrockAfterStart(controller =>
-			controller.abort(new AIError.StreamTimeoutError("budget spent")),
+		const domAbortResult = await abortBedrockAfterStart(controller =>
+			controller.abort(new DOMException("Interrupted by user", "AbortError")),
 		);
-		expect(result.stopReason).toBe("aborted");
-		expect(result.errorMessage).toBe("budget spent");
-		expect(AIError.is(result.errorId, AIError.Flag.Timeout)).toBe(true);
-		expect(AIError.is(result.errorId, AIError.Flag.Transient)).toBe(true);
-		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(false);
-		expect(reasonlessAbortRecovery().isRetryableReasonlessAbort(result)).toBe(false);
-		expect(AIError.is(result.errorId, AIError.Flag.Timeout)).toBe(true);
-		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(false);
-	});
+		expect(domAbortResult.stopReason).toBe("aborted");
+		expect(domAbortResult.errorMessage).toBe("Interrupted by user");
+		expect(AIError.is(domAbortResult.errorId, AIError.Flag.Abort)).toBe(false);
 
-	it("keeps the timeout flag when a caller StreamTimeoutError uses the generic abort text", async () => {
-		const result = await abortBedrockAfterStart(controller =>
-			controller.abort(new AIError.StreamTimeoutError("Request was aborted")),
+		const aiAbortResult = await abortBedrockAfterStart(controller =>
+			controller.abort(new AIError.AbortError("Interrupted by user")),
 		);
-		expect(result.stopReason).toBe("aborted");
-		expect(result.errorMessage).toBe("Request was aborted");
-		expect(AIError.is(result.errorId, AIError.Flag.Timeout)).toBe(true);
-		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(false);
+		expect(aiAbortResult.stopReason).toBe("aborted");
+		expect(aiAbortResult.errorMessage).toBe("Interrupted by user");
+		expect(AIError.is(aiAbortResult.errorId, AIError.Flag.Abort)).toBe(true);
 	});
 
-	it("reads the caller signal and timeouts once and still forwards the other options", async () => {
+	it("keeps the timeout flag on a caller StreamTimeoutError regardless of message text", async () => {
+		const cases: Array<[string, string]> = [
+			["budget spent", "budget spent"],
+			["", "Request was aborted"],
+			["Request was aborted", "Request was aborted"],
+		];
+		for (const [reasonText, expectedMessage] of cases) {
+			const result = await abortBedrockAfterStart(controller =>
+				controller.abort(new AIError.StreamTimeoutError(reasonText)),
+			);
+			expect(result.stopReason).toBe("aborted");
+			expect(result.errorMessage).toBe(expectedMessage);
+			expect(AIError.is(result.errorId, AIError.Flag.Timeout)).toBe(true);
+			expect(AIError.is(result.errorId, AIError.Flag.Transient)).toBe(true);
+			expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(false);
+		}
+	});
+
+	it("delivers option-getter errors through stream.result() instead of throwing synchronously", async () => {
+		setBedrockProviderModule({
+			streamBedrock: () => {
+				throw new Error("provider should not run");
+			},
+		});
+
+		const options = {
+			get headers(): Record<string, string> {
+				throw new Error("bad headers");
+			},
+		};
+
+		const stream = streamBedrock(createModel(), baseContext, options);
+		const result = await stream.result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("bad headers");
+	});
+
+	it("reads control options once, preserves symbols, and keeps own __proto__ data properties inert", async () => {
+		vi.useFakeTimers();
 		const firstController = new AbortController();
 		const secondController = new AbortController();
 		let signalReads = 0;
 		let idleReads = 0;
 		let firstEventReads = 0;
 		const partialMessage = createAssistantMessage("stop");
+		const customSymbol = Symbol("caller-setting");
 		let providerSignal: AbortSignal | undefined;
 		let steadyState = false;
 		let settled = false;
 		let seenIdle: number | undefined = 123;
 		let seenFirst: number | undefined = 123;
 		let seenHeader: string | undefined;
+		let seenSymbol: string | undefined;
+		let seenProto: unknown;
+		let seenProtoOwn = false;
 		const source = {
 			async *[Symbol.asyncIterator]() {
 				yield { type: "start", partial: partialMessage } as const;
@@ -440,12 +457,17 @@ describe("register-builtins lazy streams", () => {
 				seenIdle = options.streamIdleTimeoutMs;
 				seenFirst = options.streamFirstEventTimeoutMs;
 				seenHeader = options.headers?.["x-caller"];
+				const optionRecord = options as Record<string | symbol, unknown>;
+				seenSymbol = optionRecord[customSymbol] as string | undefined;
+				seenProto = Object.getPrototypeOf(options);
+				seenProtoOwn = Object.hasOwn(options, "__proto__");
 				providerSignal = options.signal;
 				return source;
 			},
 		});
 
-		const options = {
+		const jsonProto = JSON.parse('{"__proto__":{"polluted":"yes"}}') as Record<string, unknown>;
+		const options = Object.assign(jsonProto, {
 			get signal(): AbortSignal {
 				signalReads += 1;
 				return signalReads === 1 ? firstController.signal : secondController.signal;
@@ -459,7 +481,8 @@ describe("register-builtins lazy streams", () => {
 				return firstEventReads === 1 ? undefined : 1;
 			},
 			headers: { "x-caller": "kept" },
-		};
+			[customSymbol]: "kept-symbol",
+		});
 
 		const resultPromise = streamBedrock(createModel(), baseContext, options).result();
 		void resultPromise.then(
@@ -476,7 +499,10 @@ describe("register-builtins lazy streams", () => {
 				() => steadyState,
 				"Bedrock mock stream did not reach steady state for the single-read options test",
 			);
-			await Bun.sleep(50);
+			vi.advanceTimersByTime(50);
+			for (let i = 0; i < 30; i++) {
+				await Promise.resolve();
+			}
 			expect(settled).toBe(false);
 			expect(signalReads).toBe(1);
 			expect(idleReads).toBe(1);
@@ -484,12 +510,16 @@ describe("register-builtins lazy streams", () => {
 			expect(seenIdle).toBeUndefined();
 			expect(seenFirst).toBeUndefined();
 			expect(seenHeader).toBe("kept");
+			expect(seenSymbol).toBe("kept-symbol");
+			expect(seenProto).toBe(Object.prototype);
+			expect(seenProtoOwn).toBe(true);
 
 			firstController.abort();
 			const result = await resultPromise;
 			expect(result.stopReason).toBe("aborted");
 		} finally {
 			firstController.abort();
+			vi.useRealTimers();
 		}
 	});
 });
