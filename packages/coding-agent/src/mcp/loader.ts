@@ -6,9 +6,7 @@
 import type { Settings } from "../config/settings";
 import type { LoadedCustomTool } from "../extensibility/custom-tools/types";
 import type { AuthStorage } from "../session/auth-storage";
-import { type MCPLoadResult, MCPManager } from "./manager";
-import type { McpConnectionStatusEvent } from "./startup-events";
-import type { MCPTransformContext } from "./transforms";
+import { type MCPDiscoverOptions, type MCPLoadResult, MCPManager } from "./manager";
 
 /** Result from loading MCP tools */
 export interface MCPToolsLoadResult {
@@ -40,6 +38,8 @@ export interface MCPToolsLoadOptions {
 	builtinTransforms?: MCPTransformContext;
 	/** Settings scope for the Exa fold's `providers.webKeyless` read (default: the global settings). */
 	settings?: Settings;
+/** Options for loading MCP tools: discovery options plus manager setup. */
+export interface MCPToolsLoadOptions extends MCPDiscoverOptions {
 	/** Linger of an unused shared server in milliseconds (`mcp.idleStopMinutes`); the manager default when absent. */
 	idleStopMs?: number;
 	/** Auth storage used to resolve OAuth credentials before initial MCP connect */
@@ -67,6 +67,7 @@ export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoa
 			enableProjectConfig: options?.enableProjectConfig,
 			filterExa: options?.filterExa,
 			filterBrowser: options?.filterBrowser,
+			extensionRoots: options?.extensionRoots,
 			builtinTransforms: options?.builtinTransforms,
 			settings: options?.settings,
 		});
