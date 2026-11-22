@@ -2893,16 +2893,16 @@ function emitAbortedAssistantMessage(
 ): AssistantMessage {
 	const model = config.getModel?.() ?? config.model;
 	const errorMessage = abortReasonText(requestSignal);
-	const reason = requestSignal?.reason;
-	const classified = AIError.classify(reason);
-	const errorId =
-		classified !== 0
-			? classified
-			: !toolScopedAbortReason(requestSignal) && AIError.isBareAbortReason(reason)
-				? AIError.create(AIError.Flag.Abort)
-				: undefined;
+	const { errorId, errorStatus } = AIError.classifyCallerAbort(requestSignal, model.api);
+	const resolvedErrorStatus = errorStatus ?? partialMessage?.errorStatus;
 	const base: AssistantMessage = partialMessage
-		? { ...partialMessage, stopReason: "aborted", errorMessage, errorId }
+		? {
+				...partialMessage,
+				stopReason: "aborted",
+				...(resolvedErrorStatus !== undefined && { errorStatus: resolvedErrorStatus }),
+				errorMessage,
+				errorId,
+			}
 		: {
 				role: "assistant",
 				content: [],
@@ -2918,6 +2918,7 @@ function emitAbortedAssistantMessage(
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				},
 				stopReason: "aborted",
+				...(errorStatus !== undefined && { errorStatus }),
 				errorMessage,
 				errorId,
 				timestamp: Date.now(),

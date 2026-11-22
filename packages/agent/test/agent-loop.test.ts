@@ -667,12 +667,29 @@ describe("agentLoop with AgentMessage", () => {
 			labelledController.signal,
 			() => new AssistantMessageEventStream(),
 		);
-		queueMicrotask(() => labelledController.abort(new DOMException("Interrupted by user", "AbortError")));
+		queueMicrotask(() => labelledController.abort(new DOMException("Aborted", "AbortError")));
 		const labelledMessages = await labelledStream.result();
 		const labelledFinal = labelledMessages[labelledMessages.length - 1] as AssistantMessage;
 		expect(labelledFinal.stopReason).toBe("aborted");
-		expect(labelledFinal.errorMessage).toBe("Interrupted by user");
+		expect(labelledFinal.errorMessage).toBe("Aborted");
 		expect(AIError.is(labelledFinal.errorId, AIError.Flag.Abort)).toBe(false);
+		expect(AIError.is(labelledFinal.errorId, AIError.Flag.CallerAbort)).toBe(true);
+
+		const sentinelController = new AbortController();
+		const sentinelStream = agentLoop(
+			[createUserMessage("Hello")],
+			{ systemPrompt: ["You are helpful."], messages: [], tools: [] },
+			config,
+			sentinelController.signal,
+			() => new AssistantMessageEventStream(),
+		);
+		queueMicrotask(() => sentinelController.abort("Request was aborted"));
+		const sentinelMessages = await sentinelStream.result();
+		const sentinelFinal = sentinelMessages[sentinelMessages.length - 1] as AssistantMessage;
+		expect(sentinelFinal.stopReason).toBe("aborted");
+		expect(sentinelFinal.errorMessage).toBe("Request was aborted");
+		expect(AIError.is(sentinelFinal.errorId, AIError.Flag.Abort)).toBe(false);
+		expect(AIError.is(sentinelFinal.errorId, AIError.Flag.CallerAbort)).toBe(true);
 
 		const timeoutController = new AbortController();
 		const timeoutStream = agentLoop(

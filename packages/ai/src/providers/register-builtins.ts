@@ -182,24 +182,15 @@ function createProviderStreamError<TApi extends Api>(
 	stopReason: Extract<AssistantMessage["stopReason"], "aborted" | "error"> = "error",
 	callerSignal?: AbortSignal,
 ): AssistantMessage {
-	// Classify the caller signal's own reason independently of the display text
-	// so a StreamTimeoutError with empty or generic text keeps Flag.Timeout and
-	// only a bare abort() falls back to Flag.Abort.
 	let errorMessage: string;
 	let errorId: number | undefined;
+	let errorStatus: number | undefined;
 	if (stopReason === "aborted") {
-		const reason = callerSignal?.reason;
-		const classified = AIError.classify(reason, model.api);
-		errorMessage = AIError.callerAbortReason(callerSignal) ?? "Request was aborted";
-		errorId =
-			classified !== 0
-				? classified
-				: AIError.isBareAbortReason(reason)
-					? AIError.create(AIError.Flag.Abort)
-					: undefined;
+		({ errorMessage, errorId, errorStatus } = AIError.classifyCallerAbort(callerSignal, model.api));
 	} else {
 		errorMessage = error instanceof Error ? error.message : String(error);
 		errorId = AIError.classify(error, model.api) || undefined;
+		errorStatus = AIError.status(error);
 	}
 	return {
 		role: "assistant",
@@ -216,6 +207,7 @@ function createProviderStreamError<TApi extends Api>(
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason,
+		...(errorStatus !== undefined && { errorStatus }),
 		errorId,
 		errorMessage,
 		timestamp: Date.now(),

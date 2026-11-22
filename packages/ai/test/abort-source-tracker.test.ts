@@ -33,6 +33,11 @@ describe("createAbortSourceTracker", () => {
 		caller.abort("Interrupted by user");
 		expect(tracker.getCallerAbortReason()).toBe("Interrupted by user");
 
+		const domAbort = new AbortController();
+		const domTracker = createAbortSourceTracker(domAbort.signal);
+		domAbort.abort(new DOMException("Aborted", "AbortError"));
+		expect(domTracker.getCallerAbortReason()).toBe("Aborted");
+
 		const bare = new AbortController();
 		const untold = createAbortSourceTracker(bare.signal);
 		bare.abort();

@@ -52,6 +52,14 @@ export const Flag = {
 	 * status value, so no raw status id can set it.
 	 */
 	CacheControlUnsupported: 0x0000_0800,
+	/**
+	 * Explicit caller-supplied abort reason (`controller.abort(reason)` where
+	 * `reason` is not the runtime's bare-abort default). Keeps deliberate
+	 * cancellations whose text matches a generic sentinel (or is empty) out of
+	 * reasonless-abort auto-retry. Claims bit 10 (`0x0400` = 1024), above the
+	 * raw HTTP status lane (100-599).
+	 */
+	CallerAbort: 0x0000_0400,
 	/** HTTP 413 byte/media rejection — token compaction cannot shrink bytes or media budgets (#9235). */
 	PayloadRejected: 0x8000_0000,
 } as const;
@@ -74,6 +82,7 @@ const KIND_MASK =
 	Flag.PayloadRejected |
 	Flag.SilentAbort |
 	Flag.UserInterrupt |
+	Flag.CallerAbort |
 	Flag.Abort |
 	Flag.Grammar |
 	Flag.FastModeUnsupported |
@@ -492,6 +501,7 @@ const ERROR_KIND_LABELS: readonly [Flag, string][] = [
 	[Flag.AuthFailed, "auth-failed"],
 	[Flag.SilentAbort, "silent-abort"],
 	[Flag.UserInterrupt, "user-interrupt"],
+	[Flag.CallerAbort, "caller-abort"],
 	[Flag.Abort, "abort"],
 ];
 
@@ -526,11 +536,11 @@ export function retriable(id: number | undefined, opts?: { replayUnsafe?: boolea
 	return ((id ?? 0) & RETRIABLE_KINDS) !== 0;
 }
 
-function isClassified(id: number | undefined): boolean {
+export function isClassified(id: number | undefined): boolean {
 	return ((id ?? 0) & Flag.Class) !== 0;
 }
 
-function statusFromId(id: number | undefined): number | undefined {
+export function statusFromId(id: number | undefined): number | undefined {
 	return id && !isClassified(id) ? id : undefined;
 }
 

@@ -1594,7 +1594,9 @@ export class TurnRecovery {
 		}
 
 		const id = this.#classifyRetryMessage(message);
-		if (AIError.hasNonAbortKind(id)) return false;
+		if (AIError.hasNonAbortKind(id) || message.errorStatus !== undefined || AIError.statusFromId(id) !== undefined) {
+			return false;
+		}
 		const genericAbort =
 			message.errorMessage !== undefined && Object.hasOwn(GENERIC_ABORT_MESSAGES, message.errorMessage);
 		const hasCustomReason =
@@ -1752,6 +1754,7 @@ export class TurnRecovery {
 	 */
 	classifyResolvedInterruptedToolTurn(message: AssistantMessage): "reasonless-abort" | "stream-stall" | undefined {
 		const id = this.#classifyRetryMessage(message);
+		const hasKnownStatus = message.errorStatus !== undefined || AIError.statusFromId(id) !== undefined;
 		const genericAbort =
 			message.errorMessage !== undefined && Object.hasOwn(GENERIC_ABORT_MESSAGES, message.errorMessage);
 		const hasCustomReason =
@@ -1762,6 +1765,7 @@ export class TurnRecovery {
 			!this.#host.isDisposed() &&
 			!this.#host.streamingEditAbortTriggered() &&
 			!AIError.hasNonAbortKind(id) &&
+			!hasKnownStatus &&
 			!hasCustomReason &&
 			((message.stopReason === "aborted" && AIError.is(id, AIError.Flag.Abort)) || genericAbort);
 		if (!reasonlessAbort && !this.#isMidStreamTransportFailure(message, id)) return undefined;
@@ -2806,6 +2810,8 @@ export class TurnRecovery {
 		this.#retryAttempt++;
 		this.#genericAbortStreak =
 			!AIError.hasNonAbortKind(message.errorId) &&
+			message.errorStatus === undefined &&
+			AIError.statusFromId(message.errorId) === undefined &&
 			message.errorMessage !== undefined &&
 			Object.hasOwn(GENERIC_ABORT_MESSAGES, message.errorMessage)
 				? this.#genericAbortStreak + 1

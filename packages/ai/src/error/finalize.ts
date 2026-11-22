@@ -1,5 +1,5 @@
 import type { Api } from "../types";
-import { callerAbortReason } from "./abort";
+import { callerAbortReason, classifyCallerAbort } from "./abort";
 import type { AbortSourceTracker } from "../utils/abort";
 import type { CapturedHttpErrorResponse, RawHttpRequestDump } from "../utils/http-inspector";
 import { classify, classifyMessage, status } from "./flags";
@@ -59,6 +59,25 @@ export async function finalize(error: unknown, opts: FinalizeOptions = {}): Prom
 		message = localReason?.message ?? callerReason ?? (await formatMessage(error, opts));
 	} catch {
 		message = error instanceof Error ? error.message : String(error);
+	}
+
+	if (aborted) {
+		const callerSignal = opts.abortTracker ? opts.abortTracker.callerSignal : opts.signal;
+		const callerAbort = classifyCallerAbort(callerSignal, opts.api);
+		const id = classifyMessage({
+			api: opts.api,
+			provider: opts.provider,
+			model: opts.model,
+			errorId: callerAbort.errorId,
+			errorMessage: callerAbortReason(callerSignal),
+			errorStatus: callerAbort.errorStatus,
+		});
+		return {
+			id,
+			status: callerAbort.errorStatus,
+			stopReason: "aborted",
+			message,
+		};
 	}
 
 	// A captured status is transport context for the original error. Put it at

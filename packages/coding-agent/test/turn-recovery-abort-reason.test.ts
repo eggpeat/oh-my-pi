@@ -101,14 +101,16 @@ describe("TurnRecovery abort-reason and specific-flag handling", () => {
 		expect(createRecovery().isRetryableReasonlessAbort(bare)).toBe(true);
 		expect(AIError.is(bare.errorId, AIError.Flag.Abort)).toBe(true);
 
-		const labelledCases: Array<() => unknown> = [
-			() => "Interrupted by user",
-			() => new DOMException("Interrupted by user", "AbortError"),
-			() => new AIError.AbortError("Interrupted by user"),
+		const labelledCases: Array<[() => unknown, string]> = [
+			[() => "Interrupted by user", "Interrupted by user"],
+			[() => new DOMException("Aborted", "AbortError"), "Aborted"],
+			[() => new DOMException("Interrupted by user", "AbortError"), "Interrupted by user"],
+			[() => new AIError.AbortError("Interrupted by user"), "Interrupted by user"],
+			[() => "Request was aborted", "Request was aborted"],
 		];
-		for (const makeReason of labelledCases) {
+		for (const [makeReason, expectedMessage] of labelledCases) {
 			const result = await abortBedrockAfterStart(controller => controller.abort(makeReason()));
-			expect(result.errorMessage).toBe("Interrupted by user");
+			expect(result.errorMessage).toBe(expectedMessage);
 			expect(createRecovery().isRetryableReasonlessAbort(result)).toBe(false);
 		}
 	});
@@ -181,5 +183,70 @@ describe("TurnRecovery abort-reason and specific-flag handling", () => {
 			createRecovery([reasonlessGeneric, syntheticResult]).classifyResolvedInterruptedToolTurn(reasonlessGeneric),
 		).toBe("reasonless-abort");
 		expect(AIError.is(reasonlessGeneric.errorId, AIError.Flag.Abort)).toBe(true);
+	});
+
+	it("keeps status 404 and explicit caller intent across both retry checks without overwriting status", async () => {
+		const toolCallBlock: AssistantMessage["content"][number] = {
+			type: "toolCall",
+			id: "call_1",
+			name: "bash",
+			arguments: { command: "pwd" },
+		};
+		const syntheticResult: ToolResultMessage<SyntheticToolResultDetails> = {
+			role: "toolResult",
+			toolCallId: "call_1",
+			toolName: "bash",
+			content: [{ type: "text", text: "Tool call was not executed." }],
+			isError: true,
+			details: { __synthetic: true, source: "assistant_stop_error", executed: false },
+			timestamp: Date.now(),
+		};
+
+		const statusStreamResult = await abortBedrockAfterStart(controller =>
+			controller.abort(Object.assign(new Error("Request was aborted"), { status: 404 })),
+		);
+		expect(createRecovery().isRetryableReasonlessAbort(statusStreamResult)).toBe(false);
+		expect(statusStreamResult.errorId).toBe(404);
+		expect(statusStreamResult.errorStatus).toBe(404);
+
+		const statusIdOnlyEmpty: AssistantMessage = {
+			...createPartialMessage(),
+			stopReason: "aborted",
+			errorMessage: "Request was aborted",
+			errorId: 404,
+		};
+		expect(createRecovery().isRetryableReasonlessAbort(statusIdOnlyEmpty)).toBe(false);
+		expect(statusIdOnlyEmpty.errorId).toBe(404);
+
+		const statusToolTurn: AssistantMessage = {
+			...createPartialMessage(),
+			content: [toolCallBlock],
+			stopReason: "aborted",
+			errorMessage: "Request was aborted",
+			errorId: 404,
+		};
+		expect(
+			createRecovery([statusToolTurn, syntheticResult]).classifyResolvedInterruptedToolTurn(statusToolTurn),
+		).toBeUndefined();
+		expect(statusToolTurn.errorId).toBe(404);
+
+		const explicitSentinelStreamResult = await abortBedrockAfterStart(controller =>
+			controller.abort("Request was aborted"),
+		);
+		expect(createRecovery().isRetryableReasonlessAbort(explicitSentinelStreamResult)).toBe(false);
+		expect(AIError.is(explicitSentinelStreamResult.errorId, AIError.Flag.CallerAbort)).toBe(true);
+		expect(AIError.is(explicitSentinelStreamResult.errorId, AIError.Flag.Abort)).toBe(false);
+
+		const explicitSentinelToolTurn: AssistantMessage = {
+			...explicitSentinelStreamResult,
+			content: [toolCallBlock],
+		};
+		expect(
+			createRecovery([explicitSentinelToolTurn, syntheticResult]).classifyResolvedInterruptedToolTurn(
+				explicitSentinelToolTurn,
+			),
+		).toBeUndefined();
+		expect(AIError.is(explicitSentinelToolTurn.errorId, AIError.Flag.CallerAbort)).toBe(true);
+		expect(AIError.is(explicitSentinelToolTurn.errorId, AIError.Flag.Abort)).toBe(false);
 	});
 });

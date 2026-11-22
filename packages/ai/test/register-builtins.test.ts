@@ -360,18 +360,36 @@ describe("register-builtins lazy streams", () => {
 		expect(AIError.is(result.errorId, AIError.Flag.Timeout)).toBe(false);
 	});
 
-	it("keeps a labelled caller abort text and avoids Flag.Abort for string and DOMException reasons", async () => {
+	it("keeps caller abort labels, status codes, and caller intent without setting Flag.Abort alone", async () => {
 		const stringResult = await abortBedrockAfterStart(controller => controller.abort("Interrupted by user"));
 		expect(stringResult.stopReason).toBe("aborted");
 		expect(stringResult.errorMessage).toBe("Interrupted by user");
 		expect(AIError.is(stringResult.errorId, AIError.Flag.Abort)).toBe(false);
+		expect(AIError.is(stringResult.errorId, AIError.Flag.CallerAbort)).toBe(true);
 
 		const domAbortResult = await abortBedrockAfterStart(controller =>
-			controller.abort(new DOMException("Interrupted by user", "AbortError")),
+			controller.abort(new DOMException("Aborted", "AbortError")),
 		);
 		expect(domAbortResult.stopReason).toBe("aborted");
-		expect(domAbortResult.errorMessage).toBe("Interrupted by user");
+		expect(domAbortResult.errorMessage).toBe("Aborted");
 		expect(AIError.is(domAbortResult.errorId, AIError.Flag.Abort)).toBe(false);
+		expect(AIError.is(domAbortResult.errorId, AIError.Flag.CallerAbort)).toBe(true);
+
+		const explicitSentinelResult = await abortBedrockAfterStart(controller =>
+			controller.abort("Request was aborted"),
+		);
+		expect(explicitSentinelResult.stopReason).toBe("aborted");
+		expect(explicitSentinelResult.errorMessage).toBe("Request was aborted");
+		expect(AIError.is(explicitSentinelResult.errorId, AIError.Flag.Abort)).toBe(false);
+		expect(AIError.is(explicitSentinelResult.errorId, AIError.Flag.CallerAbort)).toBe(true);
+
+		const statusAbortResult = await abortBedrockAfterStart(controller =>
+			controller.abort(Object.assign(new Error("Request was aborted"), { status: 404 })),
+		);
+		expect(statusAbortResult.stopReason).toBe("aborted");
+		expect(statusAbortResult.errorMessage).toBe("Request was aborted");
+		expect(statusAbortResult.errorId).toBe(404);
+		expect(statusAbortResult.errorStatus).toBe(404);
 
 		const aiAbortResult = await abortBedrockAfterStart(controller =>
 			controller.abort(new AIError.AbortError("Interrupted by user")),
@@ -379,6 +397,7 @@ describe("register-builtins lazy streams", () => {
 		expect(aiAbortResult.stopReason).toBe("aborted");
 		expect(aiAbortResult.errorMessage).toBe("Interrupted by user");
 		expect(AIError.is(aiAbortResult.errorId, AIError.Flag.Abort)).toBe(true);
+		expect(AIError.is(aiAbortResult.errorId, AIError.Flag.CallerAbort)).toBe(true);
 	});
 
 	it("keeps the timeout flag on a caller StreamTimeoutError regardless of message text", async () => {
@@ -436,6 +455,7 @@ describe("register-builtins lazy streams", () => {
 		let seenSymbol: string | undefined;
 		let seenProto: unknown;
 		let seenProtoOwn = false;
+		let seenPolluted = true;
 		const source = {
 			async *[Symbol.asyncIterator]() {
 				yield { type: "start", partial: partialMessage } as const;
@@ -461,13 +481,14 @@ describe("register-builtins lazy streams", () => {
 				seenSymbol = optionRecord[customSymbol] as string | undefined;
 				seenProto = Object.getPrototypeOf(options);
 				seenProtoOwn = Object.hasOwn(options, "__proto__");
+				seenPolluted = "polluted" in options;
 				providerSignal = options.signal;
 				return source;
 			},
 		});
 
-		const jsonProto = JSON.parse('{"__proto__":{"polluted":"yes"}}') as Record<string, unknown>;
-		const options = Object.assign(jsonProto, {
+		const options = {
+			["__proto__"]: { polluted: "yes" },
 			get signal(): AbortSignal {
 				signalReads += 1;
 				return signalReads === 1 ? firstController.signal : secondController.signal;
@@ -482,8 +503,11 @@ describe("register-builtins lazy streams", () => {
 			},
 			headers: { "x-caller": "kept" },
 			[customSymbol]: "kept-symbol",
-		});
-
+		};
+		expect(signalReads).toBe(0);
+		expect(idleReads).toBe(0);
+		expect(firstEventReads).toBe(0);
+		expect("polluted" in options).toBe(false);
 		const resultPromise = streamBedrock(createModel(), baseContext, options).result();
 		void resultPromise.then(
 			() => {
@@ -513,6 +537,7 @@ describe("register-builtins lazy streams", () => {
 			expect(seenSymbol).toBe("kept-symbol");
 			expect(seenProto).toBe(Object.prototype);
 			expect(seenProtoOwn).toBe(true);
+			expect(seenPolluted).toBe(false);
 
 			firstController.abort();
 			const result = await resultPromise;

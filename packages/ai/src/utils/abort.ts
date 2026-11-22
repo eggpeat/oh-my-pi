@@ -3,6 +3,7 @@ import * as AIError from "../error";
 export interface AbortSourceTracker {
 	requestAbortController: AbortController;
 	requestSignal: AbortSignal;
+	callerSignal?: AbortSignal;
 	abortLocally(reason: Error): Error;
 	getLocalAbortReason(): Error | undefined;
 	/** The reason the caller passed to `abort()`, read from the caller's own signal, never the racy merged one. */
@@ -31,6 +32,7 @@ export function createAbortSourceTracker(callerSignal?: AbortSignal): AbortSourc
 	return {
 		requestAbortController,
 		requestSignal,
+		callerSignal,
 		abortLocally(reason) {
 			localAbortReason = reason;
 			requestAbortController.abort(reason);
