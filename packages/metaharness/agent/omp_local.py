@@ -123,9 +123,9 @@ _CONFIG_DST = "/tmp/omp-config.yml"
 _OUTPUT_FILENAME = "omp.txt"
 
 # Print mode enables `launch.persist` so bash `name` services keep holding omp's
-# daemon after omp exits; `OMP_DAEMON_IDLE_GRACE_MS` also keeps an otherwise-idle
-# daemon up (default 3 s, and covers older `--install published` builds) until
-# the verifier finishes in the same container.
+# daemon after omp exits; `OMP_DAEMON_IDLE_GRACE_MS` keeps an otherwise-idle
+# daemon up (default 3 s) and keeps services alive on older `--install published`
+# builds that used the per-project broker until the container is torn down.
 _SERVICE_GRACE_ENV = {"OMP_DAEMON_IDLE_GRACE_MS": str(24 * 60 * 60 * 1000)}
 
 # Provider → host env vars used in --no-gateway (direct-auth) mode only.

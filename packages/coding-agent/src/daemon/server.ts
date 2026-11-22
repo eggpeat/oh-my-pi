@@ -6,7 +6,7 @@
  */
 import * as fs from "node:fs/promises";
 import { execReplace, FileLock, type IpcConnection, IpcServer } from "@oh-my-pi/pi-natives";
-import { isEnoent, isRecord, logger, postmortem, setProcessName } from "@oh-my-pi/pi-utils";
+import { isEnoent, isRecord, logger, postmortem, setProcessName, sleepLong } from "@oh-my-pi/pi-utils";
 import { daemonBuildId } from "./build";
 import { isSameProcess, processStartTime } from "./children";
 import type { ModuleClient, ModuleTunnel } from "./module";
@@ -46,8 +46,6 @@ const LISTEN_OPTIONS = { framing: "lines", maxFrameBytes: MAX_FRAME_BYTES } as c
 const LOCK_HANDOVER_TIMEOUT_MS = 10_000;
 /** A handover record older than this is stale even when its pid is alive. */
 const HANDOVER_MAX_AGE_MS = 60_000;
-/** Maximum delay `setTimeout` accepts without overflowing a 32-bit signed integer to 1 ms. */
-const MAX_TIMEOUT_MS = 0x7fff_ffff;
 
 /** Daemon side of one tunnelled connection. */
 class ConnectionTunnel implements ModuleTunnel {
@@ -181,9 +179,9 @@ class Daemon {
 	readonly #connections = new Set<DaemonConnection>();
 	readonly #finished = Promise.withResolvers<void>();
 	#server: IpcServer | undefined;
-	#idleTimer: NodeJS.Timeout | undefined;
-	/** True once a client connected (or across a re-exec); before that, startup waits at least `DAEMON_IDLE_EXIT_GRACE_MS`. */
-	#hadConnection: boolean;
+	#idleExit: AbortController | undefined;
+	/** True once a client's hello was accepted (or across a re-exec); before that, startup waits at least `DAEMON_IDLE_EXIT_GRACE_MS`. */
+	#servedClient: boolean;
 	/** `upgrade` or `shutdown` began: new requests are rejected. */
 	#closing = false;
 	#shutdown: Promise<void> | undefined;
@@ -200,7 +198,7 @@ class Daemon {
 		this.#lock = lock;
 		this.#store = store;
 		this.#idleExitGraceMs = idleExitGraceMs;
-		this.#hadConnection = resumed;
+		this.#servedClient = resumed;
 		this.#units = new UnitTable({
 			store,
 			modules: DAEMON_MODULES,
@@ -230,8 +228,7 @@ class Daemon {
 	shutdown(): Promise<void> {
 		this.#shutdown ??= (async () => {
 			this.#closing = true;
-			clearTimeout(this.#idleTimer);
-			this.#idleTimer = undefined;
+			this.#cancelIdleExit();
 			try {
 				await this.#units.shutdown();
 			} catch (error) {
@@ -254,10 +251,8 @@ class Daemon {
 
 	#accept(connection: IpcConnection): void {
 		const state = new DaemonConnection(connection);
-		this.#hadConnection = true;
 		this.#connections.add(state);
-		clearTimeout(this.#idleTimer);
-		this.#idleTimer = undefined;
+		this.#cancelIdleExit();
 		connection.start(
 			line => void this.#onLine(state, line),
 			() => this.#onClose(state),
@@ -284,6 +279,7 @@ class Daemon {
 				if (hello.token !== this.#token) throw new Error("Daemon authentication failed");
 				if (this.#closing) throw new Error("Daemon is shutting down");
 				state.hello = hello;
+				this.#servedClient = true;
 				state.client = {
 					connectionId: state.client.connectionId,
 					pid: hello.client.pid,
@@ -427,8 +423,7 @@ class Daemon {
 			await this.shutdown();
 			process.exit(0);
 		}
-		clearTimeout(this.#idleTimer);
-		this.#idleTimer = undefined;
+		this.#cancelIdleExit();
 		await this.#units.prepareReexec();
 		await this.#closeTransport();
 		const [command, ...rest] = hello.client.exe;
@@ -472,35 +467,39 @@ class Daemon {
 		this.#store.reopen();
 		await this.#units.abortReexec();
 		this.#closing = false;
-		this.#hadConnection = false;
+		this.#servedClient = false;
 		await this.#listen();
 		this.#scheduleIdleExit();
+	}
+
+	#cancelIdleExit(): void {
+		this.#idleExit?.abort();
+		this.#idleExit = undefined;
 	}
 
 	/** Exit once nothing is connected and no unit but `hold: "detached"` ones is live. */
 	#scheduleIdleExit(): void {
 		if (this.#closing || this.#connections.size > 0 || this.#units.keepsDaemonAlive()) {
-			clearTimeout(this.#idleTimer);
-			this.#idleTimer = undefined;
+			this.#cancelIdleExit();
 			return;
 		}
-		if (this.#idleTimer) return;
-		const graceMs = this.#hadConnection
+		if (this.#idleExit) return;
+		const graceMs = this.#servedClient
 			? this.#idleExitGraceMs
 			: Math.max(DAEMON_IDLE_EXIT_GRACE_MS, this.#idleExitGraceMs);
-		const arm = (remainingMs: number): void => {
-			const stepMs = Math.min(remainingMs, MAX_TIMEOUT_MS);
-			this.#idleTimer = setTimeout(() => {
-				this.#idleTimer = undefined;
+		const controller = new AbortController();
+		this.#idleExit = controller;
+		void sleepLong(graceMs, controller.signal).then(
+			() => {
+				if (this.#idleExit !== controller) return;
+				this.#idleExit = undefined;
 				if (this.#closing || this.#connections.size > 0 || this.#units.keepsDaemonAlive()) return;
-				if (remainingMs > stepMs) {
-					arm(remainingMs - stepMs);
-					return;
-				}
 				void this.shutdown();
-			}, stepMs);
-		};
-		arm(graceMs);
+			},
+			() => {
+				if (this.#idleExit === controller) this.#idleExit = undefined;
+			},
+		);
 	}
 }
 

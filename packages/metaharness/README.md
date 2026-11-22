@@ -225,7 +225,7 @@ known-correct fix for a failed task), `--concurrency` (default 8).
 - **Agent-started services outlive omp.** The verifier runs after omp exits,
   in the same container or VM: print and RPC modes enable `launch.persist` so
   services started with the bash tool's `name` stay persistent, and both
-  runners set `OMP_DAEMON_IDLE_GRACE_MS` to 24 h so an otherwise-idle omp
-  daemon (and older `--install published` builds) stays up until teardown
-  instead of exiting 3 s after omp disconnects. An explicit
-  `--env OMP_DAEMON_IDLE_GRACE_MS=<ms>` wins.
+  runners set `OMP_DAEMON_IDLE_GRACE_MS` to 24 h so an otherwise-idle daemon
+  lingers until teardown (and so older `--install published` builds that used
+  the per-project broker keep their services up instead of stopping 3 s after
+  omp exits). An explicit `--env OMP_DAEMON_IDLE_GRACE_MS=<ms>` wins.
