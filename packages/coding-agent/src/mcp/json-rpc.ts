@@ -173,7 +173,7 @@ export async function callMCP(
 			throw options.onHttpError(response, await response.text());
 		}
 		const errorMsg = `MCP request failed: ${response.status} ${response.statusText}`;
-		logger.error(errorMsg, { url: redactUrlForLog(url), method, params });
+		logger.error(errorMsg, { url: redactUrlForLog(url, "omit"), method, params });
 		throw new Error(errorMsg);
 	}
 
@@ -181,7 +181,7 @@ export async function callMCP(
 		return await readMcpJsonRpcResponse(response, body.id, signal);
 	} catch (error) {
 		logger.error("Failed to parse MCP response", {
-			url: redactUrlForLog(url),
+			url: redactUrlForLog(url, "omit"),
 			method,
 			error: error instanceof Error ? error.message : String(error),
 		});

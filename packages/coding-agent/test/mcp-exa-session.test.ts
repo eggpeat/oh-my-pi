@@ -19,14 +19,22 @@ import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { cfgProvidersWebKeyless } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { ExaProvider } from "@oh-my-pi/pi-coding-agent/web/search/providers/exa";
+import { runSearchQuery } from "@oh-my-pi/pi-coding-agent/web/search/index";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
-import { getConfigRootDir, getProjectDir, removeWithRetries, setAgentDir, setProjectDir } from "@oh-my-pi/pi-utils";
+import {
+	__resetDirsFromEnvForTests,
+	getProjectDir,
+	removeWithRetries,
+	setAgentDir,
+	setProjectDir,
+} from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 import { createInteractiveModeContext } from "./helpers/interactive-mode-context";
 import "@oh-my-pi/pi-coding-agent/discovery";
 
 const originalAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
-const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
+const originalOmpProfile = process.env.OMP_PROFILE;
+const originalPiProfile = process.env.PI_PROFILE;
 const KEYLESS_EXA = { type: "http", url: "https://mcp.exa.ai/mcp" } as const;
 const DUMMY_KEY = "exa-test-key";
 
@@ -60,12 +68,13 @@ describe("Exa MCP folding with session settings", () => {
 		vi.restoreAllMocks();
 		resetSettingsForTest();
 		clearFsCache();
-		if (originalAgentDirEnv) {
-			setAgentDir(originalAgentDirEnv);
-		} else {
-			setAgentDir(fallbackAgentDir);
-			delete process.env.PI_CODING_AGENT_DIR;
-		}
+		if (originalAgentDirEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = originalAgentDirEnv;
+		if (originalOmpProfile === undefined) delete process.env.OMP_PROFILE;
+		else process.env.OMP_PROFILE = originalOmpProfile;
+		if (originalPiProfile === undefined) delete process.env.PI_PROFILE;
+		else process.env.PI_PROFILE = originalPiProfile;
+		__resetDirsFromEnvForTests();
 		if (originalHome === undefined) delete process.env.HOME;
 		else process.env.HOME = originalHome;
 		if (originalExaApiKey === undefined) delete process.env.EXA_API_KEY;
@@ -176,6 +185,36 @@ describe("Exa MCP folding with session settings", () => {
 			authStorage.keys.setRuntime("exa", DUMMY_KEY);
 			await noKeyless.session.reloadMCPServers();
 			expect(noKeyless.mcpManager!.getAllServerNames()).not.toContain("exa");
+
+			// Reverse override: the session turns Exa on while the process setting leaves it off.
+			authStorage.keys.removeRuntime("exa");
+			await Settings.init({ inMemory: true, overrides: { "exa.enabled": false, "providers.webKeyless": true } });
+			const reverse = await startWithSettings({
+				"exa.enabled": true,
+				"exa.searchDelayMs": 0,
+				modelRoles: { web: "web/exa" },
+			});
+			expect(reverse.mcpManager!.getAllServerNames()).not.toContain("exa");
+			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(
+				Object.assign(
+					async (_input: string | Request | URL, init?: RequestInit) => {
+						const requestBody = JSON.parse(String(init?.body ?? "{}"));
+						return Response.json({
+							jsonrpc: "2.0",
+							id: requestBody.id,
+							result: { results: [{ title: "Session Exa", url: "https://exa.example/session" }] },
+						});
+					},
+					{ preconnect: fetch.preconnect },
+				),
+			);
+			const search = await runSearchQuery(
+				{ query: "reverse override" },
+				{ settings: reverse.session.settings, authStorage, modelRegistry },
+			);
+			expect(search.details.response.provider).toBe("exa");
+			expect(search.details.response.sources.map(source => source.url)).toEqual(["https://exa.example/session"]);
+			fetchMock.mockRestore();
 		} finally {
 			for (const session of sessionsToDispose) await session.dispose().catch(() => {});
 			authStorage.close();
@@ -254,6 +293,67 @@ describe("Exa MCP folding with session settings", () => {
 			} finally {
 				await authOnlyManager.disconnectAll();
 			}
+		} finally {
+			await manager.disconnectAll();
+			authStorage.close();
+		}
+	});
+
+	test("delivers an embedded key only to the session store", async () => {
+		initTheme();
+		delete process.env.EXA_API_KEY;
+		await Settings.init({ inMemory: true, overrides: { "exa.enabled": true, "providers.webKeyless": true } });
+		setProjectDir(projectDir);
+		const param = ["exa", "Api", "Key"].join("");
+		const keyed = { type: "http", url: `https://mcp.exa.ai/mcp?${param}=${DUMMY_KEY}` } as const;
+		await writeMcpJson(path.join(projectDir, ".omp"), { exa: keyed });
+
+		// Without a session store, a keyed server stays mounted so its value is not lost.
+		const noStore = await loadAllMCPConfigs(projectDir, {
+			settings: Settings.isolated({ "exa.enabled": true, "providers.webKeyless": false }),
+		});
+		expect(noStore.configs.exa).toEqual(keyed);
+		expect(noStore.exaApiKeys).toEqual([]);
+		expect(process.env.EXA_API_KEY).toBeUndefined();
+
+		const authStorage = createInMemoryAuthStorage();
+		const manager = new MCPManager(projectDir);
+		manager.setAuthStorage(authStorage);
+		try {
+			const sessionSettings = Settings.isolated({ "exa.enabled": true, "providers.webKeyless": false });
+			const controller = new MCPCommandController(
+				createInteractiveModeContext({
+					settings: sessionSettings,
+					mcpManager: manager,
+					session: { modelRegistry: { authStorage } as unknown as ModelRegistry },
+				}),
+			);
+
+			await controller.reloadServers();
+			expect(manager.getAllServerNames()).not.toContain("exa");
+			expect(await authStorage.keys.get("exa")).toBe(DUMMY_KEY);
+			expect(process.env.EXA_API_KEY).toBeUndefined();
+
+			authStorage.keys.removeRuntime("exa");
+			await writeMcpJson(path.join(projectDir, ".omp"), { exa: { ...keyed, enabled: false } });
+			clearFsCache();
+			await controller.handle("/mcp enable exa").catch(() => {});
+			expect(await authStorage.keys.get("exa")).toBe(DUMMY_KEY);
+			expect(process.env.EXA_API_KEY).toBeUndefined();
+
+			authStorage.keys.removeRuntime("exa");
+			await manager.disconnectAll();
+			await writeMcpJson(path.join(projectDir, ".omp"), { exa: keyed });
+			clearFsCache();
+			const dashboard = createExtensionDashboardRuntime({
+				cwd: projectDir,
+				settings: sessionSettings,
+				mcpManager: manager,
+			});
+			await dashboard.applyMcpToggle("exa", true);
+			expect(manager.getAllServerNames()).not.toContain("exa");
+			expect(await authStorage.keys.get("exa")).toBe(DUMMY_KEY);
+			expect(process.env.EXA_API_KEY).toBeUndefined();
 		} finally {
 			await manager.disconnectAll();
 			authStorage.close();

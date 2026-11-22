@@ -131,5 +131,5 @@ export async function mcpFetch(
 		}
 		currentUrl = new URL(location, currentUrl).href;
 	}
-	throw new Error(`Too many redirects (> ${MAX_REDIRECT_HOPS}) fetching ${url}`);
+	throw new Error(`Too many redirects (> ${MAX_REDIRECT_HOPS})`);
 }

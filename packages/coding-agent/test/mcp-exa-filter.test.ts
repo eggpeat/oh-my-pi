@@ -7,7 +7,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import type { SourceMeta } from "@oh-my-pi/pi-coding-agent/capability/types";
-import { filterExaMCPServers, shouldFilterBrowserMCPForPrelude } from "@oh-my-pi/pi-coding-agent/mcp/config";
+import { extractExaApiKey, filterExaMCPServers, shouldFilterBrowserMCPForPrelude } from "@oh-my-pi/pi-coding-agent/mcp/config";
 import type { MCPServerConfig } from "@oh-my-pi/pi-coding-agent/mcp/types";
 
 const SOURCE: SourceMeta = {
@@ -96,5 +96,38 @@ describe("Exa MCP filtering", () => {
 		const result = filterExaMCPServers(configs, { exa: SOURCE });
 
 		expect(Object.keys(result.configs)).toEqual(["exa"]);
+	});
+
+	test("keeps an exa server whose key still needs connect-time resolution", () => {
+		const envName = ["EXA", "API", "KEY"].join("_");
+		const named = ["EXA", "NAMED", "TEST", "VAR"].join("_");
+		const param = ["exa", "Api", "Key"].join("");
+		const unresolved: MCPServerConfig[] = [
+			{ type: "stdio", command: "exa-mcp", env: { [envName]: "!" + "read-helper" } },
+			{ type: "stdio", command: "exa-mcp", env: { [envName]: named } },
+			{ type: "stdio", command: "exa-mcp", env: { [envName]: "${" + named + "}" } },
+			{ type: "http", url: `https://mcp.exa.ai/mcp?${param}=$` + named },
+		];
+		for (const config of unresolved) {
+			expect(extractExaApiKey(config)).toBeUndefined();
+			const result = filterExaMCPServers({ exa: config }, { exa: SOURCE });
+			expect(Object.keys(result.configs)).toEqual(["exa"]);
+			expect(result.exaApiKeys).toEqual([]);
+		}
+	});
+
+	test("folds an exa server whose env marks the key value literal", () => {
+		const envName = ["EXA", "API", "KEY"].join("_");
+		const named = ["EXA", "NAMED", "TEST", "VAR"].join("_");
+		const literal: MCPServerConfig = {
+			type: "stdio",
+			command: "exa-mcp",
+			env: { [envName]: named },
+			envPolicy: "literal",
+		};
+		expect(extractExaApiKey(literal)).toBe(named);
+		const folded = filterExaMCPServers({ exa: literal }, { exa: SOURCE });
+		expect(folded.configs).toEqual({});
+		expect(folded.exaApiKeys).toEqual([named]);
 	});
 });

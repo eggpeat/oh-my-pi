@@ -374,8 +374,8 @@ async function executeSearch(
 			}
 			lastProvider = provider;
 			const available = candidate.explicit
-				? await provider.isExplicitlyAvailable(authStorage, model)
-				: await provider.isAvailable(authStorage, model);
+				? await provider.isExplicitlyAvailable(authStorage, model, activeSettings)
+				: await provider.isAvailable(authStorage, model, activeSettings);
 			if (!available && !candidate.explicit) continue;
 			if (!available && candidate.explicit) {
 				throw new SearchProviderError(
@@ -404,6 +404,7 @@ async function executeSearch(
 				modelRegistry,
 				explicit: candidate.explicit,
 				sessionId,
+				settings: activeSettings,
 				antigravityEndpointMode,
 			};
 			// An extension may own the request for its provider's models; availability stays the backend's.
@@ -655,7 +656,7 @@ export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchResul
 			modelRegistry: ctx.modelRegistry,
 			sessionId,
 			sessionModel: ctx.model,
-			signal,
+			settings: ctx.settings,
 		});
 	},
 };

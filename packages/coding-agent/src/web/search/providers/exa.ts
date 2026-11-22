@@ -6,9 +6,9 @@
  * Requests per-result summaries via `contents.summary` and synthesizes
  * them into a combined `answer` string on the SearchResponse.
  */
-import { type ApiKey, type AuthStorage, type FetchImpl, getEnvApiKey, withAuth } from "@oh-my-pi/pi-ai";
+import { type Api, type ApiKey, type AuthStorage, type FetchImpl, getEnvApiKey, type Model, withAuth } from "@oh-my-pi/pi-ai";
 import { $env, asRecord } from "@oh-my-pi/pi-utils";
-import { settings } from "../../../config/settings";
+import { settings, type Settings } from "../../../config/settings";
 import { normalizeMcpToolPayload } from "../../../exa/mcp-client";
 import { readMcpJsonRpcResponse } from "../../../mcp/json-rpc";
 import type { SearchResponse, SearchSource } from "../types";
@@ -30,9 +30,9 @@ const DEFAULT_EXA_SEARCH_DELAY_MS = cfgExaSearchDelayMs.default;
 let nextExaSearchRequestAt = 0;
 let exaSearchThrottle = Promise.resolve();
 
-function configuredExaSearchDelayMs(): number {
+function configuredExaSearchDelayMs(activeSettings?: Settings): number {
 	try {
-		const delayMs = cfgExaSearchDelayMs.get(settings);
+		const delayMs = cfgExaSearchDelayMs.get(activeSettings ?? settings);
 		return Number.isFinite(delayMs) && delayMs > 0 ? Math.floor(delayMs) : 0;
 	} catch {
 		return DEFAULT_EXA_SEARCH_DELAY_MS;
@@ -84,8 +84,8 @@ function waitUntilDoneOrAborted<T>(promise: Promise<T>, signal: AbortSignal | un
 	});
 }
 
-async function waitForExaSearchSlot(signal: AbortSignal | undefined): Promise<void> {
-	const delayMs = configuredExaSearchDelayMs();
+async function waitForExaSearchSlot(signal: AbortSignal | undefined, activeSettings?: Settings): Promise<void> {
+	const delayMs = configuredExaSearchDelayMs(activeSettings);
 	if (delayMs <= 0) return;
 
 	const prior = exaSearchThrottle.catch(() => {});
@@ -129,6 +129,8 @@ export interface ExaSearchParams {
 	 */
 	authStorage?: AuthStorage;
 	sessionId?: string;
+	/** Owning session settings for availability and pacing; falls back to the process global. */
+	settings?: Settings;
 }
 
 interface ExaSearchResult {
@@ -276,7 +278,7 @@ async function callExaSearch(apiKey: string, params: ExaSearchParams): Promise<E
 	const body = buildExaRequestBody(params);
 
 	const fetchImpl = params.fetch ?? fetch;
-	await waitForExaSearchSlot(params.signal);
+	await waitForExaSearchSlot(params.signal, params.settings);
 	const response = await fetchImpl(EXA_API_URL, {
 		method: "POST",
 		headers: {
@@ -320,7 +322,7 @@ async function callExaMcpSearch(params: ExaSearchParams): Promise<ExaSearchRespo
 	if (apiKey) query.set("exaApiKey", apiKey);
 	query.set("tools", "web_search_exa");
 	const fetchImpl = params.fetch ?? fetch;
-	await waitForExaSearchSlot(params.signal);
+	await waitForExaSearchSlot(params.signal, params.settings);
 	const requestId = Math.random().toString(36).slice(2);
 	const signal = withHardTimeout(params.signal, params.timeoutMs);
 	const response = await fetchImpl(`${EXA_MCP_URL}?${query.toString()}`, {
@@ -455,9 +457,9 @@ export class ExaProvider extends SearchProvider {
 	 * Available unless disabled in settings: without a credential, search runs
 	 * through Exa's unauthenticated public MCP.
 	 */
-	isAvailable(_authStorage: AuthStorage): boolean {
+	isAvailable(_authStorage: AuthStorage, _model?: Model<Api>, activeSettings?: Settings): boolean {
 		try {
-			if (cfgExaEnabled.get(settings) === false) {
+			if (cfgExaEnabled.get(activeSettings ?? settings) === false) {
 				return false;
 			}
 		} catch {
@@ -480,6 +482,7 @@ export class ExaProvider extends SearchProvider {
 			authStorage: params.authStorage,
 			sessionId: params.sessionId,
 			fetch: params.fetch,
+			settings: params.settings,
 		});
 	}
 }

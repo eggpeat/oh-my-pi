@@ -4,7 +4,7 @@ How MCP servers are discovered, hosted, shared between sessions, exposed as tool
 
 ## Lifecycle at a glance
 
-1. **Discovery** (`loadAllMCPConfigs`) resolves server configs from capability sources and filters disabled, project-level, Exa (unless `exa.enabled` is `false`, or `providers.webKeyless` is `false` with no Exa key), and browser entries.
+1. **Discovery** (`loadAllMCPConfigs`) resolves server configs from capability sources and filters disabled, project-level, Exa (unless native Exa cannot cover that server for this session), and browser entries.
 2. **Connect** (`MCPManager.connectServers`): for each server the session resolves credentials, asks the **MCP host** for the server's protocol era, attaches a tunnel to the server's host unit, and reads `server/discover` and `tools/list` over it.
 3. **Host** (`src/mcp/host/`, served by the daemon's `mcp` module or in-process): owns every server process and remote connection. It answers discovery and list requests from a shared store and starts a server only when a request needs it.
 4. **Startup window**: `connectServers` waits up to `mcp.startupTimeoutMs` (250 ms). Servers that answered contribute tools; the rest are merged when they are ready.

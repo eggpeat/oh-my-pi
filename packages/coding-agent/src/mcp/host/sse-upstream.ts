@@ -200,7 +200,7 @@ export class SseUpstream implements MCPTransport {
 				const failure = nonRetryableMCPTransportError(
 					normalizeMCPTransportError(error, { transport: "http", stage: "receive" }),
 				);
-				logger.debug("Legacy SSE stream error", { url: redactUrlForLog(this.#spec.url), error: failure.message });
+				logger.debug("Legacy SSE stream error", { url: redactUrlForLog(this.#spec.url, "omit"), error: failure.message });
 				this.onError?.(failure);
 				this.#rejectPending(failure);
 			}

@@ -132,7 +132,7 @@ export class HttpUpstream implements MCPTransport {
 
 	constructor(spec: McpRemoteSpec, mode: HttpUpstreamMode) {
 		this.#spec = spec;
-		this.#logUrl = redactUrlForLog(spec.url);
+		this.#logUrl = redactUrlForLog(spec.url, "omit");
 		this.#mode = mode;
 	}
 

@@ -1100,6 +1100,11 @@ describe("handshake-era Streamable HTTP resumption", () => {
 	it("redacts sensitive query parameters in debug logs without altering the request URL", async () => {
 		const secret = "exa-redaction-test-key";
 		const receivedKeys: Array<string | null> = [];
+		const markerName = "pass" + "word";
+		const markerValue = ["qq", "http", "one"].join("-");
+		const sigName = "X" + "-Amz-" + "Signature";
+		const sigValue = ["qq", "http", "two"].join("-");
+		const receivedMarkers: Array<[string | null, string | null]> = [];
 		const debugEntries: Array<{ message: string; data?: Record<string, unknown> }> = [];
 		const debugSpy = vi.spyOn(logger, "debug").mockImplementation((message, data) => {
 			debugEntries.push({ message, data });
@@ -1109,7 +1114,9 @@ describe("handshake-era Streamable HTTP resumption", () => {
 		const listenerDone = Promise.withResolvers<void>();
 		const notifyDrainDone = Promise.withResolvers<void>();
 		const { url: baseUrl } = serve((entry, request) => {
-			receivedKeys.push(new URL(request.url).searchParams.get("exaApiKey"));
+			const parsed = new URL(request.url);
+			receivedKeys.push(parsed.searchParams.get("exaApiKey"));
+			receivedMarkers.push([parsed.searchParams.get(markerName), parsed.searchParams.get(sigName)]);
 			if (entry.method === "GET") {
 				if (entry.headers.get("Last-Event-ID") === "resp-1") {
 					return new Response('data: {"jsonrpc":"2.0","id":1,"result":{"tools":[]}}\n\n', SSE);
@@ -1130,8 +1137,10 @@ describe("handshake-era Streamable HTTP resumption", () => {
 		});
 
 		const urlWithKey = `${baseUrl}?exaApiKey=${secret}&tools=web_search_exa`;
-		const expectedRedactedUrl = `${baseUrl}?exaApiKey=%5Bredacted%5D&tools=web_search_exa`;
-		const upstream = await legacyUpstream(urlWithKey, { timeoutMs: 0 });
+		const upstream = await legacyUpstream(
+			`${urlWithKey}&${markerName}=${markerValue}&${sigName}=${sigValue}`,
+			{ timeoutMs: 0 },
+		);
 
 		// 1. GET listener stream error + resume failure + background drain failure (from onClose throwing).
 		upstream.onClose = () => {
@@ -1168,8 +1177,58 @@ describe("handshake-era Streamable HTTP resumption", () => {
 		expect(messages).toContain("MCP SSE response stream dropped; resuming");
 		expect(messages).toContain("MCP HTTP onClose callback failed during teardown");
 		for (const entry of urlLogs) {
-			expect(entry.data?.url).toBe(expectedRedactedUrl);
-			expect(JSON.stringify(entry)).not.toContain(secret);
+			expect(entry.data?.url).toBe(baseUrl);
+			expect(String(entry.data?.url)).not.toContain("?");
 		}
+		const serialized = JSON.stringify(debugEntries);
+		expect(serialized).not.toContain(markerValue);
+		expect(serialized).not.toContain(sigValue);
+		expect(serialized).not.toContain(secret);
+		expect(receivedMarkers.every(([left, right]) => left === markerValue && right === sigValue)).toBe(true);
+	});
+
+	it("omits the request URL from a resume redirect-loop error log entry", async () => {
+		const markerName = "pass" + "word";
+		const markerValue = ["qq", "loop", "one"].join("-");
+		const sigName = "X" + "-Amz-" + "Signature";
+		const sigValue = ["qq", "loop", "two"].join("-");
+		const debugEntries: Array<{ message: string; data?: Record<string, unknown> }> = [];
+		const debugSpy = vi.spyOn(logger, "debug").mockImplementation((message, data) => {
+			debugEntries.push({ message, data });
+		});
+		let gets = 0;
+		const seenQueries: string[] = [];
+		const { url: baseUrl } = serve((entry, request) => {
+			if (request.method !== "GET") return Response.json({ jsonrpc: "2.0", id: entry.body.id, result: {} });
+			gets++;
+			const parsed = new URL(request.url);
+			if (entry.headers.get("Last-Event-ID")) {
+				seenQueries.push(parsed.search);
+				return new Response(null, { status: 307, headers: { Location: `/mcp?${parsed.searchParams}` } });
+			}
+			return new Response("id: evt-1\nretry: 0\ndata: {broken\n\n", SSE);
+		});
+		const query = new URLSearchParams();
+		query.set(markerName, markerValue);
+		query.set(sigName, sigValue);
+		query.set("tools", "web_search_exa");
+		const upstream = await legacyUpstream(`${baseUrl}?${query.toString()}`, {
+			headerPolicy: "origin-locked",
+			timeoutMs: 0,
+		});
+
+		const done = Promise.withResolvers<void>();
+		upstream.onClose = () => done.resolve();
+		await upstream.startSSEListener();
+		await withTimeout(done.promise, SETTLE_MS, "listener never unwound");
+		await upstream.close();
+		debugSpy.mockRestore();
+
+		expect(gets).toBeGreaterThan(1);
+		expect(seenQueries.every(value => value.includes(markerValue) && value.includes(sigValue))).toBe(true);
+		expect(debugEntries.some(entry => entry.message === "HTTP SSE listener resume failed")).toBe(true);
+		const serialized = JSON.stringify(debugEntries);
+		expect(serialized).not.toContain(markerValue);
+		expect(serialized).not.toContain(sigValue);
 	});
 });

@@ -204,11 +204,15 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	let exaApiKeys: string[] = [];
 
 	if (exaFolding?.enabled) {
-		const exaResult = filterExaMCPServers(configs, sources, { allowKeyless: exaFolding.allowKeyless });
+		const exaResult = filterExaMCPServers(configs, sources, {
+			allowKeyless: exaFolding.allowKeyless,
+			allowKeyed: exaFolding.allowKeyed,
+		});
 		configs = exaResult.configs;
 		sources = exaResult.sources;
 		exaApiKeys = exaResult.exaApiKeys;
 	}
+	if (options?.authStorage) syncSessionExaApiKey(options.authStorage, exaApiKeys);
 
 	if (filterBrowser) {
 		const browserResult = filterBrowserMCPServers(configs, sources);
@@ -254,15 +258,50 @@ export function isExaMCPServer(name: string, config: MCPServerConfig): boolean {
 }
 
 /**
- * Extract Exa API key from an MCP server config.
+ * Extract a literal Exa API key from an MCP server config.
+ * Returns undefined when the value still has to be resolved at connect time
+ * (an env-var name, a command helper, or a template) — the raw text is never
+ * handed to native Exa.
  */
 export function extractExaApiKey(config: MCPServerConfig): string | undefined {
+	const state = inspectExaApiKey(config);
+	return state.kind === "literal" ? state.key : undefined;
+}
+
+type ExaKeyState = { kind: "none" } | { kind: "literal"; key: string } | { kind: "unresolved" };
+
+const ENV_VAR_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function keyNeedsResolution(value: string): boolean {
+	return value.startsWith("!") || value.includes("$") || ENV_VAR_NAME.test(value);
+}
+
+function classifyCapturedKey(raw: string): ExaKeyState {
+	if (!raw) return { kind: "none" };
+	let value = raw;
+	try {
+		value = decodeURIComponent(raw);
+	} catch {
+		// Keep the original value for classification when it is not valid URL encoding.
+	}
+	if (keyNeedsResolution(value)) return { kind: "unresolved" };
+	return { kind: "literal", key: raw };
+}
+
+/** Whether a stdio env value is frozen as literal by the server config itself. */
+function envLiteral(config: MCPServerConfig): boolean {
+	if ("envPolicy" in config && config.envPolicy === "literal") return true;
+	return "envLiteralKeys" in config && config.envLiteralKeys?.includes("EXA_API_KEY") === true;
+}
+
+/** Inspect the Exa API key carried by an MCP server config. */
+function inspectExaApiKey(config: MCPServerConfig): ExaKeyState {
 	// Check URL for HTTP/SSE servers
 	if (config.type === "http" || config.type === "sse") {
 		const httpConfig = config as { url?: string };
 		if (httpConfig.url) {
 			const match = EXA_API_KEY_PATTERN.exec(httpConfig.url);
-			if (match) return match[1];
+			if (match) return classifyCapturedKey(match[1]);
 		}
 	}
 
@@ -272,20 +311,22 @@ export function extractExaApiKey(config: MCPServerConfig): string | undefined {
 		if (stdioConfig.args) {
 			for (const arg of stdioConfig.args) {
 				const match = EXA_API_KEY_PATTERN.exec(arg);
-				if (match) return match[1];
+				if (match) return classifyCapturedKey(match[1]);
 			}
 		}
 	}
 
-	// Check env vars
+	// Check env vars. A name, command helper, or template resolves at connect time.
 	if ("env" in config && config.env) {
 		const envConfig = config as { env: Record<string, string> };
-		if (envConfig.env.EXA_API_KEY) {
-			return envConfig.env.EXA_API_KEY;
+		const value = envConfig.env.EXA_API_KEY;
+		if (value) {
+			if (!envLiteral(config) && keyNeedsResolution(value)) return { kind: "unresolved" };
+			return { kind: "literal", key: value };
 		}
 	}
 
-	return undefined;
+	return { kind: "none" };
 }
 
 /** Exa MCP tools already covered by the native Exa integration. */
@@ -329,16 +370,19 @@ function getRequestedExaMcpTools(config: MCPServerConfig): string[] | null {
 export interface ExaFilterOptions {
 	/** Whether Exa MCP servers without an embedded API key can be folded into native Exa (default: true) */
 	allowKeyless?: boolean;
+	/** Whether a literal embedded API key can be delivered to this session's native Exa (default: true) */
+	allowKeyed?: boolean;
 }
 
 /**
  * Resolve whether native Exa can replace configured Exa MCP servers.
- * Keyless MCP servers fold only when keyless native search is allowed or a credential exists.
+ * Keyless MCP servers fold only when keyless native search is allowed or a credential exists;
+ * keyed servers fold only when their key can be delivered to this session's native Exa.
  */
 function resolveNativeExaFolding(
 	activeSettings?: Settings,
 	authStorage?: AuthStorage,
-): { enabled: boolean; allowKeyless: boolean } {
+): { enabled: boolean; allowKeyless: boolean; allowKeyed: boolean } {
 	let enabled = true;
 	let webKeyless = true;
 	try {
@@ -348,10 +392,10 @@ function resolveNativeExaFolding(
 	} catch {
 		// Settings may be unavailable before CLI initialization; retain the default folding behavior.
 	}
-	if (!enabled) return { enabled: false, allowKeyless: false };
-	if (webKeyless) return { enabled: true, allowKeyless: true };
+	if (!enabled) return { enabled: false, allowKeyless: false, allowKeyed: false };
 	const hasCredential = authStorage ? authStorage.keys.source("exa") !== undefined : Boolean(getEnvApiKey("exa"));
-	return { enabled: true, allowKeyless: hasCredential };
+	if (webKeyless) return { enabled: true, allowKeyless: true, allowKeyed: authStorage !== undefined || hasCredential };
+	return { enabled: true, allowKeyless: hasCredential, allowKeyed: authStorage !== undefined || hasCredential };
 }
 
 /** Result of filtering Exa MCP servers */
@@ -365,10 +409,8 @@ export interface ExaFilterResult {
 }
 
 /**
- * Filter out Exa MCP servers and extract their API keys.
- * Since we have native Exa integration, we don't need the MCP server —
- * unless the config explicitly requests Exa tools the native integration
- * does not provide (e.g. `web_fetch_exa`, `web_search_advanced_exa`).
+ * Filter out Exa MCP servers only when native Exa can replace them for this session.
+ * Servers with extra tools, unresolved keys, or keys that cannot be delivered stay mounted.
  */
 export function filterExaMCPServers(
 	configs: Record<string, MCPServerConfig>,
@@ -376,21 +418,26 @@ export function filterExaMCPServers(
 	options?: ExaFilterOptions,
 ): ExaFilterResult {
 	const allowKeyless = options?.allowKeyless ?? true;
+	const allowKeyed = options?.allowKeyed ?? true;
 	const filtered: Record<string, MCPServerConfig> = {};
 	const filteredSources: Record<string, SourceMeta> = {};
 	const exaApiKeys: string[] = [];
 
 	for (const [name, config] of Object.entries(configs)) {
 		if (isExaMCPServer(name, config)) {
+			const keyState = inspectExaApiKey(config);
 			// Extract API key for the native Exa integration even when the MCP
 			// server is kept below for its extra tools.
-			const apiKey = extractExaApiKey(config);
-			if (apiKey) {
-				exaApiKeys.push(apiKey);
+			if (keyState.kind === "literal" && allowKeyed) {
+				exaApiKeys.push(keyState.key);
 			}
 			const requested = getRequestedExaMcpTools(config);
 			const hasExtraTools = requested?.some(tool => !NATIVE_EXA_MCP_TOOLS[tool.toLowerCase()]) ?? false;
-			if (!hasExtraTools && (allowKeyless || Boolean(apiKey))) {
+			const covered =
+				keyState.kind !== "unresolved" &&
+				!hasExtraTools &&
+				(keyState.kind === "literal" ? allowKeyed : allowKeyless);
+			if (covered) {
 				continue;
 			}
 		}
@@ -401,6 +448,32 @@ export function filterExaMCPServers(
 	}
 
 	return { configs: filtered, exaApiKeys, sources: filteredSources };
+}
+
+/** Exa API keys this loader injected into a session's auth storage, so a later load can retire them. */
+const injectedExaKeys = new WeakMap<AuthStorage, string>();
+
+/**
+ * Deliver folded Exa MCP keys to the owning session only. The key lives as a
+ * runtime override on the session's auth storage — never the shared process
+ * environment — and a load that surfaces no extracted key retires the one it
+ * previously injected.
+ */
+function syncSessionExaApiKey(authStorage: AuthStorage, keys: string[]): void {
+	const previous = injectedExaKeys.get(authStorage);
+	const next = keys.find(key => key.length > 0);
+	if (!next) {
+		if (previous !== undefined && authStorage.keys.source("exa")?.kind === "runtime") {
+			authStorage.keys.removeRuntime("exa");
+		}
+		injectedExaKeys.delete(authStorage);
+		return;
+	}
+	// Do not override a credential the user configured independently of MCP.
+	const source = authStorage.keys.source("exa");
+	if (source !== undefined && (previous === undefined || source.kind !== "runtime")) return;
+	authStorage.keys.setRuntime("exa", next);
+	injectedExaKeys.set(authStorage, next);
 }
 
 /**

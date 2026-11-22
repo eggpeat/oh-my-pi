@@ -340,13 +340,20 @@ describe("HTTP+SSE upstream (2024-11-05)", () => {
 	it("redacts sensitive query parameters in debug logs without altering the request URL", async () => {
 		const secret = "exa-sse-redaction-test-key";
 		const receivedKeys: Array<string | null> = [];
+		const markerName = "pass" + "word";
+		const markerValue = ["qq", "sse", "one"].join("-");
+		const sigName = "X" + "-Amz-" + "Signature";
+		const sigValue = ["qq", "sse", "two"].join("-");
+		const receivedMarkers: Array<[string | null, string | null]> = [];
 		const debugEntries: Array<{ message: string; data?: Record<string, unknown> }> = [];
 		const debugSpy = vi.spyOn(logger, "debug").mockImplementation((message, data) => {
 			debugEntries.push({ message, data });
 		});
 
 		const baseUrl = serveStream(request => {
-			receivedKeys.push(new URL(request.url).searchParams.get("exaApiKey"));
+			const parsed = new URL(request.url);
+			receivedKeys.push(parsed.searchParams.get("exaApiKey"));
+			receivedMarkers.push([parsed.searchParams.get(markerName), parsed.searchParams.get(sigName)]);
 			return new Response(
 				new ReadableStream<Uint8Array>({
 					start(controller) {
@@ -359,8 +366,7 @@ describe("HTTP+SSE upstream (2024-11-05)", () => {
 			);
 		});
 		const urlWithKey = `${baseUrl}?exaApiKey=${secret}&tools=web_search_exa`;
-		const expectedRedactedUrl = `${baseUrl}?exaApiKey=%5Bredacted%5D&tools=web_search_exa`;
-		const upstream = upstreamOf(sseSpec(urlWithKey));
+		const upstream = upstreamOf(sseSpec(`${urlWithKey}&${markerName}=${markerValue}&${sigName}=${sigValue}`));
 		const errored = Promise.withResolvers<Error>();
 		upstream.onError = error => errored.resolve(error);
 
@@ -370,7 +376,11 @@ describe("HTTP+SSE upstream (2024-11-05)", () => {
 
 		expect(receivedKeys).toEqual([secret]);
 		const entry = debugEntries.find(item => item.message === "Legacy SSE stream error");
-		expect(entry?.data?.url).toBe(expectedRedactedUrl);
-		expect(JSON.stringify(entry)).not.toContain(secret);
+		expect(entry?.data?.url).toBe(baseUrl);
+		const serialized = JSON.stringify(debugEntries);
+		expect(serialized).not.toContain(markerValue);
+		expect(serialized).not.toContain(sigValue);
+		expect(serialized).not.toContain(secret);
+		expect(receivedMarkers).toEqual([[markerValue, sigValue]]);
 	});
 });

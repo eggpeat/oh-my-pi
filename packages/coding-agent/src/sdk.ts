@@ -621,12 +621,6 @@ function logMCPLoadErrors(errors: MCPLoadResult["errors"]): void {
 	}
 }
 
-function applyMCPEnvironment(result: { exaApiKeys: string[] }): void {
-	if (result.exaApiKeys.length > 0 && !$env.EXA_API_KEY) {
-		Bun.env.EXA_API_KEY = result.exaApiKeys[0];
-	}
-}
-
 // Types
 export interface CreateAgentSessionOptions {
 	/** Working directory for project-local discovery. Default: getProjectDir() */
@@ -3069,7 +3063,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 								await deferredMCPManager.disconnectAll();
 								return;
 							}
-							applyMCPEnvironment(mcpResult);
 							logMCPLoadErrors(mcpResult.errors);
 							// Connected MCP tools are
 							// enabled and mounted as tool commands right away, so a turn whose
@@ -3110,7 +3103,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				if (cfgMcpNotifications.get(settings)) {
 					discoveredMCPManager.setNotificationsEnabled(true);
 				}
-				applyMCPEnvironment(mcpResult);
 
 				// Log MCP errors
 				for (const { path, error } of mcpResult.errors) {
@@ -5455,7 +5447,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							await owningMcpManager.disconnectAll();
 							return undefined;
 						}
-						applyMCPEnvironment(result);
 						logMCPLoadErrors(result.errors);
 						return result;
 					};
