@@ -40,6 +40,12 @@ export const launchHelp = {
 		"plan-yolo-into": Flags.string({ description: 'Target model for plan-yolo execution (default the "smol" role)' }),
 		provider: Flags.string({ description: "Provider to use (legacy; prefer --model)" }),
 		"api-key": Flags.string({ description: "API key (defaults to env vars)" }),
+		"provider-session-id": Flags.string({
+			description: "Reuse a specific provider-side session ID for continuity and cache scoping",
+		}),
+		"prompt-cache-key": Flags.string({
+			description: "Override the provider prompt-cache key for this session",
+		}),
 		"system-prompt": Flags.string({ description: "System prompt (default: coding assistant prompt)" }),
 		"system-prompt-template": Flags.string({
 			description: "Handlebars system prompt template (mutually exclusive with --system-prompt)",
@@ -64,9 +70,15 @@ export const launchHelp = {
 		print: Flags.boolean({ char: "p", description: "Non-interactive mode: process prompt and exit" }),
 		continue: Flags.boolean({ char: "c", description: "Continue previous session" }),
 		resume: Flags.string({ char: "r", description: "Resume a session (by ID prefix, path, or picker if omitted)" }),
+		session: Flags.string({
+			description: "Resume a session (alias for --resume; by ID prefix, path, or picker if omitted)",
+		}),
 		restore: Flags.string({
 			description:
 				"Resume a session as --resume does, then go on with what its last process left unfinished (the interrupted turn and the subagents it was running)",
+		}),
+		fork: Flags.string({
+			description: "Fork a saved session (by ID prefix or path) into a new session",
 		}),
 		"from-claude": Flags.boolean({ description: "Import a Claude Code session into OMP" }),
 		"from-codex": Flags.boolean({ description: "Import a Codex session into OMP" }),
@@ -111,6 +123,15 @@ export const launchHelp = {
 		extension: Flags.string({
 			char: "e",
 			description: "Load an extension file (can be used multiple times)",
+			multiple: true,
+		}),
+		"trusted-extension": Flags.string({
+			description:
+				"Load only allowlisted absolute extension module files (repeatable; disables discovery; incompatible with --extension/-e/--hook)",
+			multiple: true,
+		}),
+		"plugin-dir": Flags.string({
+			description: "Load plugin from directory (repeatable)",
 			multiple: true,
 		}),
 		"no-extensions": Flags.boolean({
