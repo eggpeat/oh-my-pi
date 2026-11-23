@@ -128,11 +128,18 @@ _OUTPUT_FILENAME = "omp.txt"
 # grades those services, so keep them alive until the container is torn down.
 _SERVICE_GRACE_ENV = {"OMP_DAEMON_IDLE_GRACE_MS": str(24 * 60 * 60 * 1000)}
 
-# Provider → host env vars used in --no-gateway (direct-auth) mode only.
-_PROVIDER_KEYS: dict[str, list[str]] = {
+# Provider → host env vars used in --no-gateway (direct-auth) mode only. Each
+# item is one credential: a bare name forwards that variable as-is; a tuple
+# lists aliases omp treats as one key (first non-blank wins, mirroring
+# `$pickenv`), so only the first non-blank alias is forwarded — leaking the
+# shadowed alias into the container buys nothing and widens the exposure.
+# An explicit --env value under any name in an entry suppresses host
+# forwarding of that entry (nonblank values only), so a user-supplied token is
+# never shadowed by a preferred host alias.
+_PROVIDER_KEYS: dict[str, list[str | tuple[str, ...]]] = {
     "amazon-bedrock": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"],
-    "anthropic": ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"],
-    "github-copilot": ["GITHUB_TOKEN"],
+    "anthropic": [("ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY")],
+    "github-copilot": ["COPILOT_GITHUB_TOKEN"],
     "google": [
         "GEMINI_API_KEY",
         "GOOGLE_GENERATIVE_AI_API_KEY",
@@ -143,7 +150,7 @@ _PROVIDER_KEYS: dict[str, list[str]] = {
         "GOOGLE_GENAI_USE_VERTEXAI",
     ],
     "groq": ["GROQ_API_KEY"],
-    "huggingface": ["HF_TOKEN"],
+    "huggingface": [("HUGGINGFACE_HUB_TOKEN", "HF_TOKEN")],
     "mistral": ["MISTRAL_API_KEY"],
     "openai": ["OPENAI_API_KEY"],
     "openrouter": ["OPENROUTER_API_KEY"],
@@ -559,12 +566,23 @@ class OmpLocal(BaseInstalledAgent):
         return [str(item) for item in parsed]
 
     def _collect_provider_keys(self, provider: str) -> dict[str, str]:
-        """Host env vars for the primary model's provider (direct-auth mode only)."""
+        """Host env vars for the primary model's provider (direct-auth mode only).
+
+        Each entry in _PROVIDER_KEYS is one credential; tuples are aliases omp
+        resolves by first non-blank match, so only the winning alias is
+        forwarded. An explicit --env value under any name in an entry
+        suppresses host forwarding for that entry.
+        """
         env: dict[str, str] = {}
-        for key in _PROVIDER_KEYS.get(provider, []):
-            value = os.environ.get(key)
-            if value:
-                env[key] = value
+        for item in _PROVIDER_KEYS.get(provider, []):
+            names = item if isinstance(item, tuple) else (item,)
+            if any(self._forward_env.get(name) for name in names):
+                continue
+            for name in names:
+                value = os.environ.get(name)
+                if value:
+                    env[name] = value
+                    break
         return env
 
     # ---------------------------------------------------------------------- run
