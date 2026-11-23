@@ -129,13 +129,10 @@ _OUTPUT_FILENAME = "omp.txt"
 _SERVICE_GRACE_ENV = {"OMP_DAEMON_IDLE_GRACE_MS": str(24 * 60 * 60 * 1000)}
 
 # Provider → host env vars used in --no-gateway (direct-auth) mode only. Each
-# item is one credential: a bare name forwards that variable as-is; a tuple
-# lists aliases omp treats as one key (first non-blank wins, mirroring
-# `$pickenv`), so only the first non-blank alias is forwarded — leaking the
-# shadowed alias into the container buys nothing and widens the exposure.
-# An explicit --env value under any name in an entry suppresses host
-# forwarding of that entry (nonblank values only), so a user-supplied token is
-# never shadowed by a preferred host alias.
+# item is one credential: a bare name forwards that variable; a tuple lists
+# aliases omp treats as one key (first non-blank wins, mirroring `$pickenv`),
+# so only the first non-blank host alias is forwarded. A nonblank --env value
+# under any name in an entry suppresses host forwarding for that entry.
 _PROVIDER_KEYS: dict[str, list[str | tuple[str, ...]]] = {
     "amazon-bedrock": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"],
     "anthropic": [("ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY")],
@@ -568,10 +565,8 @@ class OmpLocal(BaseInstalledAgent):
     def _collect_provider_keys(self, provider: str) -> dict[str, str]:
         """Host env vars for the primary model's provider (direct-auth mode only).
 
-        Each entry in _PROVIDER_KEYS is one credential; tuples are aliases omp
-        resolves by first non-blank match, so only the winning alias is
-        forwarded. An explicit --env value under any name in an entry
-        suppresses host forwarding for that entry.
+        Tuples are aliases: only the first non-blank host name forwards, and a
+        nonblank --env value under any name in an entry suppresses the entry.
         """
         env: dict[str, str] = {}
         for item in _PROVIDER_KEYS.get(provider, []):
