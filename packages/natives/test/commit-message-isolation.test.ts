@@ -147,22 +147,27 @@ describe("commitCreate message isolation", () => {
 			// only tells this fixture which invocation is running and what the
 			// shared file must contain. The first invocation parks inside the
 			// hook until the test releases it, so the second call reaches its
-			// shared-file write while the first hook is still running.
+			// shared-file write while the first hook is still running. Each
+			// invocation records what the shared file held when it looked.
 			await installHook(
 				root,
 				[
 					"#!/bin/sh",
 					'msg=$(cat "$1")',
+					"label=other",
 					'case "$msg" in',
 					"first*)",
+					"	label=first",
 					'	: > "$GIT_DIR/first-entered"',
 					'	while [ ! -e "$GIT_DIR/release-first" ]; do sleep 0.02; done',
 					"	;;",
 					"second*)",
+					"	label=second",
 					'	: > "$GIT_DIR/second-entered"',
 					"	;;",
 					"esac",
 					'shared=$(cat "$GIT_DIR/COMMIT_EDITMSG")',
+					'printf \'%s\' "$shared" > "$GIT_DIR/seen-$label"',
 					'if [ "$shared" != "$msg" ]; then echo "legacy hook saw: $shared" >&2; exit 1; fi',
 					"",
 				].join("\n"),
@@ -181,22 +186,27 @@ describe("commitCreate message isolation", () => {
 					async () => (await fs.readdir(gitDir)).filter(name => name.startsWith(".omp-commit-msg-")).length >= 2,
 				);
 				if (!bothMessaged) throw new Error("second call never wrote its message file");
-				// Unserialized, the second call overwrites COMMIT_EDITMSG and
-				// enters its hook right away. Serialized, it blocks until the
-				// first hook returns, so give it a bounded chance to enter
-				// before releasing the first hook either way.
-				await waitFor(() => Bun.file(path.join(gitDir, "second-entered")).exists(), 5_000);
 			} finally {
+				// Release the parked hook and wait for both commits, so the
+				// fixture is not torn down while a commit is still running.
 				await Bun.write(path.join(gitDir, "release-first"), "");
+				await first;
+				if (second) await second;
 			}
 			const firstResult = await first;
 			const secondResult = await second!;
-			if (!("sha" in firstResult)) throw firstResult.error;
-			expect(firstResult.sha).toBe(await git(root, "rev-parse", "HEAD"));
-			expect(await git(root, "log", "-1", "--format=%B")).toBe("first subject");
-			// The overlapping call read the same HEAD before the first landed,
-			// so its ref update loses; it must not take the first's place.
-			expect("error" in secondResult).toBe(true);
+			// Each hook saw the message of its own call, not the other one's.
+			expect(await Bun.file(path.join(gitDir, "seen-first")).text()).toBe("first subject");
+			expect(await Bun.file(path.join(gitDir, "seen-second")).text()).toBe("second subject");
+			// Both calls read the same HEAD before either landed, so exactly
+			// one of them updates the branch: which one is a race of its own.
+			const landed = [firstResult, secondResult].filter(result => "sha" in result);
+			expect(landed).toHaveLength(1);
+			const winner = landed[0] as { sha: string };
+			const winnerMessage = winner === firstResult ? "first subject" : "second subject";
+			expect(await git(root, "rev-parse", "HEAD")).toBe(winner.sha);
+			expect(await git(root, "log", "-1", "--format=%B")).toBe(winnerMessage);
+			expect(await git(root, "rev-list", "--count", "HEAD")).toBe("2");
 		},
 		60_000,
 	);
@@ -211,15 +221,19 @@ describe("commitCreate message isolation", () => {
 				[
 					"#!/bin/sh",
 					'msg=$(cat "$1")',
+					"label=other",
 					'case "$msg" in',
 					"first*)",
+					"	label=first",
 					'	: > "$GIT_DIR/first-entered"',
 					"	;;",
 					"second*)",
+					"	label=second",
 					'	: > "$GIT_DIR/second-entered"',
 					"	;;",
 					"esac",
 					'shared=$(cat "$GIT_DIR/COMMIT_EDITMSG")',
+					'printf \'%s\' "$shared" > "$GIT_DIR/seen-$label"',
 					'if [ "$shared" != "$msg" ]; then echo "legacy hook saw: $shared" >&2; exit 1; fi',
 					"",
 				].join("\n"),
@@ -264,19 +278,27 @@ describe("commitCreate message isolation", () => {
 					throw new Error("second commit-msg hook never ran while the first commit was signing");
 				}
 			} finally {
+				// Release the parked signer and wait for both commits, so the
+				// fixture is not torn down while a commit is still running.
 				await Bun.write(path.join(gitDir, "release-sign"), "");
+				await first;
+				if (second) await second;
 			}
 			const firstResult = await first;
 			const secondResult = await second!;
-			if (!("sha" in firstResult)) throw firstResult.error;
-			expect(firstResult.sha).toBe(await git(root, "rev-parse", "HEAD"));
-			expect(await git(root, "log", "-1", "--format=%B")).toBe("first subject");
+			// Each hook saw the message of its own call, not the other one's.
+			expect(await Bun.file(path.join(gitDir, "seen-first")).text()).toBe("first subject");
+			expect(await Bun.file(path.join(gitDir, "seen-second")).text()).toBe("second subject");
+			// Both calls read the same HEAD before either landed, so exactly
+			// one of them updates the branch: which one is a race of its own.
+			const landed = [firstResult, secondResult].filter(result => "sha" in result);
+			expect(landed).toHaveLength(1);
+			const winner = landed[0] as { sha: string };
+			expect(await git(root, "rev-parse", "HEAD")).toBe(winner.sha);
 			// Signing really ran: the parked signer was this path, not a
 			// fallback that skipped it.
 			expect(await git(root, "cat-file", "commit", "HEAD")).toContain("\ngpgsig ");
-			// The overlapping call read the same HEAD before the first landed,
-			// so its ref update loses; it must not take the first's place.
-			expect("error" in secondResult).toBe(true);
+			expect(await git(root, "rev-list", "--count", "HEAD")).toBe("2");
 		},
 		60_000,
 	);

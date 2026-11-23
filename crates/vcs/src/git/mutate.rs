@@ -375,11 +375,12 @@ impl GitRepo {
 				.ok_or_else(|| Error::backend("git commit", "author identity is not configured"))?
 				.map_err(|err| Error::backend("git commit", err))?
 		};
-		// Whether a `commit-msg` hook may run for this call. Only then can a
-		// hook read the shared file below, so only then do failures to lock
-		// or write it abort the commit instead of skipping that write.
-		let commit_msg_hook = !options.no_verify
-			&& (hook_configured(self, "commit-msg")? || self.hook_path("commit-msg")?.is_some());
+		// Resolve the `commit-msg` hook. `no_verify` skips it entirely.
+		let mut commit_msg_hook = if options.no_verify {
+			None
+		} else {
+			Some(CommitHook::resolve(self, "commit-msg")?)
+		};
 		// Not `.git/COMMIT_EDITMSG`: overlapping calls reread whichever message
 		// landed last, including when `no_verify` skips the hook.
 		let message_file = CommitMessageFile::create(&self.info().git_dir, message)?;
@@ -387,24 +388,41 @@ impl GitRepo {
 		// message, as under `git commit`; only the private copy is read back.
 		// Holding the lock across the hook keeps an overlapping call from
 		// replacing the shared file between this write and the hook's read.
-		let editmsg_lock = match CommitEditmsgLock::acquire(&self.info().git_dir) {
-			Ok(lock) => Some(lock),
-			Err(err) if commit_msg_hook => {
-				return Err(Error::backend("git commit write COMMIT_EDITMSG", err));
-			},
-			Err(_) => None,
+		let editmsg_lock = if commit_msg_hook.as_ref().is_some_and(CommitHook::runs) {
+			let lock = CommitEditmsgLock::acquire(&self.info().git_dir)
+				.map_err(|err| Error::backend("git commit write COMMIT_EDITMSG", err))?;
+			// Another call held the lock while this one waited for it, so the
+			// hook may have changed meanwhile. Resolve again, now that this
+			// answer can drive both the shared write and the hook's launch: a
+			// hook never runs against a shared file that another answer
+			// produced.
+			commit_msg_hook = Some(CommitHook::resolve(self, "commit-msg")?);
+			Some(lock)
+		} else {
+			// No hook reads the shared file, so never wait for the lock: a
+			// hook that runs a commit of its own holds the lock that nested
+			// commit would wait for, and the nested commit would never end.
+			// A busy lock only means another call writes the shared file now,
+			// which no hook of this call reads.
+			CommitEditmsgLock::try_acquire(&self.info().git_dir)
+				.ok()
+				.flatten()
 		};
+		// Only a hook that runs can read the shared file, so only then do
+		// failures to lock or write it abort the commit instead of skipping
+		// that write.
+		let hook_reads_shared = commit_msg_hook.as_ref().is_some_and(CommitHook::runs);
 		if editmsg_lock.is_some() {
 			match fs::write(self.info().git_dir.join("COMMIT_EDITMSG"), message) {
 				Ok(()) => {},
-				Err(err) if commit_msg_hook => {
+				Err(err) if hook_reads_shared => {
 					return Err(Error::backend("git commit write COMMIT_EDITMSG", err));
 				},
 				Err(_) => {},
 			}
 		}
-		if !options.no_verify {
-			run_commit_hook(self, "commit-msg", &[message_file.path.as_os_str()], index_path)?;
+		if let Some(hook) = commit_msg_hook.as_ref() {
+			run_resolved_hook(self, "commit-msg", hook, &[message_file.path.as_os_str()], index_path)?;
 		}
 		drop(editmsg_lock);
 		let message = fs::read_to_string(&message_file.path)
@@ -1283,29 +1301,72 @@ struct CommitEditmsgLock {
 }
 
 impl CommitEditmsgLock {
-	fn acquire(git_dir: &Path) -> io::Result<Self> {
+	/// Open the lock file. The lock needs no write access to an existing
+	/// file, so fall back to a read-only open when the file another user
+	/// created (a shared or container-run checkout) refuses a write open.
+	fn open(git_dir: &Path) -> io::Result<fs::File> {
 		let path = git_dir.join(".omp-commit-editmsg.lock");
-		// The lock needs no write access to an existing file, so fall back to
-		// a read-only open when the file another user created (a shared or
-		// container-run checkout) refuses a write open.
-		let file = match fs::OpenOptions::new()
+		match fs::OpenOptions::new()
 			.read(true)
 			.write(true)
 			.create(true)
 			.truncate(false)
 			.open(&path)
 		{
-			Ok(file) => file,
+			Ok(file) => Ok(file),
 			Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
 				match fs::OpenOptions::new().read(true).open(&path) {
-					Ok(file) => file,
-					Err(_) => return Err(err),
+					Ok(file) => Ok(file),
+					Err(_) => Err(err),
 				}
 			},
-			Err(err) => return Err(err),
-		};
+			Err(err) => Err(err),
+		}
+	}
+
+	/// Take the lock, waiting for a holder to release it.
+	fn acquire(git_dir: &Path) -> io::Result<Self> {
+		let file = Self::open(git_dir)?;
 		file.lock()?;
 		Ok(Self { _file: file })
+	}
+
+	/// Take the lock only when it is free; `None` when another call holds it.
+	fn try_acquire(git_dir: &Path) -> io::Result<Option<Self>> {
+		let file = Self::open(git_dir)?;
+		match file.try_lock() {
+			Ok(()) => Ok(Some(Self { _file: file })),
+			Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+			Err(std::fs::TryLockError::Error(err)) => Err(err),
+		}
+	}
+}
+
+/// A commit hook, resolved once.
+///
+/// Git finds a hook either in the hooks directory or through
+/// `hook.<id>.event` in the config. One resolution drives both the
+/// shared-message write and the hook's launch, so a hook never runs against
+/// a shared file that another answer produced.
+struct CommitHook {
+	/// Whether a `hook.<id>.event` names the hook; git runs such a hook
+	/// through `git hook run`, together with the hooks-directory file.
+	configured: bool,
+	/// The hooks-directory file, when it exists and is executable.
+	path:       Option<PathBuf>,
+}
+
+impl CommitHook {
+	fn resolve(repository: &GitRepo, name: &str) -> Result<Self> {
+		Ok(Self {
+			configured: hook_configured(repository, name)?,
+			path:       repository.hook_path(name)?,
+		})
+	}
+
+	/// Whether the hook runs for this call.
+	const fn runs(&self) -> bool {
+		self.configured || self.path.is_some()
 	}
 }
 
@@ -1322,11 +1383,22 @@ fn run_commit_hook(
 	args: &[&OsStr],
 	index_path: Option<&Path>,
 ) -> Result<()> {
-	let configured = hook_configured(repository, name)?;
-	let mut command = match repository.hook_path(name)? {
+	let hook = CommitHook::resolve(repository, name)?;
+	run_resolved_hook(repository, name, &hook, args, index_path)
+}
+
+/// Run an already resolved commit hook.
+fn run_resolved_hook(
+	repository: &GitRepo,
+	name: &str,
+	hook: &CommitHook,
+	args: &[&OsStr],
+	index_path: Option<&Path>,
+) -> Result<()> {
+	let mut command = match &hook.path {
 		// Windows CreateProcess cannot execute a shebang script directly.
-		Some(hook) if !configured && !cfg!(windows) => Command::new(hook),
-		None if !configured => return Ok(()),
+		Some(path) if !hook.configured && !cfg!(windows) => Command::new(path),
+		None if !hook.configured => return Ok(()),
 		// Only git runs config-defined hooks, together with the hooks-directory
 		// file in its own order, and through its own shell on Windows, exactly
 		// as `git commit` does.
