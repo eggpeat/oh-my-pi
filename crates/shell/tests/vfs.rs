@@ -323,7 +323,12 @@ async fn run_virtual(root: &Path, script: &str) -> Captured {
 async fn run_virtual_no_utils(root: &Path, script: &str) -> Captured {
 	let (sinks, stdout, stderr) = stream_sinks();
 	let options = ShellExecuteOptions {
-		session_env: Some(HashMap::from([("PI_DISABLE_UUTILS_BUILTINS".into(), "1".into())])),
+		session_env: Some(HashMap::from([
+			("PI_DISABLE_UUTILS_BUILTINS".into(), "1".into()),
+			// The stand-ins report the setting they inherit; it is the test's
+			// own, not the developer's.
+			("REF".into(), String::new()),
+		])),
 		..script_options(provider(root, true), None, script)
 	};
 	let result = execute_shell_streams(options, sinks, CancelToken::default())
@@ -742,9 +747,11 @@ async fn omp_ownership_covers_wrappers_settings_and_find_actions() {
 	fs::set_permissions(&provider_omp, fs::Permissions::from_mode(0o755))
 		.expect("executable provider omp");
 	let bin = tempfile::tempdir().expect("program directory");
-	for name in
-		["showargs", "npx", "npm", "uv", "bunx", "bun", "pnpm", "setsid", "ssh", "npx.cmd", "NPX"]
-	{
+	// `stdbuf` is not on every system, so the test supplies one.
+	for name in [
+		"showargs", "npx", "npm", "uv", "bunx", "bun", "pnpm", "setsid", "ssh", "npx.cmd", "NPX",
+		"stdbuf",
+	] {
 		let path = bin.path().join(name);
 		fs::write(&path, b"#!/bin/sh\nprintf '%s\\n' \"$@\"\n").expect("stand-in program");
 		fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("executable stand-in");
@@ -812,6 +819,16 @@ async fn omp_ownership_covers_wrappers_settings_and_find_actions() {
 			raw_b.into(),
 			"ref=virtual://docs/a.txt".into(),
 		]),
+		(format!("env -S 'MODE=quiet omp read' {raw_b}"), vec![
+			"read".into(),
+			raw_b.into(),
+			"ref=".into(),
+		]),
+		(format!("env -S virtual://bin/omp read {raw}"), vec![
+			"read".into(),
+			raw.into(),
+			"ref=".into(),
+		]),
 		// `bun x` is `bunx`; `pnpm exec` is the package-manager launcher.
 		(format!("bun x omp read {raw}"), vec!["x".into(), "omp".into(), "read".into(), raw.into()]),
 		(format!("pnpm exec omp read {raw}"), vec![
@@ -820,9 +837,16 @@ async fn omp_ownership_covers_wrappers_settings_and_find_actions() {
 			"read".into(),
 			raw.into(),
 		]),
-		// Windows launcher spellings still launch `npx`.
+		// A script suffix never counts. Case matches only on Windows.
 		(format!("npx.cmd omp read {raw}"), vec!["omp".into(), "read".into(), raw.into()]),
-		(format!("NPX omp read {raw}"), vec!["omp".into(), "read".into(), raw.into()]),
+		(
+			format!("NPX omp read {raw}"),
+			if cfg!(windows) {
+				vec!["omp".into(), "read".into(), raw.into()]
+			} else {
+				vec!["omp".into(), "read".into(), file.clone()]
+			},
+		),
 		(format!("'{bin}/npx' omp read {raw}", bin = bin.path().display()), vec![
 			"omp".into(),
 			"read".into(),
@@ -876,6 +900,12 @@ async fn omp_ownership_covers_wrappers_settings_and_find_actions() {
 		]),
 		(format!("uv run omp {raw}"), vec!["run".into(), "omp".into(), raw.into()]),
 		(format!("uv run virtual://script.py"), vec!["run".into(), script_py.clone()]),
+		(format!("uv run --script virtual://script.py {raw}"), vec![
+			"run".into(),
+			"--script".into(),
+			script_py.clone(),
+			file.clone(),
+		]),
 		(format!("uv run virtual://bin/omp {raw}"), vec!["run".into(), host_omp.clone(), raw.into()]),
 		// The same rules apply inside each `find -exec` action, for the
 		// wrappers a real `find` can launch.
@@ -984,6 +1014,12 @@ async fn omp_ownership_covers_wrappers_settings_and_find_actions() {
 			raw.into(),
 			"ref=".into(),
 		]),
+		(
+			format!(
+				"env REF=virtual://docs/a.txt find virtual://docs -name a.txt -exec omp read {raw} \\;"
+			),
+			vec!["read".into(), raw.into(), "ref=virtual://docs/a.txt".into()],
+		),
 		(format!("find virtual://docs -name a.txt -exec env -C /tmp omp read {raw} \\;"), vec![
 			"read".into(),
 			raw.into(),
@@ -1005,9 +1041,10 @@ async fn omp_ownership_covers_wrappers_settings_and_find_actions() {
 			"ref=".into(),
 		]),
 		(format!("find virtual://docs -name a.txt -exec stdbuf -oL omp read {raw} \\;"), vec![
+			"-oL".into(),
+			"omp".into(),
 			"read".into(),
 			raw.into(),
-			"ref=".into(),
 		]),
 		(format!("find virtual://docs -name a.txt -exec setsid omp read {raw} \\;"), vec![
 			"omp".into(),

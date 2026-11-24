@@ -684,18 +684,16 @@ impl crate::bash::Host for PiHost {
 	/// only after the resolution succeeded, so dropping it earlier spawns
 	/// nothing. Any other spawn launches at once and returns a ready future.
 	fn spawn(&mut self, spec: SpawnSpec<'_>) -> SpawnFuture {
-		let Some(fs) = self
-			.vfs
-			.as_ref()
-			.filter(|_| urls::names_url(&spec))
-			.map(crate::vfs::VfsFs::filesystem)
-		else {
+		let Some(fs) = self.vfs.as_ref().map(crate::vfs::VfsFs::filesystem) else {
+			return Box::pin(std::future::ready(self.launcher.launch(spec)));
+		};
+		let Some(plan) = urls::plan(&spec) else {
 			return Box::pin(std::future::ready(self.launcher.launch(spec)));
 		};
 		let launcher = self.launcher.clone();
-		let (names, rest) = urls::split(spec);
+		let (names, rest) = urls::split(spec, plan);
 		Box::pin(async move {
-			let hosted = urls::resolve(&fs, &names).await?;
+			let hosted = urls::resolve(&fs, names).await?;
 			rest.launch(&hosted, |spec| launcher.launch(spec))
 		})
 	}

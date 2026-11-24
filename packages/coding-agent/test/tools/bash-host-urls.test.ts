@@ -31,6 +31,9 @@ const backing: UrlBacking = async url => {
 
 const host = (command: string, shell?: string) => hostCommandUrls(command, backing, shell);
 
+/** Whether this process spells program names the way Windows does. */
+const windows = process.platform === "win32";
+
 describe("hostCommandUrls", () => {
 	it("names the file behind a URL argument, bare or attached to an option", async () => {
 		expect(
@@ -130,8 +133,8 @@ describe("hostCommandUrls", () => {
 			["bun x omp read local://x", "bun x omp read local://x"],
 			["pnpm exec omp read local://x", "pnpm exec omp read local://x"],
 			["npx.cmd omp read local://x", "npx.cmd omp read local://x"],
-			["NPX omp read local://x", "NPX omp read local://x"],
-			["NPX.CMD omp read local://x", "NPX.CMD omp read local://x"],
+			["NPX omp read local://x", windows ? "NPX omp read local://x" : "NPX omp read /host/x"],
+			["NPX.CMD omp read local://x", windows ? "NPX.CMD omp read local://x" : "NPX.CMD omp read /host/x"],
 			["C:/tools/npx.cmd omp read local://x", "C:/tools/npx.cmd omp read local://x"],
 			["/usr/local/bin/npx omp read local://x", "/usr/local/bin/npx omp read local://x"],
 			["REF=local://x omp read local://y", "REF=local://x omp read local://y"],
@@ -152,9 +155,32 @@ describe("hostCommandUrls", () => {
 			["uv run omp local://x", "uv run omp local://x"],
 			["uv run local://script.py", "uv run /host/script.py"],
 			["uv run local://bin/omp local://x", "uv run /host/bin/omp local://x"],
+			["2>&1 omp read local://x", "2>&1 omp read local://x"],
+			["nice 2>/dev/null -n 5 omp read local://x", "nice 2>/dev/null -n 5 omp read local://x"],
+			["bun x --cafile ca.pem omp read local://x", "bun x --cafile ca.pem omp read local://x"],
+			["bun x --ca ca.pem omp read local://x", "bun x --ca ca.pem omp read local://x"],
+			["uv run --script ./omp local://x", "uv run --script ./omp /host/x"],
+			["uv run -s ./omp local://x", "uv run -s ./omp /host/x"],
+			["env -S 'MODE=quiet omp read' local://x", "env -S 'MODE=quiet omp read' local://x"],
+			["env -S 'local://bin/omp read' local://x", "env -S '/host/bin/omp read' local://x"],
+			["env -S MODE=quiet omp read local://x", "env -S MODE=quiet omp read local://x"],
+			["REF+=local://x omp read local://y", "REF+=local://x omp read local://y"],
+			["REF=local://x find . -exec omp read {} \\;", "REF=local://x find . -exec omp read {} \\;"],
+			["find . -exec omp + local://x \\;", "find . -exec omp + local://x \\;"],
+			["find . -exec omp read {} + local://x \\;", "find . -exec omp read {} + /host/x \\;"],
+			['for omp in local://x; do cat "$omp"; done', 'for omp in /host/x; do cat "$omp"; done'],
+			['grep "<<" local://x', 'grep "<<" /host/x'],
+			['omp read ">" local://x', 'omp read ">" local://x'],
+			["omp read $(cat local://in) local://two", "omp read $(cat /host/in) local://two"],
+			["omp read local://in>local://out", "omp read local://in>/host/out"],
 		] as const) {
 			expect(await host(command)).toBe(expected);
 		}
+	});
+
+	it("reads a Windows launcher path the way cmd.exe does", async () => {
+		// cmd.exe keeps backslashes, so this names npx even on a POSIX host.
+		expect(await host("C:\\bin\\npx.cmd omp read local://x", "cmd.exe")).toBe("C:\\bin\\npx.cmd omp read local://x");
 	});
 
 	it("finds the command after shell keywords, assignments and redirections", async () => {
@@ -242,7 +268,10 @@ describe("hostCommandUrls", () => {
 				"find . -exec C:/tools/npx.cmd omp read local://x \\;",
 				"find . -exec C:/tools/npx.cmd omp read local://x \\;",
 			],
-			["find . -exec NPX omp read local://x \\;", "find . -exec NPX omp read local://x \\;"],
+			[
+				"find . -exec NPX omp read local://x \\;",
+				windows ? "find . -exec NPX omp read local://x \\;" : "find . -exec NPX omp read /host/x \\;",
+			],
 			[
 				"find . -exec /usr/local/bin/npx omp read local://x \\;",
 				"find . -exec /usr/local/bin/npx omp read local://x \\;",
