@@ -2,8 +2,11 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { reset as resetDiscoveryCache } from "@oh-my-pi/pi-coding-agent/discovery";
 import * as mcpClient from "@oh-my-pi/pi-coding-agent/mcp/client";
+import { loadAllMCPConfigs } from "@oh-my-pi/pi-coding-agent/mcp/config";
 import { cfgMcpEnableProjectConfig } from "@oh-my-pi/pi-coding-agent/mcp/settings";
 import type { MCPConfigFile } from "@oh-my-pi/pi-coding-agent/mcp/types";
 import { handleMcpAcp } from "@oh-my-pi/pi-coding-agent/slash-commands/helpers/mcp";
@@ -44,6 +47,8 @@ describe("ACP /mcp config resolution", () => {
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		clearFsCache();
+		resetDiscoveryCache();
 		setProjectDir(originalProjectDir);
 		restoreEnvValue("PI_PROFILE", originalPiProfile);
 		restoreEnvValue("OMP_PROFILE", originalOmpProfile);
@@ -257,10 +262,11 @@ describe("ACP /mcp config resolution", () => {
 		expect(userConfig.disabledServers ?? []).not.toContain("denied");
 	});
 
-	test("disable edits the user server when project config is off", async () => {
+	test("disable edits only user config and leaves ignored project entries untouched when project config is off", async () => {
 		await writeConfig("project", {
 			mcpServers: {
 				shared: { type: "stdio", command: "project-command" },
+				"project-only": { type: "stdio", command: "project-only-command" },
 			},
 		});
 		const projectPath = getMCPConfigPath("project", projectDir);
@@ -274,8 +280,11 @@ describe("ACP /mcp config resolution", () => {
 		cfgMcpEnableProjectConfig.set(runtime.settings, false);
 		const connect = mockConnections();
 
-		const disabled = await runMcp("disable shared", runtime);
-		expect(disabled).toEqual({ consumed: true });
+		const disabledShared = await runMcp("disable shared", runtime);
+		expect(disabledShared).toEqual({ consumed: true });
+
+		const disabledProjectOnly = await runMcp("disable project-only", runtime);
+		expect(disabledProjectOnly).toEqual({ consumed: true });
 
 		const testShared = await runMcp("test shared", runtime);
 		expect(testShared).toEqual({ consumed: true, failed: true });
@@ -283,6 +292,7 @@ describe("ACP /mcp config resolution", () => {
 		expect(await Bun.file(projectPath).text()).toBe(originalProjectText);
 		const userConfig = (await Bun.file(getMCPConfigPath("user", projectDir)).json()) as MCPConfigFile;
 		expect(userConfig.mcpServers?.shared).toMatchObject({ enabled: false });
+		expect(userConfig.disabledServers ?? []).toContain("project-only");
 	});
 
 	test("enable edits the user server when project config is off", async () => {
@@ -317,5 +327,44 @@ describe("ACP /mcp config resolution", () => {
 		const userConfig = (await Bun.file(getMCPConfigPath("user", projectDir)).json()) as MCPConfigFile;
 		expect(userConfig.mcpServers?.other).toMatchObject({ enabled: true });
 		expect(userConfig.enabledServers ?? []).not.toContain("other");
+	});
+
+	test("disabling then re-enabling a force-enabled external server restores its override on reload", async () => {
+		await Bun.write(
+			path.join(projectDir, "opencode.json"),
+			JSON.stringify({
+				mcp: {
+					"ext-off": {
+						type: "local",
+						command: ["echo", "opencode"],
+						enabled: false,
+					},
+				},
+			}),
+		);
+		await writeConfig("user", {
+			enabledServers: ["ext-off"],
+		});
+		clearFsCache();
+		resetDiscoveryCache();
+		const runtime = makeRuntime();
+
+		expect((await loadAllMCPConfigs(projectDir, { filterExa: false })).configs["ext-off"]).toBeDefined();
+
+		const disabled = await runMcp("disable ext-off", runtime);
+		expect(disabled).toEqual({ consumed: true });
+		clearFsCache();
+		resetDiscoveryCache();
+		expect((await loadAllMCPConfigs(projectDir, { filterExa: false })).configs["ext-off"]).toBeUndefined();
+
+		const enabled = await runMcp("enable ext-off", runtime);
+		expect(enabled).toEqual({ consumed: true });
+		clearFsCache();
+		resetDiscoveryCache();
+		const reloaded = (await loadAllMCPConfigs(projectDir, { filterExa: false })).configs["ext-off"];
+		expect(reloaded).toMatchObject({ type: "stdio", command: "echo" });
+		const userConfig = (await Bun.file(getMCPConfigPath("user", projectDir)).json()) as MCPConfigFile;
+		expect(userConfig.disabledServers ?? []).not.toContain("ext-off");
+		expect(userConfig.enabledServers ?? []).toContain("ext-off");
 	});
 });

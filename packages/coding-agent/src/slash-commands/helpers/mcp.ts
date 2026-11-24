@@ -7,8 +7,6 @@ import {
 	readMCPConfigFile,
 	removeMCPServer,
 	setMcpServerEnabled,
-	setServerDisabled,
-	setServerForceEnabled,
 } from "../../mcp/config-writer";
 import { cfgMcpEnableProjectConfig } from "../../mcp/settings";
 import { MCPManager } from "../../mcp/manager";
@@ -342,31 +340,30 @@ async function handleEnableDisableCommand(
 	try {
 		const entries = await readMcpConfigEntries(runtime);
 		const entry = entries.find(item => item.name === name);
+		const enableProjectConfig = cfgMcpEnableProjectConfig.get(runtime.settings);
 		const userPath = getMCPConfigPath("user", runtime.cwd);
-		const projectPath = getMCPConfigPath("project", runtime.cwd);
-		if (entry) {
-			// Same row /mcp list shows. The source file is written before the project
-			// file, so an ignored project config stays untouched.
-			await setMcpServerEnabled({
-				userPath,
-				projectPath,
-				sourcePath: getMCPConfigPath(entry.scope, runtime.cwd),
-				name,
-				enabled,
-			});
-			await runtime.output(`Server "${name}" ${enabled ? "enabled" : "disabled"} (${entry.scope} config).`);
-			return commandConsumed();
-		}
-		const disabledList = await readDisabledServers(userPath);
-		if (!enabled || disabledList.includes(name)) {
-			await setServerDisabled(userPath, name, !enabled);
-			if (!enabled && (await readEnabledServers(userPath)).includes(name)) {
-				await setServerForceEnabled(userPath, name, false);
+		if (!entry) {
+			const [disabledList, enabledList] = await Promise.all([
+				readDisabledServers(userPath),
+				readEnabledServers(userPath),
+			]);
+			if (enabled && !disabledList.includes(name) && !enabledList.includes(name)) {
+				return usage(`Server "${name}" not found in user or project config.`, runtime);
 			}
-			await runtime.output(`Server "${name}" ${enabled ? "enabled" : "disabled"}.`);
-			return commandConsumed();
 		}
-		return usage(`Server "${name}" not found in user or project config.`, runtime);
+		await setMcpServerEnabled({
+			userPath,
+			projectPath: enableProjectConfig ? getMCPConfigPath("project", runtime.cwd) : undefined,
+			sourcePath: entry ? getMCPConfigPath(entry.scope, runtime.cwd) : undefined,
+			name,
+			enabled,
+		});
+		await runtime.output(
+			entry
+				? `Server "${name}" ${enabled ? "enabled" : "disabled"} (${entry.scope} config).`
+				: `Server "${name}" ${enabled ? "enabled" : "disabled"}.`,
+		);
+		return commandConsumed();
 	} catch (err) {
 		return usage(`Failed to ${verb} MCP server: ${errorMessage(err)}`, runtime);
 	}
