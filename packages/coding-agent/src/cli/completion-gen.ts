@@ -12,10 +12,13 @@
  * script. A small set of flags resolve dynamic candidates (the live model
  * catalog and on-disk sessions) by calling back into `<bin> __complete <kind>`
  * — see `commands/complete.ts`. The flag→source mapping below is the only manual
- * knob and is keyed by flag name so it stays stable as flags are added.
+ * knob and is keyed by flag name so it stays stable as flags are added. Whether
+ * a launch flag's value may be omitted is not mapped here: completions read
+ * {@link OPTIONAL_VALUE_FLAGS} from `flag-tables.ts`, the same set the parser uses.
  */
 import type { ArgDescriptor, CliConfig, CommandMetadata, FlagDescriptor } from "@oh-my-pi/pi-utils/cli";
 import { BUILTIN_TOOL_NAMES } from "../tools/builtin-names";
+import { OPTIONAL_VALUE_FLAGS } from "./flag-tables";
 
 export type Shell = "bash" | "zsh" | "fish";
 
@@ -28,7 +31,8 @@ export type ValueSource =
 	| { kind: "models"; multiple: boolean } // dynamic: live model catalog
 	| { kind: "sessions" } // dynamic: on-disk sessions
 	| { kind: "file" }
-	| { kind: "dir" };
+	| { kind: "dir" }
+	| { kind: "absolute-file" }; // path the CLI accepts only when absolute
 
 export interface CompletionFlag {
 	/** Long name without the leading `--`. */
@@ -39,6 +43,11 @@ export interface CompletionFlag {
 	value: ValueSource;
 	/** Flag may appear multiple times (oclif `multiple`). */
 	repeatable: boolean;
+	/**
+	 * Value may be omitted. A dash-prefixed word is the next flag, not this
+	 * flag's value (launch parser: {@link OPTIONAL_VALUE_FLAGS}).
+	 */
+	optionalValue?: boolean;
 }
 
 export interface CompletionArg {
@@ -70,6 +79,17 @@ const MODEL_FLAGS: Record<string, true> = { model: true, smol: true, slow: true,
 const SESSION_FLAGS: Record<string, true> = { resume: true, restore: true, fork: true, session: true };
 /** Flags whose value is a directory path. */
 const DIR_FLAGS: Record<string, true> = { "session-dir": true, "plugin-dir": true };
+/**
+ * Flags whose value is an opaque id or key, never a filesystem path.
+ * The default for an unmapped string flag is file completion, which would
+ * turn a picked filename into the id.
+ */
+const TEXT_FLAGS: Record<string, true> = { "provider-session-id": true, "prompt-cache-key": true };
+/**
+ * Flags whose value must already be absolute. A relative suggestion is
+ * rejected (`--trusted-extension requires an absolute path`).
+ */
+const ABSOLUTE_PATH_FLAGS: Record<string, true> = { "trusted-extension": true };
 
 function flagValue(name: string, desc: FlagDescriptor): ValueSource {
 	if (desc.kind === "boolean") return { kind: "flag" };
@@ -80,6 +100,8 @@ function flagValue(name: string, desc: FlagDescriptor): ValueSource {
 	if (name === "tools") return { kind: "list", values: BUILTIN_TOOL_NAMES };
 	if (DIR_FLAGS[name]) return { kind: "dir" };
 	if (desc.kind === "integer") return { kind: "value" };
+	if (TEXT_FLAGS[name]) return { kind: "value" };
+	if (ABSOLUTE_PATH_FLAGS[name]) return { kind: "absolute-file" };
 	return { kind: "file" };
 }
 
@@ -88,17 +110,25 @@ function argValue(desc: ArgDescriptor): ValueSource {
 	return { kind: "file" };
 }
 
-function buildFlags(command: CommandMetadata): CompletionFlag[] {
+/**
+ * @param honorOptionalValue Launch (root) flags only. Optional-value is a
+ *   launch-parser fact; other commands always require a string flag's value.
+ */
+function buildFlags(command: CommandMetadata, honorOptionalValue: boolean): CompletionFlag[] {
 	const out: CompletionFlag[] = [];
 	const flags = command.flags ?? {};
 	for (const name in flags) {
 		const desc = flags[name];
+		const char = desc.char;
 		out.push({
 			name,
-			char: desc.char,
+			char,
 			description: desc.description ?? "",
 			value: flagValue(name, desc),
 			repeatable: Boolean(desc.multiple),
+			optionalValue:
+				honorOptionalValue &&
+				(OPTIONAL_VALUE_FLAGS.has(`--${name}`) || (char !== undefined && OPTIONAL_VALUE_FLAGS.has(`-${char}`))),
 		});
 	}
 	return out;
@@ -130,7 +160,7 @@ export function buildSpec(
 	const commands: CompletionCommand[] = [];
 	let root: CompletionSpec["root"] = { flags: [], args: [] };
 	for (const [name, Cmd] of config.commands) {
-		const flags = buildFlags(Cmd);
+		const flags = buildFlags(Cmd, name === rootName);
 		const args = buildArgs(Cmd);
 		if (name === rootName) {
 			root = { flags, args };
@@ -154,6 +184,14 @@ export function buildSpec(
 /** Every value source except a bare boolean flag consumes the following token. */
 function takesValue(v: ValueSource): boolean {
 	return v.kind !== "flag";
+}
+
+/**
+ * `[[ ]]` test: `word` is an absolute path prefix the CLI accepts.
+ * Drive form matches Node's win32 `path.isAbsolute` (`C:/…`, `C:\\…`), not `C:rel`.
+ */
+function shellAbsolutePrefix(word: string): string {
+	return `[[ "${word}" == /* || "${word}" == [A-Za-z]:[/\\\\]* ]]`;
 }
 
 /** All token forms (`name` + aliases) under which a subcommand can be invoked. */
@@ -199,6 +237,11 @@ function bashValueBranch(bin: string, v: ValueSource): string {
 			return `COMPREPLY=( $(compgen -f -- "$cur") ); compopt -o filenames; return 0`;
 		case "dir":
 			return `COMPREPLY=( $(compgen -d -- "$cur") ); compopt -o filenames; return 0`;
+		case "absolute-file":
+			// `return 0` even when the prefix is relative, so the scope's
+			// generic branch does not offer subcommand names (or, via readline,
+			// filenames) for a path the CLI will reject.
+			return `if ${shellAbsolutePrefix("$cur")}; then COMPREPLY=( $(compgen -f -- "$cur") ); compopt -o filenames; fi; return 0`;
 	}
 }
 
@@ -208,7 +251,13 @@ function bashFlagCase(bin: string, flags: CompletionFlag[]): string {
 	for (const f of flags) {
 		if (!takesValue(f.value)) continue;
 		const labels = [`--${f.name}`, ...(f.char ? [`-${f.char}`] : [])];
-		lines.push(`\t\t${labels.join("|")})\n\t\t\t${bashValueBranch(bin, f.value)}\n\t\t\t;;`);
+		const branch = bashValueBranch(bin, f.value);
+		// Optional value: a dash-prefixed word is the next flag. Don't return,
+		// so the scope's flag-name branch after `esac` can offer it.
+		const body = f.optionalValue
+			? `if [[ "$cur" != -* ]]; then\n\t\t\t\t${branch}\n\t\t\tfi`
+			: branch;
+		lines.push(`\t\t${labels.join("|")})\n\t\t\t${body}\n\t\t\t;;`);
 	}
 	return lines.join("\n");
 }
@@ -322,29 +371,34 @@ function zshDesc(s: string): string {
 		.trim();
 }
 
-function zshAction(v: ValueSource): string {
+function zshAction(v: ValueSource, optional = false): string {
+	// `::` makes the option argument optional, so a dash-prefixed word is
+	// offered as another flag instead of being consumed as the value.
+	const colon = optional ? "::" : ":";
 	switch (v.kind) {
 		case "flag":
 			return "";
 		case "value":
-			return ":value:";
+			return `${colon}value:`;
 		case "enum":
-			return `:value:(${v.values.join(" ")})`;
+			return `${colon}value:(${v.values.join(" ")})`;
 		case "list":
-			return ":value:_omp_tools";
+			return `${colon}value:_omp_tools`;
 		case "models":
-			return v.multiple ? ":models:_omp_models_list" : ":model:_omp_call models";
+			return v.multiple ? `${colon}models:_omp_models_list` : `${colon}model:_omp_call models`;
 		case "sessions":
-			return ":session:_omp_call sessions";
+			return `${colon}session:_omp_call sessions`;
 		case "file":
-			return ":file:_files";
+			return `${colon}file:_files`;
 		case "dir":
-			return ":dir:_files -/";
+			return `${colon}dir:_files -/`;
+		case "absolute-file":
+			return `${colon}file:_omp_absolute_files`;
 	}
 }
 
 function zshFlagSpec(f: CompletionFlag): string {
-	const body = `[${zshDesc(f.description)}]${zshAction(f.value)}`;
+	const body = `[${zshDesc(f.description)}]${zshAction(f.value, Boolean(f.optionalValue))}`;
 	if (f.char && f.repeatable) return `'*'{-${f.char},--${f.name}}'${body}'`;
 	if (f.char) return `'(-${f.char} --${f.name})'{-${f.char},--${f.name}}'${body}'`;
 	if (f.repeatable) return `'*--${f.name}${body}'`;
@@ -396,7 +450,13 @@ _omp_models_list() {
 	done
 	_values -s , 'models' $items
 }
-_omp_tools() { _values -s , 'tools' ${toolNames} }`);
+	_omp_tools() { _values -s , 'tools' ${toolNames} }`);
+	parts.push(`_omp_absolute_files() {
+	# A relative match is rejected ("requires an absolute path").
+	if ${shellAbsolutePrefix("$PREFIX")}; then
+		_files "$@"
+	fi
+}`);
 	parts.push("");
 
 	// Subcommand description table.
@@ -477,11 +537,15 @@ function fishValue(bin: string, v: ValueSource): string {
 		case "models":
 			return `-x -a '(command ${bin} __complete models -- (commandline -ct))'`;
 		case "sessions":
+			// fish `-x` already offers other options for a dash prefix and the
+			// `-a` candidates for an id prefix, so optional-value needs no extra gate.
 			return `-x -a '(command ${bin} __complete sessions -- (commandline -ct))'`;
 		case "file":
 			return "-r -F";
 		case "dir":
 			return "-x -a '(__fish_complete_directories (commandline -ct))'";
+		case "absolute-file":
+			return `-x -a '(__omp_absolute_files)'`;
 	}
 }
 
@@ -500,6 +564,15 @@ function generateFish(spec: CompletionSpec): string {
 	const lines: string[] = [];
 	lines.push(`# fish completion for ${bin} — generated by \`${bin} completions fish\``);
 	lines.push("");
+	lines.push(`function __omp_absolute_files`);
+	lines.push(`\tset -l token (commandline -ct)`);
+	lines.push(`\t# A relative match is rejected ("requires an absolute path").`);
+	lines.push(
+		`\tif string match -q -- '/*' -- $token; or string match -q -r -- '^[A-Za-z]:[/\\\\]' -- $token`,
+	);
+	lines.push(`\t\tcomplete -C "'' $(string escape -- $token)"`);
+	lines.push(`\tend`);
+	lines.push(`end`);
 
 	const allTokens = spec.commands.flatMap(commandTokens);
 	lines.push(`function __fish_omp_no_subcommand`);
