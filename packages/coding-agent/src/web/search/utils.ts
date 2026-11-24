@@ -1,3 +1,14 @@
+import { isSettingsInitialized, Settings, settings as globalSettings } from "../../config/settings";
+
+/**
+ * Settings a search provider reads: the caller's session instance when supplied,
+ * otherwise global settings (if initialized) or isolated defaults, so a one-shot
+ * caller that never called `Settings.init()` still gets a usable instance.
+ */
+export function searchSettings(settings?: Settings): Settings {
+	return settings ?? (isSettingsInitialized() ? globalSettings : Settings.isolated());
+}
+
 /** Calculate age in seconds from an ISO date string. Returns undefined on invalid input. */
 export function dateToAgeSeconds(dateStr: string | null | undefined): number | undefined {
 	if (!dateStr) return undefined;
