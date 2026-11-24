@@ -3,10 +3,12 @@ import { connectToServer, disconnectServer, listPrompts, listResources, listTool
 import {
 	addMCPServer,
 	readDisabledServers,
+	readEnabledServers,
 	readMCPConfigFile,
 	removeMCPServer,
+	setMcpServerEnabled,
 	setServerDisabled,
-	updateMCPServer,
+	setServerForceEnabled,
 } from "../../mcp/config-writer";
 import { cfgMcpEnableProjectConfig } from "../../mcp/settings";
 import { MCPManager } from "../../mcp/manager";
@@ -338,25 +340,29 @@ async function handleEnableDisableCommand(
 	if (!name) return usage(`Usage: /mcp ${verb} <name>`, runtime);
 	const enabled = verb === "enable";
 	try {
+		const entries = await readMcpConfigEntries(runtime);
+		const entry = entries.find(item => item.name === name);
 		const userPath = getMCPConfigPath("user", runtime.cwd);
 		const projectPath = getMCPConfigPath("project", runtime.cwd);
-		const [userConfig, projectConfig] = await Promise.all([
-			readMCPConfigFile(userPath),
-			readMCPConfigFile(projectPath),
-		]);
-		if (projectConfig.mcpServers?.[name] !== undefined) {
-			await updateMCPServer(projectPath, name, { ...projectConfig.mcpServers[name], enabled } as MCPServerConfig);
-			await runtime.output(`Server "${name}" ${enabled ? "enabled" : "disabled"} (project config).`);
-			return commandConsumed();
-		}
-		if (userConfig.mcpServers?.[name] !== undefined) {
-			await updateMCPServer(userPath, name, { ...userConfig.mcpServers[name], enabled } as MCPServerConfig);
-			await runtime.output(`Server "${name}" ${enabled ? "enabled" : "disabled"} (user config).`);
+		if (entry) {
+			// Same row /mcp list shows. The source file is written before the project
+			// file, so an ignored project config stays untouched.
+			await setMcpServerEnabled({
+				userPath,
+				projectPath,
+				sourcePath: getMCPConfigPath(entry.scope, runtime.cwd),
+				name,
+				enabled,
+			});
+			await runtime.output(`Server "${name}" ${enabled ? "enabled" : "disabled"} (${entry.scope} config).`);
 			return commandConsumed();
 		}
 		const disabledList = await readDisabledServers(userPath);
 		if (!enabled || disabledList.includes(name)) {
 			await setServerDisabled(userPath, name, !enabled);
+			if (!enabled && (await readEnabledServers(userPath)).includes(name)) {
+				await setServerForceEnabled(userPath, name, false);
+			}
 			await runtime.output(`Server "${name}" ${enabled ? "enabled" : "disabled"}.`);
 			return commandConsumed();
 		}
