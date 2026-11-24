@@ -99,6 +99,7 @@ function forwardStream<TApi extends Api>(
 	model: Model<TApi>,
 	options: OptionsForApi<TApi>,
 	abortTracker: AbortSourceTracker,
+	callerSignal: AbortSignal | undefined,
 	limits?: StreamLimits,
 ): void {
 	(async () => {
@@ -141,7 +142,7 @@ function forwardStream<TApi extends Api>(
 				onIdle: () => abortTracker.abortLocally(new AIError.StreamTimeoutError(STREAM_IDLE_TIMEOUT_ERROR)),
 				onFirstItemTimeout: () =>
 					abortTracker.abortLocally(new AIError.StreamTimeoutError(STREAM_FIRST_EVENT_TIMEOUT_ERROR)),
-				abortSignal: options.signal,
+				abortSignal: callerSignal,
 				// The synthetic `start` event is yielded immediately by every provider before
 				// the upstream model has emitted any tokens. Treating it as the first "real"
 				// item would flip the watchdog from `firstItemTimeoutMs` to the much shorter
@@ -161,7 +162,7 @@ function forwardStream<TApi extends Api>(
 			}
 		} catch (error) {
 			const stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-			const message = createProviderStreamError(model, error, stopReason);
+			const message = createProviderStreamError(model, error, stopReason, abortTracker, callerSignal);
 			target.push({ type: "error", reason: stopReason, error: message });
 			target.end(message);
 		}
@@ -172,7 +173,34 @@ function createProviderStreamError<TApi extends Api>(
 	model: Model<TApi>,
 	error: unknown,
 	stopReason: Extract<AssistantMessage["stopReason"], "aborted" | "error"> = "error",
+	abortTracker?: AbortSourceTracker,
+	callerSignal?: AbortSignal,
 ): AssistantMessage {
+	// The wrapper's watchdog can throw before the provider's own `finalize` runs.
+	// Resolve a caller abort here the way the rest of the runtime does: classify
+	// the caller's own reason object so its flags survive (even when its label is
+	// empty or happens to read like a plain cancel), report the caller's label
+	// falling back to plain-cancel text only for the display, and give only a
+	// bare `abort()` the generic Abort marker. An unreadable caller reason falls
+	// back to the generic marker so the stream still ends.
+	let callerReason: string | undefined;
+	try {
+		callerReason = stopReason === "aborted" ? abortTracker?.getCallerAbortReason() : undefined;
+	} catch {
+		callerReason = undefined;
+	}
+	let callerReasonId: number | undefined;
+	if (stopReason === "aborted") {
+		try {
+			callerReasonId = AIError.classify(callerSignal?.reason, model.api) || undefined;
+		} catch {
+			callerReasonId = undefined;
+		}
+	}
+	const errorId =
+		stopReason === "aborted"
+			? (callerReasonId ?? (callerReason === undefined ? AIError.create(AIError.Flag.Abort) : undefined))
+			: AIError.classify(error, model.api) || undefined;
 	return {
 		role: "assistant",
 		content: [],
@@ -188,9 +216,13 @@ function createProviderStreamError<TApi extends Api>(
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason,
-		errorId: stopReason === "error" ? AIError.classify(error, model.api) || undefined : undefined,
+		errorId,
 		errorMessage:
-			stopReason === "aborted" ? "Request was aborted" : error instanceof Error ? error.message : String(error),
+			stopReason === "aborted"
+				? (callerReason ?? "Request was aborted")
+				: error instanceof Error
+					? error.message
+					: String(error),
 		timestamp: Date.now(),
 	};
 }
@@ -217,10 +249,15 @@ function createLazyProviderStream<TModule, TApi extends Api>(
 
 		load()
 			.then(mod => {
-				const abortTracker = createAbortSourceTracker(streamOptions.signal);
-				const providerOptions: OptionsForApi<TApi> = { ...streamOptions, signal: abortTracker.requestSignal };
+				// Read the caller's signal once, inside the error-handled setup, and
+				// reuse it for the abort tracker, the watchdog, and abort-reason
+				// classification: a throwing getter becomes a stream error instead of
+				// a synchronous throw, and the options copy cannot read it again.
+				const { signal: callerSignal, ...restOptions } = streamOptions;
+				const abortTracker = createAbortSourceTracker(callerSignal);
+				const providerOptions: OptionsForApi<TApi> = { ...restOptions, signal: abortTracker.requestSignal };
 				const inner = pick(mod)(model, context, providerOptions);
-				forwardStream(outer, inner, model, streamOptions, abortTracker, limits);
+				forwardStream(outer, inner, model, streamOptions, abortTracker, callerSignal, limits);
 			})
 			.catch(error => {
 				const message = createProviderStreamError(model, error);

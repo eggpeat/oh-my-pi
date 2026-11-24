@@ -61,6 +61,54 @@ function createAssistantMessage(
 
 const baseContext: Context = { messages: [] };
 
+/**
+ * Drive a forwarded Bedrock stream to its first event, abort the caller signal,
+ * and return the terminal message. Mirrors a user pressing Esc mid-stream while
+ * the lazy watchdog wrapper owns the iterator.
+ */
+async function abortForwardedStreamAfterStart(reason?: string | Error): Promise<AssistantMessage> {
+	const abortController = new AbortController();
+	const partialMessage = createAssistantMessage("stop");
+	let providerSignal: AbortSignal | undefined;
+	const source = {
+		async *[Symbol.asyncIterator]() {
+			yield { type: "start", partial: partialMessage } as const;
+			const { promise, reject } = Promise.withResolvers<never>();
+			if (providerSignal?.aborted) {
+				reject(new Error("Request was aborted"));
+			}
+			providerSignal?.addEventListener("abort", () => reject(new Error("Request was aborted")), {
+				once: true,
+			});
+			await promise;
+		},
+	} as unknown as AssistantMessageEventStream;
+
+	setBedrockProviderModule({
+		streamBedrock: (_model, _context, options) => {
+			providerSignal = options.signal;
+			return source;
+		},
+	});
+
+	const stream = streamBedrock(createModel(), baseContext, {
+		signal: abortController.signal,
+		streamIdleTimeoutMs: 500,
+	});
+	const iterator = stream[Symbol.asyncIterator]();
+	const firstEvent = await iterator.next();
+	expect(firstEvent.value?.type).toBe("start");
+
+	if (reason === undefined) {
+		abortController.abort();
+	} else {
+		abortController.abort(reason);
+	}
+	const result = await Promise.race([stream.result(), Bun.sleep(500).then(() => "timeout" as const)]);
+	if (result === "timeout") throw new Error("Timed out waiting for forwarded caller abort result");
+	return result;
+}
+
 describe("register-builtins lazy streams", () => {
 	it("resolves the outer stream result from source.result() when no terminal event is iterated", async () => {
 		const finalMessage = createAssistantMessage("stop");
@@ -274,46 +322,136 @@ describe("register-builtins lazy streams", () => {
 	});
 
 	it("preserves caller aborts while forwarding lazy provider streams", async () => {
-		const abortController = new AbortController();
+		const result = await abortForwardedStreamAfterStart();
+
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("Request was aborted");
+		// A bare cancel carries the generic Abort marker, the shape turn recovery
+		// uses to decide a reasonless, output-free abort is safe to retry.
+		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(true);
+	});
+
+	it("reports the caller's labelled abort reason instead of the transport abort text", async () => {
+		const result = await abortForwardedStreamAfterStart("Interrupted by user");
+
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("Interrupted by user");
+		// A labelled stop must stay outside the generic Abort marker: that marker
+		// makes the terminal render "Operation aborted" and lets turn recovery
+		// retry an empty turn as a reasonless abort.
+		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(false);
+		expect(AIError.is(result.errorId, AIError.Flag.UserInterrupt)).toBe(false);
+	});
+
+	it("classifies the caller's abort reason object instead of dropping its flags", async () => {
+		const result = await abortForwardedStreamAfterStart(new AIError.StreamTimeoutError("budget spent"));
+
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("budget spent");
+		// Classification must read the caller's own reason object, not the
+		// wrapper's transport abort, so the reason's Timeout/Transient flags survive.
+		expect(AIError.is(result.errorId, AIError.Flag.Timeout)).toBe(true);
+		expect(AIError.is(result.errorId, AIError.Flag.Transient)).toBe(true);
+		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(false);
+	});
+
+	it("uses the same caller signal for the watchdog and the abort reason", async () => {
+		const watchdogController = new AbortController();
+		const ignoredController = new AbortController();
 		const partialMessage = createAssistantMessage("stop");
-		let providerSignal: AbortSignal | undefined;
+		let reads = 0;
 		const source = {
 			async *[Symbol.asyncIterator]() {
 				yield { type: "start", partial: partialMessage } as const;
-				const { promise, reject } = Promise.withResolvers<never>();
-				if (providerSignal?.aborted) {
-					reject(new Error("Request was aborted"));
-				}
-				providerSignal?.addEventListener("abort", () => reject(new Error("Request was aborted")), {
-					once: true,
-				});
-				await promise;
+				// Ignore the provider signal: only the wrapper's own abort listener can
+				// settle this stream, so a watchdog bound to a later signal read hangs.
+				await new Promise<never>(() => {});
 			},
 		} as unknown as AssistantMessageEventStream;
 
 		setBedrockProviderModule({
-			streamBedrock: (_model, _context, options) => {
-				providerSignal = options.signal;
-				return source;
-			},
+			streamBedrock: () => source,
 		});
 
 		const stream = streamBedrock(createModel(), baseContext, {
-			signal: abortController.signal,
-			streamIdleTimeoutMs: 500,
+			get signal() {
+				reads += 1;
+				return reads === 1 ? watchdogController.signal : ignoredController.signal;
+			},
+			// Both watchdogs off so only the abort signal can settle the stream.
+			streamIdleTimeoutMs: 0,
+			streamFirstEventTimeoutMs: 0,
 		});
 		const iterator = stream[Symbol.asyncIterator]();
-		const firstEvent = await iterator.next();
-		expect(firstEvent.value?.type).toBe("start");
+		expect((await iterator.next()).value?.type).toBe("start");
 
-		abortController.abort();
+		watchdogController.abort("Interrupted by user");
 		const result = await Promise.race([stream.result(), Bun.sleep(500).then(() => "timeout" as const)]);
-
 		expect(result).not.toBe("timeout");
-		if (result === "timeout") {
-			throw new Error("Timed out waiting for forwarded caller abort result");
-		}
+		if (result === "timeout") throw new Error("Timed out waiting for the captured caller signal");
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("Interrupted by user");
+	});
+
+	it("keeps the timeout marker when the caller's abort reason reads like a plain cancel", async () => {
+		const result = await abortForwardedStreamAfterStart(new AIError.StreamTimeoutError("Request was aborted"));
+
 		expect(result.stopReason).toBe("aborted");
 		expect(result.errorMessage).toBe("Request was aborted");
+		// The reason's own classification must win over its text: a timeout that
+		// happens to read like a bare cancel keeps its Timeout/Transient flags.
+		expect(AIError.is(result.errorId, AIError.Flag.Timeout)).toBe(true);
+		expect(AIError.is(result.errorId, AIError.Flag.Transient)).toBe(true);
+		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(false);
+	});
+
+	it("keeps the timeout marker when the caller's abort reason has no message", async () => {
+		const result = await abortForwardedStreamAfterStart(new AIError.StreamTimeoutError(""));
+
+		expect(result.stopReason).toBe("aborted");
+		// The empty label yields no display text, but the reason's own
+		// classification must still keep its Timeout/Transient flags.
+		expect(result.errorMessage).toBe("Request was aborted");
+		expect(AIError.is(result.errorId, AIError.Flag.Timeout)).toBe(true);
+		expect(AIError.is(result.errorId, AIError.Flag.Transient)).toBe(true);
+		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(false);
+	});
+
+	it("still ends the stream when the abort reason cannot be read", async () => {
+		const reason = new Error("placeholder");
+		Object.defineProperty(reason, "message", {
+			get() {
+				throw new Error("unreadable abort reason");
+			},
+		});
+
+		const result = await abortForwardedStreamAfterStart(reason);
+
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("Request was aborted");
+		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(true);
+	});
+
+	it("turns a throwing signal getter into a stream error instead of a synchronous throw", async () => {
+		const partialMessage = createAssistantMessage("stop");
+		const source = {
+			async *[Symbol.asyncIterator]() {
+				yield { type: "start", partial: partialMessage } as const;
+			},
+		} as unknown as AssistantMessageEventStream;
+
+		setBedrockProviderModule({
+			streamBedrock: () => source,
+		});
+
+		const stream = streamBedrock(createModel(), baseContext, {
+			get signal(): AbortSignal {
+				throw new Error("signal getter exploded");
+			},
+		});
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("signal getter exploded");
 	});
 });

@@ -24,7 +24,11 @@ export class AbortError extends Error {
 export function callerAbortReason(signal: AbortSignal | undefined): string | undefined {
 	const reason = signal?.reason;
 	if (typeof reason === "string" && reason.trim().length > 0) return reason;
-	if (reason instanceof Error && reason.name !== "AbortError" && reason.message.trim().length > 0)
-		return reason.message;
+	if (reason instanceof Error && reason.name !== "AbortError") {
+		// `message` is typed string but a malformed Error can carry a non-string
+		// value; reading it here must not throw while reporting an abort.
+		const message: unknown = reason.message;
+		if (typeof message === "string" && message.trim().length > 0) return message;
+	}
 	return undefined;
 }

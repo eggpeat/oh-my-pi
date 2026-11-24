@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Aborted built-in provider streams now report the reason the caller passed to the abort signal, such as "Interrupted by user", instead of always saying "Request was aborted"; only a bare cancel keeps the generic abort marker ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 - DeepSeek tool calls written as DSML text on OpenRouter's Responses route (and other Responses hosts) are now turned into real tool calls while streaming, as on the chat-completions route, instead of failing and triggering a retry nudge
 - Kimi K2 and Qwen tool calls written as text on OpenRouter's Responses route (and other Responses hosts) are now turned into real tool calls while streaming, as on the chat-completions route
 - GitHub Copilot Gemini models no longer fail every request with `400 invalid request body` when an MCP tool schema declares a `type` array (e.g. `["string", "null"]`); tool schemas are rewritten into Gemini's schema dialect ([#20198](https://github.com/can1357/oh-my-pi/issues/20198))

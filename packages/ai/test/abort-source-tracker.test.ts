@@ -39,6 +39,18 @@ describe("createAbortSourceTracker", () => {
 		expect(untold.getCallerAbortReason()).toBeUndefined();
 	});
 
+	it("returns no caller reason when the abort reason's message is not a string", () => {
+		const caller = new AbortController();
+		const tracker = createAbortSourceTracker(caller.signal);
+		const reason = new Error("placeholder");
+		(reason as unknown as { message: unknown }).message = null;
+		caller.abort(reason);
+
+		// A malformed Error must not make the reason reader throw while reporting
+		// an abort; the caller's intent is still a cancel with no readable label.
+		expect(tracker.getCallerAbortReason()).toBeUndefined();
+	});
+
 	it("reports local abort when only a local watchdog fires (no caller signal)", () => {
 		const tracker = createAbortSourceTracker(undefined);
 		const reason = new Error("idle timeout");
