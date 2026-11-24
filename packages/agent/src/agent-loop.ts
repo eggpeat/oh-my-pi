@@ -170,6 +170,18 @@ const MAX_DSML_LEAK_NUDGES = 2;
 const MAX_SOFT_TOOL_ESCALATIONS = 3;
 
 /**
+ * The loop ended the turn itself, not a provider: the model kept missing a soft
+ * tool requirement. `Agent` marks the turn's error message `errorFromAgentLoop`
+ * so recovery does not report it as a failed request.
+ */
+export class AgentLoopError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "AgentLoopError";
+	}
+}
+
+/**
  * Whether a hard `toolChoice` for a turn conflicts with a pending soft tool
  * requirement — i.e. forbids tools (`"none"`) or forces a *different* specific
  * tool. `"auto"`/`"required"`/`"any"` and a same-tool force still let the model
@@ -1341,6 +1353,7 @@ async function runLoopBody(
 		let hostToolChoice: ToolChoice | undefined;
 		let softRequiredTool: string | undefined;
 		let softSatisfies: SoftToolRequirement["satisfies"];
+		let softUnsatisfiedNotice: SoftToolRequirement["unsatisfiedNotice"];
 		let directiveResolvedForTurn = false;
 		let turnOpen = false;
 		// A trailing assistant message with unpaired tool calls: the harness
@@ -1442,6 +1455,7 @@ async function runLoopBody(
 						hostToolChoice = directive === undefined || isSoftToolRequirement(directive) ? undefined : directive;
 						softRequiredTool = softReq?.toolName;
 						softSatisfies = softReq?.satisfies;
+						softUnsatisfiedNotice = softReq?.unsatisfiedNotice;
 						const softRequirementId = softRequirementState.id;
 						if (softReq !== undefined) {
 							if (softReq.id !== softRequirementId) {
@@ -1726,11 +1740,6 @@ async function runLoopBody(
 				const additionalMessages: AgentMessage[] = [];
 				if (softNonCompliant && softRequiredTool !== undefined) {
 					SpeculativeOperationCoordinator.discardForMessage(message, "soft tool requirement deferred execution");
-					if (softRequirementState.escalations >= MAX_SOFT_TOOL_ESCALATIONS) {
-						throw new Error(
-							`Soft tool requirement '${softRequiredTool}' was not satisfied after ${MAX_SOFT_TOOL_ESCALATIONS} forced turns; aborting to avoid an unbounded force loop.`,
-						);
-					}
 					// A soft-required tool is pending but the model called something else
 					// (or yielded). Do NOT execute the detour — pair each call with a
 					// skipped result and force the required tool next turn. This is the
@@ -1738,11 +1747,18 @@ async function runLoopBody(
 					// reminder pays no message-cache invalidation. Re-engage so the loop
 					// never yields while the requirement is unmet.
 					for (const toolCall of toolCalls) {
+						// A call to the required tool that fails `satisfies` already did what the
+						// generic notice asks; give it the host's notice naming the invocation needed.
+						const wrongInvocationNotice =
+							toolCall.name === softRequiredTool && softSatisfies?.(toolCall) === false
+								? softUnsatisfiedNotice?.(toolCall)
+								: undefined;
 						const result = createAbortedToolResult(
 							toolCall,
 							stream,
 							"skipped",
-							`Not executed: call the \`${softRequiredTool}\` tool to resolve the pending action before using other tools.`,
+							wrongInvocationNotice ??
+								`Not executed: call the \`${softRequiredTool}\` tool to resolve the pending action before using other tools.`,
 						);
 						currentContext.messages.push(result);
 						newMessages.push(result);
@@ -1752,6 +1768,14 @@ async function runLoopBody(
 							toolName: toolCall.name,
 							status: "skipped",
 						});
+					}
+					// Abort only after pairing the calls: a retry continues from this
+					// transcript, and `agentLoopContinue` executes an unanswered tool-call
+					// tail, which would run the calls the gate just refused.
+					if (softRequirementState.escalations >= MAX_SOFT_TOOL_ESCALATIONS) {
+						throw new AgentLoopError(
+							`Soft tool requirement '${softRequiredTool}' was not satisfied after ${MAX_SOFT_TOOL_ESCALATIONS} forced turns; aborting to avoid an unbounded force loop.`,
+						);
 					}
 					softRequirementState.forcedToolChoice = { type: "tool", name: softRequiredTool };
 					softRequirementState.escalations++;
