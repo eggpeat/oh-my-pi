@@ -56,6 +56,37 @@ async function installHook(root: string, script: string): Promise<void> {
 
 const EDITMSG_LOCK = ".omp-commit-editmsg.lock";
 
+/** Try taking the shared-message flock from outside; returns whether it succeeded. */
+function tryExternalFlock(lockPath: string): boolean {
+	const busyCode = 11;
+	const result = Bun.which("flock")
+		? Bun.spawnSync(["flock", "-n", "-E", String(busyCode), lockPath, "true"], { stderr: "pipe" })
+		: Bun.which("python3")
+			? Bun.spawnSync(
+					[
+						"python3",
+						"-c",
+						[
+							"import errno, fcntl, sys",
+							"try:",
+							"    with open(sys.argv[1], 'rb') as f:",
+							"        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)",
+							"except OSError as err:",
+							`    if err.errno in (errno.EACCES, errno.EAGAIN): sys.exit(${busyCode})`,
+							"    raise",
+						].join("\n"),
+						lockPath,
+					],
+					{ stderr: "pipe" },
+				)
+			: (() => {
+					throw new Error("need flock or python3 to probe the shared-message lock");
+				})();
+	if (result.exitCode === 0) return true;
+	if (result.exitCode === busyCode) return false;
+	throw new Error(`external lock probe failed (${result.exitCode}): ${result.stderr.toString()}`);
+}
+
 /** Poll `check` until it passes or the wall-clock deadline passes. */
 async function waitFor(check: () => Promise<boolean>, timeoutMs = 30_000): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs;
@@ -186,6 +217,13 @@ describe("commitCreate message isolation", () => {
 					async () => (await fs.readdir(gitDir)).filter(name => name.startsWith(".omp-commit-msg-")).length >= 2,
 				);
 				if (!bothMessaged) throw new Error("second call never wrote its message file");
+				// Before releasing the first hook, prove the lock is actually
+				// held: a separate attempt to take it cannot succeed, and the
+				// second hook has not entered yet.
+				const lockPath = path.join(gitDir, EDITMSG_LOCK);
+				expect(await Bun.file(lockPath).exists()).toBe(true);
+				expect(tryExternalFlock(lockPath)).toBe(false);
+				expect(await Bun.file(path.join(gitDir, "second-entered")).exists()).toBe(false);
 			} finally {
 				// Release the parked hook and wait for both commits, so the
 				// fixture is not torn down while a commit is still running.
@@ -255,8 +293,10 @@ describe("commitCreate message isolation", () => {
 				signer,
 				[
 					"#!/bin/sh",
-					`: > "${path.join(gitDir, "sign-entered")}"`,
-					`while [ ! -e "${path.join(gitDir, "release-sign")}" ]; do sleep 0.02; done`,
+					`if mkdir "${path.join(gitDir, "first-sign-hold")}" 2>/dev/null; then`,
+					`	: > "${path.join(gitDir, "sign-entered")}"`,
+					`	while [ ! -e "${path.join(gitDir, "release-sign")}" ]; do sleep 0.02; done`,
+					"fi",
 					'exec ssh-keygen "$@"',
 					"",
 				].join("\n"),
@@ -277,6 +317,7 @@ describe("commitCreate message isolation", () => {
 				if (!(await waitFor(() => Bun.file(path.join(gitDir, "second-entered")).exists()))) {
 					throw new Error("second commit-msg hook never ran while the first commit was signing");
 				}
+				await second;
 			} finally {
 				// Release the parked signer and wait for both commits, so the
 				// fixture is not torn down while a commit is still running.
@@ -295,6 +336,8 @@ describe("commitCreate message isolation", () => {
 			expect(landed).toHaveLength(1);
 			const winner = landed[0] as { sha: string };
 			expect(await git(root, "rev-parse", "HEAD")).toBe(winner.sha);
+			const winnerMessage = winner === firstResult ? "first subject" : "second subject";
+			expect(await git(root, "log", "-1", "--format=%B")).toBe(winnerMessage);
 			// Signing really ran: the parked signer was this path, not a
 			// fallback that skipped it.
 			expect(await git(root, "cat-file", "commit", "HEAD")).toContain("\ngpgsig ");

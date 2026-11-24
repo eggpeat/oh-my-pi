@@ -38,6 +38,7 @@ fn fixture() -> (TempDir, PathBuf) {
 	git(&root, &["config", "user.name", "Test"]);
 	git(&root, &["config", "user.email", "test@example.com"]);
 	git(&root, &["config", "core.hooksPath", ".git/hooks"]);
+	git(&root, &["config", "commit.gpgsign", "false"]);
 	(temp, root)
 }
 
@@ -60,6 +61,7 @@ fn commit_without_a_hook_does_not_wait_for_the_shared_message_lock() {
 	let (_temp, root) = fixture();
 	let git_dir = root.join(".git");
 	let _holder = hold_lock(&git_dir);
+	std::fs::write(git_dir.join("COMMIT_EDITMSG"), "hook commit message\n").unwrap();
 
 	let (tx, rx) = mpsc::channel();
 	let worker = root.clone();
@@ -80,4 +82,9 @@ fn commit_without_a_hook_does_not_wait_for_the_shared_message_lock() {
 	);
 	let id = outcome.unwrap().unwrap();
 	assert_eq!(git(&root, &["rev-parse", "HEAD"]), id);
+	assert_eq!(
+		std::fs::read_to_string(git_dir.join("COMMIT_EDITMSG")).unwrap(),
+		"hook commit message\n",
+		"a commit that skips the lock when busy must not overwrite COMMIT_EDITMSG",
+	);
 }
