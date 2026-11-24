@@ -565,17 +565,26 @@ class OmpLocal(BaseInstalledAgent):
     def _collect_provider_keys(self, provider: str) -> dict[str, str]:
         """Host env vars for the primary model's provider (direct-auth mode only).
 
-        Tuples are aliases: only the first non-blank host name forwards, and a
-        nonblank --env value under any name in an entry suppresses the entry.
+        Tuples are aliases: only the first non-blank host name forwards; a
+        non-blank --env value under any name in an entry suppresses the entry,
+        and an explicitly cleared --env name is skipped so aliases can fall back.
         """
+        if (
+            provider == "anthropic"
+            and _truthy(self._forward_env.get("CLAUDE_CODE_USE_FOUNDRY", ""))
+            and (self._forward_env.get("ANTHROPIC_FOUNDRY_API_KEY") or "").strip()
+        ):
+            return {}
         env: dict[str, str] = {}
         for item in _PROVIDER_KEYS.get(provider, []):
             names = item if isinstance(item, tuple) else (item,)
-            if any(self._forward_env.get(name) for name in names):
+            if any((self._forward_env.get(name) or "").strip() for name in names):
                 continue
             for name in names:
+                if name in self._forward_env:
+                    continue
                 value = os.environ.get(name)
-                if value:
+                if value and value.strip():
                     env[name] = value
                     break
         return env

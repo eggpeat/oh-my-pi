@@ -100,9 +100,10 @@ describe("OmpLocal._collect_provider_keys (direct-auth env forwarding)", () => {
 
 	it("forwards only the alias omp would pick for huggingface", () => {
 		// omp's env fallback for huggingface is HUGGINGFACE_HUB_TOKEN then
-		// HF_TOKEN (first non-blank wins); forwarding both lets the shadowed
-		// token leak permissions the run never uses.
-		const [both, fallback] = collect([
+		// HF_TOKEN (first non-blank wins, trimming whitespace); forwarding both
+		// lets the shadowed token leak permissions, and spaces must not block
+		// the fallback.
+		const [both, fallback, whitespace] = collect([
 			{
 				provider: "huggingface",
 				host: { HUGGINGFACE_HUB_TOKEN: "hub-token", HF_TOKEN: "hf-token" },
@@ -111,15 +112,21 @@ describe("OmpLocal._collect_provider_keys (direct-auth env forwarding)", () => {
 				provider: "huggingface",
 				host: { HF_TOKEN: "hf-token" },
 			},
+			{
+				provider: "huggingface",
+				host: { HUGGINGFACE_HUB_TOKEN: "   ", HF_TOKEN: "hf-token" },
+			},
 		]);
 		expect(both).toEqual({ HUGGINGFACE_HUB_TOKEN: "hub-token" });
 		expect(fallback).toEqual({ HF_TOKEN: "hf-token" });
+		expect(whitespace).toEqual({ HF_TOKEN: "hf-token" });
 	});
 
-	it("drops host huggingface tokens when --env supplies the credential under either name", () => {
+	it("drops host huggingface tokens when --env supplies a non-blank credential under either name", () => {
 		// --env lands in _forward_env and must win; without suppression a host
-		// HUGGINGFACE_HUB_TOKEN would silently shadow --env HF_TOKEN.
-		const [envHf, envHub, envBlank] = collect([
+		// HUGGINGFACE_HUB_TOKEN would silently shadow --env HF_TOKEN, while
+		// empty or whitespace-only --env values must not block the host token.
+		const [envHf, envHub, envBlank, envWhitespace] = collect([
 			{
 				provider: "huggingface",
 				host: { HUGGINGFACE_HUB_TOKEN: "hub-token", HF_TOKEN: "hf-token" },
@@ -135,18 +142,22 @@ describe("OmpLocal._collect_provider_keys (direct-auth env forwarding)", () => {
 				host: { HUGGINGFACE_HUB_TOKEN: "hub-token" },
 				forward: { HF_TOKEN: "" },
 			},
+			{
+				provider: "huggingface",
+				host: { HUGGINGFACE_HUB_TOKEN: "hub-token" },
+				forward: { HF_TOKEN: "   " },
+			},
 		]);
 		expect(envHf).toEqual({});
 		expect(envHub).toEqual({});
-		// A blank --env supplies no credential, so the host token still forwards.
 		expect(envBlank).toEqual({ HUGGINGFACE_HUB_TOKEN: "hub-token" });
+		expect(envWhitespace).toEqual({ HUGGINGFACE_HUB_TOKEN: "hub-token" });
 	});
 
-	it("forwards only omp's winning anthropic alias and honors --env overrides", () => {
-		// omp's anthropic env hook resolves ANTHROPIC_OAUTH_TOKEN before
-		// ANTHROPIC_API_KEY; forwarding both leaks the unused key and can shadow
-		// an --env override.
-		const [both, envOverride] = collect([
+	it("forwards only omp's winning anthropic alias, handles cleared aliases, and honors Foundry", () => {
+		// omp's anthropic env hook picks ANTHROPIC_FOUNDRY_API_KEY when Foundry
+		// mode is enabled, otherwise ANTHROPIC_OAUTH_TOKEN then ANTHROPIC_API_KEY.
+		const [both, envOverride, oauthCleared, foundryActive, foundryNoKey, foundryDisabled] = collect([
 			{
 				provider: "anthropic",
 				host: { ANTHROPIC_API_KEY: "api-key", ANTHROPIC_OAUTH_TOKEN: "oauth-token" },
@@ -156,9 +167,33 @@ describe("OmpLocal._collect_provider_keys (direct-auth env forwarding)", () => {
 				host: { ANTHROPIC_OAUTH_TOKEN: "oauth-token" },
 				forward: { ANTHROPIC_API_KEY: "user-key" },
 			},
+			{
+				provider: "anthropic",
+				host: { ANTHROPIC_OAUTH_TOKEN: "oauth-token", ANTHROPIC_API_KEY: "api-key" },
+				forward: { ANTHROPIC_OAUTH_TOKEN: "" },
+			},
+			{
+				provider: "anthropic",
+				host: { ANTHROPIC_OAUTH_TOKEN: "oauth-token", ANTHROPIC_API_KEY: "api-key" },
+				forward: { CLAUDE_CODE_USE_FOUNDRY: "1", ANTHROPIC_FOUNDRY_API_KEY: "foundry-key" },
+			},
+			{
+				provider: "anthropic",
+				host: { ANTHROPIC_OAUTH_TOKEN: "oauth-token", ANTHROPIC_API_KEY: "api-key" },
+				forward: { CLAUDE_CODE_USE_FOUNDRY: "1" },
+			},
+			{
+				provider: "anthropic",
+				host: { ANTHROPIC_OAUTH_TOKEN: "oauth-token" },
+				forward: { ANTHROPIC_FOUNDRY_API_KEY: "foundry-key" },
+			},
 		]);
 		expect(both).toEqual({ ANTHROPIC_OAUTH_TOKEN: "oauth-token" });
 		expect(envOverride).toEqual({});
+		expect(oauthCleared).toEqual({ ANTHROPIC_API_KEY: "api-key" });
+		expect(foundryActive).toEqual({});
+		expect(foundryNoKey).toEqual({ ANTHROPIC_OAUTH_TOKEN: "oauth-token" });
+		expect(foundryDisabled).toEqual({ ANTHROPIC_OAUTH_TOKEN: "oauth-token" });
 	});
 
 	it("still forwards independent multi-var credentials", () => {
