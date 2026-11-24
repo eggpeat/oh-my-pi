@@ -3,6 +3,7 @@
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 use std::{
+	collections::HashMap,
 	fs,
 	io::{self, SeekFrom},
 	path::{Path, PathBuf},
@@ -314,6 +315,25 @@ async fn run_script(filesystem: Fs, cwd: Option<&Path>, script: &str) -> Capture
 /// working directory.
 async fn run_virtual(root: &Path, script: &str) -> Captured {
 	run_script(provider(root, true), None, script).await
+}
+
+/// The same run with every utility handed to `PATH`, so the spawns that see
+/// a command's argv are the external ones `resolve` writes for.
+#[cfg(unix)]
+async fn run_virtual_no_utils(root: &Path, script: &str) -> Captured {
+	let (sinks, stdout, stderr) = stream_sinks();
+	let options = ShellExecuteOptions {
+		session_env: Some(HashMap::from([("PI_DISABLE_UUTILS_BUILTINS".into(), "1".into())])),
+		..script_options(provider(root, true), None, script)
+	};
+	let result = execute_shell_streams(options, sinks, CancelToken::default())
+		.await
+		.expect("filesystem-backed shell execution");
+	Captured {
+		status: result.exit_code,
+		stdout: received_text(&stdout),
+		stderr: received_text(&stderr),
+	}
 }
 
 #[tokio::test]
@@ -694,6 +714,327 @@ async fn only_the_command_named_omp_receives_urls_as_written() {
 		raw.to_owned(),
 	];
 	assert_eq!(run.stdout.lines().collect::<Vec<_>>(), expected);
+}
+
+/// A wrapper's own arguments are still ours to resolve, and only its command
+/// is `omp`: a URL executable is a host file (`nice virtual://bin/omp …`),
+/// `env -S` names the command inside its split string, option values like
+/// `npx -w` and `npm exec --cache` are not the command, Windows launcher
+/// spellings (`npx.cmd`, `NPX`) still launch it, `ssh` finds its command
+/// after the destination's options, `uv -m` is a module, `exec -a` is only a
+/// display name, and every `find -exec` action decides on its own command.
+#[cfg(unix)]
+#[tokio::test]
+async fn omp_ownership_covers_wrappers_settings_and_find_actions() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let directory = tempfile::tempdir().expect("isolated provider filesystem");
+	let docs = directory.path().join("docs");
+	fs::create_dir(&docs).expect("provider directory");
+	fs::write(docs.join("a.txt"), b"alpha\n").expect("document");
+	fs::write(docs.join("b.txt"), b"beta\n").expect("second document");
+	fs::write(directory.path().join("script.py"), b"print('hi')\n").expect("provider script");
+	let provider_bin = directory.path().join("bin");
+	fs::create_dir(&provider_bin).expect("provider bin");
+	let provider_omp = provider_bin.join("omp");
+	fs::write(&provider_omp, b"#!/bin/sh\nprintf '%s\\n' \"$@\" \"ref=$REF\"\n")
+		.expect("provider omp");
+	fs::set_permissions(&provider_omp, fs::Permissions::from_mode(0o755))
+		.expect("executable provider omp");
+	let bin = tempfile::tempdir().expect("program directory");
+	for name in
+		["showargs", "npx", "npm", "uv", "bunx", "bun", "pnpm", "setsid", "ssh", "npx.cmd", "NPX"]
+	{
+		let path = bin.path().join(name);
+		fs::write(&path, b"#!/bin/sh\nprintf '%s\\n' \"$@\"\n").expect("stand-in program");
+		fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("executable stand-in");
+	}
+	// The `omp` stand-in also reports the setting it inherits.
+	let omp = bin.path().join("omp");
+	fs::write(&omp, b"#!/bin/sh\nprintf '%s\\n' \"$@\" \"ref=$REF\"\n").expect("stand-in omp");
+	fs::set_permissions(&omp, fs::Permissions::from_mode(0o755)).expect("executable stand-in");
+
+	let file = docs.join("a.txt").display().to_string();
+	let dir = docs.display().to_string();
+	let host_omp = provider_omp.display().to_string();
+	let script_py = directory.path().join("script.py").display().to_string();
+	let raw = "virtual://docs/a.txt";
+	let raw_b = "virtual://docs/b.txt";
+
+	let cases: Vec<(String, Vec<String>)> = vec![
+		// A URL naming the executable still resolves; only its own arguments
+		// stay as written.
+		(format!("nice virtual://bin/omp read {raw}"), vec![
+			"read".into(),
+			raw.into(),
+			"ref=".into(),
+		]),
+		(format!("virtual://bin/omp read {raw}"), vec!["read".into(), raw.into(), "ref=".into()]),
+		// `find` decides on each action's command separately. It is an
+		// external and runs the actions itself, so `-name` narrows it to one
+		// match for a deterministic transcript.
+		(
+			format!("find virtual://docs -name a.txt -exec omp read {raw} \\; -exec cat {raw_b} \\;"),
+			vec!["read".into(), raw.into(), "ref=".into(), "beta".into()],
+		),
+		(
+			format!("find virtual://docs -name a.txt -exec cat {raw_b} \\; -exec omp read {raw} \\;"),
+			vec!["beta".into(), "read".into(), raw.into(), "ref=".into()],
+		),
+		(format!("find virtual://docs -name a.txt -exec omp read {raw} \\;"), vec![
+			"read".into(),
+			raw.into(),
+			"ref=".into(),
+		]),
+		(format!("find virtual://docs -name a.txt -exec cat {raw} \\;"), vec!["alpha".into()]),
+		// Option values are not the command.
+		(format!("npx -w omp eslint {raw}"), vec![
+			"-w".into(),
+			"omp".into(),
+			"eslint".into(),
+			file.clone(),
+		]),
+		(format!("npm exec --cache omp -- eslint {raw}"), vec![
+			"exec".into(),
+			"--cache".into(),
+			"omp".into(),
+			"--".into(),
+			"eslint".into(),
+			file.clone(),
+		]),
+		// `env -S` names the command inside its split string.
+		(format!("env -S showargs omp {raw}"), vec!["omp".into(), file.clone()]),
+		(format!("env -S omp read {raw}"), vec!["read".into(), raw.into(), "ref=".into()]),
+		(format!("env -S 'omp read' {raw}"), vec!["read".into(), raw.into(), "ref=".into()]),
+		(format!("env -S 'showargs omp' {raw}"), vec!["omp".into(), file.clone()]),
+		(format!("env -S 'REF=virtual://docs/a.txt omp read' {raw_b}"), vec![
+			"read".into(),
+			raw_b.into(),
+			"ref=virtual://docs/a.txt".into(),
+		]),
+		// `bun x` is `bunx`; `pnpm exec` is the package-manager launcher.
+		(format!("bun x omp read {raw}"), vec!["x".into(), "omp".into(), "read".into(), raw.into()]),
+		(format!("pnpm exec omp read {raw}"), vec![
+			"exec".into(),
+			"omp".into(),
+			"read".into(),
+			raw.into(),
+		]),
+		// Windows launcher spellings still launch `npx`.
+		(format!("npx.cmd omp read {raw}"), vec!["omp".into(), "read".into(), raw.into()]),
+		(format!("NPX omp read {raw}"), vec!["omp".into(), "read".into(), raw.into()]),
+		(format!("'{bin}/npx' omp read {raw}", bin = bin.path().display()), vec![
+			"omp".into(),
+			"read".into(),
+			raw.into(),
+		]),
+		// A setting `omp` inherits stays as written; an option's `NAME=value`
+		// is the wrapper's own argument and resolves.
+		(format!("env REF=virtual://docs/a.txt omp read {raw_b}"), vec![
+			"read".into(),
+			raw_b.into(),
+			"ref=virtual://docs/a.txt".into(),
+		]),
+		(format!("npx --cache FOO=virtual://docs omp read {raw}"), vec![
+			"--cache".into(),
+			format!("FOO={dir}"),
+			"omp".into(),
+			"read".into(),
+			raw.into(),
+		]),
+		// `exec -a` is a display name only: `grep` is the program.
+		(format!("(exec -a omp showargs needle {raw})"), vec!["needle".into(), file.clone()]),
+		// `ssh` finds its command after the destination's own options.
+		(format!("ssh server -p 2222 omp read {raw}"), vec![
+			"server".into(),
+			"-p".into(),
+			"2222".into(),
+			"omp".into(),
+			"read".into(),
+			raw.into(),
+		]),
+		(format!("ssh server cat {raw}"), vec!["server".into(), "cat".into(), file.clone()]),
+		(format!("ssh server LANG=C omp read {raw}"), vec![
+			"server".into(),
+			"LANG=C".into(),
+			"omp".into(),
+			"read".into(),
+			raw.into(),
+		]),
+		// `uv -m`/`--module` runs a module, not the executable.
+		(format!("uv run -m omp {raw}"), vec!["run".into(), "-m".into(), "omp".into(), file.clone()]),
+		(format!("uv run --module omp {raw}"), vec![
+			"run".into(),
+			"--module".into(),
+			"omp".into(),
+			file.clone(),
+		]),
+		(format!("uv run --module=omp {raw}"), vec![
+			"run".into(),
+			"--module=omp".into(),
+			file.clone(),
+		]),
+		(format!("uv run omp {raw}"), vec!["run".into(), "omp".into(), raw.into()]),
+		(format!("uv run virtual://script.py"), vec!["run".into(), script_py.clone()]),
+		(format!("uv run virtual://bin/omp {raw}"), vec!["run".into(), host_omp.clone(), raw.into()]),
+		// The same rules apply inside each `find -exec` action, for the
+		// wrappers a real `find` can launch.
+		(
+			format!("find virtual://docs -name a.txt -exec nice virtual://bin/omp read {raw} \\;"),
+			vec!["read".into(), raw.into(), "ref=".into()],
+		),
+		(
+			format!(
+				"find virtual://docs -name a.txt -exec env REF=virtual://docs/a.txt omp read {raw_b} \
+				 \\;"
+			),
+			vec!["read".into(), raw_b.into(), "ref=virtual://docs/a.txt".into()],
+		),
+		(format!("find virtual://docs -name a.txt -exec env -S 'omp read' {raw} \\;"), vec![
+			"read".into(),
+			raw.into(),
+			"ref=".into(),
+		]),
+		(format!("find virtual://docs -name a.txt -exec env -S 'showargs omp' {raw} \\;"), vec![
+			"omp".into(),
+			file.clone(),
+		]),
+		(format!("find virtual://docs -name a.txt -exec uv run -m omp {raw} \\;"), vec![
+			"run".into(),
+			"-m".into(),
+			"omp".into(),
+			file.clone(),
+		]),
+		(
+			format!("find virtual://docs -name a.txt -exec ssh server -p 2222 omp read {raw} \\;"),
+			vec!["server".into(), "-p".into(), "2222".into(), "omp".into(), "read".into(), raw.into()],
+		),
+		(format!("find virtual://docs -name a.txt -execdir omp read {raw} \\;"), vec![
+			"read".into(),
+			raw.into(),
+			"ref=".into(),
+		]),
+		(format!("find virtual://docs -name a.txt -exec bun x omp read {raw} \\;"), vec![
+			"x".into(),
+			"omp".into(),
+			"read".into(),
+			raw.into(),
+		]),
+		(format!("find virtual://docs -name a.txt -exec pnpm exec omp read {raw} \\;"), vec![
+			"exec".into(),
+			"omp".into(),
+			"read".into(),
+			raw.into(),
+		]),
+		(format!("find virtual://docs -name a.txt -exec npx -w omp eslint {raw} \\;"), vec![
+			"-w".into(),
+			"omp".into(),
+			"eslint".into(),
+			file.clone(),
+		]),
+		(
+			format!("find virtual://docs -name a.txt -exec npm exec --cache omp -- eslint {raw} \\;"),
+			vec![
+				"exec".into(),
+				"--cache".into(),
+				"omp".into(),
+				"--".into(),
+				"eslint".into(),
+				file.clone(),
+			],
+		),
+		(
+			format!(
+				"find virtual://docs -name a.txt -exec npx --cache virtual://docs omp read {raw} \\;"
+			),
+			vec!["--cache".into(), dir.clone(), "omp".into(), "read".into(), raw.into()],
+		),
+		(
+			format!(
+				"find virtual://docs -name a.txt -exec npx --cache FOO=virtual://docs omp read {raw} \
+				 \\;"
+			),
+			vec!["--cache".into(), format!("FOO={dir}"), "omp".into(), "read".into(), raw.into()],
+		),
+		(format!("find virtual://docs -name a.txt -exec uv run omp {raw} \\;"), vec![
+			"run".into(),
+			"omp".into(),
+			raw.into(),
+		]),
+		(format!("find virtual://docs -name a.txt -exec uv run virtual://script.py \\;"), vec![
+			"run".into(),
+			script_py.clone(),
+		]),
+		(format!("find virtual://docs -name a.txt -exec uv run virtual://bin/omp {raw} \\;"), vec![
+			"run".into(),
+			host_omp.clone(),
+			raw.into(),
+		]),
+		(format!("find virtual://docs -name a.txt -exec ssh server cat {raw} \\;"), vec![
+			"server".into(),
+			"cat".into(),
+			file.clone(),
+		]),
+		(
+			format!("find virtual://docs -name a.txt -exec ssh server LANG=C omp read {raw} \\;"),
+			vec!["server".into(), "LANG=C".into(), "omp".into(), "read".into(), raw.into()],
+		),
+		(format!("find virtual://docs -name a.txt -exec env -u LEAF omp read {raw} \\;"), vec![
+			"read".into(),
+			raw.into(),
+			"ref=".into(),
+		]),
+		(format!("find virtual://docs -name a.txt -exec env -C /tmp omp read {raw} \\;"), vec![
+			"read".into(),
+			raw.into(),
+			"ref=".into(),
+		]),
+		(format!("find virtual://docs -name a.txt -exec nice -n 5 omp read {raw} \\;"), vec![
+			"read".into(),
+			raw.into(),
+			"ref=".into(),
+		]),
+		(format!("find virtual://docs -name a.txt -exec nice omp read {raw} \\;"), vec![
+			"read".into(),
+			raw.into(),
+			"ref=".into(),
+		]),
+		(format!("find virtual://docs -name a.txt -exec nohup omp read {raw} \\;"), vec![
+			"read".into(),
+			raw.into(),
+			"ref=".into(),
+		]),
+		(format!("find virtual://docs -name a.txt -exec stdbuf -oL omp read {raw} \\;"), vec![
+			"read".into(),
+			raw.into(),
+			"ref=".into(),
+		]),
+		(format!("find virtual://docs -name a.txt -exec setsid omp read {raw} \\;"), vec![
+			"omp".into(),
+			"read".into(),
+			raw.into(),
+		]),
+		(format!("find virtual://docs -name a.txt -exec timeout 30 omp read {raw} \\;"), vec![
+			"read".into(),
+			raw.into(),
+			"ref=".into(),
+		]),
+		(
+			format!("find virtual://docs -name a.txt -exec timeout -s KILL 30 omp read {raw} \\;"),
+			vec!["read".into(), raw.into(), "ref=".into()],
+		),
+		(format!("find virtual://docs -name a.txt -exec xargs -n 1 omp read {raw} \\;"), vec![
+			"read".into(),
+			raw.into(),
+			"ref=".into(),
+		]),
+	];
+	for (command, expected) in &cases {
+		let script = format!("PATH='{bin}':$PATH; {command}", bin = bin.path().display());
+		let run = run_virtual_no_utils(directory.path(), &script).await;
+		assert_eq!(run.status, Some(0), "command `{command}` failed:\n{}", run.stderr);
+		assert_eq!(run.stdout.lines().collect::<Vec<_>>(), *expected, "command `{command}`");
+	}
 }
 
 /// A provider directory that aliases a real one is a usable working directory

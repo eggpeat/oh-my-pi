@@ -118,6 +118,193 @@ describe("hostCommandUrls", () => {
 			["find local://dir -exec omp read local://x \\;", "find /host/dir -exec omp read local://x \\;"],
 			// A wrapper's own file argument resolves; the command it runs keeps its URLs.
 			["npx --cache local://cache omp read local://book:1", "npx --cache /host/cache omp read local://book:1"],
+			["nice local://bin/omp read local://x", "nice /host/bin/omp read local://x"],
+			["local://bin/omp read local://x", "/host/bin/omp read local://x"],
+			["npx -w omp eslint local://x", "npx -w omp eslint /host/x"],
+			["npm exec --cache omp -- eslint local://x", "npm exec --cache omp -- eslint /host/x"],
+			["env -S grep omp local://x", "env -S grep omp /host/x"],
+			["env -S omp read local://x", "env -S omp read local://x"],
+			["env -S 'omp read' local://x", "env -S 'omp read' local://x"],
+			["env -S 'grep omp' local://x", "env -S 'grep omp' /host/x"],
+			["env -S 'ref=local://in omp read' local://x", "env -S 'ref=local://in omp read' local://x"],
+			["bun x omp read local://x", "bun x omp read local://x"],
+			["pnpm exec omp read local://x", "pnpm exec omp read local://x"],
+			["npx.cmd omp read local://x", "npx.cmd omp read local://x"],
+			["NPX omp read local://x", "NPX omp read local://x"],
+			["NPX.CMD omp read local://x", "NPX.CMD omp read local://x"],
+			["C:/tools/npx.cmd omp read local://x", "C:/tools/npx.cmd omp read local://x"],
+			["/usr/local/bin/npx omp read local://x", "/usr/local/bin/npx omp read local://x"],
+			["REF=local://x omp read local://y", "REF=local://x omp read local://y"],
+			["env REF=local://x omp read local://y", "env REF=local://x omp read local://y"],
+			["env -- --flag=/opt/omp grep x local://file", "env -- --flag=/opt/omp grep x /host/file"],
+			["npx --cache FOO=local://dir omp read local://x", "npx --cache FOO=/host/dir omp read local://x"],
+			["exec -a omp grep needle local://x", "exec -a omp grep needle /host/x"],
+			["exec -a foo omp read local://x", "exec -a foo omp read local://x"],
+			["ssh server -p 2222 omp read local://x", "ssh server -p 2222 omp read local://x"],
+			[
+				"ssh -F local://conf server -p 2222 omp read local://x",
+				"ssh -F /host/conf server -p 2222 omp read local://x",
+			],
+			["ssh server env omp read local://x", "ssh server env omp read local://x"],
+			["uv run -m omp local://x", "uv run -m omp /host/x"],
+			["uv run --module omp local://x", "uv run --module omp /host/x"],
+			["uv run --module=omp local://x", "uv run --module=omp /host/x"],
+			["uv run omp local://x", "uv run omp local://x"],
+			["uv run local://script.py", "uv run /host/script.py"],
+			["uv run local://bin/omp local://x", "uv run /host/bin/omp local://x"],
+		] as const) {
+			expect(await host(command)).toBe(expected);
+		}
+	});
+
+	it("finds the command after shell keywords, assignments and redirections", async () => {
+		for (const [command, expected] of [
+			["if omp read local://x; then :; fi", "if omp read local://x; then :; fi"],
+			["! omp read local://x", "! omp read local://x"],
+			[">/dev/null omp read local://x", ">/dev/null omp read local://x"],
+			[">local://out omp read local://x", ">/host/out omp read local://x"],
+			["> local://out omp read local://x", "> /host/out omp read local://x"],
+			["if > /dev/null omp read local://x; then :; fi", "if > /dev/null omp read local://x; then :; fi"],
+			["REF=local://x > local://out omp read local://y", "REF=local://x > /host/out omp read local://y"],
+			["for i in local://x; do cat local://y; done", "for i in /host/x; do cat /host/y; done"],
+			["case local://x in x) cat local://y;; esac", "case /host/x in x) cat /host/y;; esac"],
+			["while omp read local://x; do cat local://y; done", "while omp read local://x; do cat /host/y; done"],
+			["{ omp read local://x; }", "{ omp read local://x; }"],
+			["[[ -f local://x ]]", "[[ -f /host/x ]]"],
+			["time -o local://log omp read local://x", "time -o /host/log omp read local://x"],
+		] as const) {
+			expect(await host(command)).toBe(expected);
+		}
+	});
+
+	it("rewrites redirection targets and nested commands even for omp", async () => {
+		for (const [command, expected] of [
+			["omp read local://in > local://out", "omp read local://in > /host/out"],
+			["omp read local://in >local://out", "omp read local://in >/host/out"],
+			["omp read local://in < local://in2", "omp read local://in < /host/in2"],
+			["omp read local://in 2> local://err", "omp read local://in 2> /host/err"],
+			["omp read local://in 2>> local://err", "omp read local://in 2>> /host/err"],
+			["omp read local://in &> local://log", "omp read local://in &> /host/log"],
+			["omp read local://in >& local://log", "omp read local://in >& /host/log"],
+			["omp read local://in &>> local://log", "omp read local://in &>> /host/log"],
+			["omp read local://in >| local://out", "omp read local://in >| /host/out"],
+			["omp read local://in <> local://rw", "omp read local://in <> /host/rw"],
+			["omp read local://in > local://out 2>&1", "omp read local://in > /host/out 2>&1"],
+			['omp read "$(cat local://in)"', 'omp read "$(cat /host/in)"'],
+			["omp read $(cat local://in)", "omp read $(cat /host/in)"],
+			['omp read "pre $(cat local://in) post"', 'omp read "pre $(cat /host/in) post"'],
+			['omp read "$(omp read local://in)"', 'omp read "$(omp read local://in)"'],
+			["omp read local://x > /dev/null", "omp read local://x > /dev/null"],
+			["omp read local://x 2>&1", "omp read local://x 2>&1"],
+			["omp read local://x >&2", "omp read local://x >&2"],
+			["omp read local://x 2>&-", "omp read local://x 2>&-"],
+			["omp read local://x <&0", "omp read local://x <&0"],
+			// Here-documents and here-strings are input text, not file targets.
+			["omp <<< local://text", "omp <<< local://text"],
+			["omp << 'local://done'", "omp << 'local://done'"],
+			["omp read local://x <<EOF", "omp read local://x <<EOF"],
+			["cat <<< local://text", "cat <<< local://text"],
+			["cat << 'local://done'", "cat << 'local://done'"],
+			["cat << local://done", "cat << local://done"],
+		] as const) {
+			expect(await host(command)).toBe(expected);
+		}
+	});
+
+	it("handles each find action separately", async () => {
+		for (const [command, expected] of [
+			[
+				"find local://dir -exec omp read local://x \\; -exec cat local://y \\;",
+				"find /host/dir -exec omp read local://x \\; -exec cat /host/y \\;",
+			],
+			[
+				"find local://dir -exec cat local://y \\; -exec omp read local://x \\;",
+				"find /host/dir -exec cat /host/y \\; -exec omp read local://x \\;",
+			],
+			["find . -exec omp read local://x \\;", "find . -exec omp read local://x \\;"],
+			["find . -exec cat local://x \\;", "find . -exec cat /host/x \\;"],
+			["find . -name omp -exec cat local://x \\;", "find . -name omp -exec cat /host/x \\;"],
+			["find . -exec nice local://bin/omp read local://x \\;", "find . -exec nice /host/bin/omp read local://x \\;"],
+			[
+				"find . -exec env REF=local://x omp read local://y \\;",
+				"find . -exec env REF=local://x omp read local://y \\;",
+			],
+			["find . -exec env -S 'omp read' local://x \\;", "find . -exec env -S 'omp read' local://x \\;"],
+			["find . -exec env -S 'grep omp' local://x \\;", "find . -exec env -S 'grep omp' /host/x \\;"],
+			["find . -exec uv run -m omp local://x \\;", "find . -exec uv run -m omp /host/x \\;"],
+			[
+				"find . -exec ssh server -p 2222 omp read local://x \\;",
+				"find . -exec ssh server -p 2222 omp read local://x \\;",
+			],
+			["find . -exec exec -a omp grep needle local://x \\;", "find . -exec exec -a omp grep needle /host/x \\;"],
+			["find . -exec npx.cmd omp read local://x \\;", "find . -exec npx.cmd omp read local://x \\;"],
+			[
+				"find . -exec C:/tools/npx.cmd omp read local://x \\;",
+				"find . -exec C:/tools/npx.cmd omp read local://x \\;",
+			],
+			["find . -exec NPX omp read local://x \\;", "find . -exec NPX omp read local://x \\;"],
+			[
+				"find . -exec /usr/local/bin/npx omp read local://x \\;",
+				"find . -exec /usr/local/bin/npx omp read local://x \\;",
+			],
+			["find . -exec bun x omp read local://x \\;", "find . -exec bun x omp read local://x \\;"],
+			["find . -exec pnpm exec omp read local://x \\;", "find . -exec pnpm exec omp read local://x \\;"],
+			["find . -exec npx -w omp eslint local://x \\;", "find . -exec npx -w omp eslint /host/x \\;"],
+			[
+				"find . -exec npm exec --cache omp -- eslint local://x \\;",
+				"find . -exec npm exec --cache omp -- eslint /host/x \\;",
+			],
+			[
+				"find . -exec npx --cache local://dir omp read local://x \\;",
+				"find . -exec npx --cache /host/dir omp read local://x \\;",
+			],
+			[
+				"find . -exec npx --cache FOO=local://dir omp read local://x \\;",
+				"find . -exec npx --cache FOO=/host/dir omp read local://x \\;",
+			],
+			["find . -exec REF=local://x omp read local://y \\;", "find . -exec REF=local://x omp read local://y \\;"],
+			["find . -exec uv run omp local://x \\;", "find . -exec uv run omp local://x \\;"],
+			["find . -exec uv run local://script.py \\;", "find . -exec uv run /host/script.py \\;"],
+			["find . -exec uv run local://bin/omp local://x \\;", "find . -exec uv run /host/bin/omp local://x \\;"],
+			["find . -exec ssh server cat local://x \\;", "find . -exec ssh server cat /host/x \\;"],
+			[
+				"find . -exec ssh server LANG=C omp read local://x \\;",
+				"find . -exec ssh server LANG=C omp read local://x \\;",
+			],
+			["find . -exec command -v omp local://x \\;", "find . -exec command -v omp /host/x \\;"],
+			["find . -exec exec -a foo omp read local://x \\;", "find . -exec exec -a foo omp read local://x \\;"],
+			["find . -exec time omp read local://x \\;", "find . -exec time omp read local://x \\;"],
+			["find . -exec command omp read local://x \\;", "find . -exec command omp read local://x \\;"],
+			["find . -exec exec omp read local://x \\;", "find . -exec exec omp read local://x \\;"],
+			["find . -exec nice omp read local://x \\;", "find . -exec nice omp read local://x \\;"],
+			["find . -exec env - omp read local://x \\;", "find . -exec env - omp read local://x \\;"],
+			["find . -exec env -u LEAF omp read local://x \\;", "find . -exec env -u LEAF omp read local://x \\;"],
+			["find . -exec env -i omp read local://x \\;", "find . -exec env -i omp read local://x \\;"],
+			["find . -exec env -C /tmp omp read local://x \\;", "find . -exec env -C /tmp omp read local://x \\;"],
+			["find . -exec nice -n 5 omp read local://x \\;", "find . -exec nice -n 5 omp read local://x \\;"],
+			["find . -exec nohup omp read local://x \\;", "find . -exec nohup omp read local://x \\;"],
+			["find . -exec stdbuf -oL omp read local://x \\;", "find . -exec stdbuf -oL omp read local://x \\;"],
+			["find . -exec setsid omp read local://x \\;", "find . -exec setsid omp read local://x \\;"],
+			["find . -exec xargs -n 1 omp read local://x \\;", "find . -exec xargs -n 1 omp read local://x \\;"],
+			["find . -exec ifne omp read local://x \\;", "find . -exec ifne omp read local://x \\;"],
+			["find . -exec timeout 30 omp read local://x \\;", "find . -exec timeout 30 omp read local://x \\;"],
+			[
+				"find . -exec timeout -s KILL 30 omp read local://x \\;",
+				"find . -exec timeout -s KILL 30 omp read local://x \\;",
+			],
+			["find . -exec doas -u root omp read local://x \\;", "find . -exec doas -u root omp read local://x \\;"],
+			["find . -exec sudo -u root omp read local://x \\;", "find . -exec sudo -u root omp read local://x \\;"],
+			["find . -exec command -p omp read local://x \\;", "find . -exec command -p omp read local://x \\;"],
+			["find . -exec exec -a nice grep omp local://x \\;", "find . -exec exec -a nice grep omp /host/x \\;"],
+			["find . -exec omp read local://x > local://out \\;", "find . -exec omp read local://x > /host/out \\;"],
+			["find . -exec > local://out omp read local://x \\;", "find . -exec > /host/out omp read local://x \\;"],
+			['find . -exec omp read "$(cat local://in)" \\;', 'find . -exec omp read "$(cat /host/in)" \\;'],
+			['find . -exec cat "$(omp read local://in)" \\;', 'find . -exec cat "$(omp read local://in)" \\;'],
+			["find . -exec omp <<< local://text \\;", "find . -exec omp <<< local://text \\;"],
+			["find . -exec omp read local://x +", "find . -exec omp read local://x +"],
+			["find . -execdir omp read local://x \\;", "find . -execdir omp read local://x \\;"],
+			["find . -ok omp read local://x \\;", "find . -ok omp read local://x \\;"],
+			["find . -okdir omp read local://x \\;", "find . -okdir omp read local://x \\;"],
 		] as const) {
 			expect(await host(command)).toBe(expected);
 		}
@@ -143,6 +330,13 @@ describe("hostCommandUrls", () => {
 				"\tEOF",
 				"cat /host/done.txt",
 			].join("\n"),
+		);
+	});
+
+	it("keeps a URL delimiter spelling the document it opens", async () => {
+		const command = ["cat << local://done", "local://body", "local://done", "cat local://after.txt"].join("\n");
+		expect(await host(command)).toBe(
+			["cat << local://done", "local://body", "local://done", "cat /host/after.txt"].join("\n"),
 		);
 	});
 });

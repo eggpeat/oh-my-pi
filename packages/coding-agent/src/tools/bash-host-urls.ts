@@ -30,10 +30,10 @@ export function urlBacking(filesystem: InternalUrlFilesystem): UrlBacking {
 
 /** `scheme://`, as the shell's filesystem spells a URL path (a drive letter is no scheme). */
 const URL_ROOT = /^[A-Za-z][A-Za-z0-9+.-]+:\/\//;
-/** An unquoted redirection operator attached to its target (`<local://in`, `2>>local://log`). */
-const REDIRECT = /^\d*(?:<>|>>|<|>)/;
+/** An unquoted redirection operator that opens a file (`<local://in`, `2>>local://log`). */
+const REDIRECT = /^\d*(?:&>>|&>|<>>|<>|>>|<<|>|>|<|<)/;
 /** `<<WORD`, `<<-WORD`, `<<'WORD'`, `<<"WORD"`: a here-document and its delimiter. */
-const HEREDOC = /(?<!<)<<(-?)[ \t]*(?:'([^'\n]+)'|"([^"\n]+)"|\\?([A-Za-z_][A-Za-z0-9_]*))/g;
+const HEREDOC = /(?<!<)<<(-?)[ \t]*(?:'([^'\n]+)'|"([^"\n]+)"|\\?([A-Za-z_][A-Za-z0-9_./:@%+=,-]*))/g;
 const WORD_SAFE = /^[A-Za-z0-9_./:@%+=,-]+$/;
 const GLOB_RUN = /([*?[\]{}]+)/;
 
@@ -60,8 +60,8 @@ function urlStart(text: string): number | undefined {
 
 /** Whether `word` names the `omp` program, by any path. */
 function isOmp(word: string): boolean {
-	const name = programName(word).toLowerCase();
-	return name === "omp" || name === "omp.exe";
+	const name = launcherName(word);
+	return name === "omp";
 }
 
 /** The last path segment of `word`: the program's name. */
@@ -69,8 +69,43 @@ function programName(word: string): string {
 	return word.slice(Math.max(word.lastIndexOf("/"), word.lastIndexOf("\\")) + 1);
 }
 
+/** A launcher's name: the last path segment, lowercased, without a Windows script suffix. */
+function launcherName(word: string): string {
+	const name = programName(word).toLowerCase();
+	for (const suffix of [".exe", ".cmd", ".bat", ".ps1"]) {
+		if (name.endsWith(suffix)) return name.slice(0, -suffix.length);
+	}
+	return name;
+}
+
 /** `NAME=value`, as a simple command or a wrapper's options take before the command. */
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+/** Reserved words that may precede a simple command and are not one. */
+const NO_COMMAND_KEYWORDS = new Set([
+	"if",
+	"then",
+	"elif",
+	"else",
+	"fi",
+	"while",
+	"until",
+	"do",
+	"done",
+	"for",
+	"in",
+	"case",
+	"esac",
+	"select",
+	"function",
+	"coproc",
+	"!",
+	"{",
+	"}",
+	"[[",
+	"]]",
+	"noglob",
+]);
 
 /** Options that take the next word as their value: short letters and long names. */
 interface OptionValues {
@@ -119,7 +154,7 @@ const XARGS: OptionValues = {
 };
 const IFNE: OptionValues = { short: "", long: [] };
 const NPX: OptionValues = {
-	short: "pc",
+	short: "pcw",
 	long: [
 		"cache",
 		"prefix",
@@ -139,6 +174,24 @@ const BUNX: OptionValues = {
 	short: "p",
 	long: ["package", "registry", "cache-dir", "minimum-release-age", "cwd", "env-file"],
 };
+const BUN_GLOBAL: OptionValues = {
+	short: "",
+	long: [
+		"cwd",
+		"env-file",
+		"preload",
+		"require",
+		"import",
+		"define",
+		"loader",
+		"conditions",
+		"main-fields",
+		"tsconfig",
+		"port",
+		"config",
+	],
+};
+
 const NPM_GLOBAL: OptionValues = {
 	short: "w",
 	long: [
@@ -156,7 +209,26 @@ const NPM_GLOBAL: OptionValues = {
 		"script-shell",
 	],
 };
-const NPM_EXEC: OptionValues = { short: "cw", long: ["package", "call", "workspace", "prefix"] };
+const NPM_EXEC: OptionValues = {
+	short: "cw",
+	long: [
+		"package",
+		"call",
+		"workspace",
+		"prefix",
+		"cache",
+		"registry",
+		"userconfig",
+		"loglevel",
+		"log-level",
+		"location",
+		"tag",
+		"otp",
+		"before",
+		"script-shell",
+	],
+};
+const PNPM: OptionValues = { short: "C", long: ["dir", "filter"] };
 const UV_GLOBAL: OptionValues = { short: "", long: ["directory", "project", "config-file", "cache-dir"] };
 const UV_RUN: OptionValues = {
 	short: "wpif",
@@ -187,86 +259,248 @@ const COMMAND: OptionValues = { short: "", long: [] };
 const EXEC: OptionValues = { short: "a", long: [] };
 const FIND_EXEC = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
 
-/**
- * Index of the word naming the `omp` command, past any wrapper (`nice omp …`,
- * `npx omp …`) and the options and assignments before it. A word spelled
- * `omp` anywhere else (`grep omp …`) is an argument, not the program.
- */
-function ompCommand(words: readonly string[]): number | undefined {
-	let at = 0;
-	for (;;) {
-		while (at < words.length && ASSIGNMENT.test(words[at])) at++;
-		const word = words[at];
-		if (word === undefined) return undefined;
-		if (isOmp(word)) return at;
-		const next = wrapperCommand(words, at);
-		if (next === undefined) return undefined;
-		at = next;
-	}
+interface CommandWord {
+	/** Index of the command word itself; for `env -S`, first word of the split string. */
+	index: number;
+	/** The command word itself; for `env -S`, first word of the split string. */
+	word: string;
 }
 
-/** The index of the command word a wrapper at `at` runs, or `undefined` when it is no wrapper. */
-function wrapperCommand(words: readonly string[], at: number): number | undefined {
-	const after = (values: OptionValues) => afterOptions(words, at + 1, values);
-	const command = (next: number) => (next > at && next < words.length ? next : undefined);
-	switch (programName(words[at])) {
-		case "nice":
-			return command(after(NICE));
-		case "nohup":
-			return command(after(NOHUP));
-		case "time":
-			return command(after(TIME));
-		case "env": {
-			// `env` takes `NAME=value` settings after its options; coreutils
-			// does not validate the name, and a lone `-` is a setting too.
-			const options = afterOptions(words, at + 1, ENV, true);
-			return command(skipWords(words, options, word => word === "-" || word.includes("=")));
+interface CommandParse {
+	/** The program the command line runs, after any wrappers. `undefined` when there is none. */
+	command: CommandWord | undefined;
+	/** The `NAME=value` words the command inherits. */
+	settings: number[];
+}
+
+/**
+ * The command word a simple command runs and the settings it inherits, after leading
+ * assignments, shell keywords and redirections, and any wrapper chain (`nice omp …`,
+ * `npx omp …`). A word spelled `omp` anywhere else (`grep omp …`) is an argument.
+ */
+function commandWord(words: readonly string[], from = 0): CommandParse {
+	const settings: number[] = [];
+	let at = from;
+	while (at < words.length) {
+		const word = words[at];
+		if (ASSIGNMENT.test(word)) {
+			settings.push(at);
+			at++;
+			continue;
 		}
+		if (NO_COMMAND_KEYWORDS.has(word)) {
+			at++;
+			continue;
+		}
+		const redirect = skipRedirects(words, at);
+		if (redirect > 0) {
+			at += redirect;
+			continue;
+		}
+		break;
+	}
+	if (at >= words.length) return { settings, command: undefined };
+	const next = wrapperCommand(words, at);
+	if (next === undefined) return { settings, command: { index: at, word: words[at] } };
+	settings.push(...next.settings);
+	return { settings, command: next.command };
+}
+
+/** The command a wrapper at `at` runs, or `undefined` when `words[at]` is no known wrapper. */
+function wrapperCommand(words: readonly string[], at: number): CommandParse | undefined {
+	const after = (values: OptionValues, dash = false) => afterOptions(words, at + 1, values, dash);
+	const commandAt = (next: number): CommandParse | undefined => {
+		if (next <= at || next >= words.length) return undefined;
+		return commandWord(words, next);
+	};
+	switch (launcherName(words[at])) {
+		case "nice":
+			return commandAt(after(NICE));
+		case "nohup":
+			return commandAt(after(NOHUP));
+		case "time":
+			return commandAt(after(TIME));
+		case "env":
+			return envCommand(words, at);
 		case "sudo":
-			return command(skipWords(words, after(SUDO), word => ASSIGNMENT.test(word)));
+			return settingsCommand(words, at, after(SUDO));
 		case "doas":
-			return command(skipWords(words, after(DOAS), word => ASSIGNMENT.test(word)));
+			return settingsCommand(words, at, after(DOAS));
 		case "timeout":
 		case "gtimeout":
-			return command(after(TIMEOUT) + 1);
+			return commandAt(after(TIMEOUT) + 1);
 		case "stdbuf":
-			return command(after(STDBUF));
+			return commandAt(after(STDBUF));
 		case "setsid":
-			return command(after(SETSID));
+			return commandAt(after(SETSID));
 		case "xargs":
-			return command(after(XARGS));
+			return commandAt(after(XARGS));
 		case "ifne":
-			return command(after(IFNE));
+			return commandAt(after(IFNE));
 		case "npx":
-			return command(after(NPX));
+			return commandAt(after(NPX));
 		case "bunx":
-			return command(after(BUNX));
+			return commandAt(after(BUNX));
+		case "bun": {
+			const sub = after(BUN_GLOBAL);
+			if (words[sub] !== "x") return undefined;
+			return commandAt(afterOptions(words, sub + 1, BUNX));
+		}
 		case "npm": {
-			const sub = afterOptions(words, at + 1, NPM_GLOBAL);
+			const sub = after(NPM_GLOBAL);
 			if (words[sub] !== "exec" && words[sub] !== "x") return undefined;
-			return command(afterOptions(words, sub + 1, NPM_EXEC));
+			return commandAt(afterOptions(words, sub + 1, NPM_EXEC));
 		}
-		case "uv": {
-			const sub = afterOptions(words, at + 1, UV_GLOBAL);
-			if (words[sub] !== "run") return undefined;
-			return command(afterOptions(words, sub + 1, UV_RUN));
+		case "pnpm": {
+			const sub = after(PNPM);
+			if (words[sub] !== "exec") return undefined;
+			return commandAt(afterOptions(words, sub + 1, PNPM));
 		}
-		case "ssh":
-			return command(after(SSH) + 1);
+		case "uv":
+			return uvCommand(words, at);
+		case "ssh": {
+			const host = after(SSH);
+			if (host >= words.length) return undefined;
+			return commandAt(afterOptions(words, host + 1, SSH));
+		}
 		case "command": {
 			const next = after(COMMAND);
 			const namesOnly = words.slice(at + 1, next).some(word => /^-[^-]/.test(word) && /[vV]/.test(word));
-			return namesOnly ? undefined : command(next);
+			return namesOnly ? undefined : commandAt(next);
 		}
 		case "exec":
-			return command(after(EXEC));
-		case "find": {
-			const exec = words.findIndex((word, index) => index > at && FIND_EXEC.has(word));
-			return exec < 0 ? undefined : command(exec + 1);
-		}
+			return commandAt(after(EXEC));
 		default:
 			return undefined;
 	}
+}
+
+/** `sudo`/`doas`: the command after options and `NAME=value` settings, which stay its own. */
+function settingsCommand(words: readonly string[], at: number, options: number): CommandParse | undefined {
+	const settings: number[] = [];
+	let i = options;
+	while (i < words.length && ASSIGNMENT.test(words[i])) {
+		settings.push(i);
+		i++;
+	}
+	if (i >= words.length) return { settings, command: undefined };
+	const parsed = commandWord(words, i);
+	if (parsed.command === undefined) return { settings, command: undefined };
+	settings.push(...parsed.settings);
+	return { settings, command: parsed.command };
+}
+
+/**
+ * `env [options] [NAME=value…] command`: options come first, then the settings the
+ * command inherits, then the command. `-S`/`--split-string` names the command inside
+ * its value instead.
+ */
+function envCommand(words: readonly string[], at: number): CommandParse | undefined {
+	const settings: number[] = [];
+	let i = at + 1;
+	while (i < words.length) {
+		const word = words[i];
+		if (word === "--") {
+			i++;
+			break;
+		}
+		if (word === "-") {
+			i++;
+			continue;
+		}
+		if (word === "-S" || word === "--split-string") {
+			const value = words[i + 1];
+			return splitStringCommand(value, i, settings);
+		}
+		if (word.startsWith("--split-string=")) return splitStringCommand(word.slice(15), i, settings);
+		if (word.startsWith("-S") && word.length > 2) return splitStringCommand(word.slice(2), i, settings);
+		if (word.startsWith("-")) {
+			i += optionWords(word, ENV);
+			continue;
+		}
+		break;
+	}
+	// `env` takes `NAME=value` settings after its options; coreutils does not
+	// validate the name, and a lone `-` is a setting too.
+	while (i < words.length && (words[i] === "-" || words[i].includes("="))) {
+		if (words[i] !== "-") settings.push(i);
+		i++;
+	}
+	if (i >= words.length) return { settings, command: undefined };
+	const parsed = commandWord(words, i);
+	settings.push(...parsed.settings);
+	return { settings, command: parsed.command };
+}
+
+/**
+ * The command inside `env -S`'s `value`: split like the shell does, then parsed as
+ * its own command line. `option` stands in for every word inside the string.
+ */
+function splitStringCommand(value: string | undefined, option: number, settings: number[]): CommandParse {
+	if (value === undefined) return { settings, command: undefined };
+	const argv = splitStringWords(value);
+	if (argv.length === 0) return { settings, command: undefined };
+	const parsed = commandWord(argv);
+	if (parsed.settings.length > 0) settings.push(option);
+	const command = parsed.command === undefined ? undefined : { index: option, word: parsed.command.word };
+	return { settings, command };
+}
+
+/** `text` split into words the way `env -S` splits it: whitespace, with quotes and `\`. */
+function splitStringWords(text: string): string[] {
+	const words: string[] = [];
+	let word = "";
+	let quote = "";
+	for (let i = 0; i < text.length; i++) {
+		const ch = text[i];
+		if (quote === "'") {
+			if (ch === "'") quote = "";
+			else word += ch;
+			continue;
+		}
+		if (ch === "\\") {
+			if (i + 1 < text.length) word += text[++i];
+			continue;
+		}
+		if (quote !== "") {
+			if (ch === quote) quote = "";
+			else word += ch;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			continue;
+		}
+		if (/\s/.test(ch)) {
+			if (word !== "") {
+				words.push(word);
+				word = "";
+			}
+			continue;
+		}
+		word += ch;
+	}
+	if (word !== "") words.push(word);
+	return words;
+}
+
+/** `uv [options] run [options] command`: `-m`/`--module` runs a module, not an executable. */
+function uvCommand(words: readonly string[], at: number): CommandParse | undefined {
+	const sub = afterOptions(words, at + 1, UV_GLOBAL);
+	if (words[sub] !== "run") return undefined;
+	let i = sub + 1;
+	while (i < words.length) {
+		const word = words[i];
+		if (word === "--") {
+			i++;
+			break;
+		}
+		if (word === "-" || !word.startsWith("-")) break;
+		if (word === "-m" || word === "--module" || word.startsWith("--module=")) return undefined;
+		i += optionWords(word, UV_RUN);
+	}
+	if (i >= words.length) return undefined;
+	return commandWord(words, i);
 }
 
 /** The first word from `from` on that is not an option (`--` ends them). */
@@ -300,11 +534,80 @@ function optionWords(word: string, values: OptionValues): number {
 	return 1;
 }
 
-/** The first word from `from` on that `skip` rejects. */
-function skipWords(words: readonly string[], from: number, skip: (word: string) => boolean): number {
-	let at = from;
-	while (at < words.length && skip(words[at])) at++;
-	return at;
+/** Any redirection operator, attached or separate (`>`, `2>`, `<<EOF`, `<<<x`, `2>&1`). */
+const REDIRECT_OP = /^\d*(?:&>>|&>|<<<|<<|<&|<>|>&|>>|>|>|<|<)/;
+
+/** A file redirection as a whole word, whose target is the next word (`>`, `2>`, `<>`, `<`). */
+const REDIRECT_FILE_WORD = /^\d*(?:&>>|&>|<>|>>|>|<|<)$/;
+
+/** The words one redirection occupies before the command: its own, plus a separate target. */
+function skipRedirects(words: readonly string[], at: number): number {
+	const match = REDIRECT_OP.exec(words[at]);
+	if (!match) return 0;
+	return match[0].length === words[at].length ? 2 : 1;
+}
+
+/** Whether `words[i]` is a redirection's file target (`>local://out`, `> out`). */
+function redirectTarget(words: readonly string[], i: number): boolean {
+	const own = REDIRECT.exec(words[i]);
+	if (own && own[0].length < words[i].length) return true;
+	return i > 0 && REDIRECT_FILE_WORD.test(words[i - 1]);
+}
+
+/** `find … -exec cmd \; -exec cmd +`: the word range each action's command occupies. */
+function findActions(words: readonly string[], from: number): { start: number; end: number }[] {
+	const actions: { start: number; end: number }[] = [];
+	let i = from;
+	while (i < words.length) {
+		if (FIND_EXEC.has(words[i]) && words[i + 1] !== undefined && words[i + 1] !== ";" && words[i + 1] !== "+") {
+			const start = i + 1;
+			let end = start;
+			while (end < words.length && words[end] !== ";" && words[end] !== "+") end++;
+			actions.push({ start, end });
+			i = end + 1;
+		} else {
+			i++;
+		}
+	}
+	return actions;
+}
+
+/**
+ * Which words of a simple command stay as written: the arguments and inherited settings
+ * of an `omp` run itself. Its own command word (`nice local://bin/omp …` still needs the
+ * executable) and a redirection's file target (`omp read local://in > local://out`,
+ * which the shell opens rather than omp) still resolve.
+ */
+function literalArgs(words: readonly string[]): boolean[] {
+	const literal = words.map(() => false);
+	// A here-document's delimiter and a here-string's text are input, not file
+	// targets (`cat << 'local://done'`, `cat <<< local://text`).
+	for (let i = 0; i < words.length; i++) {
+		const match = /^\d*<<(?:<|[-~])?/.exec(words[i]);
+		if (!match) continue;
+		literal[i] = true;
+		if (match[0].length === words[i].length) literal[i + 1] = true;
+	}
+	const parsed = commandWord(words);
+	if (parsed.command === undefined) return literal;
+	if (launcherName(parsed.command.word) === "find") {
+		for (const action of findActions(words, parsed.command.index + 1)) {
+			const actionParse = commandWord(words.slice(action.start, action.end));
+			const actionCommand = actionParse.command;
+			if (actionCommand === undefined || !isOmp(actionCommand.word)) continue;
+			for (const setting of actionParse.settings) literal[action.start + setting] = true;
+			for (let i = actionCommand.index + 1; i < action.end - action.start; i++) {
+				if (!redirectTarget(words, action.start + i)) literal[action.start + i] = true;
+			}
+		}
+		return literal;
+	}
+	if (!isOmp(parsed.command.word)) return literal;
+	for (const setting of parsed.settings) literal[setting] = true;
+	for (let i = parsed.command.index + 1; i < words.length; i++) {
+		if (!redirectTarget(words, i)) literal[i] = true;
+	}
+	return literal;
 }
 
 /** `text` as one literal shell word. */
@@ -397,16 +700,17 @@ class HostUrls {
 		let out = "";
 		for (const tokens of segments) {
 			// `omp` resolves the URLs it is given itself (`omp read skill://x:1-20`):
-			// its own command's arguments are its own, while a wrapper's arguments
-			// (`npx --cache local://dir omp …`) still name host files.
-			const omp = ompCommand(tokens.flatMap(token => (token.kind === "word" ? [token.value] : [])));
+			// its own command's arguments stay as written, but a wrapper's own
+			// file arguments, a redirection target, and a nested command are
+			// still the shell's to resolve.
+			const literal = literalArgs(tokens.flatMap(token => (token.kind === "word" ? [token.value] : [])));
 			let word = 0;
 			for (const token of tokens) {
 				if (token.kind === "separator") {
 					out += token.raw;
 					continue;
 				}
-				out += omp !== undefined && word >= omp ? token.raw : await this.#word(token.raw, token.value);
+				out += literal[word] && !token.raw.includes("$(") ? token.raw : await this.#word(token.raw, token.value);
 				word++;
 			}
 		}

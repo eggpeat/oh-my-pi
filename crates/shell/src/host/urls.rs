@@ -104,7 +104,7 @@ impl Rest {
 /// it, but a wrapper's own arguments (`npx --cache local://dir omp …`) still
 /// resolve.
 pub(super) fn names_url(spec: &SpawnSpec<'_>) -> bool {
-	let omp = omp_command(spec.argv);
+	let owned = ownership(spec.path, spec.argv);
 	is_url(spec.path)
 		|| is_url(spec.cwd)
 		|| spec
@@ -112,32 +112,100 @@ pub(super) fn names_url(spec: &SpawnSpec<'_>) -> bool {
 			.iter()
 			.enumerate()
 			.skip(1)
-			.any(|(i, arg)| arg.contains_str("://") && omp.is_none_or(|at| i < at))
-		|| (omp.is_none() && spec.env.iter().any(|(name, value)| env_url(name, value)))
+			.any(|(i, arg)| arg.contains_str("://") && !owned.literal[i])
+		|| (!owned.omp && spec.env.iter().any(|(name, value)| env_url(name, value)))
 }
 
-/// The index of the word naming `omp` in `argv`: the program itself, or the
-/// command a wrapper (`nice omp …`, `npx omp …`) runs after its options and
-/// assignments. A word spelled `omp` anywhere else (`grep omp …`, `ls ./omp
-/// …`) is an argument, not the program.
-fn omp_command(argv: &[BString]) -> Option<usize> {
+/// Which arguments of a spawn stay as written: the arguments and inherited
+/// settings of an `omp` run itself. Its own command word (`nice
+/// local://bin/omp …` still needs the executable) and a wrapper's own file
+/// arguments (`npx --cache local://dir omp …`) still resolve, as does its
+/// environment when the command is not `omp` at all.
+struct Ownership {
+	/// Per-`argv` index: `true` for the arguments and inherited settings of
+	/// an `omp` run itself.
+	literal: Vec<bool>,
+	/// `true` when the command line's program is `omp`.
+	omp:     bool,
+}
+
+/// The program the command line runs, after any wrappers. `None` when there
+/// is no command (`env` alone, a lone assignment).
+struct CommandParse {
+	command:  Option<CommandWord>,
+	/// The `NAME=value` words the command inherits.
+	settings: Vec<usize>,
+}
+
+struct CommandWord {
+	/// The command word's index in `argv`.
+	index: usize,
+	/// The command word itself; for `env -S`, the first word of the split
+	/// string.
+	word:  BString,
+}
+
+/// The command word a simple command runs and the settings it inherits: the
+/// program itself, or the command a wrapper (`nice omp …`, `npx omp …`) runs
+/// after its options and assignments. A word spelled `omp` anywhere else
+/// (`grep omp …`, `ls ./omp …`) is an argument, not the program.
+fn command_word(program: &BStr, words: &[BString]) -> CommandParse {
+	let word_at = |at: usize| -> &[u8] {
+		if at == 0 {
+			program.as_bytes()
+		} else {
+			words[at].as_bytes()
+		}
+	};
+	let mut settings = Vec::new();
 	let mut at = 0;
-	loop {
-		while argv.get(at).is_some_and(|word| is_assignment(word)) {
-			at += 1;
-		}
-		let word = argv.get(at)?;
-		if is_omp(word) {
-			return Some(at);
-		}
-		at = wrapper_command(argv, at)?;
+	while at < words.len() && is_assignment(word_at(at)) {
+		settings.push(at);
+		at += 1;
+	}
+	if at >= words.len() {
+		return CommandParse { command: None, settings };
+	}
+	let word: &BStr = if at == 0 {
+		program
+	} else {
+		words[at].as_bstr()
+	};
+	match wrapper_command(word, &words[at..]) {
+		Some(mut next) => {
+			if let Some(command) = &mut next.command {
+				command.index += at;
+			}
+			for setting in &mut next.settings {
+				*setting += at;
+			}
+			settings.extend(next.settings);
+			CommandParse { command: next.command, settings }
+		},
+		None => CommandParse {
+			command: Some(CommandWord { index: at, word: BString::from(word_at(at)) }),
+			settings,
+		},
 	}
 }
 
 /// Whether `word` names the `omp` program, by any path.
 fn is_omp(word: &[u8]) -> bool {
+	launcher_name(word) == b"omp"
+}
+
+/// A launcher's name: the last path segment, lowercased, without a Windows
+/// script suffix (`npx.cmd`, `NPX.CMD`).
+fn launcher_name(word: &[u8]) -> BString {
 	let name = program_name(word);
-	name == b"omp" || (cfg!(windows) && name.eq_ignore_ascii_case(b"omp.exe"))
+	let mut name = name.to_ascii_lowercase();
+	for suffix in [".exe", ".cmd", ".bat", ".ps1"] {
+		if name.ends_with(suffix.as_bytes()) {
+			name.truncate(name.len() - suffix.len());
+			break;
+		}
+	}
+	BString::from(name)
 }
 
 /// The last path segment of `word`: the program's name.
@@ -209,7 +277,7 @@ const XARGS: OptionValues = OptionValues {
 };
 const IFNE: OptionValues = OptionValues { short: b"", long: &[] };
 const NPX: OptionValues = OptionValues {
-	short: b"pc",
+	short: b"pcw",
 	long:  &[
 		"cache",
 		"prefix",
@@ -229,6 +297,23 @@ const BUNX: OptionValues = OptionValues {
 	short: b"p",
 	long:  &["package", "registry", "cache-dir", "minimum-release-age", "cwd", "env-file"],
 };
+const BUN_GLOBAL: OptionValues = OptionValues {
+	short: b"",
+	long:  &[
+		"cwd",
+		"env-file",
+		"preload",
+		"require",
+		"import",
+		"define",
+		"loader",
+		"conditions",
+		"main-fields",
+		"tsconfig",
+		"port",
+		"config",
+	],
+};
 const NPM_GLOBAL: OptionValues = OptionValues {
 	short: b"w",
 	long:  &[
@@ -246,8 +331,26 @@ const NPM_GLOBAL: OptionValues = OptionValues {
 		"script-shell",
 	],
 };
-const NPM_EXEC: OptionValues =
-	OptionValues { short: b"cw", long: &["package", "call", "workspace", "prefix"] };
+const NPM_EXEC: OptionValues = OptionValues {
+	short: b"cw",
+	long:  &[
+		"package",
+		"call",
+		"workspace",
+		"prefix",
+		"cache",
+		"registry",
+		"userconfig",
+		"loglevel",
+		"log-level",
+		"location",
+		"tag",
+		"otp",
+		"before",
+		"script-shell",
+	],
+};
+const PNPM: OptionValues = OptionValues { short: b"C", long: &["dir", "filter"] };
 const UV_GLOBAL: OptionValues =
 	OptionValues { short: b"", long: &["directory", "project", "config-file", "cache-dir"] };
 const UV_RUN: OptionValues = OptionValues {
@@ -278,44 +381,82 @@ const SSH: OptionValues = OptionValues { short: b"BbcDEeFIiJLlmOoPpQRSWw", long:
 const COMMAND: OptionValues = OptionValues { short: b"", long: &[] };
 const EXEC: OptionValues = OptionValues { short: b"a", long: &[] };
 
-/// The index of the command word `argv[at]` runs as a wrapper, or `None`
-/// when it is not a known wrapper or names no command.
-fn wrapper_command(argv: &[BString], at: usize) -> Option<usize> {
-	let name = program_name(argv.get(at)?.as_bytes());
-	let next = match name {
-		b"nice" => after_options(argv, at + 1, NICE, false),
-		b"nohup" => after_options(argv, at + 1, NOHUP, false),
-		b"time" => after_options(argv, at + 1, TIME, false),
-		b"env" => {
-			let options = after_options(argv, at + 1, ENV, true);
-			// `env` takes `NAME=value` settings after its options; coreutils
-			// does not validate the name, and a lone `-` is a setting too.
-			skip_words(argv, options, |word| word == b"-".as_slice() || word.contains_str("="))
-		},
-		b"sudo" => {
-			let options = after_options(argv, at + 1, SUDO, false);
-			skip_words(argv, options, is_assignment)
-		},
-		b"doas" => {
-			let options = after_options(argv, at + 1, DOAS, false);
-			skip_words(argv, options, is_assignment)
-		},
-		b"timeout" | b"gtimeout" => after_options(argv, at + 1, TIMEOUT, false) + 1,
-		b"stdbuf" => after_options(argv, at + 1, STDBUF, false),
-		b"setsid" => after_options(argv, at + 1, SETSID, false),
-		b"xargs" => after_options(argv, at + 1, XARGS, false),
-		b"ifne" => after_options(argv, at + 1, IFNE, false),
-		b"npx" => after_options(argv, at + 1, NPX, false),
-		b"bunx" => after_options(argv, at + 1, BUNX, false),
-		b"npm" => npm_command(argv, at)?,
-		b"uv" => uv_command(argv, at)?,
-		b"ssh" => after_options(argv, at + 1, SSH, false) + 1,
-		b"command" => command_builtin(argv, at)?,
-		b"exec" => after_options(argv, at + 1, EXEC, false),
-		b"find" => find_command(argv, at + 1)?,
-		_ => return None,
+/// The command a wrapper at `program`/`words` runs, or `None` when it is not
+/// a known wrapper or names no command.
+fn wrapper_command(program: &BStr, words: &[BString]) -> Option<CommandParse> {
+	let name = launcher_name(program);
+	let after = |values: OptionValues, dash: bool| after_options(words, 1, values, dash);
+	let command_at = |next: usize| -> Option<CommandParse> {
+		if next == 0 || next >= words.len() {
+			return None;
+		}
+		let mut parse = command_word(words[next].as_bstr(), &words[next..]);
+		if let Some(command) = &mut parse.command {
+			command.index += next;
+		}
+		for setting in &mut parse.settings {
+			*setting += next;
+		}
+		Some(parse)
 	};
-	(next > at && next < argv.len()).then_some(next)
+	match name.as_slice() {
+		b"nice" => command_at(after(NICE, false)),
+		b"nohup" => command_at(after(NOHUP, false)),
+		b"time" => command_at(after(TIME, false)),
+		b"env" => Some(env_command(words)),
+		b"sudo" => Some(settings_command(words, after(SUDO, false))),
+		b"doas" => Some(settings_command(words, after(DOAS, false))),
+		b"timeout" | b"gtimeout" => command_at(after(TIMEOUT, false) + 1),
+		b"stdbuf" => command_at(after(STDBUF, false)),
+		b"setsid" => command_at(after(SETSID, false)),
+		b"xargs" => command_at(after(XARGS, false)),
+		b"ifne" => command_at(after(IFNE, false)),
+		b"npx" => command_at(after(NPX, false)),
+		b"bunx" => command_at(after(BUNX, false)),
+		b"bun" => {
+			let sub = after(BUN_GLOBAL, false);
+			if words.get(sub).is_none_or(|word| word.as_bytes() != b"x") {
+				return None;
+			}
+			command_at(after_options(words, sub + 1, BUNX, false))
+		},
+		b"npm" => {
+			let sub = after(NPM_GLOBAL, false);
+			if words
+				.get(sub)
+				.is_none_or(|word| word.as_bytes() != b"exec" && word.as_bytes() != b"x")
+			{
+				return None;
+			}
+			command_at(after_options(words, sub + 1, NPM_EXEC, false))
+		},
+		b"pnpm" => {
+			let sub = after(PNPM, false);
+			if words.get(sub).is_none_or(|word| word.as_bytes() != b"exec") {
+				return None;
+			}
+			command_at(after_options(words, sub + 1, PNPM, false))
+		},
+		b"uv" => uv_command(words),
+		b"ssh" => {
+			let host = after(SSH, false);
+			if host >= words.len() {
+				return None;
+			}
+			command_at(after_options(words, host + 1, SSH, false))
+		},
+		b"command" => {
+			let next = after(COMMAND, false);
+			let names_only = next <= words.len()
+				&& words[1..next].iter().any(|word| {
+					let word = word.as_bytes();
+					word.starts_with(b"-") && word[1..].iter().any(|&b| b == b'v' || b == b'V')
+				});
+			if names_only { None } else { command_at(next) }
+		},
+		b"exec" => command_at(after(EXEC, false)),
+		_ => None,
+	}
 }
 
 /// The first word from `from` on that is not an option (`--` ends them); a
@@ -363,53 +504,264 @@ fn option_words(word: &[u8], values: OptionValues) -> usize {
 	1
 }
 
-/// The first word from `from` on that `skip` rejects.
-fn skip_words(argv: &[BString], mut at: usize, mut skip: impl FnMut(&[u8]) -> bool) -> usize {
-	while argv.get(at).is_some_and(|word| skip(word.as_bytes())) {
-		at += 1;
+/// `sudo`/`doas`: the command after options and `NAME=value` settings, which
+/// stay its own.
+fn settings_command(words: &[BString], options: usize) -> CommandParse {
+	let mut settings = Vec::new();
+	let mut i = options;
+	while i < words.len() && is_assignment(words[i].as_bytes()) {
+		settings.push(i);
+		i += 1;
 	}
-	at
+	if i >= words.len() {
+		return CommandParse { command: None, settings };
+	}
+	let mut parse = command_word(words[i].as_bstr(), &words[i..]);
+	if let Some(command) = &mut parse.command {
+		command.index += i;
+	}
+	for setting in &mut parse.settings {
+		*setting += i;
+	}
+	settings.extend(parse.settings);
+	CommandParse { command: parse.command, settings }
 }
 
-/// `npm [options] exec [options] command`: only `exec`/`x` run a command.
-fn npm_command(argv: &[BString], at: usize) -> Option<usize> {
-	let sub = after_options(argv, at + 1, NPM_GLOBAL, false);
-	let word = argv.get(sub)?.as_bytes();
-	if word != b"exec" && word != b"x" {
+/// `env [options] [NAME=value…] command`: options come first, then the
+/// settings the command inherits, then the command. `-S`/`--split-string`
+/// names the command inside its value instead.
+fn env_command(words: &[BString]) -> CommandParse {
+	let mut settings = Vec::new();
+	let mut i = 1;
+	while i < words.len() {
+		let word = words[i].as_bytes();
+		if word == b"--" {
+			i += 1;
+			break;
+		}
+		if word == b"-" {
+			i += 1;
+			continue;
+		}
+		if word == b"-S" || word == b"--split-string" {
+			let value = words.get(i + 1);
+			return split_string_command(value.map(|w| w.as_bstr()), i, settings);
+		}
+		if let Some(value) = word.strip_prefix(b"--split-string=") {
+			return split_string_command(Some(value.as_bstr()), i, settings);
+		}
+		if word.starts_with(b"-S") && word.len() > 2 {
+			return split_string_command(Some(word[2..].as_bstr()), i, settings);
+		}
+		if word.starts_with(b"-") {
+			i += option_words(word, ENV);
+			continue;
+		}
+		break;
+	}
+	// `env` takes `NAME=value` settings after its options; coreutils does not
+	// validate the name, and a lone `-` is a setting too.
+	while i < words.len() && (words[i].as_bytes() == b"-" || words[i].as_bytes().contains_str("=")) {
+		if words[i].as_bytes() != b"-" {
+			settings.push(i);
+		}
+		i += 1;
+	}
+	if i >= words.len() {
+		return CommandParse { command: None, settings };
+	}
+	let mut parse = command_word(words[i].as_bstr(), &words[i..]);
+	if let Some(command) = &mut parse.command {
+		command.index += i;
+	}
+	for setting in &mut parse.settings {
+		*setting += i;
+	}
+	settings.extend(parse.settings);
+	CommandParse { command: parse.command, settings }
+}
+
+/// The command inside `env -S`'s `value`: split like the shell does, then
+/// parsed as its own command line. `option` stands in for every word inside
+/// the string.
+fn split_string_command(
+	value: Option<&BStr>,
+	option: usize,
+	mut settings: Vec<usize>,
+) -> CommandParse {
+	let Some(value) = value else {
+		return CommandParse { command: None, settings };
+	};
+	let argv = split_string_words(value.as_bytes());
+	if argv.is_empty() {
+		return CommandParse { command: None, settings };
+	}
+	let mut parse = command_word(argv[0].as_bstr(), &argv);
+	if let Some(command) = &mut parse.command {
+		command.index = option;
+	}
+	if !parse.settings.is_empty() {
+		settings.push(option);
+	}
+	parse.settings.clear();
+	CommandParse { command: parse.command, settings }
+}
+
+/// `text` split into words the way `env -S` splits it: whitespace, with
+/// quotes and `\`.
+fn split_string_words(text: &[u8]) -> Vec<BString> {
+	let mut words = Vec::new();
+	let mut word = Vec::new();
+	let mut quote = 0u8;
+	let mut i = 0;
+	while i < text.len() {
+		let ch = text[i];
+		if quote == b'\'' {
+			if ch == b'\'' {
+				quote = 0;
+			} else {
+				word.push(ch);
+			}
+			i += 1;
+			continue;
+		}
+		if ch == b'\\' {
+			if i + 1 < text.len() {
+				word.push(text[i + 1]);
+				i += 1;
+			}
+			i += 1;
+			continue;
+		}
+		if quote != 0 {
+			if ch == quote {
+				quote = 0;
+			} else {
+				word.push(ch);
+			}
+			i += 1;
+			continue;
+		}
+		if ch == b'\'' || ch == b'"' {
+			quote = ch;
+			i += 1;
+			continue;
+		}
+		if ch.is_ascii_whitespace() {
+			if !word.is_empty() {
+				words.push(BString::from(std::mem::take(&mut word)));
+			}
+			i += 1;
+			continue;
+		}
+		word.push(ch);
+		i += 1;
+	}
+	if !word.is_empty() {
+		words.push(BString::from(word));
+	}
+	words
+}
+
+/// `uv [options] run [options] command`: `-m`/`--module` runs a module, not
+/// an executable.
+fn uv_command(words: &[BString]) -> Option<CommandParse> {
+	let sub = after_options(words, 1, UV_GLOBAL, false);
+	if words.get(sub)?.as_bytes() != b"run" {
 		return None;
 	}
-	Some(after_options(argv, sub + 1, NPM_EXEC, false))
-}
-
-/// `uv [options] run [options] command`.
-fn uv_command(argv: &[BString], at: usize) -> Option<usize> {
-	let sub = after_options(argv, at + 1, UV_GLOBAL, false);
-	if argv.get(sub)?.as_bytes() != b"run" {
+	let mut i = sub + 1;
+	while i < words.len() {
+		let word = words[i].as_bytes();
+		if word == b"--" {
+			i += 1;
+			break;
+		}
+		if word == b"-" || !word.starts_with(b"-") {
+			break;
+		}
+		if word == b"-m" || word == b"--module" || word.starts_with(b"--module=") {
+			return None;
+		}
+		i += option_words(word, UV_RUN);
+	}
+	if i >= words.len() {
 		return None;
 	}
-	Some(after_options(argv, sub + 1, UV_RUN, false))
+	let mut parse = command_word(words[i].as_bstr(), &words[i..]);
+	if let Some(command) = &mut parse.command {
+		command.index += i;
+	}
+	for setting in &mut parse.settings {
+		*setting += i;
+	}
+	Some(parse)
 }
 
-/// `command [-p] [-v|-V] command`: `-v`/`-V` name a command instead of
-/// running it, so nothing is executed.
-fn command_builtin(argv: &[BString], at: usize) -> Option<usize> {
-	let next = after_options(argv, at + 1, COMMAND, false);
-	let names_only = argv.get(at + 1..next)?.iter().any(|word| {
-		let word = word.as_bytes();
-		word.starts_with(b"-") && word[1..].iter().any(|&b| b == b'v' || b == b'V')
-	});
-	(!names_only).then_some(next)
+/// `find … -exec cmd \; -exec cmd +`: the word range each action's command
+/// occupies.
+fn find_actions(argv: &[BString], from: usize) -> Vec<(usize, usize)> {
+	let mut actions = Vec::new();
+	let mut i = from;
+	while i < argv.len() {
+		if matches!(argv[i].as_bytes(), b"-exec" | b"-execdir" | b"-ok" | b"-okdir")
+			&& argv
+				.get(i + 1)
+				.is_some_and(|word| word.as_bytes() != b";" && word.as_bytes() != b"+")
+		{
+			let start = i + 1;
+			let mut end = start;
+			while end < argv.len() && argv[end].as_bytes() != b";" && argv[end].as_bytes() != b"+" {
+				end += 1;
+			}
+			actions.push((start, end));
+			i = end + 1;
+		} else {
+			i += 1;
+		}
+	}
+	actions
 }
 
-/// `find … -exec command …`: the first `-exec`/`-execdir`/`-ok`/`-okdir`
-/// names the command find runs.
-fn find_command(argv: &[BString], from: usize) -> Option<usize> {
-	argv
-		.iter()
-		.enumerate()
-		.skip(from)
-		.find(|(_, word)| matches!(word.as_bytes(), b"-exec" | b"-execdir" | b"-ok" | b"-okdir"))
-		.map(|(i, _)| i + 1)
+/// Which arguments of `program`/`argv` stay as written: the arguments and
+/// inherited settings of an `omp` run itself. Its own command word still
+/// resolves (`nice local://bin/omp …` needs the executable).
+fn ownership(program: &BStr, argv: &[BString]) -> Ownership {
+	let mut literal = vec![false; argv.len()];
+	let parse = command_word(program, argv);
+	let Some(command) = parse.command else {
+		return Ownership { literal, omp: false };
+	};
+	if launcher_name(command.word.as_slice()) == b"find" {
+		for (start, end) in find_actions(argv, command.index + 1) {
+			if start >= end {
+				continue;
+			}
+			let mut action = command_word(argv[start].as_bstr(), &argv[start..end]);
+			for setting in &mut action.settings {
+				*setting += start;
+			}
+			let Some(ac) = action.command else {
+				continue;
+			};
+			if !is_omp(ac.word.as_slice()) {
+				continue;
+			}
+			for setting in action.settings {
+				literal[setting] = true;
+			}
+			literal[start + ac.index + 1..end].fill(true);
+		}
+		return Ownership { literal, omp: false };
+	}
+	if !is_omp(command.word.as_slice()) {
+		return Ownership { literal, omp: false };
+	}
+	for setting in parse.settings {
+		literal[setting] = true;
+	}
+	literal[command.index + 1..].fill(true);
+	Ownership { literal, omp: true }
 }
 
 /// Whether the environment variable `name` holds a URL to resolve. `PWD`
@@ -524,12 +876,12 @@ pub(super) async fn resolve(fs: &omp_vfs::Fs, names: &Names) -> io::Result<Names
 		},
 		_ => names.path.clone(),
 	};
-	let omp = omp_command(&names.argv);
+	let owned = ownership(names.path.as_bstr(), &names.argv);
 	let mut argv = Vec::with_capacity(names.argv.len());
 	for (i, arg) in names.argv.iter().enumerate() {
 		// The program is resolved above; `omp` resolves the arguments it is
 		// given itself, while a wrapper's own arguments are still ours.
-		let host = if i == 0 || omp.is_some_and(|at| i >= at) {
+		let host = if i == 0 || owned.literal[i] {
 			None
 		} else {
 			host_arg(fs, arg.as_bstr()).await
@@ -539,7 +891,7 @@ pub(super) async fn resolve(fs: &omp_vfs::Fs, names: &Names) -> io::Result<Names
 	// What the child's environment says differently from the shell's. `omp`
 	// resolves the URLs in its own environment.
 	let mut hosted: Vec<(BString, BString)> = Vec::new();
-	if omp.is_none() {
+	if !owned.omp {
 		for (name, value) in names.env.iter() {
 			if env_url(name, value)
 				&& let Some(host) = host_arg(fs, value).await
