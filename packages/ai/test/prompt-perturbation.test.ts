@@ -5,12 +5,15 @@ import * as catalogPolicy from "@oh-my-pi/pi-catalog/compat/catalog-policy";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { TempDir } from "@oh-my-pi/pi-utils/temp";
 import type { BunPlugin } from "bun";
+import { validatePool } from "../../../scripts/gen-prompt-perturbation";
 import { perturbContext, perturbPromptText, resetPromptPerturbation } from "../src/prompts/perturbation";
 import type { Context } from "../src/types";
 
-const pool: { entries: { source: string; variants: string[]; manual?: boolean }[] } = JSON.parse(
-	readFileSync(new URL("../src/prompts/perturbation-pool.json.txt", import.meta.url), "utf8"),
-);
+const pool: {
+	version: number;
+	generatedWith: string;
+	entries: { source: string; origin: string; variants: string[]; manual?: boolean }[];
+} = JSON.parse(readFileSync(new URL("../src/prompts/perturbation-pool.json.txt", import.meta.url), "utf8"));
 
 const sample = pool.entries.find(entry => !entry.manual && /^[A-Z`]/.test(entry.source));
 if (!sample) throw new Error("pool has no generated sentence");
@@ -45,6 +48,21 @@ describe("per-install prompt perturbation", () => {
 		expect(first).not.toBe(sample.source);
 		expect(sample.variants).toContain(first);
 		expect(second).toBe(first);
+	});
+
+	it("keeps every pooled entry valid and rewritable through the word tree and memo eviction", () => {
+		expect(validatePool(pool)).toEqual([]);
+		const firstSample = perturbPromptText(sample.source);
+		const unrewritten: string[] = [];
+		for (const entry of pool.entries) {
+			if (entry.manual) continue;
+			if (!entry.variants.includes(perturbPromptText(entry.source))) {
+				unrewritten.push(`${entry.origin}: ${entry.source.slice(0, 60)}`);
+			}
+		}
+		expect(unrewritten).toEqual([]);
+		// 3,600+ distinct lookups exceed MEMO_LIMIT (512); evicted entries still pick the same variant.
+		expect(perturbPromptText(sample.source)).toBe(firstSample);
 	});
 
 	it("rewrites a pooled sentence wherever it renders, keeping its punctuation and surroundings", () => {
