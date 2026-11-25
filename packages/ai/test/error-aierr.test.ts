@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { createAbortSourceTracker } from "@oh-my-pi/pi-ai/utils/abort";
 
 describe("AIError.classify — structural provider errors", () => {
 	it("classifies an Anthropic connection timeout as timeout + transient (no regex)", () => {
@@ -146,11 +147,38 @@ describe("AIError.finalize", () => {
 		expect(result.message.length).toBeGreaterThan(0);
 	});
 
-	it("reports aborted when the caller signal is aborted", async () => {
+	it("reports a bare caller abort consistently instead of surfacing the transport error", async () => {
 		const controller = new AbortController();
 		controller.abort();
-		const result = await AIError.finalize(new Error("cancelled"), { signal: controller.signal });
+		const result = await AIError.finalize(new Error("fetch failed"), { signal: controller.signal });
 		expect(result.stopReason).toBe("aborted");
+		expect(result.message).toBe("Request was aborted");
+		expect(result.id).toBe(AIError.create(AIError.Flag.Abort));
+	});
+
+	it("keeps a provider status when a bare caller abort has no status of its own", async () => {
+		const controller = new AbortController();
+		controller.abort();
+		const result = await AIError.finalize(new AIError.ProviderHttpError("missing model", 404), {
+			signal: controller.signal,
+		});
+
+		expect(result.stopReason).toBe("aborted");
+		expect(result.status).toBe(404);
+		expect(result.message).toBe("Request was aborted");
+	});
+
+	it("uses the supplied caller signal when a tracker has no caller signal", async () => {
+		const controller = new AbortController();
+		controller.abort("Interrupted by user");
+		const result = await AIError.finalize(new Error("fetch failed"), {
+			signal: controller.signal,
+			abortTracker: createAbortSourceTracker(),
+		});
+
+		expect(result.stopReason).toBe("aborted");
+		expect(result.message).toBe("Interrupted by user");
+		expect(AIError.is(result.id, AIError.Flag.Abort)).toBe(false);
 	});
 
 	it("surfaces the HTTP status from a ProviderHttpError", async () => {
