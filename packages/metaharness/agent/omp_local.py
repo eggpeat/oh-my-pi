@@ -122,10 +122,11 @@ _MODELS_DST = "/tmp/omp-models.yml"
 _CONFIG_DST = "/tmp/omp-config.yml"
 _OUTPUT_FILENAME = "omp.txt"
 
-# omp's daemon broker stops the services the agent started (bash `name` +
-# `ready`) once its last client has been gone for OMP_DAEMON_IDLE_GRACE_MS
-# (default 3 s). The verifier runs after omp exits, in the same container, and
-# grades those services, so keep them alive until the container is torn down.
+# Non-interactive omp (print/RPC) sets `launch.persist = true`, so bash
+# services (`name` + `ready`) use `hold: "persist"` and keep the daemon alive
+# past omp exit until stopped. Keep OMP_DAEMON_IDLE_GRACE_MS at 24 h as well
+# so the daemon itself lingers for the verifier (and for older published omp
+# builds without `launch.persist`).
 _SERVICE_GRACE_ENV = {"OMP_DAEMON_IDLE_GRACE_MS": str(24 * 60 * 60 * 1000)}
 
 # Provider → host env vars used in --no-gateway (direct-auth) mode only.

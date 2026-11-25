@@ -6,7 +6,7 @@
  */
 import * as fs from "node:fs/promises";
 import { execReplace, FileLock, type IpcConnection, IpcServer } from "@oh-my-pi/pi-natives";
-import { errorMessage, isEnoent, isRecord, logger, postmortem, setProcessName } from "@oh-my-pi/pi-utils";
+import { errorMessage, isEnoent, isRecord, logger, postmortem, setProcessName, sleepLong } from "@oh-my-pi/pi-utils";
 import { daemonBuildId } from "./build";
 import { isSameProcess, processStartTime } from "./children";
 import type { ModuleClient, ModuleTunnel } from "./module";
@@ -175,10 +175,12 @@ class Daemon {
 	readonly #connections = new Set<DaemonConnection>();
 	readonly #finished = Promise.withResolvers<void>();
 	#server: IpcServer | undefined;
-	#idleTimer: NodeJS.Timeout | undefined;
+	/** Pending idle-exit wait. Aborting it cancels the grace when a client arrives or shutdown begins. */
+	#idleAbort: AbortController | undefined;
 	/** `upgrade` or `shutdown` began: new requests are rejected. */
 	#closing = false;
 	#shutdown: Promise<void> | undefined;
+	#hasAcceptedConnection = false;
 
 	constructor(
 		token: string,
@@ -221,8 +223,7 @@ class Daemon {
 	shutdown(): Promise<void> {
 		this.#shutdown ??= (async () => {
 			this.#closing = true;
-			clearTimeout(this.#idleTimer);
-			this.#idleTimer = undefined;
+			this.#cancelIdleExit();
 			try {
 				await this.#units.shutdown();
 			} catch (error) {
@@ -244,10 +245,10 @@ class Daemon {
 	}
 
 	#accept(connection: IpcConnection): void {
+		this.#hasAcceptedConnection = true;
 		const state = new DaemonConnection(connection);
 		this.#connections.add(state);
-		clearTimeout(this.#idleTimer);
-		this.#idleTimer = undefined;
+		this.#cancelIdleExit();
 		connection.start(
 			line => void this.#onLine(state, line),
 			() => this.#onClose(state),
@@ -417,8 +418,7 @@ class Daemon {
 			await this.shutdown();
 			process.exit(0);
 		}
-		clearTimeout(this.#idleTimer);
-		this.#idleTimer = undefined;
+		this.#cancelIdleExit();
 		await this.#units.prepareReexec();
 		await this.#closeTransport();
 		const [command, ...rest] = hello.client.exe;
@@ -469,16 +469,41 @@ class Daemon {
 	/** Exit once nothing is connected and no unit but `hold: "detached"` ones is live. */
 	#scheduleIdleExit(): void {
 		if (this.#closing || this.#connections.size > 0 || this.#units.keepsDaemonAlive()) {
-			clearTimeout(this.#idleTimer);
-			this.#idleTimer = undefined;
+			this.#cancelIdleExit();
 			return;
 		}
-		if (this.#idleTimer) return;
-		this.#idleTimer = setTimeout(() => {
-			this.#idleTimer = undefined;
-			if (this.#closing || this.#connections.size > 0 || this.#units.keepsDaemonAlive()) return;
-			void this.shutdown();
-		}, this.#idleExitGraceMs);
+		if (this.#idleAbort) return;
+		// Before the first client connects, hold at least the default grace so `OMP_DAEMON_IDLE_GRACE_MS=0`
+		// exits immediately after the last client disconnects instead of racing the spawning client's dial.
+		const delayMs = this.#hasAcceptedConnection
+			? this.#idleExitGraceMs
+			: Math.max(this.#idleExitGraceMs, DAEMON_IDLE_EXIT_GRACE_MS);
+		const abort = new AbortController();
+		this.#idleAbort = abort;
+		// `sleepLong` measures a monotonic deadline and chunks past the 32-bit timer ceiling, so setting the
+		// clock back cannot stretch the grace and a long grace cannot overflow into a 1 ms wait.
+		void sleepLong(delayMs, abort.signal).then(
+			() => {
+				if (this.#idleAbort !== abort) return;
+				this.#idleAbort = undefined;
+				if (this.#closing || this.#connections.size > 0 || this.#units.keepsDaemonAlive()) return;
+				void this.shutdown();
+			},
+			(error: unknown) => {
+				if (this.#idleAbort !== abort) return;
+				this.#idleAbort = undefined;
+				// A client, shutdown, or upgrade aborts this wait. Anything else is unexpected.
+				if (!abort.signal.aborted) {
+					logger.warn("Daemon idle-exit wait failed", { error: errorMessage(error) });
+				}
+			},
+		);
+	}
+
+	/** A connection, shutdown, or upgrade ended the pending idle wait. */
+	#cancelIdleExit(): void {
+		this.#idleAbort?.abort();
+		this.#idleAbort = undefined;
 	}
 }
 
@@ -532,10 +557,18 @@ async function acquireDaemonLock(retryMs: number): Promise<FileLock | undefined>
 	}
 }
 
-/** Milliseconds from env var `name` when positive, else `fallback`. */
-function graceMsFromEnv(name: string, fallback: number): number {
-	const graceMs = Number(process.env[name]);
-	return graceMs > 0 ? graceMs : fallback;
+/** Lease grace from {@link DAEMON_RESUME_LEASE_GRACE_ENV} when positive, else {@link DAEMON_RESUME_LEASE_GRACE_MS}. */
+function resumeLeaseGraceMs(): number {
+	const graceMs = Number(process.env[DAEMON_RESUME_LEASE_GRACE_ENV]);
+	return graceMs > 0 ? graceMs : DAEMON_RESUME_LEASE_GRACE_MS;
+}
+
+/** Idle grace from {@link DAEMON_IDLE_EXIT_GRACE_ENV} as a non-negative base-10 `parseInt` prefix, else the default. */
+function idleExitGraceMs(): number {
+	const raw = process.env[DAEMON_IDLE_EXIT_GRACE_ENV];
+	if (raw === undefined) return DAEMON_IDLE_EXIT_GRACE_MS;
+	const graceMs = Number.parseInt(raw, 10);
+	return Number.isFinite(graceMs) && graceMs >= 0 ? graceMs : DAEMON_IDLE_EXIT_GRACE_MS;
 }
 
 /** Run the daemon until it goes idle, is shut down, or replaces itself. Returns at once when another daemon holds the lock. */
@@ -555,14 +588,7 @@ export async function startDaemonFromEnvironment(): Promise<void> {
 	try {
 		const token = await readOrCreateToken();
 		store = DaemonStore.open(daemonDbPath());
-		daemon = new Daemon(
-			token,
-			lock,
-			store,
-			resumed,
-			graceMsFromEnv(DAEMON_RESUME_LEASE_GRACE_ENV, DAEMON_RESUME_LEASE_GRACE_MS),
-			graceMsFromEnv(DAEMON_IDLE_EXIT_GRACE_ENV, DAEMON_IDLE_EXIT_GRACE_MS),
-		);
+		daemon = new Daemon(token, lock, store, resumed, resumeLeaseGraceMs(), idleExitGraceMs());
 		const cancelCleanup = postmortem.register("omp-daemon", () => daemon?.shutdown());
 		try {
 			await daemon.run();

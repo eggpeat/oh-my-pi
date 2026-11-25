@@ -11,6 +11,8 @@
 ### Fixed
 
 - Fixed files and directories whose name starts with `..` being treated as outside their parent: a working directory under such a folder now counts as part of its checkout, and scoped settings, plugin roots and folder restrictions apply to it ([#20482](https://github.com/can1357/oh-my-pi/pull/20482) by [@H4vC](https://github.com/H4vC))
+- Fixed the daemon ignoring `OMP_DAEMON_IDLE_GRACE_MS`; values now use the documented base-10 `parseInt` prefix, and `0` removes the shutdown wait once the daemon is idle ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+- Setting the system clock back no longer keeps the background daemon running past its idle timeout ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 
 ### Added
 

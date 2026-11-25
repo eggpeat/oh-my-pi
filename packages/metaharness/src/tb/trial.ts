@@ -18,10 +18,10 @@ const EMPTY_USAGE: TrialUsage = {
 };
 
 /**
- * omp's daemon broker stops the services the agent started (bash `name` + `ready`) once its last
- * client has been gone for `OMP_DAEMON_IDLE_GRACE_MS` (default 3 s). The verifier runs after omp
- * exits, in the same guest, and grades those services, so keep them alive until the guest is
- * removed. An explicit `--env` value wins.
+ * Non-interactive omp (RPC/print) sets `launch.persist = true`, so bash services (`name` + `ready`)
+ * use `hold: "persist"` and keep the daemon alive past omp exit until stopped. Keep
+ * `OMP_DAEMON_IDLE_GRACE_MS` at 24 h as well so the daemon itself lingers for the verifier (and for
+ * older omp binaries without `launch.persist`). An explicit `--env` value wins.
  */
 const SERVICE_GRACE_ENV: Record<string, string> = { OMP_DAEMON_IDLE_GRACE_MS: String(24 * 60 * 60 * 1_000) };
 
