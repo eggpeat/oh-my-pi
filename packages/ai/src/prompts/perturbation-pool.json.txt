@@ -4743,6 +4743,26 @@
 			]
 		},
 		{
+			"source": "\"func $F($V $T) *$T { return &$V }\"",
+			"origin": "packages/coding-agent/src/discovery/builtin-rules/go-new-expr.md",
+			"variants": [
+				"func $F($V $T) *$T { return &$V }",
+				"\"func $F($V $T) *$T {return &$V}\"",
+				"\"func $F( $V $T ) *$T { return &$V }\"",
+				"\"func $F($V $T)*$T { return &$V }\""
+			]
+		},
+		{
+			"source": "\"func $F[$$$TP]($V $T) *$T { return &$V }\"",
+			"origin": "packages/coding-agent/src/discovery/builtin-rules/go-new-expr.md",
+			"variants": [
+				"func $F[$$$TP]($V $T) *$T { return &$V }",
+				"\"func $F[$$$TP]($V $T) *$T {return &$V}\"",
+				"\"func $F[$$$TP]( $V $T ) *$T { return &$V }\"",
+				"\"func $F[$$$TP]($V $T)*$T { return &$V }\""
+			]
+		},
+		{
 			"source": "Go 1.26: `new(expr)` allocates, stores `expr`, returns `*T`",
 			"origin": "packages/coding-agent/src/discovery/builtin-rules/go-new-expr.md",
 			"variants": [
@@ -15078,6 +15098,46 @@
 			]
 		},
 		{
+			"source": "For each one, decide now",
+			"origin": "packages/coding-agent/src/prompts/system/leftover-processes.md",
+			"variants": [
+				"Decide on each one now",
+				"For each, decide right away",
+				"Now decide for each of them",
+				"Decide now, for each one"
+			]
+		},
+		{
+			"source": "Otherwise kill it (`kill <pid>`) if you no longer need it",
+			"origin": "packages/coding-agent/src/prompts/system/leftover-processes.md",
+			"variants": [
+				"Otherwise, kill it (`kill <pid>`) if you no longer need it",
+				"If you no longer need it, kill it (`kill <pid>`) instead",
+				"Otherwise kill it with `kill <pid>` when you no longer need it",
+				"Kill it (`kill <pid>`) when you no longer need it"
+			]
+		},
+		{
+			"source": "`&` processes not registered as a service are killed when this session ends",
+			"origin": "packages/coding-agent/src/prompts/system/leftover-processes.md",
+			"variants": [
+				"Unregistered `&` processes are killed when this session ends",
+				"`&` processes not registered as a service get killed when this session ends",
+				"`&` processes are killed at session end unless registered as a service",
+				"When this session ends, `&` processes not registered as a service are killed"
+			]
+		},
+		{
+			"source": "`nohup` processes are never killed for you: if you keep one, it must be registered as a service",
+			"origin": "packages/coding-agent/src/prompts/system/leftover-processes.md",
+			"variants": [
+				"`nohup` processes are never killed for you: keeping one requires registering it as a service",
+				"`nohup` processes are never killed for you: if you keep one, register it as a service",
+				"`nohup` processes are never killed for you: to keep one, it must be registered as a service",
+				"`nohup` processes are never killed for you: if you keep one, you must register it as a service"
+			]
+		},
+		{
 			"source": "it was discarded unseen, with every tool call it planned",
 			"origin": "packages/coding-agent/src/prompts/system/length-stop-retry.md",
 			"variants": [
@@ -22371,6 +22431,16 @@
 			]
 		},
 		{
+			"source": "`await agent(prompt, { agent?, label?, schema?, schemaMode?, isolated?, apply?, merge",
+			"origin": "packages/coding-agent/src/prompts/system/workflow-notice.md",
+			"variants": [
+				"`await agent(prompt, { agent?, label?, schema?, schemaMode?, isolated?, apply?, merge?})",
+				"`await agent(prompt, {agent?, label?, schema?, schemaMode?, isolated?, apply?, merge",
+				"`await agent(prompt, { agent?, label?, schema?, schemaMode?, isolated? , apply?, merge",
+				"`await agent(prompt,{ agent?, label?, schema?, schemaMode?, isolated?, apply?, merge"
+			]
+		},
+		{
 			"source": "use for a small fixed dependency graph or when the parent needs validated `schema` data",
 			"origin": "packages/coding-agent/src/prompts/system/workflow-notice.md",
 			"variants": [
@@ -22603,6 +22673,16 @@
 				"Continue with useful local work",
 				"Carry on useful local work",
 				"Proceed with useful local work"
+			]
+		},
+		{
+			"source": "YOU verify and integrate",
+			"origin": "packages/coding-agent/src/prompts/system/workflow-notice.md",
+			"variants": [
+				"You verify and integrate",
+				"Verify and integrate it yourself",
+				"You verify and integrate it",
+				"Verify and integrate them yourself"
 			]
 		},
 		{

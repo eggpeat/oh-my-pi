@@ -132,7 +132,7 @@ function poolable(fragment: string): boolean {
 }
 
 /** Every poolable fragment of the prompt sources, mapped to the first file that uses it. */
-async function collectFragments(): Promise<Map<string, string>> {
+export async function collectFragments(): Promise<Map<string, string>> {
 	const fragments = new Map<string, string>();
 	const files: string[] = [];
 	for (const pattern of PROMPT_GLOBS) {

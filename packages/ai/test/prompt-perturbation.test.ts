@@ -7,6 +7,7 @@ import { TempDir } from "@oh-my-pi/pi-utils/temp";
 import type { BunPlugin } from "bun";
 import { perturbContext, perturbPromptText, resetPromptPerturbation } from "../src/prompts/perturbation";
 import type { Context } from "../src/types";
+import { collectFragments } from "../../../scripts/gen-prompt-perturbation";
 
 const pool: { entries: { source: string; variants: string[]; manual?: boolean }[] } = JSON.parse(
 	readFileSync(new URL("../src/prompts/perturbation-pool.json.txt", import.meta.url), "utf8"),
@@ -54,6 +55,14 @@ describe("per-install prompt perturbation", () => {
 		expect(rendered.startsWith(before)).toBe(true);
 		expect(rendered.endsWith(after)).toBe(true);
 		expect(sample.variants).toContain(rendered.slice(before.length, -after.length));
+	});
+
+	it("covers every poolable prose fragment of the model-visible prompts", async () => {
+		const pooled = new Set(pool.entries.map(entry => entry.source));
+		const missing = [...(await collectFragments()).entries()]
+			.filter(([source]) => !pooled.has(source))
+			.map(([source, origin]) => `${origin}: ${source}`);
+		expect(missing).toEqual([]);
 	});
 
 	it("leaves a pooled sentence untouched where it is only part of a longer one", () => {
