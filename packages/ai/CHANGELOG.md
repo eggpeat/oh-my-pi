@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed per-install prompt perturbation leaving the latest selective-commit guidance unchanged ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+
 ## [19.2.0] - 2026-11-25
 
 ### Breaking Changes

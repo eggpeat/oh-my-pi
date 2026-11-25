@@ -49,7 +49,7 @@ describe("per-install prompt perturbation", () => {
 
 	it("covers every static prose line of the coding-agent prompts", async () => {
 		const promptDir = new URL("../../coding-agent/src/prompts/", import.meta.url);
-		const pooled = new Set(pool.entries.map(entry => entry.source.trim()));
+		const pooled = new Map(pool.entries.map(entry => [entry.source.trim(), entry]));
 		const missing: string[] = [];
 		for await (const relative of new Bun.Glob("**/*.md").scan({ cwd: promptDir.pathname })) {
 			const text = await Bun.file(new URL(relative, promptDir)).text();
@@ -61,7 +61,8 @@ describe("per-install prompt perturbation", () => {
 				}
 				const source = raw.trim();
 				if (fenced || source.length < 40 || source.includes("{{")) continue;
-				if (!pooled.has(source)) missing.push(`${relative}: ${source.slice(0, 60)}`);
+				// Listing a source without a rewrite would still send the original prose.
+				if (!pooled.get(source)?.variants.length) missing.push(`${relative}: ${source.slice(0, 60)}`);
 			}
 		}
 		expect(missing).toEqual([]);

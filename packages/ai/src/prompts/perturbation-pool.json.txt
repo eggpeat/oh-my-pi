@@ -11196,6 +11196,15 @@
 			]
 		},
 		{
+			"source": "- `details()` is synchronous and prints nothing: it returns the draft's raw record — the `id` you would pass to the bridge, the `head` commit it started from, and the `scope` of agents it covers. `commit(...)` returns the same record for the commit it made, with the draft that remains under `remaining`.",
+			"origin": "tools/commit.md",
+			"variants": [
+				"- `details()` runs synchronously and prints nothing: it returns the draft's raw record — the `id` you would pass to the bridge, the `head` commit it started from, and the `scope` of agents it covers. `commit(...)` returns the same record for the commit it made, leaving the draft under `remaining`.",
+				"- `details()` is synchronous and prints nothing: it returns the raw record of the draft — the `id` you would pass to the bridge, the `head` commit it started from, and the `scope` of agents it covers. For the commit it made, `commit(...)` returns the same record, with the draft that remains under `remaining`.",
+				"- `details()` is synchronous and prints nothing: it returns the draft's raw record — the `id` for the bridge, the `head` commit it started from, and the `scope` of agents it covers. `commit(...)` returns the same record for the commit it made, with the remaining draft under `remaining`."
+			]
+		},
+		{
 			"source": "- `commit(subject, body=None, *, fixes=None, amend=False, no_verify=False)`: one-line subject; body is a string or a list of lines; `fixes=123` appends `Fixes #123`. Builds the commit from a private index on the current HEAD (or as the first commit of a new repository): other agents' staged entries stay staged, the worktree is never touched, and a concurrent commit by someone else is never overwritten (when it changed the same lines the call fails; draft again). Refuses while a merge, cherry-pick, revert, rebase, or `git am` is in progress, or the index has unresolved conflicts; finish or abort the operation or resolve the conflicts first, using plain `git commit` for commits within an operation. Hooks and commit signing run as with `git commit`; `no_verify=True` skips the `pre-commit` and `commit-msg` hooks (only when the user asks). Prints the commit and what remains; the draft then holds what remains, freshly preselected, so keep using it for the next commit. `amend=True` only rewrites a commit this flow made in this session.",
 			"origin": "tools/commit.md",
 			"variants": [
@@ -11214,12 +11223,12 @@
 			]
 		},
 		{
-			"source": "- Every method is async and prints its result; `silent=True` skips printing. `print(d)` repeats the current summary.",
+			"source": "- Every method is async and prints its result; `silent=True` skips printing. `details()` is the exception (synchronous, prints nothing). `print(d)` repeats the current summary.",
 			"origin": "tools/commit.md",
 			"variants": [
-				"- Every method is async and prints its result; `silent=True` suppresses printing. `print(d)` repeats the current summary.",
-				"- Each method is async and prints its result; `silent=True` skips printing. `print(d)` repeats the current summary.",
-				"- All methods are async and print their result; `silent=True` skips printing. `print(d)` repeats the current summary."
+				"- Every method is async and prints its result except `details()` (synchronous, prints nothing); `silent=True` skips printing. `print(d)` repeats the current summary.",
+				"- All methods are async and print their results; `silent=True` skips printing. `details()` is the exception (synchronous, prints nothing). `print(d)` repeats the current summary.",
+				"- Every method is async and prints its result; `silent=True` skips printing. Only `details()` runs synchronously and prints nothing. `print(d)` repeats the current summary."
 			]
 		},
 		{
