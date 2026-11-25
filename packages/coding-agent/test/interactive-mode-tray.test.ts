@@ -214,6 +214,9 @@ describe("InteractiveMode tray", () => {
 		tempDir?.removeSync();
 	});
 
+	/** Agent `id`'s transcript, in this session's artifacts tree. */
+	const transcript = (id: string): string => path.join(session.sessionManager.getArtifactsDir()!, `${id}.jsonl`);
+
 	/** A job body that runs until the test ends. */
 	const hold = (): Promise<string> => {
 		const { promise, resolve } = Promise.withResolvers<string>();
@@ -237,7 +240,7 @@ describe("InteractiveMode tray", () => {
 			parentId: "Main",
 			session: null,
 			// Its transcript, so focusing can open it.
-			sessionFile: "/tmp/TrayScan.jsonl",
+			sessionFile: transcript("TrayScan"),
 			status: "running",
 		});
 		registry.register({
@@ -261,6 +264,8 @@ describe("InteractiveMode tray", () => {
 			TASK_SUBAGENT_PROGRESS_CHANNEL,
 			progress("TrayScan", {
 				currentTool: "read",
+				currentToolArgs: "config/app.toml",
+				currentToolArgsKey: "path",
 				currentToolIntent: "Reading the config",
 				currentToolStartMs: callStart,
 				toolCount: 3,
@@ -336,19 +341,19 @@ describe("InteractiveMode tray", () => {
 		const cards = children(described[trayAt]);
 		expect(cards.map(card => [card.p?.item, card.p?.ref])).toEqual([
 			["agent", "TrayScan"],
-			["agent", "TrayReview"],
 			["job", "bg_1"],
 			["job", "bg_2"],
+			["agent", "TrayReview"],
 			["done", "done"],
 		]);
-		const [scan, review, widgetJob, bareJob, done] = cards;
+		const [scan, widgetJob, bareJob, review, done] = cards;
 
 		expect(scan!.p).toMatchObject({
 			role: "omp.tray.card",
 			status: "running",
 			tone: "accent",
 			acted: callStart,
-			aria: "TrayScan, m2, running, read · Reading the config, 3 tools",
+			aria: "TrayScan, m2, running, Read app.toml, 3 tools",
 		});
 		expect(children(scan).map(role)).toEqual(["omp.tray.head", "omp.tray.doing", "omp.tray.meta"]);
 		const scanHead = children(children(scan)[0]);
@@ -364,15 +369,16 @@ describe("InteractiveMode tray", () => {
 			],
 			key: "tools",
 		});
-		expect(children(scan)[1]!.p).toMatchObject({
-			spans: [{ t: "read", s: "dim" }, { t: " · ", s: "dim" }, { t: "Reading the config" }],
-		});
+		// The call's verb and file name, no intent; nothing changed yet.
+		expect(children(children(scan)[1]).map(node => [role(node), node.p?.spans])).toEqual([
+			["omp.tray.call", [{ t: "Read", s: "strong" }, { t: " app.toml" }]],
+		]);
 		expect(children(children(scan)[2]).map(node => node.p?.text)).toEqual(["claude-sonnet-4-5 · low", "22%"]);
 		// The status row carries only the caption: no counts.
 		expect(children(described[activity]).map(role)).toEqual(["omp.tray.caption"]);
 
 		expect(review!.p).toMatchObject({ status: "done", tone: "success" });
-		expect(children(review)[1]!.p).toMatchObject({ spans: [{ t: "Cross-check regressions" }] });
+		expect(children(children(review)[1])[0]!.p).toMatchObject({ spans: [{ t: "Cross-check regressions" }] });
 
 		expect(done!.p).toMatchObject({ status: "done" });
 		expect(JSON.stringify(children(done)[1]!.p)).toContain("TrayOld");
@@ -730,7 +736,7 @@ describe("InteractiveMode tray", () => {
 			kind: "sub",
 			parentId: "Main",
 			session: null,
-			sessionFile: "/tmp/TrayOld.jsonl",
+			sessionFile: transcript("TrayOld"),
 			status: "parked",
 			createdAt: 1_000,
 		});
@@ -740,7 +746,7 @@ describe("InteractiveMode tray", () => {
 			kind: "sub",
 			parentId: "Main",
 			session: null,
-			sessionFile: "/tmp/TrayScan.jsonl",
+			sessionFile: transcript("TrayScan"),
 			status: "aborted",
 			createdAt: 2_000,
 		});
@@ -790,6 +796,31 @@ describe("InteractiveMode tray", () => {
 				["done", "done"],
 			],
 		});
+	});
+
+	it("leaves out the agents of a session resumed earlier, which the process-global registry keeps", async () => {
+		const registry = AgentRegistry.global();
+		// Restored from the transcripts of the session `/resume` left.
+		registry.register({
+			id: "TrayOld",
+			displayName: "m2",
+			kind: "sub",
+			parentId: "Main",
+			session: null,
+			sessionFile: path.join(tempDir.path(), "earlier-session", "TrayOld.jsonl"),
+			status: "parked",
+		});
+		registry.register({
+			id: "TrayScan",
+			displayName: "m2",
+			kind: "sub",
+			parentId: "Main",
+			session: null,
+			sessionFile: transcript("TrayScan"),
+			status: "parked",
+		});
+		await traySynced();
+		expect(children(trayOf()).map(card => card.p?.ref)).toEqual(["TrayScan"]);
 	});
 
 	it("keeps the status row as the tray's seat while it has cards, one row from working to idle and back", async () => {
