@@ -54,6 +54,7 @@
 - The bash tool's visualization keeps a one-line awk, jq, regex or other embedded program highlighted where it appears in the command; only multi-line programs move below it behind a `⟦awk ↓⟧`-style chip.
 
 ### Fixed
+- Custom non-interrupt cancellation labels remain visible, and cancellations carrying a terminal HTTP client error are no longer retried as reasonless aborts ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 - Images reach each request as the receiving model needs them: after switching to a text-only model, queued and earlier images are described by the vision model (once per image, reused across turns and resumes); after switching to a vision model, they are sent as images again with no stale description. Compaction and branch summaries and advisor reviews carry the descriptions whenever their model or the session's cannot see images, and a failed description is retried instead of sticking ([#20369](https://github.com/can1357/oh-my-pi/pull/20369) by [@taibenvenuti](https://github.com/taibenvenuti))
 - Edit cards in hashline, sloppy and magic modes name their target file again instead of `…`: while a call streams, and in the Agent Hub transcript of a subagent
 - In Tern, viewing a subagent shows the composer's `Viewing` header again, so the tray marks that agent's card (amber, with an eye) and its MAIN bar leads back to the main session

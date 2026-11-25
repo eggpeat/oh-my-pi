@@ -17,14 +17,31 @@ export class AbortError extends Error {
 	}
 }
 
+const DEFAULT_ABORT_ERROR_MESSAGES: ReadonlySet<string> = new Set([
+	"Aborted",
+	"Request was aborted",
+	"Request was aborted.",
+	"The operation was aborted",
+	"The operation was aborted.",
+	"This operation was aborted",
+	"This operation was aborted.",
+]);
+
 /**
- * The text a caller gave `AbortController.abort(reason)`, a string or an `Error` other than an abort, such as the coding
- * agent's user-interrupt label; `undefined` for a bare `abort()`, whose reason is the default `AbortError`.
+ * The text a caller gave `AbortController.abort(reason)`. Strings, custom
+ * `Error`/`DOMException` messages, and tool-scoped abort objects are preserved;
+ * `undefined` means a bare `abort()` or a runtime's default `AbortError`.
  */
 export function callerAbortReason(signal: AbortSignal | undefined): string | undefined {
 	const reason = signal?.reason;
 	if (typeof reason === "string" && reason.trim().length > 0) return reason;
-	if (reason instanceof Error && reason.name !== "AbortError" && reason.message.trim().length > 0)
-		return reason.message;
+	if (reason instanceof Error && reason.message.trim().length > 0) {
+		const isDefaultAbort = reason.name === "AbortError" && DEFAULT_ABORT_ERROR_MESSAGES.has(reason.message);
+		if (!isDefaultAbort) return reason.message;
+	}
+	if (reason !== null && typeof reason === "object" && Reflect.get(reason, "kind") === "tool-scoped-abort") {
+		const message = Reflect.get(reason, "message");
+		if (typeof message === "string" && message.trim().length > 0) return message;
+	}
 	return undefined;
 }
