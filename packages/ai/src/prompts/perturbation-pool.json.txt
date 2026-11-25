@@ -33035,6 +33035,24 @@
 				"The terminal `data` MUST be the full object that matches the output schema",
 				"The terminal `data` MUST be the whole object matching the output schema"
 			]
+		},
+		{
+			"source": "The user intentionally cleared the todo list. Do NOT recreate or re-populate it unless the user explicitly asks; continue the current request without a todo list.",
+			"origin": "system/todo-user-edit.md",
+			"variants": [
+				"The user deliberately cleared the todo list. Do NOT recreate or re-populate it unless the user explicitly asks; continue the current request without a todo list.",
+				"The user intentionally emptied the todo list. Do NOT recreate or re-populate it unless the user explicitly asks; continue the current request without a todo list.",
+				"The user intentionally cleared the todo list. Do NOT rebuild or re-populate it unless the user explicitly asks; continue the current request without a todo list."
+			]
+		},
+		{
+			"source": "The user intentionally removed the entries no longer shown below. Do NOT re-add them unless the user explicitly asks.",
+			"origin": "system/todo-user-edit.md",
+			"variants": [
+				"The user deliberately removed the entries no longer shown below. Do NOT re-add them unless the user explicitly asks.",
+				"The user intentionally deleted the entries no longer shown below. Do NOT re-add them unless the user explicitly asks.",
+				"The user intentionally removed the entries no longer listed below. Do NOT re-add them unless the user explicitly asks."
+			]
 		}
 	]
 }

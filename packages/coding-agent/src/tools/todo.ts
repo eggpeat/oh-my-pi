@@ -77,9 +77,13 @@ type TodoOpEntryValue = TodoParams;
 // State helpers
 // =============================================================================
 
-function findTaskByContent(phases: TodoPhase[], content: string): { task: TodoItem; phase: TodoPhase } | undefined {
+function findTaskByContent(
+	phases: TodoPhase[],
+	content: string,
+	claimed?: ReadonlySet<TodoItem>,
+): { task: TodoItem; phase: TodoPhase } | undefined {
 	for (const phase of phases) {
-		const task = phase.tasks.find(t => t.content === content);
+		const task = phase.tasks.find(t => t.content === content && !claimed?.has(t));
 		if (task) return { task, phase };
 	}
 	return undefined;
@@ -265,12 +269,13 @@ function resolveTaskOrError(
 	phases: TodoPhase[],
 	content: string | undefined,
 	errors: string[],
+	claimed?: ReadonlySet<TodoItem>,
 ): { task: TodoItem; phase: TodoPhase } | undefined {
 	if (!content) {
 		errors.push("Missing task content");
 		return undefined;
 	}
-	const hit = findTaskByContent(phases, content);
+	const hit = findTaskByContent(phases, content, claimed);
 	if (!hit) {
 		if (/^task-\d+$/.test(content)) {
 			errors.push(
@@ -285,16 +290,24 @@ function resolveTaskOrError(
 	return hit;
 }
 
-/** Resolve every targeted task, recording one error per missing content. */
+/**
+ * Resolve every targeted task, recording one error per missing content. A content
+ * repeated N times claims N distinct tasks, so a list carrying duplicate names
+ * updates every copy rather than the first one N times.
+ */
 function resolveTasksOrError(
 	phases: TodoPhase[],
 	contents: string[],
 	errors: string[],
 ): { task: TodoItem; phase: TodoPhase }[] {
 	const hits: { task: TodoItem; phase: TodoPhase }[] = [];
+	const claimed = new Set<TodoItem>();
 	for (const content of contents) {
-		const hit = resolveTaskOrError(phases, content, errors);
-		if (hit) hits.push(hit);
+		const hit = resolveTaskOrError(phases, content, errors, claimed);
+		if (hit) {
+			claimed.add(hit.task);
+			hits.push(hit);
+		}
 	}
 	return hits;
 }
