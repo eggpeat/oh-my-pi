@@ -83,6 +83,78 @@ describe("commitCreate message isolation", () => {
 		expect(await Bun.file(shared).text()).toBe("stolen subject\n\nstolen body\n");
 	});
 
+	test("serializes the shared COMMIT_EDITMSG through the commit-msg hook", async () => {
+		const root = await repository();
+		const gitDir = path.join(root, ".git");
+		// Legacy hooks ignore $1 and read the documented COMMIT_EDITMSG path. The
+		// hook parks after recording which call it is (its private file's name);
+		// only once released does it record the shared file it actually saw.
+		await installHook(
+			root,
+			[
+				"#!/bin/bash",
+				'name=$(basename "$1")',
+				'echo "$name" >> "$GIT_DIR/hook-ran"',
+				"end=$((SECONDS + 60))",
+				'while [ ! -f "$GIT_DIR/release-all" ] && [ $SECONDS -lt $end ]; do :; done',
+				'cat "$GIT_DIR/COMMIT_EDITMSG" > "$GIT_DIR/seen-$name"',
+				"",
+			].join("\n"),
+		);
+		const repo = vcsGitDiscover(root)!;
+
+		const hookRuns = async (): Promise<string[]> => {
+			try {
+				return (await Bun.file(path.join(gitDir, "hook-ran")).text()).split("\n").filter(line => line.length > 0);
+			} catch {
+				return [];
+			}
+		};
+		// Bounded by a clock deadline, not a loop count, so a slow runner has the
+		// full budget to spawn the next hook.
+		const waitForHookCount = async (count: number): Promise<string[]> => {
+			const deadline = Date.now() + 10_000;
+			let runs = await hookRuns();
+			while (runs.length < count && Date.now() < deadline) {
+				await Bun.sleep(25);
+				runs = await hookRuns();
+			}
+			return runs;
+		};
+
+		const first = repo.commitCreate("first subject\n\nfirst body\n", { allowEmpty: true });
+		// If an assertion below fails first, the commits settle after the repo is
+		// cleaned up; keep their rejections from leaking into other tests.
+		first.catch(() => {});
+		const runs1 = await waitForHookCount(1);
+		expect(runs1).toHaveLength(1);
+		// While the first hook is parked, a second call must not reach the shared
+		// file or its own hook: without serialization it does, and the first hook
+		// then validates the second call's message.
+		const second = repo.commitCreate("second subject\n\nsecond body\n", { allowEmpty: true });
+		second.catch(() => {});
+		const runs2 = await waitForHookCount(2);
+		try {
+			expect(runs2).toHaveLength(1);
+		} finally {
+			await Bun.write(path.join(gitDir, "release-all"), "");
+		}
+		const [firstResult, secondResult] = await Promise.allSettled([first, second]);
+		expect(firstResult.status).toBe("fulfilled");
+
+		const seenFirst = (await Bun.file(path.join(gitDir, `seen-${runs1[0]}`)).text()).trim();
+		expect(seenFirst).toBe("first subject\n\nfirst body");
+		// The second call may fail the ref update once the first commit lands;
+		// either way its hook must never observe the first call's message.
+		if (secondResult.status === "fulfilled") {
+			expect(secondResult.value).toBe(await git(root, "rev-parse", "HEAD"));
+			const seenSecond = (await Bun.file(path.join(gitDir, `seen-${runs2[0]}`)).text()).trim();
+			expect(seenSecond).toBe("second subject\n\nsecond body");
+		} else {
+			expect(secondResult.reason.message).toContain("HEAD moved");
+		}
+	}, 60_000);
+
 	test("leaves no message file behind when noVerify skips the hook", async () => {
 		const root = await repository();
 		const gitDir = path.join(root, ".git");
