@@ -15,7 +15,7 @@ import { cfgOffline } from "../../config/auxiliary-model-policy";
 import { ModelRegistry } from "../../config/model-registry";
 import { type RoleChainCandidate, resolveModelRoleValue, resolveRoleChain } from "../../config/model-resolver";
 import { roleCandidatePool } from "../../config/model-roles";
-import { settings, type Settings } from "../../config/settings";
+import { resolveSettings, type Settings } from "../../config/settings";
 import type { CustomTool, CustomToolContext } from "../../extensibility/custom-tools/types";
 import webSearchSystemPrompt from "../../prompts/system/web-search.md" with { type: "text" };
 import webSearchDescription from "../../prompts/tools/web-search.md" with { type: "text" };
@@ -269,8 +269,8 @@ async function executeSearch(
 	options: ExecuteSearchOptions,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchResultDetails }> {
 	const { authStorage, sessionId, signal } = options;
-	// The session's own settings (an ACP session's project, a subagent overlay) win over the process global.
-	const activeSettings = options.settings ?? settings;
+	// Caller settings win. Otherwise the process instance, or one stable default when it was never initialized.
+	const activeSettings = resolveSettings(options.settings);
 	const modelRegistry =
 		options.modelRegistry ?? new ModelRegistry(authStorage, undefined, { settings: activeSettings });
 	const pool = roleCandidatePool("web", activeSettings, modelRegistry);
@@ -374,8 +374,8 @@ async function executeSearch(
 			}
 			lastProvider = provider;
 			const available = candidate.explicit
-				? await provider.isExplicitlyAvailable(authStorage, model)
-				: await provider.isAvailable(authStorage, model);
+				? await provider.isExplicitlyAvailable(authStorage, model, activeSettings)
+				: await provider.isAvailable(authStorage, model, activeSettings);
 			if (!available && !candidate.explicit) continue;
 			if (!available && candidate.explicit) {
 				throw new SearchProviderError(
@@ -405,6 +405,7 @@ async function executeSearch(
 				explicit: candidate.explicit,
 				sessionId,
 				antigravityEndpointMode,
+				settings: activeSettings,
 			};
 			// An extension may own the request for its provider's models; availability stays the backend's.
 			const extensionSearch = modelRegistry.getProviderWebSearch(model.provider);
@@ -655,6 +656,7 @@ export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchResul
 			modelRegistry: ctx.modelRegistry,
 			sessionId,
 			sessionModel: ctx.model,
+			settings: ctx.settings,
 			signal,
 		});
 	},

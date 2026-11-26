@@ -6,9 +6,17 @@
  * Requests per-result summaries via `contents.summary` and synthesizes
  * them into a combined `answer` string on the SearchResponse.
  */
-import { type ApiKey, type AuthStorage, type FetchImpl, getEnvApiKey, withAuth } from "@oh-my-pi/pi-ai";
+import {
+	type Api,
+	type ApiKey,
+	type AuthStorage,
+	type FetchImpl,
+	type Model,
+	getEnvApiKey,
+	withAuth,
+} from "@oh-my-pi/pi-ai";
 import { $env, asRecord } from "@oh-my-pi/pi-utils";
-import { settings } from "../../../config/settings";
+import { resolveSettings, type Settings } from "../../../config/settings";
 import { normalizeMcpToolPayload } from "../../../exa/mcp-client";
 import { readMcpJsonRpcResponse } from "../../../mcp/json-rpc";
 import type { SearchResponse, SearchSource } from "../types";
@@ -25,18 +33,26 @@ const EXA_API_URL = "https://api.exa.ai/search";
 const EXA_MCP_URL = "https://mcp.exa.ai/mcp";
 const EXA_MCP_SOURCE = "oh-my-pi";
 const MAX_EXA_SNIPPET_CHARS = 500;
-const DEFAULT_EXA_SEARCH_DELAY_MS = cfgExaSearchDelayMs.default;
+interface ExaSearchThrottle {
+	nextAt: number;
+	tail: Promise<void>;
+}
 
-let nextExaSearchRequestAt = 0;
-let exaSearchThrottle = Promise.resolve();
+let exaSearchThrottles = new WeakMap<Settings, ExaSearchThrottle>();
 
-function configuredExaSearchDelayMs(): number {
-	try {
-		const delayMs = cfgExaSearchDelayMs.get(settings);
-		return Number.isFinite(delayMs) && delayMs > 0 ? Math.floor(delayMs) : 0;
-	} catch {
-		return DEFAULT_EXA_SEARCH_DELAY_MS;
+function exaSearchThrottle(scope: Settings): ExaSearchThrottle {
+	let throttle = exaSearchThrottles.get(scope);
+	if (!throttle) {
+		throttle = { nextAt: 0, tail: Promise.resolve() };
+		exaSearchThrottles.set(scope, throttle);
 	}
+	return throttle;
+}
+
+function configuredExaSearchDelayMs(scope: Settings): number {
+	const delayMs = cfgExaSearchDelayMs.get(scope);
+	if (!Number.isFinite(delayMs) || delayMs <= 0) return 0;
+	return Math.floor(delayMs);
 }
 
 function rejectWithAbortReason(reject: (reason?: unknown) => void, signal: AbortSignal): void {
@@ -84,28 +100,26 @@ function waitUntilDoneOrAborted<T>(promise: Promise<T>, signal: AbortSignal | un
 	});
 }
 
-async function waitForExaSearchSlot(signal: AbortSignal | undefined): Promise<void> {
-	const delayMs = configuredExaSearchDelayMs();
+async function waitForExaSearchSlot(scope: Settings, signal: AbortSignal | undefined): Promise<void> {
+	const delayMs = configuredExaSearchDelayMs(scope);
 	if (delayMs <= 0) return;
 
-	const prior = exaSearchThrottle.catch(() => {});
+	const throttle = exaSearchThrottle(scope);
+	const prior = throttle.tail.catch(() => {});
 	const queued = prior.then(async () => {
 		signal?.throwIfAborted();
-		const waitMs = Math.max(0, nextExaSearchRequestAt - Date.now());
-		if (waitMs > 0) {
-			await abortableSleep(waitMs, signal);
-		}
+		const waitMs = Math.max(0, throttle.nextAt - Date.now());
+		if (waitMs > 0) await abortableSleep(waitMs, signal);
 		signal?.throwIfAborted();
-		nextExaSearchRequestAt = Date.now() + delayMs;
+		throttle.nextAt = Date.now() + delayMs;
 	});
-	exaSearchThrottle = queued.catch(() => {});
+	throttle.tail = queued.catch(() => {});
 	await waitUntilDoneOrAborted(queued, signal);
 }
 
 /** Reset Exa request pacing state for isolated provider tests. */
 export function resetExaSearchThrottleForTest(): void {
-	nextExaSearchRequestAt = 0;
-	exaSearchThrottle = Promise.resolve();
+	exaSearchThrottles = new WeakMap();
 }
 
 type ExaSearchType = "neural" | "fast" | "auto" | "deep";
@@ -129,6 +143,7 @@ export interface ExaSearchParams {
 	 */
 	authStorage?: AuthStorage;
 	sessionId?: string;
+	settings?: Settings;
 }
 
 interface ExaSearchResult {
@@ -276,7 +291,7 @@ async function callExaSearch(apiKey: string, params: ExaSearchParams): Promise<E
 	const body = buildExaRequestBody(params);
 
 	const fetchImpl = params.fetch ?? fetch;
-	await waitForExaSearchSlot(params.signal);
+	await waitForExaSearchSlot(resolveSettings(params.settings), params.signal);
 	const response = await fetchImpl(EXA_API_URL, {
 		method: "POST",
 		headers: {
@@ -320,7 +335,7 @@ async function callExaMcpSearch(params: ExaSearchParams): Promise<ExaSearchRespo
 	if (apiKey) query.set("exaApiKey", apiKey);
 	query.set("tools", "web_search_exa");
 	const fetchImpl = params.fetch ?? fetch;
-	await waitForExaSearchSlot(params.signal);
+	await waitForExaSearchSlot(resolveSettings(params.settings), params.signal);
 	const requestId = Math.random().toString(36).slice(2);
 	const signal = withHardTimeout(params.signal, params.timeoutMs);
 	const response = await fetchImpl(`${EXA_MCP_URL}?${query.toString()}`, {
@@ -455,15 +470,8 @@ export class ExaProvider extends SearchProvider {
 	 * Available unless disabled in settings: without a credential, search runs
 	 * through Exa's unauthenticated public MCP.
 	 */
-	isAvailable(_authStorage: AuthStorage): boolean {
-		try {
-			if (cfgExaEnabled.get(settings) === false) {
-				return false;
-			}
-		} catch {
-			// Settings may be unavailable before CLI initialization; assume not disabled.
-		}
-		return true;
+	isAvailable(_authStorage: AuthStorage, _model?: Model<Api>, activeSettings?: Settings): boolean {
+		return cfgExaEnabled.get(resolveSettings(activeSettings)) !== false;
 	}
 
 	override isKeyless(authStorage: AuthStorage): boolean {
@@ -480,6 +488,7 @@ export class ExaProvider extends SearchProvider {
 			authStorage: params.authStorage,
 			sessionId: params.sessionId,
 			fetch: params.fetch,
+			settings: params.settings,
 		});
 	}
 }

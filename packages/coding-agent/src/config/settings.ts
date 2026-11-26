@@ -1202,11 +1202,95 @@ export class Settings {
 	getProvenance(setting: AnySetting): SettingProvenance {
 		if (!this.isConfigured(setting)) return "default";
 		const segments = setting.segments;
-		if (getByPath(this.#overrides, segments) !== undefined) return "runtime";
-		if (getByPath(this.#configOverlay, segments) !== undefined) return "overlay";
-		if (getByPath(projectLayerForMerge(this.#project), segments) !== undefined) return "project";
-		if (getByPath(this.#global, segments) !== undefined) return "global";
+		if (getByPath(this.#rawLayer("runtime"), segments) !== undefined) return "runtime";
+		if (getByPath(this.#rawLayer("overlay"), segments) !== undefined) return "overlay";
+		if (getByPath(this.#rawLayer("project"), segments) !== undefined) return "project";
+		if (getByPath(this.#rawLayer("global"), segments) !== undefined) return "global";
 		return this.#parent?.getProvenance(setting) ?? "default";
+	}
+
+	/** Own storage for one layer. Project matches the view {@link getProvenance} consults. */
+	#rawLayer(layer: "runtime" | "overlay" | "project" | "global"): RawSettings {
+		switch (layer) {
+			case "runtime":
+				return this.#overrides;
+			case "overlay":
+				return this.#configOverlay;
+			case "project":
+				return projectLayerForMerge(this.#project);
+			case "global":
+				return this.#global;
+		}
+	}
+
+	/** This instance's layers from `layer` downward. Higher layers and the parent are left out. */
+	#cappedOwnLayers(layer: "runtime" | "overlay" | "project" | "global"): OwnLayers {
+		const layers = this.#ownLayers();
+		return {
+			global: layers.global,
+			project: layer === "global" ? {} : layers.project,
+			configOverlay: layer === "global" || layer === "project" ? {} : layers.configOverlay,
+			overrides: layer === "runtime" ? layers.overrides : {},
+		};
+	}
+
+	/** Layers at or below `layer`, over an overlay parent's view capped the same way. */
+	#mergedAt(layer: "runtime" | "overlay" | "project" | "global"): RawSettings {
+		const own = this.#mergeOwnLayers(this.#cappedOwnLayers(layer));
+		return this.#parent ? this.#deepMerge(this.#parent.#mergedAt(layer), own) : own;
+	}
+
+	/**
+	 * Value of `setting` with every source above `layer` ignored. Remaining layers merge in
+	 * {@link getProvenance} order. `null` is unset. Callers bind a credential to the address
+	 * named at the credential's own provenance instead of an address a higher layer substituted.
+	 */
+	valueAt(setting: AnySetting, layer: "runtime" | "overlay" | "project" | "global"): unknown {
+		return configuredValue(this.#mergedAt(layer), setting, this.#cwd);
+	}
+
+	/**
+	 * Value from the lowest source that sets `setting`. A child's own layers are its override, so a
+	 * parent value wins; otherwise global, then project, then `--config`, then runtime. A blank
+	 * string counts as unset.
+	 */
+	baselineValue(setting: AnySetting): unknown {
+		const present = (value: unknown): boolean =>
+			value !== undefined && value !== null && !(typeof value === "string" && value.trim() === "");
+		if (this.#parent) {
+			const inherited = this.#parent.baselineValue(setting);
+			if (present(inherited)) return inherited;
+		}
+		for (const layer of ["global", "project", "overlay", "runtime"] as const) {
+			const value = configuredValue(this.#mergeOwnLayers(this.#cappedOwnLayers(layer)), setting, this.#cwd);
+			if (present(value)) return value;
+		}
+		return undefined;
+	}
+
+	/**
+	 * Value of `setting` on the instance that stores `source`, capped at `source`'s layer.
+	 * A child that only inherited `source` asks the parent, so the child's own copy of that
+	 * layer cannot point an inherited login at a different server.
+	 */
+	valueAtSource(source: AnySetting, setting: AnySetting): unknown {
+		const layer = source.provenance(this);
+		if (layer === "env" || layer === "default") return undefined;
+		return this.#valueAtSource(source, setting, layer);
+	}
+
+	#ownsLayer(setting: AnySetting, layer: "runtime" | "overlay" | "project" | "global"): boolean {
+		return getByPath(this.#rawLayer(layer), setting.segments) !== undefined;
+	}
+
+	#valueAtSource(
+		source: AnySetting,
+		setting: AnySetting,
+		layer: "runtime" | "overlay" | "project" | "global",
+	): unknown {
+		if (this.#ownsLayer(source, layer)) return this.valueAt(setting, layer);
+		if (this.#parent) return this.#parent.#valueAtSource(source, setting, layer);
+		return this.valueAt(setting, layer);
 	}
 
 	/**
@@ -4510,6 +4594,20 @@ export function isSettingsInitialized(): boolean {
 	return globalInstance !== null;
 }
 
+/** In-memory default reused when a caller omits settings and the process never called {@link Settings.init}. */
+let unresolvedSettings: Settings | undefined;
+
+/**
+ * Settings the caller passed, otherwise the process instance, otherwise one stable in-memory default.
+ * A fresh {@link Settings.isolated} per call would not share pacing, and reading the global proxy
+ * before init throws.
+ */
+export function resolveSettings(supplied?: Settings): Settings {
+	if (supplied) return supplied;
+	if (globalInstance) return globalInstance;
+	return (unresolvedSettings ??= Settings.isolated());
+}
+
 /**
  * Resolve the settings visible to a legacy Pi `SettingsManager.create()` call.
  *
@@ -4554,6 +4652,7 @@ export function resetSettingsForTest(): void {
 	}
 	liveSettingsInstances.clear();
 	globalInstance = null;
+	unresolvedSettings = undefined;
 	globalInstancePromise = null;
 	releaseGlobalMirrorEffects = undefined;
 	clearBoundSettingsMethods();
