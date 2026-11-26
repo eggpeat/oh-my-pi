@@ -249,9 +249,7 @@ describe("ACP/RPC /todo mutations", () => {
 		const result = await executeAcpBuiltinSlashCommand("/todo start Ship\\ it", harness.runtime);
 
 		expect(result).toEqual({ consumed: true });
-		expect(harness.phases()).toEqual([
-			{ name: "Todos", tasks: [{ content: "Ship it", status: "in_progress" }] },
-		]);
+		expect(harness.phases()).toEqual([{ name: "Todos", tasks: [{ content: "Ship it", status: "in_progress" }] }]);
 	});
 
 	it("removes the task whose quoted name carries verbatim backslashes before escape decoding", async () => {
@@ -269,9 +267,7 @@ describe("ACP/RPC /todo mutations", () => {
 		const result = await executeAcpBuiltinSlashCommand(`/todo rm "${literalPath}"`, harness.runtime);
 
 		expect(result).toEqual({ consumed: true });
-		expect(harness.phases()).toEqual([
-			{ name: "Files", tasks: [{ content: "C:worktodo", status: "in_progress" }] },
-		]);
+		expect(harness.phases()).toEqual([{ name: "Files", tasks: [{ content: "C:worktodo", status: "in_progress" }] }]);
 	});
 
 	it("prefers the exact spelling typed before a case-insensitive match for tasks and phases", async () => {
@@ -287,9 +283,7 @@ describe("ACP/RPC /todo mutations", () => {
 
 		const taskResult = await executeAcpBuiltinSlashCommand('/todo rm "Readme"', taskHarness.runtime);
 		expect(taskResult).toEqual({ consumed: true });
-		expect(taskHarness.phases()).toEqual([
-			{ name: "Docs", tasks: [{ content: "README", status: "in_progress" }] },
-		]);
+		expect(taskHarness.phases()).toEqual([{ name: "Docs", tasks: [{ content: "README", status: "in_progress" }] }]);
 
 		const phaseHarness = createRuntime([
 			{ name: "DOCS", tasks: [{ content: "Upper", status: "pending" }] },

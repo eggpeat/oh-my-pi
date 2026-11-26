@@ -82,11 +82,15 @@ function findTaskByContent(
 	content: string,
 	claimed?: ReadonlySet<TodoItem>,
 ): { task: TodoItem; phase: TodoPhase } | undefined {
+	let fallback: { task: TodoItem; phase: TodoPhase } | undefined;
 	for (const phase of phases) {
-		const task = phase.tasks.find(t => t.content === content && !claimed?.has(t));
-		if (task) return { task, phase };
+		for (const task of phase.tasks) {
+			if (task.content !== content) continue;
+			if (!claimed?.has(task)) return { task, phase };
+			fallback ??= { task, phase };
+		}
 	}
-	return undefined;
+	return fallback;
 }
 
 function findPhaseByName(phases: TodoPhase[], name: string): TodoPhase | undefined {
@@ -291,9 +295,9 @@ function resolveTaskOrError(
 }
 
 /**
- * Resolve every targeted task, recording one error per missing content. A content
- * repeated N times claims N distinct tasks, so a list carrying duplicate names
- * updates every copy rather than the first one N times.
+ * Resolve every targeted task, recording one error per missing content. Repeated
+ * contents claim distinct tasks first so duplicate names update every copy, then
+ * fall back to an already-claimed match when the caller repeats a single task.
  */
 function resolveTasksOrError(
 	phases: TodoPhase[],

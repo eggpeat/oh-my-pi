@@ -6,16 +6,13 @@ import {
 	resolveTodoMarkdownPath,
 } from "../../tools/todo";
 import type { TodoPhase } from "../../tools/details/todo";
-import {
-	findPhaseFuzzy,
-	titleCaseSentence,
-	titleCaseWords,
-	tokenize,
-} from "../../slash-commands/helpers/todo";
+import { titleCaseSentence, titleCaseWords } from "../../slash-commands/helpers/todo";
 import {
 	applyTodoMutation,
 	applyTodoStart,
 	commitTodoUserEdit,
+	findPhaseFuzzy,
+	tokenize,
 	type TodoCommandOutcome,
 	type TodoUserEditHost,
 } from "../../tools/todo-command";
@@ -285,8 +282,8 @@ export class TodoCommandController {
 		};
 	}
 
-	#commit(nextPhases: TodoPhase[], action: string, opts?: { removed?: boolean }): void {
+	#commit(nextPhases: TodoPhase[], action: string): void {
 		// Commit first so HUD visibility binds to the new canonical source.
-		commitTodoUserEdit(this.#editHost(), nextPhases, action, opts?.removed ?? false);
+		commitTodoUserEdit(this.#editHost(), nextPhases, action);
 	}
 }

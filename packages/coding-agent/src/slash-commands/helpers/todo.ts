@@ -1,5 +1,5 @@
 import { errorMessage } from "@oh-my-pi/pi-utils";
-import type { TodoItem, TodoPhase } from "../../tools/details/todo";
+import type { TodoPhase } from "../../tools/details/todo";
 import {
 	getLatestTodoPhasesFromEntries,
 	markdownToPhases,
@@ -10,44 +10,14 @@ import {
 	applyTodoMutation,
 	applyTodoStart,
 	commitTodoUserEdit,
+	findPhaseFuzzy,
+	tokenize,
 	type TodoCommandOutcome,
 	type TodoMutationVerb,
 	type TodoUserEditHost,
 } from "../../tools/todo-command";
 import type { ParsedSlashCommand, SlashCommandResult, SlashCommandRuntime } from "../types";
 import { commandConsumed, parseSubcommand, usage } from "./parse";
-
-interface TodoTaskMatch {
-	task: TodoItem;
-	phase: TodoPhase;
-}
-
-export function tokenize(input: string): string[] {
-	const tokens: string[] = [];
-	let current = "";
-	let inQuote = false;
-	for (let index = 0; index < input.length; index++) {
-		const ch = input[index];
-		if (ch === "\\" && index + 1 < input.length) {
-			current += input[++index];
-			continue;
-		}
-		if (ch === '"') {
-			inQuote = !inQuote;
-			continue;
-		}
-		if (!inQuote && /\s/.test(ch)) {
-			if (current) {
-				tokens.push(current);
-				current = "";
-			}
-			continue;
-		}
-		current += ch;
-	}
-	if (current) tokens.push(current);
-	return tokens;
-}
 
 export function titleCaseWords(text: string): string {
 	return text
@@ -64,38 +34,6 @@ export function titleCaseSentence(text: string): string {
 	return trimmed[0].toUpperCase() + trimmed.slice(1);
 }
 
-export function findPhaseFuzzy(phases: TodoPhase[], query: string): TodoPhase | undefined {
-	const normalizedQuery = query.trim().toLowerCase();
-	if (!normalizedQuery) return undefined;
-	const exact = phases.find(phase => phase.name.toLowerCase() === normalizedQuery);
-	if (exact) return exact;
-	const prefixMatches = phases.filter(phase => phase.name.toLowerCase().startsWith(normalizedQuery));
-	if (prefixMatches.length === 1) return prefixMatches[0];
-	const substringMatches = phases.filter(phase => phase.name.toLowerCase().includes(normalizedQuery));
-	if (substringMatches.length === 1) return substringMatches[0];
-	return undefined;
-}
-
-export function findTaskFuzzy(phases: TodoPhase[], query: string): TodoTaskMatch | undefined {
-	const normalizedQuery = query.trim().toLowerCase();
-	if (!normalizedQuery) return undefined;
-	for (const phase of phases) {
-		for (const task of phase.tasks) {
-			if (task.content.toLowerCase() === normalizedQuery) return { task, phase };
-		}
-	}
-	const matches: TodoTaskMatch[] = [];
-	for (const phase of phases) {
-		for (const task of phase.tasks) {
-			if (task.content.toLowerCase().includes(normalizedQuery)) matches.push({ task, phase });
-		}
-	}
-	if (matches.length === 1) return matches[0];
-	const active = matches.filter(match => match.task.status === "in_progress" || match.task.status === "pending");
-	if (active.length === 1) return active[0];
-	return undefined;
-}
-
 function todoEditHost(runtime: SlashCommandRuntime): TodoUserEditHost {
 	return {
 		commitTodoPhases: phases => runtime.session.commitTodoPhases(phases),
@@ -106,8 +44,8 @@ function todoEditHost(runtime: SlashCommandRuntime): TodoUserEditHost {
 	};
 }
 
-function commitTodos(runtime: SlashCommandRuntime, phases: TodoPhase[], action: string, removed = false): void {
-	commitTodoUserEdit(todoEditHost(runtime), phases, action, removed);
+function commitTodos(runtime: SlashCommandRuntime, phases: TodoPhase[], action: string): void {
+	commitTodoUserEdit(todoEditHost(runtime), phases, action);
 }
 
 async function presentTodoOutcome(

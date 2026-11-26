@@ -113,6 +113,10 @@ function partialPhase(phases: readonly TodoPhase[], query: string): TodoPhase | 
 	return undefined;
 }
 
+export function findPhaseFuzzy(phases: readonly TodoPhase[], query: string): TodoPhase | undefined {
+	return exactPhase(phases, query) ?? exactPhase(phases, query, true) ?? partialPhase(phases, query);
+}
+
 function partialTaskAcross(phases: readonly TodoPhase[], forms: readonly string[]): TodoTaskHit | undefined {
 	for (const form of [...forms.slice(1), forms[0]]) {
 		if (!form) continue;
