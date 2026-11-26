@@ -16,13 +16,13 @@ import {
 	withAuth,
 } from "@oh-my-pi/pi-ai";
 import { $env, asRecord } from "@oh-my-pi/pi-utils";
-import type { Settings } from "../../../config/settings";
+import { resolveSettings, type Settings } from "../../../config/settings";
 import { normalizeMcpToolPayload } from "../../../exa/mcp-client";
 import { readMcpJsonRpcResponse } from "../../../mcp/json-rpc";
 import type { SearchResponse, SearchSource } from "../types";
 import { SearchProviderError } from "../../../web/search/types";
 import { formatQuery, parseSearchQuery, type StructuredQuery } from "../query";
-import { dateToAgeSeconds, searchSettings } from "../utils";
+import { dateToAgeSeconds } from "../utils";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
@@ -396,7 +396,7 @@ async function callExaMcpSearch(params: ExaSearchParams, settings: Settings): Pr
 
 /** Execute Exa web search */
 export async function searchExa(params: ExaSearchParams): Promise<SearchResponse> {
-	const activeSettings = searchSettings(params.settings);
+	const activeSettings = resolveSettings(params.settings);
 	// AuthStorage-backed key takes precedence (existing behavior); probe it once
 	// so the env-key and keyless-MCP fallbacks below stay intact, then drive the
 	// authStorage path through the central force-refresh/rotate retry policy.
@@ -462,7 +462,7 @@ export class ExaProvider extends SearchProvider {
 	 * through Exa's unauthenticated public MCP.
 	 */
 	isAvailable(_authStorage: AuthStorage, _model?: Model<Api>, settings?: Settings): boolean {
-		return cfgExaEnabled.get(searchSettings(settings)) !== false;
+		return cfgExaEnabled.get(resolveSettings(settings)) !== false;
 	}
 
 	override isKeyless(authStorage: AuthStorage): boolean {

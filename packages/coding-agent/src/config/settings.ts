@@ -4577,6 +4577,15 @@ export function isSettingsInitialized(): boolean {
 }
 
 /**
+ * The settings a caller should read: the supplied instance when there is one,
+ * otherwise the initialized global singleton, otherwise isolated defaults, so a
+ * one-shot caller that never called `Settings.init()` still gets a usable instance.
+ */
+export function resolveSettings(instance?: Settings): Settings {
+	return instance ?? globalInstance ?? Settings.isolated();
+}
+
+/**
  * Resolve the settings visible to a legacy Pi `SettingsManager.create()` call.
  *
  * An active extension session is authoritative because `cwd`/`agentDir` cannot

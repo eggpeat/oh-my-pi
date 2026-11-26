@@ -36,12 +36,12 @@
 import type { Api, AuthStorage, FetchImpl, Model } from "@oh-my-pi/pi-ai";
 
 import type { Setting } from "../../../config/registry";
-import type { Settings } from "../../../config/settings";
+import { resolveSettings, type Settings } from "../../../config/settings";
 import type { SearchResponse, SearchSource } from "../types";
 import { SearchProviderError } from "../../../web/search/types";
 import type { StructuredQuery } from "../query";
 import { formatScraperQuery, parseSearchQuery } from "../query";
-import { clampNumResults, dateToAgeSeconds, searchSettings } from "../utils";
+import { clampNumResults, dateToAgeSeconds } from "../utils";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
@@ -392,7 +392,7 @@ export async function searchSearXNG(params: {
 	settings?: Settings;
 }): Promise<SearchResponse> {
 	const numResults = clampNumResults(params.num_results, DEFAULT_NUM_RESULTS, MAX_NUM_RESULTS);
-	const activeSettings = searchSettings(params.settings);
+	const activeSettings = resolveSettings(params.settings);
 
 	const endpoint = findSetting(cfgSearxngEndpoint, activeSettings);
 	if (!endpoint) {
@@ -485,7 +485,7 @@ export class SearXNGProvider extends SearchProvider {
 	readonly label = "SearXNG";
 
 	isAvailable(_authStorage: AuthStorage, _model?: Model<Api>, settings?: Settings): boolean {
-		return !!findSetting(cfgSearxngEndpoint, searchSettings(settings));
+		return !!findSetting(cfgSearxngEndpoint, resolveSettings(settings));
 	}
 
 	search(params: SearchParams): Promise<SearchResponse> {

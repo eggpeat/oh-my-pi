@@ -15,7 +15,7 @@ import { cfgOffline } from "../../config/auxiliary-model-policy";
 import { ModelRegistry } from "../../config/model-registry";
 import { type RoleChainCandidate, resolveModelRoleValue, resolveRoleChain } from "../../config/model-resolver";
 import { roleCandidatePool } from "../../config/model-roles";
-import { isSettingsInitialized, Settings, settings } from "../../config/settings";
+import { resolveSettings, type Settings } from "../../config/settings";
 import type { CustomTool, CustomToolContext } from "../../extensibility/custom-tools/types";
 import webSearchSystemPrompt from "../../prompts/system/web-search.md" with { type: "text" };
 import webSearchDescription from "../../prompts/tools/web-search.md" with { type: "text" };
@@ -271,7 +271,7 @@ async function executeSearch(
 	const { authStorage, sessionId, signal } = options;
 	// The session's own settings (an ACP session's project, a subagent overlay) win over the process global;
 	// a one-shot caller that never called Settings.init() reads isolated defaults instead of throwing.
-	const activeSettings = options.settings ?? (isSettingsInitialized() ? settings : Settings.isolated());
+	const activeSettings = resolveSettings(options.settings);
 	const modelRegistry =
 		options.modelRegistry ?? new ModelRegistry(authStorage, undefined, { settings: activeSettings });
 	const pool = roleCandidatePool("web", activeSettings, modelRegistry);
