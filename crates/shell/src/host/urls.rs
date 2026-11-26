@@ -108,178 +108,6 @@ pub(super) fn names_url(spec: &SpawnSpec<'_>) -> bool {
 			&& !runs_omp(spec.path.as_bytes(), spec.argv))
 }
 
-#[derive(Clone, Copy)]
-enum Assignments {
-	None,
-	/// Leading `NAME=value` / `NAME+=value` assignments (`sudo`, `doas`,
-	/// `time`).
-	Shell,
-	/// Optional lone `-` followed by any `*=*` setting (`env`).
-	Env,
-}
-
-struct Wrapper {
-	names:       &'static [&'static str],
-	short_vals:  &'static [u8],
-	long_vals:   &'static [&'static str],
-	stop_shorts: &'static [u8],
-	stop_longs:  &'static [&'static str],
-	assignments: Assignments,
-	/// Positional operands consumed before the wrapped command (e.g. `timeout`'s
-	/// duration).
-	skip_args:   usize,
-}
-
-/// Wrappers that exec a target command, paired with the options that consume a
-/// following word.
-const WRAPPERS: &[Wrapper] = &[
-	Wrapper {
-		names:       &["env"],
-		short_vals:  b"uCSaP",
-		long_vals:   &["--unset", "--chdir", "--split-string", "--argv0", "--env0-from"],
-		stop_shorts: b"",
-		stop_longs:  &[],
-		assignments: Assignments::Env,
-		skip_args:   0,
-	},
-	Wrapper {
-		names:       &["sudo", "doas"],
-		short_vals:  b"ugCDhpRrTtUac",
-		long_vals:   &[
-			"--user",
-			"--group",
-			"--close-from",
-			"--chdir",
-			"--host",
-			"--prompt",
-			"--chroot",
-			"--role",
-			"--command-timeout",
-			"--type",
-			"--other-user",
-		],
-		stop_shorts: b"",
-		stop_longs:  &[],
-		assignments: Assignments::Shell,
-		skip_args:   0,
-	},
-	Wrapper {
-		names:       &["nice"],
-		short_vals:  b"n",
-		long_vals:   &["--adjustment"],
-		stop_shorts: b"",
-		stop_longs:  &[],
-		assignments: Assignments::None,
-		skip_args:   0,
-	},
-	Wrapper {
-		names:       &["nohup", "setsid", "ifne"],
-		short_vals:  b"",
-		long_vals:   &[],
-		stop_shorts: b"",
-		stop_longs:  &[],
-		assignments: Assignments::None,
-		skip_args:   0,
-	},
-	Wrapper {
-		names:       &["time"],
-		short_vals:  b"of",
-		long_vals:   &["--output", "--format"],
-		stop_shorts: b"",
-		stop_longs:  &[],
-		assignments: Assignments::Shell,
-		skip_args:   0,
-	},
-	Wrapper {
-		names:       &["timeout", "gtimeout"],
-		short_vals:  b"sk",
-		long_vals:   &["--signal", "--kill-after"],
-		stop_shorts: b"",
-		stop_longs:  &[],
-		assignments: Assignments::None,
-		skip_args:   1,
-	},
-	Wrapper {
-		names:       &["stdbuf"],
-		short_vals:  b"ioe",
-		long_vals:   &["--input", "--output", "--error"],
-		stop_shorts: b"",
-		stop_longs:  &[],
-		assignments: Assignments::None,
-		skip_args:   0,
-	},
-	Wrapper {
-		names:       &["command"],
-		short_vals:  b"",
-		long_vals:   &[],
-		stop_shorts: b"vV",
-		stop_longs:  &[],
-		assignments: Assignments::None,
-		skip_args:   0,
-	},
-	Wrapper {
-		names:       &["exec"],
-		short_vals:  b"a",
-		long_vals:   &[],
-		stop_shorts: b"",
-		stop_longs:  &[],
-		assignments: Assignments::None,
-		skip_args:   0,
-	},
-	Wrapper {
-		names:       &["xargs"],
-		short_vals:  b"adEILnPs",
-		long_vals:   &[
-			"--arg-file",
-			"--delimiter",
-			"--max-args",
-			"--max-procs",
-			"--max-chars",
-			"--process-slot-var",
-		],
-		stop_shorts: b"",
-		stop_longs:  &[],
-		assignments: Assignments::None,
-		skip_args:   0,
-	},
-	Wrapper {
-		names:       &["npx"],
-		short_vals:  b"pcw",
-		long_vals:   &[
-			"--package",
-			"--call",
-			"--cache",
-			"--userconfig",
-			"--prefix",
-			"--loglevel",
-			"--workspace",
-			"--shell",
-			"--registry",
-			"--node-options",
-		],
-		stop_shorts: b"c",
-		stop_longs:  &["--call"],
-		assignments: Assignments::None,
-		skip_args:   0,
-	},
-	Wrapper {
-		names:       &["bunx"],
-		short_vals:  b"pc",
-		long_vals:   &[
-			"--package",
-			"--shell",
-			"--registry",
-			"--minimum-release-age",
-			"--cwd",
-			"--config",
-		],
-		stop_shorts: b"c",
-		stop_longs:  &[],
-		assignments: Assignments::None,
-		skip_args:   0,
-	},
-];
-
 /// Whether `path`/`argv` runs `omp`: as the program itself, or as the target
 /// command behind known wrappers (`nice`, `nohup`, `npx`, `bunx`, `sudo`,
 /// `env`, `time`, …) and their options.
@@ -287,117 +115,17 @@ fn runs_omp(path: &[u8], argv: &[BString]) -> bool {
 	if is_omp(path) {
 		return true;
 	}
-	let mut i = 0;
-	while let Some(word) = argv.get(i) {
-		if is_omp(word) {
-			return true;
-		}
-		let Some(wrapper) = find_wrapper(word) else {
-			return false;
-		};
-		let Some(next) = skip_wrapper(argv, i + 1, wrapper) else {
-			return false;
-		};
-		i = next;
-	}
-	false
+	let launch = crate::bash::trace::viz::embedded::launch(argv);
+	!launch.remote && argv.get(launch.at).is_some_and(|word| is_omp(word))
 }
 
 /// Whether `word` names the `omp` program, by any path.
 fn is_omp(word: &[u8]) -> bool {
-	let name = basename(word);
-	name == b"omp" || (cfg!(windows) && name.eq_ignore_ascii_case(b"omp.exe"))
-}
-
-fn basename(word: &[u8]) -> &[u8] {
-	word
+	let name = word
 		.rsplit(|&b| b == b'/' || (cfg!(windows) && b == b'\\'))
 		.next()
-		.unwrap_or(word)
-}
-
-fn find_wrapper(word: &[u8]) -> Option<&'static Wrapper> {
-	let mut name = basename(word);
-	if cfg!(windows) && name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(b".exe") {
-		name = &name[..name.len() - 4];
-	}
-	let name = std::str::from_utf8(name).ok()?;
-	WRAPPERS.iter().find(|w| w.names.contains(&name))
-}
-
-fn is_shell_assignment(word: &[u8]) -> bool {
-	let Some(eq) = word.iter().position(|&b| b == b'=') else {
-		return false;
-	};
-	let name = word[..eq].strip_suffix(b"+").unwrap_or(&word[..eq]);
-	!name.is_empty()
-		&& (name[0].is_ascii_alphabetic() || name[0] == b'_')
-		&& name[1..]
-			.iter()
-			.all(|b| b.is_ascii_alphanumeric() || *b == b'_')
-}
-
-fn skip_wrapper(argv: &[BString], from: usize, wrapper: &Wrapper) -> Option<usize> {
-	let mut i = from;
-	while let Some(arg) = argv.get(i) {
-		let w = arg.as_slice();
-		if w == b"--" {
-			i += 1;
-			break;
-		}
-		if !w.starts_with(b"-") || w == b"-" {
-			break;
-		}
-		if w.starts_with(b"--") {
-			let opt_name = w.split_once_str("=").map_or(w, |(name, _)| name);
-			if wrapper
-				.stop_longs
-				.iter()
-				.any(|&opt| opt_name == opt.as_bytes())
-			{
-				return None;
-			}
-			if w.contains(&b'=') {
-				i += 1;
-			} else if wrapper.long_vals.iter().any(|&opt| w == opt.as_bytes()) {
-				i += 2;
-			} else {
-				i += 1;
-			}
-			continue;
-		}
-		let mut consumed = false;
-		for k in 1..w.len() {
-			if wrapper.stop_shorts.contains(&w[k]) {
-				return None;
-			}
-			if wrapper.short_vals.contains(&w[k]) {
-				i += if k + 1 < w.len() { 1 } else { 2 };
-				consumed = true;
-				break;
-			}
-		}
-		if !consumed {
-			i += 1;
-		}
-	}
-	match wrapper.assignments {
-		Assignments::None => {},
-		Assignments::Shell => {
-			while argv.get(i).is_some_and(|w| is_shell_assignment(w)) {
-				i += 1;
-			}
-		},
-		Assignments::Env => {
-			if argv.get(i).is_some_and(|w| w == b"-") {
-				i += 1;
-			}
-			while argv.get(i).is_some_and(|w| w.contains(&b'=')) {
-				i += 1;
-			}
-		},
-	}
-	Some(i.saturating_add(wrapper.skip_args))
+		.unwrap_or(word);
+	name == b"omp" || (cfg!(windows) && name.eq_ignore_ascii_case(b"omp.exe"))
 }
 
 /// Whether the environment variable `name` holds a URL to resolve. `PWD`
@@ -650,8 +378,6 @@ mod tests {
 	fn runs_omp_matches_only_program_or_wrapped_command() {
 		for non_omp in [
 			&["grep", "omp", "local://out.txt"][..],
-			&["rg", "-n", "omp", "skill://x/SKILL.md"][..],
-			&["ls", "./omp", "local://dir"][..],
 			&["nice", "-n", "5", "grep", "omp", "local://out.txt"][..],
 			&["npx", "--cache", "omp", "eslint", "local://app.ts"][..],
 			&["npx", "-p", "omp", "eslint", "local://app.ts"][..],
@@ -662,6 +388,8 @@ mod tests {
 			&["timeout", "30", "grep", "omp", "local://out.txt"][..],
 			&["command", "-v", "omp", "local://out.txt"][..],
 			&["setsid", "grep", "omp", "local://out.txt"][..],
+			&["uv", "run", "-m", "omp", "local://out.txt"][..],
+			&["ssh", "host", "omp", "read", "local://out.txt"][..],
 		] {
 			let args = bvec(non_omp);
 			assert!(!runs_omp(args[0].as_bytes(), &args), "expected false for {non_omp:?}");
@@ -683,6 +411,7 @@ mod tests {
 			&["stdbuf", "-oL", "omp", "read", "local://out.txt"][..],
 			&["xargs", "-n", "1", "omp", "read", "local://out.txt"][..],
 			&["ifne", "omp", "read", "local://out.txt"][..],
+			&["uv", "run", "-w", "requests", "omp", "read", "local://out.txt"][..],
 		] {
 			let args = bvec(omp_cmd);
 			assert!(runs_omp(args[0].as_bytes(), &args), "expected true for {omp_cmd:?}");
