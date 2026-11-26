@@ -136,7 +136,7 @@ type MainYamlReadResult = {
 
 type ProjectSettingsReadResult = {
 	settings: RawSettings;
-	layers: RawSettings[];
+	endpointBindings: Record<string, LayerEndpointBinding>;
 	fileSettings: RawSettings;
 	shellPathSource: string | undefined;
 	/** Discovered project files to invalidate and watch, including filtered or temporarily missing sources. */
@@ -169,7 +169,8 @@ const CONFIG_POLL_INTERVAL_MS = 500;
 
 type ConfigOverlayReadResult = {
 	settings: RawSettings;
-	layers: RawSettings[];
+	endpointBindings: Record<string, LayerEndpointBinding>;
+	firstEndpoint: string | undefined;
 	shellPathSource: string | undefined;
 };
 
@@ -342,8 +343,12 @@ export interface SettingsMirrorState {
 	readonly overrides: RawSettings;
 	readonly derived: boolean;
 	readonly projectShellPathSource: string | undefined;
-	readonly projectLayers?: readonly RawSettings[];
-	readonly configOverlayLayers?: readonly RawSettings[];
+	/** Per-credential trusted SearXNG endpoint binding within each multi-file or reloaded layer. */
+	readonly globalEndpointBindings?: Readonly<Record<string, LayerEndpointBinding>>;
+	readonly projectEndpointBindings?: Readonly<Record<string, LayerEndpointBinding>>;
+	readonly overlayEndpointBindings?: Readonly<Record<string, LayerEndpointBinding>>;
+	/** First non-blank SearXNG endpoint across `--config` files, for env login host-baseline checks. */
+	readonly overlayFirstEndpoint?: string;
 	readonly overlayShellPathSource: string | undefined;
 }
 
@@ -388,6 +393,7 @@ interface LayerRefresh {
 	settings: RawSettings;
 	source: string;
 	commit(): void;
+	onKept?(kept: ReadonlySet<string>): void;
 }
 
 /**
@@ -745,6 +751,57 @@ function physicalTargetSegments(target: string, pathApi: typeof path = path): st
 // Settings Class
 // ═══════════════════════════════════════════════════════════════════════════
 
+const SEARXNG_ENDPOINT_SEGMENTS = ["searxng", "endpoint"] as const;
+const SEARXNG_CREDENTIAL_KEYS = [
+	{ id: "searxng.token", segments: ["searxng", "token"] as const },
+	{ id: "searxng.basicUsername", segments: ["searxng", "basicUsername"] as const },
+	{ id: "searxng.basicPassword", segments: ["searxng", "basicPassword"] as const },
+] as const;
+
+/** SearXNG endpoint bound to a credential within a single settings layer. */
+export type LayerEndpointBinding =
+	| { readonly configured: false }
+	| { readonly configured: true; readonly value: string | null };
+
+/** Result of resolving the SearXNG endpoint trusted by a credential's source. */
+export type SourceBoundValue =
+	| { readonly kind: "value"; readonly value: string | null }
+	| { readonly kind: "unset" }
+	| { readonly kind: "untrusted" };
+
+function extractLayerEndpointBindings(files: readonly RawSettings[]): {
+	endpointBindings: Record<string, LayerEndpointBinding>;
+	firstEndpoint: string | undefined;
+} {
+	const endpointBindings: Record<string, LayerEndpointBinding> = {};
+	let current: LayerEndpointBinding = { configured: false };
+	let firstEndpoint: string | undefined;
+	for (const file of files) {
+		const endpoint = getByPath(file, SEARXNG_ENDPOINT_SEGMENTS);
+		if (endpoint === null) {
+			current = { configured: true, value: null };
+		} else if (typeof endpoint === "string") {
+			current = { configured: true, value: endpoint };
+			if (firstEndpoint === undefined && endpoint.trim() !== "") firstEndpoint = endpoint;
+		}
+		for (const cred of SEARXNG_CREDENTIAL_KEYS) {
+			const raw = getByPath(file, cred.segments);
+			if (raw === undefined) continue;
+			if (raw === null) delete endpointBindings[cred.id];
+			else if (typeof raw === "string") endpointBindings[cred.id] = current;
+		}
+	}
+	return { endpointBindings, firstEndpoint };
+}
+
+function endpointInRaw(raw: RawSettings): SourceBoundValue {
+	const value = getByPath(raw, SEARXNG_ENDPOINT_SEGMENTS);
+	if (value === undefined) return { kind: "unset" };
+	if (value === null) return { kind: "value", value: null };
+	if (typeof value === "string") return { kind: "value", value };
+	return { kind: "unset" };
+}
+
 let createUnresolvedSettings!: () => Settings;
 
 export class Settings {
@@ -766,16 +823,24 @@ export class Settings {
 	#global: RawSettings = {};
 	/** Project settings from .claude/settings.yml etc */
 	#project: RawSettings = {};
-	/** Per-file project layers in discovery order, after shadow stripping and migration. */
-	#projectLayers: RawSettings[] = [];
+	/** Trusted endpoints pinned for global logins kept across an invalid live reload or save merge. */
+	#globalEndpointBindings: Record<string, LayerEndpointBinding> = {};
+	/** Per-credential SearXNG endpoint binding computed before merging project files. */
+	#projectEndpointBindings: Record<string, LayerEndpointBinding> = {};
+	/** False only on a worker mirror whose snapshot omitted project endpoint bindings (fail closed). */
+	#hasProjectEndpointBindings = true;
 	/** Last successfully loaded native .omp/config.yml contents. */
 	#projectFileSettings: RawSettings = {};
 	/** Logical config paths whose malformed targets were moved aside. */
 	#quarantinedYamlTargets = new Map<string, string>();
 	/** Extra config.yml-style overlays passed by CLI */
 	#configOverlay: RawSettings = {};
-	/** Per-file `--config` layers in load order. */
-	#configOverlayLayers: RawSettings[] = [];
+	/** Per-credential SearXNG endpoint binding computed before merging `--config` files. */
+	#overlayEndpointBindings: Record<string, LayerEndpointBinding> = {};
+	/** False only on a worker mirror whose snapshot omitted overlay endpoint bindings (fail closed). */
+	#hasOverlayEndpointBindings = true;
+	/** First non-blank SearXNG endpoint across `--config` files, for env login host-baseline checks. */
+	#overlayFirstEndpoint: string | undefined;
 	/** Project settings file that most recently supplied shellPath. */
 	#projectShellPathSource: string | undefined;
 	/** Project files to invalidate and watch, including filtered or temporarily missing sources. */
@@ -1130,8 +1195,10 @@ export class Settings {
 			global: structuredClone(this.#global),
 			project: structuredClone(this.#project),
 			configOverlay: structuredClone(this.#configOverlay),
-			projectLayers: structuredClone(this.#projectLayers),
-			configOverlayLayers: structuredClone(this.#configOverlayLayers),
+			globalEndpointBindings: structuredClone(this.#globalEndpointBindings),
+			projectEndpointBindings: structuredClone(this.#projectEndpointBindings),
+			overlayEndpointBindings: structuredClone(this.#overlayEndpointBindings),
+			overlayFirstEndpoint: this.#overlayFirstEndpoint,
 			overrides: structuredClone(this.#overrides),
 			derived: this.#derived,
 			projectShellPathSource: this.#projectShellPathSource,
@@ -1157,16 +1224,16 @@ export class Settings {
 		this.#global = structuredClone(state.global);
 		this.#project = structuredClone(state.project);
 		this.#configOverlay = structuredClone(state.configOverlay);
-		this.#projectLayers = state.projectLayers
-			? structuredClone([...state.projectLayers])
-			: Object.keys(state.project).length > 0
-				? [structuredClone(state.project)]
-				: [];
-		this.#configOverlayLayers = state.configOverlayLayers
-			? structuredClone([...state.configOverlayLayers])
-			: Object.keys(state.configOverlay).length > 0
-				? [structuredClone(state.configOverlay)]
-				: [];
+		this.#globalEndpointBindings = state.globalEndpointBindings ? structuredClone(state.globalEndpointBindings) : {};
+		this.#hasProjectEndpointBindings = state.projectEndpointBindings !== undefined;
+		this.#projectEndpointBindings = state.projectEndpointBindings
+			? structuredClone(state.projectEndpointBindings)
+			: {};
+		this.#hasOverlayEndpointBindings = state.overlayEndpointBindings !== undefined;
+		this.#overlayEndpointBindings = state.overlayEndpointBindings
+			? structuredClone(state.overlayEndpointBindings)
+			: {};
+		this.#overlayFirstEndpoint = state.overlayFirstEndpoint;
 		this.#overrides = structuredClone(state.overrides);
 		this.#derived = state.derived;
 		this.#projectShellPathSource = state.projectShellPathSource;
@@ -1240,77 +1307,74 @@ export class Settings {
 	}
 
 	/**
-	 * Value from the lowest host-approved source that sets `setting` (parent first, then global,
-	 * each `--config` file in order, then runtime), skipping every project layer. A blank string
-	 * counts as unset.
+	 * Lowest host-approved SearXNG endpoint (parent first, then global, first `--config` file
+	 * naming one, then runtime), skipping every project layer. Fails closed (`"untrusted"`) if a
+	 * worker mirror snapshot lacked `--config` binding metadata.
 	 */
-	hostBaselineValue(setting: AnySetting): unknown {
-		const present = (value: unknown): boolean =>
-			value !== undefined && value !== null && !(typeof value === "string" && value.trim() === "");
+	hostBaselineEndpoint(): SourceBoundValue {
 		if (this.#parent) {
-			const inherited = this.#parent.hostBaselineValue(setting);
-			if (present(inherited)) return inherited;
+			const inherited = this.#parent.hostBaselineEndpoint();
+			if (inherited.kind === "untrusted") return inherited;
+			if (inherited.kind === "value" && typeof inherited.value === "string" && inherited.value.trim() !== "") {
+				return inherited;
+			}
 		}
-		const overlaySources = this.#configOverlayLayers.length > 0 ? this.#configOverlayLayers : [this.#configOverlay];
-		for (const source of [this.#global, ...overlaySources, this.#overrides]) {
-			const value = configuredValue(source, setting, this.#cwd);
-			if (present(value)) return value;
+		const globalEp = getByPath(this.#global, SEARXNG_ENDPOINT_SEGMENTS);
+		if (typeof globalEp === "string" && globalEp.trim() !== "") {
+			return { kind: "value", value: globalEp };
 		}
-		return undefined;
+		if (getByPath(this.#configOverlay, SEARXNG_ENDPOINT_SEGMENTS) !== undefined) {
+			if (!this.#hasOverlayEndpointBindings) return { kind: "untrusted" };
+			if (this.#overlayFirstEndpoint !== undefined) {
+				return { kind: "value", value: this.#overlayFirstEndpoint };
+			}
+		}
+		const runtimeEp = getByPath(this.#overrides, SEARXNG_ENDPOINT_SEGMENTS);
+		if (typeof runtimeEp === "string" && runtimeEp.trim() !== "") {
+			return { kind: "value", value: runtimeEp };
+		}
+		return { kind: "unset" };
 	}
 
 	/**
-	 * Value of `setting` at the source that supplied `source` (the specific file inside `--config`
-	 * or project, or the specific host layer), preserving any parent's trusted address while
-	 * excluding repository settings for host-supplied sources and excluding later files or layers.
+	 * SearXNG endpoint trusted by the source that supplied `source` (the specific file inside
+	 * `--config` or project, or the specific host layer). Preserves any parent's trusted address,
+	 * excludes repository settings for host-supplied sources, excludes later files or layers, and
+	 * fails closed (`"untrusted"`) when a worker snapshot lacks per-file binding metadata.
 	 */
-	valueAtSource(source: AnySetting, setting: AnySetting): unknown {
+	boundEndpointAtSource(source: AnySetting): SourceBoundValue {
 		const provenance = source.provenance(this);
-		if (provenance === "env" || provenance === "default") return undefined;
-		return this.#valueAtSource(source, setting);
+		if (provenance === "env" || provenance === "default") return { kind: "unset" };
+		return this.#boundEndpointAtSource(source);
 	}
 
-	#mergeLayersUpTo(layers: readonly RawSettings[], fallback: RawSettings, setting: AnySetting): RawSettings {
-		if (layers.length === 0) return fallback;
-		let ownerIndex = -1;
-		for (let i = layers.length - 1; i >= 0; i--) {
-			if (getByPath(layers[i], setting.segments) !== undefined) {
-				ownerIndex = i;
-				break;
-			}
-		}
-		if (ownerIndex < 0) return fallback;
-		let merged: RawSettings = {};
-		for (let i = 0; i <= ownerIndex; i++) {
-			merged = this.#deepMerge(merged, layers[i], { arrays: "combine" });
-		}
-		return merged;
-	}
-
-	#valueAtSource(source: AnySetting, setting: AnySetting): unknown {
+	#boundEndpointAtSource(source: AnySetting): SourceBoundValue {
 		const segments = source.segments;
 		if (getByPath(this.#overrides, segments) !== undefined) {
-			return configuredValue(this.#operatorLayers(), setting, this.#cwd);
+			return endpointInRaw(this.#operatorLayers());
 		}
 		if (getByPath(this.#configOverlay, segments) !== undefined) {
-			const overlay = this.#mergeLayersUpTo(this.#configOverlayLayers, this.#configOverlay, source);
-			const own = this.#deepMerge(this.#deepMerge({}, this.#global), overlay, { arrays: "layer" });
-			const merged = this.#parent ? this.#deepMerge(this.#parent.#operatorLayers(), own) : own;
-			return configuredValue(merged, setting, this.#cwd);
+			const binding = this.#overlayEndpointBindings[source.id];
+			if (!this.#hasOverlayEndpointBindings || !binding) return { kind: "untrusted" };
+			if (binding.configured) return { kind: "value", value: binding.value };
+			const base = this.#parent ? this.#deepMerge(this.#parent.#operatorLayers(), this.#global) : this.#global;
+			return endpointInRaw(base);
 		}
 		const project = projectLayerForMerge(this.#project);
 		if (getByPath(project, segments) !== undefined) {
-			const projectLayers = this.#projectLayers.map(projectLayerForMerge);
-			const scopedProject = this.#mergeLayersUpTo(projectLayers, project, source);
-			const own = this.#deepMerge(this.#deepMerge({}, this.#global), scopedProject, { arrays: "layer" });
-			const merged = this.#parent ? this.#deepMerge(this.#parent.#mergedView(), own) : own;
-			return configuredValue(merged, setting, this.#cwd);
+			const binding = this.#projectEndpointBindings[source.id];
+			if (!this.#hasProjectEndpointBindings || !binding) return { kind: "untrusted" };
+			if (binding.configured) return { kind: "value", value: binding.value };
+			const base = this.#parent ? this.#deepMerge(this.#parent.#mergedView(), this.#global) : this.#global;
+			return endpointInRaw(base);
 		}
 		if (getByPath(this.#global, segments) !== undefined) {
-			const merged = this.#parent ? this.#deepMerge(this.#parent.#operatorLayers(), this.#global) : this.#global;
-			return configuredValue(merged, setting, this.#cwd);
+			const kept = this.#globalEndpointBindings[source.id];
+			if (kept) return kept.configured ? { kind: "value", value: kept.value } : { kind: "unset" };
+			const base = this.#parent ? this.#deepMerge(this.#parent.#operatorLayers(), this.#global) : this.#global;
+			return endpointInRaw(base);
 		}
-		return this.#parent ? this.#parent.#valueAtSource(source, setting) : undefined;
+		return this.#parent ? this.#parent.#boundEndpointAtSource(source) : { kind: "unset" };
 	}
 
 	/**
@@ -1346,6 +1410,7 @@ export class Settings {
 		if (layer === "global") {
 			if (persistGlobal) this.#stageGlobal(setting.segments, value);
 			this.#releaseSoftPin(setting);
+			delete this.#globalEndpointBindings[setting.id];
 		} else {
 			setByPath(this.#overrides, setting.segments, value);
 		}
@@ -1366,6 +1431,7 @@ export class Settings {
 		const prev = setting.get(this);
 		this.#releaseSoftPin(setting);
 		if (current !== undefined) this.#stageGlobal(setting.segments, undefined);
+		delete this.#globalEndpointBindings[setting.id];
 		this.#rebuildMerged();
 		if (current !== undefined) this.#queueSave();
 		this.#fireIfChanged(setting, prev);
@@ -1670,7 +1736,8 @@ export class Settings {
 		if (this.#parent) {
 			cloned = (await this.#parent.cloneForCwd(cwd)).overlay({}, { derived: this.#derived });
 			cloned.#project = structuredClone(this.#project);
-			cloned.#projectLayers = structuredClone(this.#projectLayers);
+			cloned.#projectEndpointBindings = structuredClone(this.#projectEndpointBindings);
+			cloned.#hasProjectEndpointBindings = this.#hasProjectEndpointBindings;
 		} else {
 			cloned = new Settings({
 				cwd,
@@ -1687,13 +1754,19 @@ export class Settings {
 					})
 				: structuredClone(this.#project);
 			if (!this.#persist) cloned.#projectShellPathSource = this.#projectShellPathSource;
-			if (!this.#persist) cloned.#projectLayers = structuredClone(this.#projectLayers);
+			if (!this.#persist) {
+				cloned.#projectEndpointBindings = structuredClone(this.#projectEndpointBindings);
+				cloned.#hasProjectEndpointBindings = this.#hasProjectEndpointBindings;
+			}
 			cloned.#configFiles = [...this.#configFiles];
 			cloned.#overlayShellPathSource = this.#overlayShellPathSource;
 		}
 		cloned.#global = structuredClone(this.#global);
 		cloned.#configOverlay = structuredClone(this.#configOverlay);
-		cloned.#configOverlayLayers = structuredClone(this.#configOverlayLayers);
+		cloned.#globalEndpointBindings = structuredClone(this.#globalEndpointBindings);
+		cloned.#overlayEndpointBindings = structuredClone(this.#overlayEndpointBindings);
+		cloned.#hasOverlayEndpointBindings = this.#hasOverlayEndpointBindings;
+		cloned.#overlayFirstEndpoint = this.#overlayFirstEndpoint;
 		// A soft-pinned default yields to a value the clone's own scope configures.
 		cloned.#softPins = new Set(this.#softPins);
 		const layers = { ...cloned.#ownLayers(), overrides: this.#buildOriginalOverrides() };
@@ -1785,24 +1858,32 @@ export class Settings {
 				// recreates it; keep the last good layer instead of rebuilding it from pending writes.
 				const quarantined = this.#configPath !== null && this.#quarantinedYamlTargets.has(this.#configPath);
 				const settings = globalResult.value.settings ?? (quarantined ? structuredClone(this.#global) : {});
+				const globalEndpointBindings: Record<string, LayerEndpointBinding> = quarantined
+					? structuredClone(this.#globalEndpointBindings)
+					: {};
 				this.#applyPendingGlobalWrites(settings);
 				refreshed.push({
 					layer: "global",
 					settings,
 					source: configPath ?? path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]),
+					onKept: kept => this.#preserveKeptEndpointBindings("global", globalEndpointBindings, kept),
 					commit: () => {
 						this.#configPath = configPath;
+						this.#globalEndpointBindings = globalEndpointBindings;
 					},
 				});
 			}
 			if (overlayResult.status === "fulfilled") {
-				const { settings, layers: overlayLayers, shellPathSource } = overlayResult.value;
+				const { settings, endpointBindings, firstEndpoint, shellPathSource } = overlayResult.value;
 				refreshed.push({
 					layer: "configOverlay",
 					settings,
 					source: this.#configFiles.join(", "),
+					onKept: kept => this.#preserveKeptEndpointBindings("configOverlay", endpointBindings, kept),
 					commit: () => {
-						this.#configOverlayLayers = overlayLayers;
+						this.#overlayEndpointBindings = endpointBindings;
+						this.#hasOverlayEndpointBindings = true;
+						this.#overlayFirstEndpoint = firstEndpoint;
 						this.#overlayShellPathSource = shellPathSource;
 					},
 				});
@@ -1813,7 +1894,10 @@ export class Settings {
 			let layers = this.#ownLayers();
 			const adopted: LayerRefresh[] = [];
 			for (const refresh of refreshed) {
-				if (keepLastGood) this.#keepReadableValues(refresh.settings, layers[refresh.layer], refresh.source);
+				if (keepLastGood) {
+					const kept = this.#keepReadableValues(refresh.settings, layers[refresh.layer], refresh.source);
+					refresh.onKept?.(kept);
+				}
 				const trial: OwnLayers = { ...layers, [refresh.layer]: refresh.settings };
 				if (keepLastGood && !this.#acceptsLayers(trial, refresh.source)) continue;
 				layers = trial;
@@ -1858,19 +1942,54 @@ export class Settings {
 	 * chose — and rebuild every tool description and prompt derived from it, losing the session's
 	 * prompt cache. The file keeps the edit; instances loading it fresh read it as before.
 	 */
-	#keepReadableValues(fresh: RawSettings, live: RawSettings, source: string): void {
+	#keepReadableValues(fresh: RawSettings, live: RawSettings, source: string): ReadonlySet<string> {
+		const keptIds = new Set<string>();
 		for (const setting of allSettings()) {
 			const next = getByPath(fresh, setting.segments);
 			if (next === undefined || next === null || setting.accepts(next)) continue;
 			const kept = getByPath(live, setting.segments);
 			if (kept === undefined || kept === null || !setting.accepts(kept)) continue;
 			setByPath(fresh, setting.segments, structuredClone(kept));
+			keptIds.add(setting.id);
 			logger.warn("Settings: keeping last good value; on-disk value is invalid", {
 				path: source,
 				setting: setting.id,
 				value: next,
 				kept,
 			});
+		}
+		return keptIds;
+	}
+
+	/**
+	 * Keeps the original trusted SearXNG endpoint for any login retained by {@link #keepReadableValues}
+	 * so a later edit that changes the server while leaving an unreadable login cannot send the old
+	 * login to the new server.
+	 */
+	#preserveKeptEndpointBindings(
+		layer: "global" | "configOverlay",
+		target: Record<string, LayerEndpointBinding>,
+		keptIds: ReadonlySet<string>,
+	): void {
+		if (keptIds.size === 0) return;
+		const base = this.#parent ? this.#deepMerge(this.#parent.#operatorLayers(), this.#global) : this.#global;
+		const baseEp = getByPath(base, SEARXNG_ENDPOINT_SEGMENTS);
+		const inheritedValue = typeof baseEp === "string" ? baseEp : null;
+		for (const cred of SEARXNG_CREDENTIAL_KEYS) {
+			if (!keptIds.has(cred.id)) continue;
+			if (layer === "configOverlay") {
+				const prev = this.#overlayEndpointBindings[cred.id];
+				if (this.#hasOverlayEndpointBindings && prev?.configured) {
+					target[cred.id] = prev;
+				} else if (this.#hasOverlayEndpointBindings && prev) {
+					target[cred.id] = { configured: true, value: inheritedValue };
+				} else {
+					delete target[cred.id];
+				}
+			} else {
+				const prev = this.#globalEndpointBindings[cred.id];
+				target[cred.id] = prev ?? { configured: true, value: inheritedValue };
+			}
 		}
 	}
 
@@ -2970,7 +3089,7 @@ export class Settings {
 		}
 		return {
 			settings: this.#migrateRawSettings(project.settings, read.quarantineInvalid),
-			layers: project.layers,
+			endpointBindings: project.endpointBindings,
 			fileSettings: read.fileSettings,
 			shellPathSource: project.shellPathSource,
 			sourcePaths: [
@@ -2987,20 +3106,26 @@ export class Settings {
 	#mergeProjectItems(
 		items: readonly SettingsCapabilityItem[],
 		nativeModelRoles: unknown,
-	): { settings: RawSettings; layers: RawSettings[]; sourcePaths: string[]; shellPathSource: string | undefined } {
+	): {
+		settings: RawSettings;
+		endpointBindings: Record<string, LayerEndpointBinding>;
+		sourcePaths: string[];
+		shellPathSource: string | undefined;
+	} {
 		let settings: RawSettings = {};
-		const layers: RawSettings[] = [];
+		const cleanedItems: RawSettings[] = [];
 		const sourcePaths: string[] = [];
 		let shellPathSource: string | undefined;
 		for (const item of items) {
 			const cleaned = dropSettingsGroupShadows(item.data as RawSettings, item.path);
-			layers.push(this.#migrateRawSettings(structuredClone(cleaned), false));
+			cleanedItems.push(cleaned);
 			settings = this.#deepMerge(settings, cleaned, { arrays: "combine" });
 			sourcePaths.push(item.path);
 			if (Object.hasOwn(item.data, "shellPath")) shellPathSource = item.path;
 		}
 		if (nativeModelRoles !== undefined) settings = this.#deepMerge(settings, { modelRoles: nativeModelRoles });
-		return { settings, layers, sourcePaths, shellPathSource };
+		const { endpointBindings } = extractLayerEndpointBindings(cleanedItems);
+		return { settings, endpointBindings, sourcePaths, shellPathSource };
 	}
 
 	/** Provider ids `disabledProviders` resolves to for `cwd` when `layers` are merged (over the overlay parent). */
@@ -3021,7 +3146,8 @@ export class Settings {
 
 	/** Adopts the read-side state of a project read whose layer is being committed. */
 	#commitProjectRead(result: ProjectSettingsReadResult): void {
-		this.#projectLayers = result.layers;
+		this.#projectEndpointBindings = result.endpointBindings;
+		this.#hasProjectEndpointBindings = true;
 		this.#projectFileSettings = result.fileSettings;
 		this.#projectShellPathSource = result.shellPathSource;
 		this.#projectSourcePaths = result.sourcePaths;
@@ -3031,19 +3157,22 @@ export class Settings {
 	async #readConfigOverlays(captureLegacyChangelogVersion = true): Promise<ConfigOverlayReadResult> {
 		let shellPathSource: string | undefined;
 		let settings: RawSettings = {};
-		const layers: RawSettings[] = [];
+		const overlayFiles: RawSettings[] = [];
 		for (const filePath of this.#configFiles) {
 			const overlay = await this.#loadOverlayYaml(filePath, captureLegacyChangelogVersion);
-			layers.push(overlay);
+			overlayFiles.push(overlay);
 			settings = this.#deepMerge(settings, overlay, { arrays: "combine" });
 			if (Object.hasOwn(overlay, "shellPath")) shellPathSource = filePath;
 		}
-		return { settings, layers, shellPathSource };
+		const { endpointBindings, firstEndpoint } = extractLayerEndpointBindings(overlayFiles);
+		return { settings, endpointBindings, firstEndpoint, shellPathSource };
 	}
 
 	async #loadConfigOverlays(): Promise<RawSettings> {
 		const result = await this.#readConfigOverlays();
-		this.#configOverlayLayers = result.layers;
+		this.#overlayEndpointBindings = result.endpointBindings;
+		this.#hasOverlayEndpointBindings = true;
+		this.#overlayFirstEndpoint = result.firstEndpoint;
 		this.#overlayShellPathSource = result.shellPathSource;
 		return result.settings;
 	}
@@ -4365,10 +4494,13 @@ export class Settings {
 	 */
 	#adoptSavedGlobal(saved: RawSettings, source: string): void {
 		this.#applyPendingGlobalWrites(saved);
-		this.#keepReadableValues(saved, this.#global, source);
+		const kept = this.#keepReadableValues(saved, this.#global, source);
+		const nextGlobalBindings: Record<string, LayerEndpointBinding> = {};
+		this.#preserveKeptEndpointBindings("global", nextGlobalBindings, kept);
 		if (!this.#acceptsLayers({ ...this.#ownLayers(), global: saved }, source)) return;
 		const previous = this.#snapshot();
 		this.#global = saved;
+		this.#globalEndpointBindings = nextGlobalBindings;
 		this.#rebuildMerged();
 		this.#fireChangesSince(previous);
 	}

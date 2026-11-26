@@ -26,6 +26,7 @@ import { dateToAgeSeconds } from "../utils";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
+import { type ExaSlotReservation, releaseExaSlot, reserveExaSlot, resetExaSearchThrottleForTest } from "./exa-throttle";
 
 import { cfgExaEnabled, cfgExaSearchDelayMs } from "../../settings";
 
@@ -33,49 +34,12 @@ const EXA_API_URL = "https://api.exa.ai/search";
 const EXA_MCP_URL = "https://mcp.exa.ai/mcp";
 const EXA_MCP_SOURCE = "oh-my-pi";
 const MAX_EXA_SNIPPET_CHARS = 500;
-const MAX_EXA_THROTTLE_BUCKETS = 256;
-
-interface ExaSearchThrottle {
-	lastAt: number;
-	nextAt: number;
-	pending: number;
-	tail: Promise<void>;
-}
-
-const exaSearchThrottles = new Map<string, ExaSearchThrottle>();
-
 function exaLimitKey(channel: "api" | "mcp", apiKey: string | undefined): string {
 	if (!apiKey) return `${channel}:anonymous`;
 	const digest = new Bun.CryptoHasher("sha256").update(apiKey).digest("hex");
 	return `${channel}:${digest}`;
 }
 
-function exaSearchThrottle(limitKey: string, now: number): ExaSearchThrottle {
-	const existing = exaSearchThrottles.get(limitKey);
-	if (existing) {
-		// Refresh insertion order for LRU eviction of idle buckets.
-		exaSearchThrottles.delete(limitKey);
-		exaSearchThrottles.set(limitKey, existing);
-		return existing;
-	}
-	for (const [key, entry] of exaSearchThrottles) {
-		if (entry.pending === 0 && entry.nextAt <= now) exaSearchThrottles.delete(key);
-	}
-	while (exaSearchThrottles.size >= MAX_EXA_THROTTLE_BUCKETS) {
-		let evicted = false;
-		for (const [key, entry] of exaSearchThrottles) {
-			if (entry.pending === 0) {
-				exaSearchThrottles.delete(key);
-				evicted = true;
-				break;
-			}
-		}
-		if (!evicted) break;
-	}
-	const throttle: ExaSearchThrottle = { lastAt: -Infinity, nextAt: 0, pending: 0, tail: Promise.resolve() };
-	exaSearchThrottles.set(limitKey, throttle);
-	return throttle;
-}
 function configuredExaSearchDelayMs(scope: Settings): number {
 	const delayMs = cfgExaSearchDelayMs.get(scope);
 	if (!Number.isFinite(delayMs) || delayMs <= 0) return 0;
@@ -131,31 +95,28 @@ async function waitForExaSearchSlot(scope: Settings, limitKey: string, signal: A
 	const delayMs = configuredExaSearchDelayMs(scope);
 	if (delayMs <= 0) return;
 
-	const throttle = exaSearchThrottle(limitKey, Date.now());
-	throttle.pending += 1;
-	const prior = throttle.tail.catch(() => {});
-	const queued = prior
-		.then(async () => {
-			signal?.throwIfAborted();
-			const targetAt = Math.max(throttle.nextAt, throttle.lastAt + delayMs);
-			const waitMs = Math.max(0, targetAt - Date.now());
-			if (waitMs > 0) await abortableSleep(waitMs, signal);
-			signal?.throwIfAborted();
-			const sentAt = Date.now();
-			throttle.lastAt = sentAt;
-			throttle.nextAt = Math.max(throttle.nextAt, sentAt + delayMs);
-		})
-		.finally(() => {
-			throttle.pending -= 1;
-		});
-	throttle.tail = queued.catch(() => {});
-	await waitUntilDoneOrAborted(queued, signal);
+	signal?.throwIfAborted();
+	const slotPromise = reserveExaSlot(limitKey, delayMs);
+	let reservation: ExaSlotReservation;
+	try {
+		reservation = await waitUntilDoneOrAborted(slotPromise, signal);
+	} catch (error) {
+		void slotPromise.then(
+			slot => releaseExaSlot(limitKey, slot.id),
+			() => {},
+		);
+		throw error;
+	}
+	try {
+		if (reservation.waitMs > 0) await abortableSleep(reservation.waitMs, signal);
+		signal?.throwIfAborted();
+	} catch (error) {
+		releaseExaSlot(limitKey, reservation.id);
+		throw error;
+	}
 }
 
-/** Reset Exa request pacing state for isolated provider tests. */
-export function resetExaSearchThrottleForTest(): void {
-	exaSearchThrottles.clear();
-}
+export { resetExaSearchThrottleForTest };
 
 type ExaSearchType = "neural" | "fast" | "auto" | "deep";
 

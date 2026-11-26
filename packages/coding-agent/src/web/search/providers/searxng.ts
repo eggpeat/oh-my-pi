@@ -133,13 +133,16 @@ function sameSearxngServer(left: string, right: string): boolean {
 function trustedEndpoint(scope: Settings, credential: Setting<string | undefined>): string | null {
 	const provenance = credential.provenance(scope);
 	if (provenance === "env") {
-		return endpointText(cfgSearxngEndpoint.envValue()) ?? endpointText(scope.hostBaselineValue(cfgSearxngEndpoint));
+		const envAddress = endpointText(cfgSearxngEndpoint.envValue());
+		if (envAddress) return envAddress;
+		const baseline = scope.hostBaselineEndpoint();
+		return baseline.kind === "value" ? endpointText(baseline.value) : null;
 	}
 	if (provenance === "runtime" || provenance === "overlay" || provenance === "project" || provenance === "global") {
-		return (
-			endpointText(scope.valueAtSource(credential, cfgSearxngEndpoint)) ??
-			endpointText(cfgSearxngEndpoint.envValue())
-		);
+		const bound = scope.boundEndpointAtSource(credential);
+		if (bound.kind === "untrusted") return null;
+		const boundAddress = bound.kind === "value" ? endpointText(bound.value) : null;
+		return boundAddress ?? endpointText(cfgSearxngEndpoint.envValue());
 	}
 	return null;
 }

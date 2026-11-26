@@ -8,6 +8,7 @@ import { agentsThreadService } from "./agents";
 import { asyncJobsThreadService } from "./async-jobs";
 import { authService } from "./auth";
 import { executorThreadService } from "./executor";
+import { exaThrottleThreadService } from "./exa-throttle";
 import { identityThreadService } from "./identity";
 import { integrationsThreadService } from "./integrations";
 import { loggerThreadService } from "./logging";
@@ -29,6 +30,7 @@ export const THREAD_SERVICES: readonly ThreadService[] = [
 	lspThreadService,
 	telemetryThreadService,
 	memoryThreadService,
+	exaThrottleThreadService,
 	integrationsThreadService,
 	runtimeThreadService,
 	asyncJobsThreadService,

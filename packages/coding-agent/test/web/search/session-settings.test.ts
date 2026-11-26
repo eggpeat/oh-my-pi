@@ -2,9 +2,17 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { findScopedSettings, resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import {
+	findScopedSettings,
+	resetSettingsForTest,
+	Settings,
+	type SettingsMirrorSource,
+	type SettingsMirrorState,
+} from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { CustomToolContext } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
+import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { cfgTemperature } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { runSearchQuery, webSearchCustomTool } from "@oh-my-pi/pi-coding-agent/web/search";
 import { resetExaSearchThrottleForTest } from "@oh-my-pi/pi-coding-agent/web/search/providers/exa";
 import { searchSearXNG } from "@oh-my-pi/pi-coding-agent/web/search/providers/searxng";
@@ -178,18 +186,20 @@ async function withFetch(
 	}
 }
 
-async function withFrozenClock(run: (delays: number[]) => Promise<void>): Promise<void> {
+async function withFrozenClock(run: (delays: number[], advance: (ms: number) => void) => Promise<void>): Promise<void> {
 	const delays: number[] = [];
 	const originalNow = Date.now;
 	const originalTimeout = globalThis.setTimeout;
-	const now = 1_700_000_000_000;
+	let now = 1_700_000_000_000;
 	Date.now = () => now;
 	globalThis.setTimeout = ((handler: () => void, timeout?: number) => {
 		delays.push(timeout ?? 0);
 		return originalTimeout(handler, 0);
 	}) as typeof setTimeout;
 	try {
-		await run(delays);
+		await run(delays, ms => {
+			now += ms;
+		});
 	} finally {
 		Date.now = originalNow;
 		globalThis.setTimeout = originalTimeout;
@@ -408,6 +418,47 @@ describe("web search session settings", () => {
 		}
 	});
 
+	it("keeps recent Exa send times across traffic on other accounts", async () => {
+		const shortSession = Settings.isolated({ "exa.searchDelayMs": 1_000 });
+		const longSession = Settings.isolated({ "exa.searchDelayMs": 5_000 });
+		const authStorage = createInMemoryAuthStorage();
+		try {
+			await withFrozenClock(async (delays, advance) => {
+				await withFetch(
+					() => exaResponse(),
+					async () => {
+						await withEnv({ EXA_API_KEY: "account-a" }, async () => {
+							const first = await runSearchQuery(
+								{ query: "a-1", model: "web/exa" },
+								{ authStorage, settings: shortSession },
+							);
+							expect(first.details.error).toBeUndefined();
+						});
+						advance(1_500);
+						await withEnv({ EXA_API_KEY: "account-b" }, async () => {
+							const other = await runSearchQuery(
+								{ query: "b-1", model: "web/exa" },
+								{ authStorage, settings: shortSession },
+							);
+							expect(other.details.error).toBeUndefined();
+						});
+						advance(500);
+						await withEnv({ EXA_API_KEY: "account-a" }, async () => {
+							const second = await runSearchQuery(
+								{ query: "a-2", model: "web/exa" },
+								{ authStorage, settings: longSession },
+							);
+							expect(second.details.error).toBeUndefined();
+						});
+						expect(delays).toContain(3_000);
+					},
+				);
+			});
+		} finally {
+			authStorage.close();
+		}
+	});
+
 	it("does not call Exa when the session turns it off", async () => {
 		const processSettings = await initProcess({ "exa.enabled": true });
 		const session = Settings.isolated({ "exa.enabled": false });
@@ -460,7 +511,10 @@ describe("web search session settings", () => {
 					return searxngResponse();
 				},
 				async () => {
-					const first = await runSearchQuery({ query: "one" }, { authStorage, settings: limitedSession });
+					const first = await runSearchQuery(
+						{ query: "one", model: "web/searxng" },
+						{ authStorage, settings: limitedSession },
+					);
 					expect(first.details.error).toBeDefined();
 
 					const healthy = await runSearchQuery({ query: "two" }, { authStorage, settings: healthySession });
@@ -868,5 +922,162 @@ describe("SearXNG login stays with its server", () => {
 			"searxng.basicPassword": "test-pass",
 		});
 		await expect(runSearxng(settings)).rejects.toThrow(/cannot contain ':'/);
+	});
+
+	it("does not run unrelated migrations on unmerged project files before config.yml replaces them", async () => {
+		const loaded = await loadLayers({
+			globalYaml: "",
+			projectJson: JSON.stringify({
+				statusLine: { segmentOptions: "legacy-text" },
+				searxng: { endpoint: "https://first.example", token },
+			}),
+			projectYaml: `statusLine:\n  segmentOptions: {}\nsearxng:\n  endpoint: "https://second.example"\n`,
+		});
+		try {
+			const seen = await runSearxng(loaded.settings);
+			expect(seen.url.host).toBe("second.example");
+			expect(seen.authorization).toBeNull();
+		} finally {
+			await loaded.cleanup();
+		}
+	});
+
+	it("does not copy superseded passwords into worker mirror snapshots", async () => {
+		const loaded = await loadLayers({
+			globalYaml: "",
+			projectJson: JSON.stringify({
+				searxng: {
+					endpoint: "https://proj-a.example",
+					basicUsername: "proj-old-user",
+					basicPassword: "proj-old-secret",
+				},
+			}),
+			projectYaml: `searxng:\n  endpoint: "https://proj-b.example"\n  basicUsername: "proj-new-user"\n  basicPassword: "proj-new-secret"\n`,
+			overlayYamls: [
+				`searxng:\n  endpoint: "https://ovr-a.example"\n  basicUsername: "ovr-old-user"\n  basicPassword: "ovr-old-secret"\n`,
+				`searxng:\n  endpoint: "https://ovr-b.example"\n  basicUsername: "ovr-new-user"\n  basicPassword: "ovr-new-secret"\n`,
+			],
+		});
+		try {
+			const snapshot = JSON.stringify(loaded.settings.mirrorState());
+			expect(snapshot).not.toContain("proj-old-secret");
+			expect(snapshot).not.toContain("ovr-old-secret");
+			expect(snapshot).toContain("ovr-new-secret");
+		} finally {
+			await loaded.cleanup();
+		}
+	});
+
+	it("withholds logins on worker mirrors when binding metadata is absent and enforces it when present", async () => {
+		const loaded = await loadLayers({
+			globalYaml: "",
+			overlayYamls: [
+				`searxng:\n  endpoint: "https://first.example"\n  token: "${token}"\n`,
+				`searxng:\n  endpoint: "https://second.example"\n`,
+			],
+		});
+		try {
+			const fullState = loaded.settings.mirrorState();
+			const stubSource = (state: SettingsMirrorState): SettingsMirrorSource => ({
+				write: () => state,
+				refresh: async () => state,
+				cloneForCwd: async () => loaded.settings,
+			});
+			const faithfulMirror = Settings.mirror(stubSource(fullState), fullState);
+			const faithfulSeen = await runSearxng(faithfulMirror);
+			expect(faithfulSeen.url.host).toBe("second.example");
+			expect(faithfulSeen.authorization).toBeNull();
+
+			const strippedState: SettingsMirrorState = {
+				generation: fullState.generation,
+				cwd: fullState.cwd,
+				agentDir: fullState.agentDir,
+				configFiles: fullState.configFiles,
+				global: fullState.global,
+				project: fullState.project,
+				configOverlay: { searxng: { endpoint: "https://first.example", token } },
+				overrides: fullState.overrides,
+				derived: fullState.derived,
+				projectShellPathSource: fullState.projectShellPathSource,
+				overlayShellPathSource: fullState.overlayShellPathSource,
+			};
+			const strippedMirror = Settings.mirror(stubSource(strippedState), strippedState);
+			const strippedSeen = await runSearxng(strippedMirror);
+			expect(strippedSeen.url.host).toBe("first.example");
+			expect(strippedSeen.authorization).toBeNull();
+		} finally {
+			await loaded.cleanup();
+		}
+	});
+
+	it("keeps the original trusted server when a live reload retains an old login over a wrongly typed edit", async () => {
+		const root = TempDir.createSync("@omp-search-reload-");
+		const agentDir = root.join("agent");
+		const projectDir = root.join("project");
+		const overlay0 = root.join("overlay-0.yml");
+		const overlay1 = root.join("overlay-1.yml");
+		await Bun.write(path.join(agentDir, "config.yml"), "");
+		await Bun.write(path.join(projectDir, ".keep"), "");
+		await Bun.write(overlay0, `searxng:\n  endpoint: "https://old.example"\n  token: "${token}"\n`);
+		await Bun.write(overlay1, "{}\n");
+		const savedConfigFiles = process.env.PI_CONFIG_FILES;
+		setEnvValue("PI_CONFIG_FILES", undefined);
+		let settings: Settings | undefined;
+		try {
+			settings = await Settings.init({ agentDir, cwd: projectDir, configFiles: [overlay0, overlay1] });
+			const before = await runSearxng(settings);
+			expect(before.url.host).toBe("old.example");
+			expect(before.authorization).toBe(bearer(token));
+
+			await Bun.write(overlay1, `searxng:\n  endpoint: "https://evil.example"\n  token: 12345\n`);
+			const reloaded = Promise.withResolvers<void>();
+			const unlisten = cfgSearxngEndpoint.listen(settings, value => {
+				if (value === "https://evil.example") reloaded.resolve();
+			});
+			settings.startWatching();
+			try {
+				await reloaded.promise;
+			} finally {
+				unlisten();
+				settings.stopWatching();
+			}
+			expect(cfgSearxngToken.get(settings)).toBe(token);
+			const after = await runSearxng(settings);
+			expect(after.url.host).toBe("evil.example");
+			expect(after.authorization).toBeNull();
+		} finally {
+			settings?.cancelPendingSaves();
+			resetSettingsForTest();
+			AgentStorage.close();
+			setEnvValue("PI_CONFIG_FILES", savedConfigFiles);
+			await root.remove();
+		}
+	});
+
+	it("keeps the original trusted server when a global save merge retains an old login over a wrongly typed edit", async () => {
+		const root = TempDir.createSync("@omp-search-save-");
+		const agentDir = root.join("agent");
+		const projectDir = root.join("project");
+		const globalPath = path.join(agentDir, "config.yml");
+		await Bun.write(globalPath, `searxng:\n  endpoint: "https://old.example"\n  token: "${token}"\n`);
+		await Bun.write(path.join(projectDir, ".keep"), "");
+		const savedConfigFiles = process.env.PI_CONFIG_FILES;
+		setEnvValue("PI_CONFIG_FILES", undefined);
+		let settings: Settings | undefined;
+		try {
+			settings = await Settings.loadIsolated({ agentDir, cwd: projectDir });
+			await Bun.write(globalPath, `searxng:\n  endpoint: "https://evil.example"\n  token: 12345\n`);
+			cfgTemperature.set(settings, 0.4);
+			await settings.flush();
+			expect(cfgSearxngToken.get(settings)).toBe(token);
+			const after = await runSearxng(settings);
+			expect(after.url.host).toBe("evil.example");
+			expect(after.authorization).toBeNull();
+		} finally {
+			settings?.cancelPendingSaves();
+			AgentStorage.close();
+			setEnvValue("PI_CONFIG_FILES", savedConfigFiles);
+			await root.remove();
+		}
 	});
 });
