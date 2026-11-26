@@ -136,6 +136,7 @@ type MainYamlReadResult = {
 
 type ProjectSettingsReadResult = {
 	settings: RawSettings;
+	layers: RawSettings[];
 	fileSettings: RawSettings;
 	shellPathSource: string | undefined;
 	/** Discovered project files to invalidate and watch, including filtered or temporarily missing sources. */
@@ -168,6 +169,7 @@ const CONFIG_POLL_INTERVAL_MS = 500;
 
 type ConfigOverlayReadResult = {
 	settings: RawSettings;
+	layers: RawSettings[];
 	shellPathSource: string | undefined;
 };
 
@@ -340,6 +342,8 @@ export interface SettingsMirrorState {
 	readonly overrides: RawSettings;
 	readonly derived: boolean;
 	readonly projectShellPathSource: string | undefined;
+	readonly projectLayers?: readonly RawSettings[];
+	readonly configOverlayLayers?: readonly RawSettings[];
 	readonly overlayShellPathSource: string | undefined;
 }
 
@@ -741,7 +745,17 @@ function physicalTargetSegments(target: string, pathApi: typeof path = path): st
 // Settings Class
 // ═══════════════════════════════════════════════════════════════════════════
 
+let createUnresolvedSettings!: () => Settings;
+
 export class Settings {
+	static {
+		createUnresolvedSettings = () => {
+			const instance = new Settings({ inMemory: true }, { projection: true });
+			instance.#rebuildMerged();
+			return instance;
+		};
+	}
+
 	#configPath: string | null;
 	#cwd: string;
 	#agentDir: string;
@@ -752,12 +766,16 @@ export class Settings {
 	#global: RawSettings = {};
 	/** Project settings from .claude/settings.yml etc */
 	#project: RawSettings = {};
+	/** Per-file project layers in discovery order, after shadow stripping and migration. */
+	#projectLayers: RawSettings[] = [];
 	/** Last successfully loaded native .omp/config.yml contents. */
 	#projectFileSettings: RawSettings = {};
 	/** Logical config paths whose malformed targets were moved aside. */
 	#quarantinedYamlTargets = new Map<string, string>();
 	/** Extra config.yml-style overlays passed by CLI */
 	#configOverlay: RawSettings = {};
+	/** Per-file `--config` layers in load order. */
+	#configOverlayLayers: RawSettings[] = [];
 	/** Project settings file that most recently supplied shellPath. */
 	#projectShellPathSource: string | undefined;
 	/** Project files to invalidate and watch, including filtered or temporarily missing sources. */
@@ -1112,6 +1130,8 @@ export class Settings {
 			global: structuredClone(this.#global),
 			project: structuredClone(this.#project),
 			configOverlay: structuredClone(this.#configOverlay),
+			projectLayers: structuredClone(this.#projectLayers),
+			configOverlayLayers: structuredClone(this.#configOverlayLayers),
 			overrides: structuredClone(this.#overrides),
 			derived: this.#derived,
 			projectShellPathSource: this.#projectShellPathSource,
@@ -1137,6 +1157,16 @@ export class Settings {
 		this.#global = structuredClone(state.global);
 		this.#project = structuredClone(state.project);
 		this.#configOverlay = structuredClone(state.configOverlay);
+		this.#projectLayers = state.projectLayers
+			? structuredClone([...state.projectLayers])
+			: Object.keys(state.project).length > 0
+				? [structuredClone(state.project)]
+				: [];
+		this.#configOverlayLayers = state.configOverlayLayers
+			? structuredClone([...state.configOverlayLayers])
+			: Object.keys(state.configOverlay).length > 0
+				? [structuredClone(state.configOverlay)]
+				: [];
 		this.#overrides = structuredClone(state.overrides);
 		this.#derived = state.derived;
 		this.#projectShellPathSource = state.projectShellPathSource;
@@ -1202,95 +1232,85 @@ export class Settings {
 	getProvenance(setting: AnySetting): SettingProvenance {
 		if (!this.isConfigured(setting)) return "default";
 		const segments = setting.segments;
-		if (getByPath(this.#rawLayer("runtime"), segments) !== undefined) return "runtime";
-		if (getByPath(this.#rawLayer("overlay"), segments) !== undefined) return "overlay";
-		if (getByPath(this.#rawLayer("project"), segments) !== undefined) return "project";
-		if (getByPath(this.#rawLayer("global"), segments) !== undefined) return "global";
+		if (getByPath(this.#overrides, segments) !== undefined) return "runtime";
+		if (getByPath(this.#configOverlay, segments) !== undefined) return "overlay";
+		if (getByPath(projectLayerForMerge(this.#project), segments) !== undefined) return "project";
+		if (getByPath(this.#global, segments) !== undefined) return "global";
 		return this.#parent?.getProvenance(setting) ?? "default";
 	}
 
-	/** Own storage for one layer. Project matches the view {@link getProvenance} consults. */
-	#rawLayer(layer: "runtime" | "overlay" | "project" | "global"): RawSettings {
-		switch (layer) {
-			case "runtime":
-				return this.#overrides;
-			case "overlay":
-				return this.#configOverlay;
-			case "project":
-				return projectLayerForMerge(this.#project);
-			case "global":
-				return this.#global;
-		}
-	}
-
-	/** This instance's layers from `layer` downward. Higher layers and the parent are left out. */
-	#cappedOwnLayers(layer: "runtime" | "overlay" | "project" | "global"): OwnLayers {
-		const layers = this.#ownLayers();
-		return {
-			global: layers.global,
-			project: layer === "global" ? {} : layers.project,
-			configOverlay: layer === "global" || layer === "project" ? {} : layers.configOverlay,
-			overrides: layer === "runtime" ? layers.overrides : {},
-		};
-	}
-
-	/** Layers at or below `layer`, over an overlay parent's view capped the same way. */
-	#mergedAt(layer: "runtime" | "overlay" | "project" | "global"): RawSettings {
-		const own = this.#mergeOwnLayers(this.#cappedOwnLayers(layer));
-		return this.#parent ? this.#deepMerge(this.#parent.#mergedAt(layer), own) : own;
-	}
-
 	/**
-	 * Value of `setting` with every source above `layer` ignored. Remaining layers merge in
-	 * {@link getProvenance} order. `null` is unset. Callers bind a credential to the address
-	 * named at the credential's own provenance instead of an address a higher layer substituted.
+	 * Value from the lowest host-approved source that sets `setting` (parent first, then global,
+	 * each `--config` file in order, then runtime), skipping every project layer. A blank string
+	 * counts as unset.
 	 */
-	valueAt(setting: AnySetting, layer: "runtime" | "overlay" | "project" | "global"): unknown {
-		return configuredValue(this.#mergedAt(layer), setting, this.#cwd);
-	}
-
-	/**
-	 * Value from the lowest source that sets `setting`. A child's own layers are its override, so a
-	 * parent value wins; otherwise global, then project, then `--config`, then runtime. A blank
-	 * string counts as unset.
-	 */
-	baselineValue(setting: AnySetting): unknown {
+	hostBaselineValue(setting: AnySetting): unknown {
 		const present = (value: unknown): boolean =>
 			value !== undefined && value !== null && !(typeof value === "string" && value.trim() === "");
 		if (this.#parent) {
-			const inherited = this.#parent.baselineValue(setting);
+			const inherited = this.#parent.hostBaselineValue(setting);
 			if (present(inherited)) return inherited;
 		}
-		for (const layer of ["global", "project", "overlay", "runtime"] as const) {
-			const value = configuredValue(this.#mergeOwnLayers(this.#cappedOwnLayers(layer)), setting, this.#cwd);
+		const overlaySources = this.#configOverlayLayers.length > 0 ? this.#configOverlayLayers : [this.#configOverlay];
+		for (const source of [this.#global, ...overlaySources, this.#overrides]) {
+			const value = configuredValue(source, setting, this.#cwd);
 			if (present(value)) return value;
 		}
 		return undefined;
 	}
 
 	/**
-	 * Value of `setting` on the instance that stores `source`, capped at `source`'s layer.
-	 * A child that only inherited `source` asks the parent, so the child's own copy of that
-	 * layer cannot point an inherited login at a different server.
+	 * Value of `setting` at the source that supplied `source` (the specific file inside `--config`
+	 * or project, or the specific host layer), preserving any parent's trusted address while
+	 * excluding repository settings for host-supplied sources and excluding later files or layers.
 	 */
 	valueAtSource(source: AnySetting, setting: AnySetting): unknown {
-		const layer = source.provenance(this);
-		if (layer === "env" || layer === "default") return undefined;
-		return this.#valueAtSource(source, setting, layer);
+		const provenance = source.provenance(this);
+		if (provenance === "env" || provenance === "default") return undefined;
+		return this.#valueAtSource(source, setting);
 	}
 
-	#ownsLayer(setting: AnySetting, layer: "runtime" | "overlay" | "project" | "global"): boolean {
-		return getByPath(this.#rawLayer(layer), setting.segments) !== undefined;
+	#mergeLayersUpTo(layers: readonly RawSettings[], fallback: RawSettings, setting: AnySetting): RawSettings {
+		if (layers.length === 0) return fallback;
+		let ownerIndex = -1;
+		for (let i = layers.length - 1; i >= 0; i--) {
+			if (getByPath(layers[i], setting.segments) !== undefined) {
+				ownerIndex = i;
+				break;
+			}
+		}
+		if (ownerIndex < 0) return fallback;
+		let merged: RawSettings = {};
+		for (let i = 0; i <= ownerIndex; i++) {
+			merged = this.#deepMerge(merged, layers[i], { arrays: "combine" });
+		}
+		return merged;
 	}
 
-	#valueAtSource(
-		source: AnySetting,
-		setting: AnySetting,
-		layer: "runtime" | "overlay" | "project" | "global",
-	): unknown {
-		if (this.#ownsLayer(source, layer)) return this.valueAt(setting, layer);
-		if (this.#parent) return this.#parent.#valueAtSource(source, setting, layer);
-		return this.valueAt(setting, layer);
+	#valueAtSource(source: AnySetting, setting: AnySetting): unknown {
+		const segments = source.segments;
+		if (getByPath(this.#overrides, segments) !== undefined) {
+			return configuredValue(this.#operatorLayers(), setting, this.#cwd);
+		}
+		if (getByPath(this.#configOverlay, segments) !== undefined) {
+			const overlay = this.#mergeLayersUpTo(this.#configOverlayLayers, this.#configOverlay, source);
+			const own = this.#deepMerge(this.#deepMerge({}, this.#global), overlay, { arrays: "layer" });
+			const merged = this.#parent ? this.#deepMerge(this.#parent.#operatorLayers(), own) : own;
+			return configuredValue(merged, setting, this.#cwd);
+		}
+		const project = projectLayerForMerge(this.#project);
+		if (getByPath(project, segments) !== undefined) {
+			const projectLayers = this.#projectLayers.map(projectLayerForMerge);
+			const scopedProject = this.#mergeLayersUpTo(projectLayers, project, source);
+			const own = this.#deepMerge(this.#deepMerge({}, this.#global), scopedProject, { arrays: "layer" });
+			const merged = this.#parent ? this.#deepMerge(this.#parent.#mergedView(), own) : own;
+			return configuredValue(merged, setting, this.#cwd);
+		}
+		if (getByPath(this.#global, segments) !== undefined) {
+			const merged = this.#parent ? this.#deepMerge(this.#parent.#operatorLayers(), this.#global) : this.#global;
+			return configuredValue(merged, setting, this.#cwd);
+		}
+		return this.#parent ? this.#parent.#valueAtSource(source, setting) : undefined;
 	}
 
 	/**
@@ -1650,6 +1670,7 @@ export class Settings {
 		if (this.#parent) {
 			cloned = (await this.#parent.cloneForCwd(cwd)).overlay({}, { derived: this.#derived });
 			cloned.#project = structuredClone(this.#project);
+			cloned.#projectLayers = structuredClone(this.#projectLayers);
 		} else {
 			cloned = new Settings({
 				cwd,
@@ -1666,11 +1687,13 @@ export class Settings {
 					})
 				: structuredClone(this.#project);
 			if (!this.#persist) cloned.#projectShellPathSource = this.#projectShellPathSource;
+			if (!this.#persist) cloned.#projectLayers = structuredClone(this.#projectLayers);
 			cloned.#configFiles = [...this.#configFiles];
 			cloned.#overlayShellPathSource = this.#overlayShellPathSource;
 		}
 		cloned.#global = structuredClone(this.#global);
 		cloned.#configOverlay = structuredClone(this.#configOverlay);
+		cloned.#configOverlayLayers = structuredClone(this.#configOverlayLayers);
 		// A soft-pinned default yields to a value the clone's own scope configures.
 		cloned.#softPins = new Set(this.#softPins);
 		const layers = { ...cloned.#ownLayers(), overrides: this.#buildOriginalOverrides() };
@@ -1773,12 +1796,13 @@ export class Settings {
 				});
 			}
 			if (overlayResult.status === "fulfilled") {
-				const { settings, shellPathSource } = overlayResult.value;
+				const { settings, layers: overlayLayers, shellPathSource } = overlayResult.value;
 				refreshed.push({
 					layer: "configOverlay",
 					settings,
 					source: this.#configFiles.join(", "),
 					commit: () => {
+						this.#configOverlayLayers = overlayLayers;
 						this.#overlayShellPathSource = shellPathSource;
 					},
 				});
@@ -2946,6 +2970,7 @@ export class Settings {
 		}
 		return {
 			settings: this.#migrateRawSettings(project.settings, read.quarantineInvalid),
+			layers: project.layers,
 			fileSettings: read.fileSettings,
 			shellPathSource: project.shellPathSource,
 			sourcePaths: [
@@ -2962,19 +2987,20 @@ export class Settings {
 	#mergeProjectItems(
 		items: readonly SettingsCapabilityItem[],
 		nativeModelRoles: unknown,
-	): { settings: RawSettings; sourcePaths: string[]; shellPathSource: string | undefined } {
+	): { settings: RawSettings; layers: RawSettings[]; sourcePaths: string[]; shellPathSource: string | undefined } {
 		let settings: RawSettings = {};
+		const layers: RawSettings[] = [];
 		const sourcePaths: string[] = [];
 		let shellPathSource: string | undefined;
 		for (const item of items) {
-			settings = this.#deepMerge(settings, dropSettingsGroupShadows(item.data as RawSettings, item.path), {
-				arrays: "combine",
-			});
+			const cleaned = dropSettingsGroupShadows(item.data as RawSettings, item.path);
+			layers.push(this.#migrateRawSettings(structuredClone(cleaned), false));
+			settings = this.#deepMerge(settings, cleaned, { arrays: "combine" });
 			sourcePaths.push(item.path);
 			if (Object.hasOwn(item.data, "shellPath")) shellPathSource = item.path;
 		}
 		if (nativeModelRoles !== undefined) settings = this.#deepMerge(settings, { modelRoles: nativeModelRoles });
-		return { settings, sourcePaths, shellPathSource };
+		return { settings, layers, sourcePaths, shellPathSource };
 	}
 
 	/** Provider ids `disabledProviders` resolves to for `cwd` when `layers` are merged (over the overlay parent). */
@@ -2995,6 +3021,7 @@ export class Settings {
 
 	/** Adopts the read-side state of a project read whose layer is being committed. */
 	#commitProjectRead(result: ProjectSettingsReadResult): void {
+		this.#projectLayers = result.layers;
 		this.#projectFileSettings = result.fileSettings;
 		this.#projectShellPathSource = result.shellPathSource;
 		this.#projectSourcePaths = result.sourcePaths;
@@ -3004,16 +3031,19 @@ export class Settings {
 	async #readConfigOverlays(captureLegacyChangelogVersion = true): Promise<ConfigOverlayReadResult> {
 		let shellPathSource: string | undefined;
 		let settings: RawSettings = {};
+		const layers: RawSettings[] = [];
 		for (const filePath of this.#configFiles) {
 			const overlay = await this.#loadOverlayYaml(filePath, captureLegacyChangelogVersion);
+			layers.push(overlay);
 			settings = this.#deepMerge(settings, overlay, { arrays: "combine" });
 			if (Object.hasOwn(overlay, "shellPath")) shellPathSource = filePath;
 		}
-		return { settings, shellPathSource };
+		return { settings, layers, shellPathSource };
 	}
 
 	async #loadConfigOverlays(): Promise<RawSettings> {
 		const result = await this.#readConfigOverlays();
+		this.#configOverlayLayers = result.layers;
 		this.#overlayShellPathSource = result.shellPathSource;
 		return result.settings;
 	}
@@ -4598,14 +4628,13 @@ export function isSettingsInitialized(): boolean {
 let unresolvedSettings: Settings | undefined;
 
 /**
- * Settings the caller passed, otherwise the process instance, otherwise one stable in-memory default.
- * A fresh {@link Settings.isolated} per call would not share pacing, and reading the global proxy
- * before init throws.
+ * Settings the caller passed, otherwise the process instance, otherwise one stable in-memory default
+ * kept out of live session lookup. Reading the global proxy before init throws.
  */
 export function resolveSettings(supplied?: Settings): Settings {
 	if (supplied) return supplied;
 	if (globalInstance) return globalInstance;
-	return (unresolvedSettings ??= Settings.isolated());
+	return (unresolvedSettings ??= createUnresolvedSettings());
 }
 
 /**

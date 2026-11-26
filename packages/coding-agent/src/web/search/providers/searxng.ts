@@ -41,7 +41,7 @@ import type { SearchResponse, SearchSource } from "../types";
 import { SearchProviderError } from "../../../web/search/types";
 import type { StructuredQuery } from "../query";
 import { formatScraperQuery, parseSearchQuery } from "../query";
-import { clampNumResults, dateToAgeSeconds } from "../utils";
+import { clampNumResults, dateToAgeSeconds, searxngEndpointUrl } from "../utils";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
@@ -112,11 +112,6 @@ function endpointText(value: unknown): string | null {
 	return value;
 }
 
-/** Parsed `/search` or `/config` URL. A query or fragment on the base stays in the destination. */
-function searxngEndpointUrl(endpoint: string, suffix: "search" | "config"): URL {
-	return new URL(`${endpoint.replace(/\/+$/, "")}/${suffix}`);
-}
-
 /** True when both strings open the same parsed `/search` and `/config` destinations. */
 function sameSearxngServer(left: string, right: string): boolean {
 	try {
@@ -131,17 +126,20 @@ function sameSearxngServer(left: string, right: string): boolean {
 
 /**
  * Address named by the same source as `credential` (`Setting.provenance`).
- * An env login with no env address uses the parent's address, or the lowest layer on this
- * object. Any other login uses the address stored with it, not a child or higher layer
- * that only replaced the server.
+ * An env login with no env address uses the lowest host-approved address (never a repository
+ * file). Any other login uses the address stored with its own source, falling back to
+ * `SEARXNG_ENDPOINT` when that source names no address.
  */
 function trustedEndpoint(scope: Settings, credential: Setting<string | undefined>): string | null {
 	const provenance = credential.provenance(scope);
 	if (provenance === "env") {
-		return endpointText(cfgSearxngEndpoint.envValue()) ?? endpointText(scope.baselineValue(cfgSearxngEndpoint));
+		return endpointText(cfgSearxngEndpoint.envValue()) ?? endpointText(scope.hostBaselineValue(cfgSearxngEndpoint));
 	}
 	if (provenance === "runtime" || provenance === "overlay" || provenance === "project" || provenance === "global") {
-		return endpointText(scope.valueAtSource(credential, cfgSearxngEndpoint));
+		return (
+			endpointText(scope.valueAtSource(credential, cfgSearxngEndpoint)) ??
+			endpointText(cfgSearxngEndpoint.envValue())
+		);
 	}
 	return null;
 }
@@ -163,8 +161,12 @@ function hasControlCharacters(value: string): boolean {
 
 /** Basic auth wins over a bearer token. A login is sent only to the server its own source named. */
 function findAuth(scope: Settings, endpoint: string): SearXNGAuth | null {
-	const basicUsername = readSetting(cfgSearxngBasicUsername, scope);
-	const basicPassword = readSetting(cfgSearxngBasicPassword, scope);
+	const rawBasicUsername = readSetting(cfgSearxngBasicUsername, scope);
+	const rawBasicPassword = readSetting(cfgSearxngBasicPassword, scope);
+	const basicUsername =
+		rawBasicUsername !== null && loginFits(scope, cfgSearxngBasicUsername, endpoint) ? rawBasicUsername : null;
+	const basicPassword =
+		rawBasicPassword !== null && loginFits(scope, cfgSearxngBasicPassword, endpoint) ? rawBasicPassword : null;
 	if (basicUsername !== null || basicPassword !== null) {
 		if (basicUsername === null || basicPassword === null) {
 			throw new Error(
@@ -177,9 +179,7 @@ function findAuth(scope: Settings, endpoint: string): SearXNGAuth | null {
 		if (hasControlCharacters(basicUsername) || hasControlCharacters(basicPassword)) {
 			throw new Error("SearXNG Basic auth credentials must not contain RFC 7617 control characters.");
 		}
-		if (loginFits(scope, cfgSearxngBasicUsername, endpoint) && loginFits(scope, cfgSearxngBasicPassword, endpoint)) {
-			return { type: "basic", value: buildBasicAuthValue(basicUsername, basicPassword) };
-		}
+		return { type: "basic", value: buildBasicAuthValue(basicUsername, basicPassword) };
 	}
 
 	const token = readSetting(cfgSearxngToken, scope);

@@ -27,3 +27,8 @@ const RECENCY_DAYS: Record<"day" | "week" | "month" | "year", number> = {
 export function recencyAfterDate(recency: "day" | "week" | "month" | "year"): string {
 	return new Date(Date.now() - RECENCY_DAYS[recency] * 86_400_000).toISOString().slice(0, 10);
 }
+
+/** Parsed SearXNG `/search` or `/config` URL. A query or fragment on the base stays in the destination. */
+export function searxngEndpointUrl(endpoint: string, suffix: "search" | "config"): URL {
+	return new URL(`${endpoint.replace(/\/+$/, "")}/${suffix}`);
+}

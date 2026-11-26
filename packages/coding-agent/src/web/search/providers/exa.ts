@@ -33,22 +33,49 @@ const EXA_API_URL = "https://api.exa.ai/search";
 const EXA_MCP_URL = "https://mcp.exa.ai/mcp";
 const EXA_MCP_SOURCE = "oh-my-pi";
 const MAX_EXA_SNIPPET_CHARS = 500;
+const MAX_EXA_THROTTLE_BUCKETS = 256;
+
 interface ExaSearchThrottle {
+	lastAt: number;
 	nextAt: number;
+	pending: number;
 	tail: Promise<void>;
 }
 
-let exaSearchThrottles = new WeakMap<Settings, ExaSearchThrottle>();
+const exaSearchThrottles = new Map<string, ExaSearchThrottle>();
 
-function exaSearchThrottle(scope: Settings): ExaSearchThrottle {
-	let throttle = exaSearchThrottles.get(scope);
-	if (!throttle) {
-		throttle = { nextAt: 0, tail: Promise.resolve() };
-		exaSearchThrottles.set(scope, throttle);
-	}
-	return throttle;
+function exaLimitKey(channel: "api" | "mcp", apiKey: string | undefined): string {
+	if (!apiKey) return `${channel}:anonymous`;
+	const digest = new Bun.CryptoHasher("sha256").update(apiKey).digest("hex");
+	return `${channel}:${digest}`;
 }
 
+function exaSearchThrottle(limitKey: string, now: number): ExaSearchThrottle {
+	const existing = exaSearchThrottles.get(limitKey);
+	if (existing) {
+		// Refresh insertion order for LRU eviction of idle buckets.
+		exaSearchThrottles.delete(limitKey);
+		exaSearchThrottles.set(limitKey, existing);
+		return existing;
+	}
+	for (const [key, entry] of exaSearchThrottles) {
+		if (entry.pending === 0 && entry.nextAt <= now) exaSearchThrottles.delete(key);
+	}
+	while (exaSearchThrottles.size >= MAX_EXA_THROTTLE_BUCKETS) {
+		let evicted = false;
+		for (const [key, entry] of exaSearchThrottles) {
+			if (entry.pending === 0) {
+				exaSearchThrottles.delete(key);
+				evicted = true;
+				break;
+			}
+		}
+		if (!evicted) break;
+	}
+	const throttle: ExaSearchThrottle = { lastAt: -Infinity, nextAt: 0, pending: 0, tail: Promise.resolve() };
+	exaSearchThrottles.set(limitKey, throttle);
+	return throttle;
+}
 function configuredExaSearchDelayMs(scope: Settings): number {
 	const delayMs = cfgExaSearchDelayMs.get(scope);
 	if (!Number.isFinite(delayMs) || delayMs <= 0) return 0;
@@ -100,26 +127,34 @@ function waitUntilDoneOrAborted<T>(promise: Promise<T>, signal: AbortSignal | un
 	});
 }
 
-async function waitForExaSearchSlot(scope: Settings, signal: AbortSignal | undefined): Promise<void> {
+async function waitForExaSearchSlot(scope: Settings, limitKey: string, signal: AbortSignal | undefined): Promise<void> {
 	const delayMs = configuredExaSearchDelayMs(scope);
 	if (delayMs <= 0) return;
 
-	const throttle = exaSearchThrottle(scope);
+	const throttle = exaSearchThrottle(limitKey, Date.now());
+	throttle.pending += 1;
 	const prior = throttle.tail.catch(() => {});
-	const queued = prior.then(async () => {
-		signal?.throwIfAborted();
-		const waitMs = Math.max(0, throttle.nextAt - Date.now());
-		if (waitMs > 0) await abortableSleep(waitMs, signal);
-		signal?.throwIfAborted();
-		throttle.nextAt = Date.now() + delayMs;
-	});
+	const queued = prior
+		.then(async () => {
+			signal?.throwIfAborted();
+			const targetAt = Math.max(throttle.nextAt, throttle.lastAt + delayMs);
+			const waitMs = Math.max(0, targetAt - Date.now());
+			if (waitMs > 0) await abortableSleep(waitMs, signal);
+			signal?.throwIfAborted();
+			const sentAt = Date.now();
+			throttle.lastAt = sentAt;
+			throttle.nextAt = Math.max(throttle.nextAt, sentAt + delayMs);
+		})
+		.finally(() => {
+			throttle.pending -= 1;
+		});
 	throttle.tail = queued.catch(() => {});
 	await waitUntilDoneOrAborted(queued, signal);
 }
 
 /** Reset Exa request pacing state for isolated provider tests. */
 export function resetExaSearchThrottleForTest(): void {
-	exaSearchThrottles = new WeakMap();
+	exaSearchThrottles.clear();
 }
 
 type ExaSearchType = "neural" | "fast" | "auto" | "deep";
@@ -291,7 +326,7 @@ async function callExaSearch(apiKey: string, params: ExaSearchParams): Promise<E
 	const body = buildExaRequestBody(params);
 
 	const fetchImpl = params.fetch ?? fetch;
-	await waitForExaSearchSlot(resolveSettings(params.settings), params.signal);
+	await waitForExaSearchSlot(resolveSettings(params.settings), exaLimitKey("api", apiKey), params.signal);
 	const response = await fetchImpl(EXA_API_URL, {
 		method: "POST",
 		headers: {
@@ -335,7 +370,7 @@ async function callExaMcpSearch(params: ExaSearchParams): Promise<ExaSearchRespo
 	if (apiKey) query.set("exaApiKey", apiKey);
 	query.set("tools", "web_search_exa");
 	const fetchImpl = params.fetch ?? fetch;
-	await waitForExaSearchSlot(resolveSettings(params.settings), params.signal);
+	await waitForExaSearchSlot(resolveSettings(params.settings), exaLimitKey("mcp", apiKey), params.signal);
 	const requestId = Math.random().toString(36).slice(2);
 	const signal = withHardTimeout(params.signal, params.timeoutMs);
 	const response = await fetchImpl(`${EXA_MCP_URL}?${query.toString()}`, {

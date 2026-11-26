@@ -43,12 +43,14 @@ import {
 	type SearchResponse,
 	type SearchResultDetails,
 } from "./types";
+import { searxngEndpointUrl } from "./utils";
 
 import {
 	cfgProvidersAntigravityEndpoint,
 	cfgProvidersWebKeyless,
 	cfgProvidersWebSearchTimeoutSeconds,
 } from "../../session/settings";
+import { cfgSearxngEndpoint } from "../settings";
 
 /** Web search tool parameters schema */
 export const webSearchSchema = type({
@@ -153,7 +155,36 @@ const RATE_LIMIT_COOLDOWN_MS = 5 * 60 * 1000;
  * try them again. A keyless engine's free tier (Parallel, Exa) rate-limits for minutes,
  * so retrying it on every call only adds the 429's latency before the fallback answers.
  */
+const MAX_RATE_LIMIT_ENTRIES = 256;
 const rateLimitedUntil = new Map<string, number>();
+
+function rateLimitKey(model: Model<Api>, activeSettings: Settings): string {
+	const base = `${model.provider}/${model.id}`;
+	if (model.provider === "web" && model.id === "searxng") {
+		const endpoint = cfgSearxngEndpoint.get(activeSettings);
+		if (endpoint) {
+			try {
+				return `${base}@${searxngEndpointUrl(endpoint, "search").href}`;
+			} catch {
+				return `${base}@${endpoint}`;
+			}
+		}
+	}
+	return base;
+}
+
+function recordRateLimit(key: string, now: number): void {
+	for (const [entryKey, until] of rateLimitedUntil) {
+		if (until <= now) rateLimitedUntil.delete(entryKey);
+	}
+	rateLimitedUntil.delete(key);
+	rateLimitedUntil.set(key, now + RATE_LIMIT_COOLDOWN_MS);
+	while (rateLimitedUntil.size > MAX_RATE_LIMIT_ENTRIES) {
+		const oldest = rateLimitedUntil.keys().next().value;
+		if (oldest === undefined) break;
+		rateLimitedUntil.delete(oldest);
+	}
+}
 
 function hasRenderableSearchContent(response: SearchResponse): boolean {
 	if (response.answer?.trim()) return true;
@@ -342,7 +373,7 @@ async function executeSearch(
 		let provider: SearchProvider | undefined;
 		const candidateMeta = { id: candidate.model.id, label: candidate.model.name };
 		lastProvider = candidateMeta;
-		const engineKey = `${candidate.model.provider}/${candidate.model.id}`;
+		const engineKey = rateLimitKey(candidate.model, activeSettings);
 		const cooldownEnds = rateLimitedUntil.get(engineKey);
 		if (cooldownEnds !== undefined && !params.model) {
 			if (cooldownEnds > Date.now()) {
@@ -488,7 +519,7 @@ async function executeSearch(
 			failedResponseProvider = provider?.id ?? "none";
 			failures.push({ provider: provider ?? candidateMeta, error });
 			if (error instanceof SearchProviderError && error.status === 429) {
-				rateLimitedUntil.set(engineKey, Date.now() + RATE_LIMIT_COOLDOWN_MS);
+				recordRateLimit(engineKey, Date.now());
 			}
 		}
 	}
