@@ -97,6 +97,7 @@ import {
 	escapeSummaryBoundaryTags,
 	extractFileOpsFromMessage,
 	incompleteOutputError,
+	indexToolResultDetails,
 	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversationForSummary,
 	stripReadSelector,
@@ -110,15 +111,25 @@ import {
 export interface CompactionDetails {
 	readFiles: string[];
 	modifiedFiles: string[];
+	/**
+	 * True when `readFiles` already hold each read's resolved path (so literal
+	 * colon-named files keep their full name across later compactions). Legacy
+	 * entries without this flag still pass through `stripReadSelector`.
+	 */
+	readFilesResolved?: boolean;
 }
 
 /**
  * Extract file operations from messages and previous compaction entries.
+ * `resultDetails` pairs tool calls with their own turn's results (see
+ * {@link indexToolResultDetails}); pass one index built over the full message
+ * list the extracted messages were sliced from.
  */
 function extractFileOperations(
 	messages: AgentMessage[],
 	entries: SessionEntry[],
 	prevCompactionIndex: number,
+	resultDetails: ReadonlyMap<object, unknown>,
 ): snapcompact.FileOperations {
 	const fileOps = snapcompact.createFileOps();
 
@@ -128,7 +139,10 @@ function extractFileOperations(
 		if (!prevCompaction.fromExtension && prevCompaction.details) {
 			const details = prevCompaction.details as CompactionDetails;
 			if (Array.isArray(details.readFiles)) {
-				for (const f of details.readFiles) fileOps.read.add(stripReadSelector(f));
+				const resolved = details.readFilesResolved === true;
+				for (const f of details.readFiles) {
+					fileOps.read.add(resolved ? f : stripReadSelector(f));
+				}
 			}
 			if (Array.isArray(details.modifiedFiles)) {
 				for (const f of details.modifiedFiles) fileOps.edited.add(f);
@@ -138,7 +152,7 @@ function extractFileOperations(
 
 	// Extract from tool calls in messages
 	for (const msg of messages) {
-		extractFileOpsFromMessage(msg, fileOps);
+		extractFileOpsFromMessage(msg, fileOps, resultDetails);
 	}
 
 	return fileOps;
@@ -1686,12 +1700,13 @@ function prepareCompactionUnlabeled(
 	}
 
 	// Extract file operations from messages and previous compaction
-	const fileOps = extractFileOperations(messagesToSummarize, pathEntries, prevCompactionIndex);
+	const resultDetails = indexToolResultDetails(compactionMessages);
+	const fileOps = extractFileOperations(messagesToSummarize, pathEntries, prevCompactionIndex, resultDetails);
 
 	// Also extract file ops from turn prefix if splitting
 	if (cutPoint.isSplitTurn) {
 		for (const msg of turnPrefixMessages) {
-			extractFileOpsFromMessage(msg, fileOps);
+			extractFileOpsFromMessage(msg, fileOps, resultDetails);
 		}
 	}
 
@@ -2299,7 +2314,10 @@ export async function compact(
 				: safeCut === originalCut
 					? firstKeptEntryId
 					: (recentEntryIds?.[safeCut - originalCut] ?? "");
-		for (let i = originalCut; i < safeCut; i++) extractFileOpsFromMessage(allMessages[i], fileOps);
+		if (safeCut > originalCut) {
+			const movedDetails = indexToolResultDetails(allMessages);
+			for (let i = originalCut; i < safeCut; i++) extractFileOpsFromMessage(allMessages[i], fileOps, movedDetails);
+		}
 		const summarizedMessages = [
 			...(previousSummaryMessage ? [previousSummaryMessage] : []),
 			...allMessages.slice(0, safeCut),
@@ -2497,7 +2515,7 @@ export async function compact(
 		...(shortSummary !== undefined ? { shortSummary } : {}),
 		firstKeptEntryId: nativeSummary !== undefined ? nativeFirstKeptEntryId : firstKeptEntryId,
 		tokensBefore,
-		details: { readFiles, modifiedFiles } as CompactionDetails,
+		details: { readFiles, modifiedFiles, readFilesResolved: true } as CompactionDetails,
 		preserveData: finalPreserveData,
 		...(remoteReplayThroughEntryId ? { providerReplayThroughEntryId: remoteReplayThroughEntryId } : {}),
 	};

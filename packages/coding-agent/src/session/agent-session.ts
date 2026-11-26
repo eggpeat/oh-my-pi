@@ -15670,6 +15670,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			summaryDetails = {
 				readFiles: result.readFiles || [],
 				modifiedFiles: result.modifiedFiles || [],
+				readFilesResolved: result.readFilesResolved === true,
 			};
 		} else if (hookSummary) {
 			summaryText = hookSummary.summary;

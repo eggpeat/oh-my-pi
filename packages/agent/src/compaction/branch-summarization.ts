@@ -26,6 +26,7 @@ import branchSummaryPreamble from "./prompts/branch-summary-preamble.md" with { 
 import {
 	extractFileOpsFromMessage,
 	incompleteOutputError,
+	indexToolResultDetails,
 	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversationForSummary,
 	stripReadSelector,
@@ -40,6 +41,7 @@ export interface BranchSummaryResult {
 	summary?: string;
 	readFiles?: string[];
 	modifiedFiles?: string[];
+	readFilesResolved?: boolean;
 	aborted?: boolean;
 	error?: string;
 }
@@ -48,6 +50,11 @@ export interface BranchSummaryResult {
 export interface BranchSummaryDetails {
 	readFiles: string[];
 	modifiedFiles: string[];
+	/**
+	 * True when `readFiles` already hold each read's resolved path; legacy
+	 * entries without this flag still pass through `stripReadSelector`.
+	 */
+	readFilesResolved?: boolean;
 }
 
 export interface BranchPreparation {
@@ -258,7 +265,10 @@ export function prepareBranchEntries(
 		if (entry.type === "branch_summary" && !entry.fromExtension && entry.details) {
 			const details = entry.details as BranchSummaryDetails;
 			if (Array.isArray(details.readFiles)) {
-				for (const f of details.readFiles) fileOps.read.add(stripReadSelector(f));
+				const resolved = details.readFilesResolved === true;
+				for (const f of details.readFiles) {
+					fileOps.read.add(resolved ? f : stripReadSelector(f));
+				}
 			}
 			if (Array.isArray(details.modifiedFiles)) {
 				// Modified files go into both edited and written for proper deduplication
@@ -269,6 +279,20 @@ export function prepareBranchEntries(
 		}
 	}
 
+	// Pair each read call with its own turn's result. Raw stored messages keep
+	// results that `getMessageFromEntry` drops (e.g. pruned toolResult entries) available
+	// for pairing while sharing exact call-block identity with the second pass.
+	const indexedMessages: AgentMessage[] = [];
+	for (const entry of entries) {
+		if (entry.type === "message") {
+			indexedMessages.push(entry.message);
+		} else {
+			const message = getMessageFromEntry(entry);
+			if (message) indexedMessages.push(message);
+		}
+	}
+	const resultDetails = indexToolResultDetails(indexedMessages);
+
 	// Second pass: walk from newest to oldest, adding messages until token budget
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
@@ -276,7 +300,7 @@ export function prepareBranchEntries(
 		if (!message) continue;
 
 		// Extract file ops from assistant messages (tool calls)
-		extractFileOpsFromMessage(message, fileOps);
+		extractFileOpsFromMessage(message, fileOps, resultDetails);
 
 		const tokens = estimateBranchSummaryTokens(message, tokenizer);
 
@@ -403,5 +427,6 @@ export async function generateBranchSummary(
 		summary: summary || "No summary generated",
 		readFiles,
 		modifiedFiles,
+		readFilesResolved: true,
 	};
 }

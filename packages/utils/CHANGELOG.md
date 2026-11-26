@@ -5,6 +5,7 @@
 ### Added
 
 - Added `getBunStubDir()`, the cache directory holding the `bun` stub a compiled omp appends to its JS eval kernel's PATH ([#19241](https://github.com/can1357/oh-my-pi/pull/19241) by [@mccraigmccraig](https://github.com/mccraigmccraig))
+- Added shared filesystem read-selector splitting utilities (`splitPathAndSel` and `isAlternateFormReadSelector`) ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 ### Breaking Changes
 
 - Removed the unused `getToolsDir()` export. Custom tool discovery is unchanged.

@@ -5,6 +5,8 @@
 ### Fixed
 
 - Fixed OpenTelemetry chat spans reporting the requested model as `gen_ai.response.model` when the provider recorded the model that actually served the turn ([#20466](https://github.com/can1357/oh-my-pi/pull/20466) by [@byhow](https://github.com/byhow))
+- Fixed compaction `<files>` lists and stale-read pruning for tail (`:-N`), SVG image (`:img`), per-chunk `:raw`, and colon-folded read selectors, keeping SVG raster reads distinct from plain text reads ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+- Fixed compaction `<files>` lists, branch summaries, and stale-read pruning using the read tool's resolved path and selector so literal colon-named files (`notes.txt:-5`, `a:1-30,`) and shell-escaped paths stay distinct across repeated summaries ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 
 ## [19.2.1] - 2026-11-25
 

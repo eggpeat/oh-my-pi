@@ -1,3 +1,4 @@
+import { LINE_RANGE_CHUNK_SOURCE } from "@oh-my-pi/pi-utils";
 import { ToolError } from "./tool-errors";
 
 /**
@@ -9,9 +10,7 @@ export interface LineRange {
 	endLine: number | undefined;
 }
 
-/** Shared line-range grammar for selector recognition and parsing. */
-export const LINE_RANGE_CHUNK_SOURCE = String.raw`L?(\d+)(?:(\.\.|[-+])L?(\d+)?)?`;
-
+export { LINE_RANGE_CHUNK_SOURCE };
 const LINE_RANGE_CHUNK_RE = new RegExp(`^${LINE_RANGE_CHUNK_SOURCE}$`, "i");
 
 /**

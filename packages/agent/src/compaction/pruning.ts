@@ -125,10 +125,16 @@ export const USELESS_NOTICE = "[Uneventful result elided]";
  * which a newer successful result supersedes every older one. A key `K` also
  * covers keys with prefix `K + "\u0000"`: they are superseded only when the
  * newest successful result for `K` is complete (see
- * {@link SupersedeCompleteFn}). Return `undefined` to exempt a call from
- * supersede grouping.
+ * {@link SupersedeCompleteFn}). `result` is the paired tool-result message,
+ * whose `details` can disambiguate what the tool actually read (e.g. a literal
+ * `notes.txt:-5` file vs a `:-5` tail selector on `notes.txt`). Return
+ * `undefined` to exempt a call from supersede grouping.
  */
-export type SupersedeKeyFn = (toolName: string, args: Record<string, unknown>) => string | undefined;
+export type SupersedeKeyFn = (
+	toolName: string,
+	args: Record<string, unknown>,
+	result?: ToolResultMessage,
+) => string | undefined;
 
 /**
  * Whether a successful keyed result shows its whole target, so a result for a
@@ -385,7 +391,7 @@ function collectSupersededResults(
 		const toolCall = toolCalls.get(message.toolCallId);
 		if (!toolCall) continue;
 		if (isProtectedToolResult(message, toolCall, protectedTools)) continue;
-		const key = supersedeKey(toolCall.name, toolCall.arguments as Record<string, unknown>);
+		const key = supersedeKey(toolCall.name, toolCall.arguments as Record<string, unknown>, message);
 		if (key === undefined) continue;
 		const separator = key.indexOf("\u0000");
 		const sameKey = newerByKey.get(key);
@@ -668,20 +674,27 @@ export function pruneToolOutputs(
 /**
  * Supersede key for the `read` tool: the file path with the trailing line/raw
  * selector stripped (the read tool's own splitter grammar via
- * {@link splitReadSelector}, e.g. `src/foo.ts:50-200`, `:2-4:raw`).
+ * {@link splitReadSelector}, e.g. `src/foo.ts:50-200`, `:2-4:raw`, `:-60`).
  * Internal/URL-scheme paths (`skill://…`, `https://…`) are exempt.
  * Selector-free reads key on the bare path; line-range reads key on
  * `path + "\u0000" + selector`, so a complete bare-path read can supersede them.
- * `raw` and `conflicts` reads show a different form than a plain read (e.g. raw
- * notebook JSON vs converted notebook text), so they key on
- * `path + "\u0001" + selector` and are superseded only by the same selector.
+ * `raw`, `conflicts`, and `img` reads show a different form than a plain read
+ * (e.g. raw notebook JSON vs converted notebook text, rasterized SVG vs XML),
+ * so they key on `path + "\u0001" + selector` and are superseded only by the
+ * same selector. When `result`'s `details.readTarget` records the path and
+ * selector the read tool actually chose (e.g. a real `notes.txt:-5` file or an
+ * unfolded `a:1-30,` base), that choice governs instead of re-splitting `args`.
  */
-export function readToolSupersedeKey(toolName: string, args: Record<string, unknown>): string | undefined {
+export function readToolSupersedeKey(
+	toolName: string,
+	args: Record<string, unknown>,
+	result?: ToolResultMessage,
+): string | undefined {
 	if (toolName !== "read") return undefined;
 	const path = args.path;
 	if (typeof path !== "string" || path.length === 0) return undefined;
 	if (path.includes("://")) return undefined;
-	const { path: base, sel } = splitReadSelector(path);
+	const { path: base, sel } = splitReadSelector(path, result?.details);
 	if (sel === undefined) return base;
 	return `${base}${isAlternateFormReadSelector(sel) ? "\u0001" : "\u0000"}${sel}`;
 }

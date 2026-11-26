@@ -449,7 +449,7 @@ function handoffSummaryFromDocument(
 	const { readFiles, modifiedFiles } = snapcompact.computeFileLists(preparation.fileOps);
 	return {
 		summary: snapcompact.upsertFileOperations(document, readFiles, modifiedFiles, preparation.fileOps.read),
-		details: { readFiles, modifiedFiles },
+		details: { readFiles, modifiedFiles, readFilesResolved: true },
 	};
 }
 
@@ -1711,7 +1711,7 @@ export class SessionMaintenance {
 				shortSummary = snapcompactResult.shortSummary;
 				firstKeptEntryId = snapcompactResult.firstKeptEntryId;
 				tokensBefore = snapcompactResult.tokensBefore;
-				details = snapcompactResult.details;
+				details = { ...snapcompactResult.details, readFilesResolved: true };
 				preserveData = { ...compactionPrep.preserveData, ...snapcompactResult.preserveData };
 			} else if (selectedMethod === "handoff") {
 				if (
@@ -5154,13 +5154,15 @@ export class SessionMaintenance {
 		const rebuilt = snapcompact.getPreservedArchive(result.preserveData);
 		if (!rebuilt || rebuilt.frames.length >= archive.frames.length) return undefined;
 
+		const staleResolved =
+			(staleEntry.details as { readFilesResolved?: boolean } | undefined)?.readFilesResolved === true;
 		const rebuiltEntryId = this.#host.sessionManager.appendCompaction(
 			result.summary,
 			result.shortSummary,
 			result.firstKeptEntryId,
 			result.tokensBefore,
 			{
-				details: result.details,
+				details: staleResolved ? { ...result.details, readFilesResolved: true } : result.details,
 				preserveData: result.preserveData,
 				method: "snapcompact",
 				tokensAfter: this.#projectCompactedContextTokens({
@@ -6306,7 +6308,7 @@ export class SessionMaintenance {
 				shortSummary = snapcompactResult.shortSummary;
 				firstKeptEntryId = snapcompactResult.firstKeptEntryId;
 				tokensBefore = snapcompactResult.tokensBefore;
-				details = snapcompactResult.details;
+				details = { ...snapcompactResult.details, readFilesResolved: true };
 				preserveData = { ...compactionPrep.preserveData, ...snapcompactResult.preserveData };
 			} else {
 				const liveModel = this.#model;

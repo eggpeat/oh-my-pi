@@ -98,6 +98,7 @@ import {
 import {
 	expandPath,
 	formatPathRelativeToCwd,
+	formatResolvedReadTargetPath,
 	probeLiteralPathExists,
 	resolveReadPathAsync,
 	specialFileKind,
@@ -2316,17 +2317,24 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		readPath: string,
 		options: FilesystemReadOptions,
 	): Promise<AgentToolResult<ReadToolDetails>> {
-		const media: { path?: string } = {};
-		const result = await this.#readFilesystemPipeline(readPath, options, media);
-		if (media.path === undefined || result.isError) return result;
-		return { ...result, details: { ...result.details, mediaPath: media.path } };
+		const out: { mediaPath?: string; readTarget?: { path: string; sel?: string } } = {};
+		const result = await this.#readFilesystemPipeline(readPath, options, out);
+		if (result.isError || (out.mediaPath === undefined && out.readTarget === undefined)) return result;
+		return {
+			...result,
+			details: {
+				...result.details,
+				...(out.mediaPath !== undefined ? { mediaPath: out.mediaPath } : {}),
+				...(out.readTarget !== undefined ? { readTarget: out.readTarget } : {}),
+			},
+		};
 	}
 
-	/** {@link #readFilesystemPath}'s body; sets `media.path` once the read is known to be a whole Tern-viewable file. */
+	/** {@link #readFilesystemPath}'s body; sets `out.mediaPath` and `out.readTarget` once the target is resolved. */
 	async #readFilesystemPipeline(
 		readPath: string,
 		options: FilesystemReadOptions,
-		media: { path?: string },
+		out: { mediaPath?: string; readTarget?: { path: string; sel?: string } },
 	): Promise<AgentToolResult<ReadToolDetails>> {
 		const {
 			located,
@@ -2561,6 +2569,26 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const renderAbsolutePath = lexicalAbsolutePath ?? absolutePath;
 		markRawSuffixResolution(suffixResolution, isRawSelector(parsed));
 
+		// Record the path and selector this read actually resolved to, so history
+		// bookkeeping (compaction `<files>` lists and stale-read pruning) uses the
+		// reader's own interpretation instead of re-splitting the raw argument.
+		{
+			const targetPath = formatResolvedReadTargetPath(localReadPath, absolutePath, this.session.cwd);
+			if (question !== undefined) {
+				const qualifier = pdfImageRead
+					? `:${pdfImageRead.member}`
+					: localTarget.sel !== undefined
+						? `:${localTarget.sel}`
+						: "";
+				out.readTarget = { path: `${targetPath}${qualifier}?q=${question}` };
+			} else if (pdfImageRead) {
+				out.readTarget = { path: targetPath, sel: pdfImageRead.member };
+			} else {
+				out.readTarget =
+					localTarget.sel !== undefined ? { path: targetPath, sel: localTarget.sel } : { path: targetPath };
+			}
+		}
+
 		if (isDirectory) {
 			if (question !== undefined) throw new ToolError(IMAGE_QUESTION_SELECTOR_ERROR);
 			// A located directory lists through its handler, which names entries by URL.
@@ -2613,7 +2641,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			(localTarget.sel === undefined || parsed.kind === "raw" || parsed.kind === "image") &&
 			ternShowsMedia(absolutePath)
 		) {
-			media.path = absolutePath;
+			out.mediaPath = absolutePath;
 		}
 
 		// Metadata inspection precedes whole-file snapshots and never starts analysis.

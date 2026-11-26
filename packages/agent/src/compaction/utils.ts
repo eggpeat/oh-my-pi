@@ -5,7 +5,7 @@
 import type { Message, ToolCall } from "@oh-my-pi/pi-ai";
 import { type Dialect, getDialectDefinition } from "@oh-my-pi/pi-ai/dialect";
 import { escapeHarmonyControlTokens } from "@oh-my-pi/pi-ai/utils/harmony-leak";
-import { prompt, stringifyJson } from "@oh-my-pi/pi-utils";
+import { isAlternateFormReadSelector, isRecord, prompt, splitPathAndSel, stringifyJson } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import type { AgentMessage } from "../types";
 import summarizationSystemPrompt from "./prompts/summarization-system.md" with { type: "text" };
@@ -33,68 +33,95 @@ export function incompleteOutputError(prefix: string): string {
 	return `${prefix}: model output ended incomplete (stopReason: length)`;
 }
 
-// Read-tool selector grammar, mirrored from the conservative filesystem splitter in
-// packages/coding-agent/src/tools/path-utils.ts (splitPathAndSel). Keep in sync.
-// A trailing `:chunk` is a selector only when it is a line-range list
-// (`50`, `50-200`, `50+10`, `5-16,960-973`, `..` alias), `raw`, or `conflicts` —
-// alone or as a `range:raw` / `raw:range` compound.
-const RANGE_CHUNK_SRC = String.raw`L?\d+(?:(?:[-+]|\.\.)L?\d+|-|\.\.)?`;
-const RANGE_LIST_SRC = `${RANGE_CHUNK_SRC}(?:,${RANGE_CHUNK_SRC})*`;
-const READ_SELECTOR_RE = new RegExp(`^(?:${RANGE_LIST_SRC}|raw|conflicts)$`, "i");
-const READ_RANGE_ONLY_RE = new RegExp(`^${RANGE_LIST_SRC}$`, "i");
-const READ_RAW_ONLY_RE = /^raw$/i;
-const READ_ALTERNATE_FORM_RE = /^(?:raw|conflicts)$/i;
+export { isAlternateFormReadSelector };
 
 /**
- * Split a read-tool path into its base path and trailing selector, mirroring the
- * read tool's own splitter. Single source of the grammar in this package: the
+ * The filesystem path and selector the read tool actually resolved the request
+ * to, recorded on the result's `details.readTarget` after literal-path
+ * preference, unfolded colon-list checks, shell unescaping, and workspace
+ * suffix resolution. `undefined` for results that predate the field or carry
+ * no resolved target (e.g. URL/internal reads).
+ */
+function readTargetDetails(details: unknown): { path: string; sel?: string } | undefined {
+	if (!isRecord(details) || !isRecord(details.readTarget)) return undefined;
+	const { path, sel } = details.readTarget;
+	if (typeof path !== "string" || path.length === 0) return undefined;
+	if (sel !== undefined && typeof sel !== "string") return undefined;
+	return sel === undefined ? { path } : { path, sel };
+}
+
+/**
+ * Split a read-tool path into its base path and trailing selector using the
+ * shared filesystem selector splitter ({@link splitPathAndSel}): the
  * file-operations list strips selectors via {@link stripReadSelector}, and the
  * supersede-prune pass keys on both parts via `readToolSupersedeKey`.
+ *
+ * `resultDetails` is the paired tool result's `details` when available. When
+ * it records the read tool's resolved `readTarget`, that choice governs: a
+ * real file named `notes.txt:-5` reads as that file with no selector, an
+ * unfolded `a:1-30,:-30` tail read keeps base `a:1-30,`, and shell-escaped
+ * paths keep the unescaped spelling the reader resolved. Results without a
+ * target (older sessions, URL reads) fall back to re-splitting the argument.
  */
-export function splitReadSelector(path: string): { path: string; sel?: string } {
-	const colon = path.lastIndexOf(":");
-	if (colon <= 0) return { path };
-	const candidate = path.slice(colon + 1);
-	if (!READ_SELECTOR_RE.test(candidate)) return { path };
-	let base = path.slice(0, colon);
-	let sel = candidate;
-	// Compound trailing selector: `path:1-50:raw` or `path:raw:1-50`.
-	const inner = base.lastIndexOf(":");
-	if (inner > 0) {
-		const innerCandidate = base.slice(inner + 1);
-		const innerIsRaw = READ_RAW_ONLY_RE.test(innerCandidate);
-		const outerIsRaw = READ_RAW_ONLY_RE.test(candidate);
-		const innerIsRange = READ_RANGE_ONLY_RE.test(innerCandidate);
-		const outerIsRange = READ_RANGE_ONLY_RE.test(candidate);
-		if ((innerIsRaw && outerIsRange) || (innerIsRange && outerIsRaw)) {
-			sel = `${innerCandidate}:${candidate}`;
-			base = base.slice(0, inner);
-		}
-	}
-	return { path: base, sel };
+export function splitReadSelector(path: string, resultDetails?: unknown): { path: string; sel?: string } {
+	return readTargetDetails(resultDetails) ?? splitPathAndSel(path);
 }
 
 /**
- * Strip a trailing read-tool selector (`:50-200`, `:raw`, `:1-50:raw`, `:conflicts`, …)
- * so the same file read with different line ranges dedupes to one `<files>` entry
+ * Strip a trailing read-tool selector (`:50-200`, `:-60`, `:raw`, `:1-50:raw`, `:conflicts`, `:img`, …)
+ * so the same file read with different selectors dedupes to one `<files>` entry
  * and matches its write/edit path when computing Read/Write/RW markers.
  */
-export function stripReadSelector(path: string): string {
-	return splitReadSelector(path).path;
+export function stripReadSelector(path: string, resultDetails?: unknown): string {
+	return splitReadSelector(path, resultDetails).path;
 }
 
 /**
- * Whether a selector from {@link splitReadSelector} shows the file in a form other
- * than its plain lines: verbatim `raw` bytes or the merge `conflicts` view.
+ * Index tool-result `details` by assistant tool-call block identity. Indexing
+ * is turn-scoped: a `role === "user"` message ends the current turn and clears
+ * every pending call, so a call id reused by a later turn (provider retries,
+ * resumed sessions) can never bind another turn's result to this call.
  */
-export function isAlternateFormReadSelector(sel: string): boolean {
-	return sel.split(":").some(part => READ_ALTERNATE_FORM_RE.test(part));
+export function indexToolResultDetails(messages: readonly AgentMessage[]): ReadonlyMap<object, unknown> {
+	const details = new Map<object, unknown>();
+	const pending = new Map<string, object[]>();
+	for (const message of messages) {
+		if (message.role === "user") {
+			pending.clear();
+			continue;
+		}
+		if (message.role === "assistant" && Array.isArray(message.content)) {
+			for (const block of message.content) {
+				if (typeof block !== "object" || block === null) continue;
+				if (!("type" in block) || block.type !== "toolCall") continue;
+				if (!("id" in block) || typeof block.id !== "string") continue;
+				const queue = pending.get(block.id);
+				if (queue) queue.push(block);
+				else pending.set(block.id, [block]);
+			}
+			continue;
+		}
+		if (message.role !== "toolResult") continue;
+		const queue = pending.get(message.toolCallId);
+		const block = queue?.shift();
+		if (!block) continue;
+		details.set(block, message.details);
+		if (queue!.length === 0) pending.delete(message.toolCallId);
+	}
+	return details;
 }
 
 /**
  * Extract file operations from tool calls in an assistant message.
+ * `resultDetails` comes from {@link indexToolResultDetails} over the same
+ * message list; reads whose result records the resolved path use it instead
+ * of re-splitting the raw argument.
  */
-export function extractFileOpsFromMessage(message: AgentMessage, fileOps: snapcompact.FileOperations): void {
+export function extractFileOpsFromMessage(
+	message: AgentMessage,
+	fileOps: snapcompact.FileOperations,
+	resultDetails?: ReadonlyMap<object, unknown>,
+): void {
 	if (message.role !== "assistant") return;
 	if (!("content" in message) || !Array.isArray(message.content)) return;
 
@@ -115,7 +142,7 @@ export function extractFileOpsFromMessage(message: AgentMessage, fileOps: snapco
 
 		switch (block.name) {
 			case "read":
-				fileOps.read.add(stripReadSelector(path));
+				fileOps.read.add(stripReadSelector(path, resultDetails?.get(block)));
 				break;
 			case "write":
 				fileOps.written.add(path);

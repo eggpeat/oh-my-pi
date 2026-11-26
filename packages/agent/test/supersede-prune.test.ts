@@ -175,11 +175,34 @@ describe("readToolSupersedeKey", () => {
 		expect(readToolSupersedeKey("read", { path: "src/foo.ts:raw" })).toBe("src/foo.ts\u0001raw");
 		expect(readToolSupersedeKey("read", { path: "src/foo.ts:conflicts" })).toBe("src/foo.ts\u0001conflicts");
 		expect(readToolSupersedeKey("read", { path: "src/foo.ts:2-4:raw" })).toBe("src/foo.ts\u00012-4:raw");
+		expect(readToolSupersedeKey("read", { path: "src/foo.ts:-60" })).toBe("src/foo.ts\u0000-60");
+		expect(readToolSupersedeKey("read", { path: "src/foo.ts:1-12,-15" })).toBe("src/foo.ts\u00001-12,-15");
+		expect(readToolSupersedeKey("read", { path: "src/foo.ts:1-30,:-30" })).toBe("src/foo.ts\u00001-30,-30");
+		expect(readToolSupersedeKey("read", { path: "src/foo.ts:-60:raw" })).toBe("src/foo.ts\u0001-60:raw");
+		expect(readToolSupersedeKey("read", { path: "src/foo.ts:raw:-60" })).toBe("src/foo.ts\u0001raw:-60");
+		expect(readToolSupersedeKey("read", { path: "src/foo.ts:1-3:raw,9:raw" })).toBe("src/foo.ts\u00011-3,9:raw");
+		expect(readToolSupersedeKey("read", { path: "assets/logo.svg:img" })).toBe("assets/logo.svg\u0001img");
 	});
 
 	test("does not strip non-selector colon segments", () => {
 		expect(readToolSupersedeKey("read", { path: "db.sqlite:users" })).toBe("db.sqlite:users");
 		expect(readToolSupersedeKey("read", { path: "db.sqlite:users:42" })).toBe("db.sqlite:users\u000042");
+	});
+
+	test("uses the readTarget recorded on result details instead of re-splitting the raw path", () => {
+		const literal = toolResultMessage("read", "c1", "ok", T0);
+		literal.details = { readTarget: { path: "notes.txt:-5" } };
+		expect(readToolSupersedeKey("read", { path: "notes.txt:-5" }, literal)).toBe("notes.txt:-5");
+
+		const unfoldedTail = toolResultMessage("read", "c2", "ok", T0);
+		unfoldedTail.details = { readTarget: { path: "a:1-30,", sel: "-30" } };
+		expect(readToolSupersedeKey("read", { path: "a:1-30,:-30" }, unfoldedTail)).toBe(
+			`a:1-30,${String.fromCharCode(0)}-30`,
+		);
+
+		const escapedLiteral = toolResultMessage("read", "c3", "ok", T0);
+		escapedLiteral.details = { readTarget: { path: "my file.txt:-5" } };
+		expect(readToolSupersedeKey("read", { path: "my\\ file.txt:-5" }, escapedLiteral)).toBe("my file.txt:-5");
 	});
 });
 
@@ -273,6 +296,50 @@ describe("pruneSupersededToolResults — tail case", () => {
 	});
 });
 
+describe("pruneSupersededToolResults — literal colon-named files", () => {
+	test("a literal colon-named file read or unfolded colon-base tail read is not superseded by its shorter prefix", () => {
+		const [callLit, resultLit] = readPair("notes.txt:-5", FILE_CONTENT, T0);
+		resultMessage(resultLit).details = { readTarget: { path: "notes.txt:-5" } };
+		const [callUnfolded, resultUnfolded] = readPair("a:1-30,:-30", FILE_CONTENT, T0 + 500);
+		resultMessage(resultUnfolded).details = { readTarget: { path: "a:1-30,", sel: "-30" } };
+		const [callFullNotes, resultFullNotes] = readPair("notes.txt", FILE_CONTENT, T0 + 1_000);
+		resultMessage(resultFullNotes).details = { readTarget: { path: "notes.txt" } };
+		const [callFullA, resultFullA] = readPair("a", FILE_CONTENT, T0 + 1_500);
+		resultMessage(resultFullA).details = { readTarget: { path: "a" } };
+		const entries: SessionEntry[] = [
+			callLit,
+			resultLit,
+			callUnfolded,
+			resultUnfolded,
+			callFullNotes,
+			resultFullNotes,
+			callFullA,
+			resultFullA,
+		];
+
+		const result = pruneSupersededToolResults(entries, tokenizer, cfg({ now: T0 + 1_500 }));
+
+		expect(result.prunedCount).toBe(0);
+		expect(resultText(resultLit)).toBe(FILE_CONTENT);
+		expect(resultText(resultUnfolded)).toBe(FILE_CONTENT);
+
+		// Full reads of the actual files (`notes.txt:-5` and `a:1-30,`) do supersede them.
+		const [callLit2, resultLit2] = readPair("notes.txt:-5", FILE_CONTENT, T0 + 2_000);
+		resultMessage(resultLit2).details = { readTarget: { path: "notes.txt:-5" } };
+		const [callFullAColon, resultFullAColon] = readPair("a:1-30,", FILE_CONTENT, T0 + 2_500);
+		resultMessage(resultFullAColon).details = { readTarget: { path: "a:1-30," } };
+		entries.push(callLit2, resultLit2, callFullAColon, resultFullAColon);
+
+		const again = pruneSupersededToolResults(entries, tokenizer, cfg({ now: T0 + 2_500 }));
+
+		expect(again.prunedCount).toBe(2);
+		expect(resultText(resultLit)).toBe(SUPERSEDED_NOTICE);
+		expect(resultText(resultUnfolded)).toBe(SUPERSEDED_NOTICE);
+		expect(resultText(resultLit2)).toBe(FILE_CONTENT);
+		expect(resultText(resultFullAColon)).toBe(FILE_CONTENT);
+	});
+});
+
 describe("pruneSupersededToolResults — selectors", () => {
 	test("(d) different range selectors do not supersede each other; a later selector-free read supersedes them", () => {
 		const [callA, resultA] = readPair("src/foo.ts:50-200", FILE_CONTENT, T0);
@@ -314,6 +381,46 @@ describe("pruneSupersededToolResults — selectors", () => {
 		expect(result.prunedCount).toBe(0);
 		expect(resultText(resultFull)).toBe(FILE_CONTENT);
 		expect(resultText(resultRange)).toBe(FILE_CONTENT);
+	});
+
+	test("a complete bare read supersedes tail and mixed-tail reads while preserving raw-tail and :img reads", () => {
+		const [callTail, resultTail] = readPair("src/foo.ts:-60", FILE_CONTENT, T0);
+		const [callMix, resultMix] = readPair("src/foo.ts:1-12,-15", FILE_CONTENT, T0 + 1_000);
+		const [callRawTail, resultRawTail] = readPair("src/foo.ts:-60:raw", FILE_CONTENT, T0 + 2_000);
+		const [callSvgImg, resultSvgImg] = readPair("assets/logo.svg:img", FILE_CONTENT, T0 + 3_000);
+		const [callFullFoo, resultFullFoo] = readPair("src/foo.ts", FILE_CONTENT, T0 + 4_000);
+		const [callFullSvg, resultFullSvg] = readPair("assets/logo.svg", FILE_CONTENT, T0 + 5_000);
+		let entries: SessionEntry[] = [
+			callTail,
+			resultTail,
+			callMix,
+			resultMix,
+			callRawTail,
+			resultRawTail,
+			callSvgImg,
+			resultSvgImg,
+			callFullFoo,
+			resultFullFoo,
+			callFullSvg,
+			resultFullSvg,
+		];
+
+		let result = pruneSupersededToolResults(entries, tokenizer, cfg({ now: T0 + 5_000 }));
+		expect(result.prunedCount).toBe(2);
+		expect(resultText(resultTail)).toBe(SUPERSEDED_NOTICE);
+		expect(resultText(resultMix)).toBe(SUPERSEDED_NOTICE);
+		expect(resultText(resultRawTail)).toBe(FILE_CONTENT);
+		expect(resultText(resultSvgImg)).toBe(FILE_CONTENT);
+		expect(resultText(resultFullFoo)).toBe(FILE_CONTENT);
+		expect(resultText(resultFullSvg)).toBe(FILE_CONTENT);
+
+		// Re-reading the same :img selector supersedes the earlier :img read.
+		const [callSvgImg2, resultSvgImg2] = readPair("assets/logo.svg:img", FILE_CONTENT, T0 + 6_000);
+		entries = [...entries, callSvgImg2, resultSvgImg2];
+		result = pruneSupersededToolResults(entries, tokenizer, cfg({ now: T0 + 6_000 }));
+		expect(result.prunedCount).toBe(1);
+		expect(resultText(resultSvgImg)).toBe(SUPERSEDED_NOTICE);
+		expect(resultText(resultSvgImg2)).toBe(FILE_CONTENT);
 	});
 });
 

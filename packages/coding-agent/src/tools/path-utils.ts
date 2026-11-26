@@ -536,6 +536,19 @@ export function formatPathRelativeToCwd(
 }
 
 /**
+ * Spelling of `resolvedAbsolutePath` in the caller's path style: keeps
+ * `requestedPath` verbatim when `resolveToCwd` already landed on the file, and
+ * otherwise formats the resolved file as absolute or cwd-relative to match
+ * `requestedPath` (e.g. after shell-escape unescaping or suffix resolution).
+ */
+export function formatResolvedReadTargetPath(requestedPath: string, resolvedAbsolutePath: string, cwd: string): string {
+	if (resolvedAbsolutePath === resolveToCwd(requestedPath, cwd)) return requestedPath;
+	return path.isAbsolute(expandPath(requestedPath))
+		? normalizePosixPath(resolvedAbsolutePath)
+		: formatPathRelativeToCwd(resolvedAbsolutePath, cwd);
+}
+
+/**
  * Strip matching surrounding double quotes from a path string.
  * Common when users paste quoted paths from Windows Explorer or shell copy-paste.
  * Only double quotes — single quotes are valid POSIX filename characters.
