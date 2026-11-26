@@ -187,11 +187,12 @@ function takesValue(v: ValueSource): boolean {
 }
 
 /**
- * `[[ ]]` test: `word` is an absolute path prefix the CLI accepts.
- * Drive form matches Node's win32 `path.isAbsolute` (`C:/…`, `C:\\…`), not `C:rel`.
+ * `[[ ]]` test: `word` is an absolute path prefix (or `~…`, which the shell
+ * expands to one before invoking the CLI). Drive form matches Node's win32
+ * `path.isAbsolute` (`C:/…`, `C:\\…`), not `C:rel`.
  */
 function shellAbsolutePrefix(word: string): string {
-	return `[[ "${word}" == /* || "${word}" == [A-Za-z]:[/\\\\]* ]]`;
+	return `[[ "${word}" == /* || "${word}" == "~"* || "${word}" == [A-Za-z]:[/\\\\]* ]]`;
 }
 
 /** All token forms (`name` + aliases) under which a subcommand can be invoked. */
@@ -450,7 +451,7 @@ _omp_models_list() {
 	done
 	_values -s , 'models' $items
 }
-	_omp_tools() { _values -s , 'tools' ${toolNames} }`);
+_omp_tools() { _values -s , 'tools' ${toolNames} }`);
 	parts.push(`_omp_absolute_files() {
 	# A relative match is rejected ("requires an absolute path").
 	if ${shellAbsolutePrefix("$PREFIX")}; then
@@ -568,11 +569,12 @@ function generateFish(spec: CompletionSpec): string {
 	lines.push(`\tset -l token (commandline -ct)`);
 	lines.push(`\t# A relative match is rejected ("requires an absolute path").`);
 	lines.push(
-		`\tif string match -q -- '/*' -- $token; or string match -q -r -- '^[A-Za-z]:[/\\\\]' -- $token`,
+		`\tif string match -q -- '/*' $token; or string match -q -- '~*' $token; or string match -q -r -- '^[A-Za-z]:[/\\\\\\\\]' $token`,
 	);
-	lines.push(`\t\tcomplete -C "'' $(string escape -- $token)"`);
+	lines.push(`\t\tcomplete -C"'' $token"`);
 	lines.push(`\tend`);
 	lines.push(`end`);
+	lines.push("");
 
 	const allTokens = spec.commands.flatMap(commandTokens);
 	lines.push(`function __fish_omp_no_subcommand`);

@@ -34,11 +34,12 @@ function bashQuote(value: string): string {
 }
 
 /** Source the generated script and read COMPREPLY. Does not depend on the script's indentation. */
-function completeWithBash(script: string, words: string[], cwd: string, binDir: string): string[] {
+function completeWithBash(script: string, words: string[], cwd: string, binDir: string, homeDir: string): string[] {
 	const scriptPath = path.join(binDir, "completion.bash");
 	fs.writeFileSync(scriptPath, script);
 	const env: Record<string, string | undefined> = {
 		...process.env,
+		HOME: homeDir,
 		PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
 	};
 	delete env.BASH_ENV;
@@ -64,6 +65,14 @@ function fishFlagLine(script: string, flag: string): string {
 	if (!line) throw new Error(`fish completion has no -l ${flag} line`);
 	return line;
 }
+
+const hasFish = (() => {
+	try {
+		return Bun.spawnSync(["fish", "--version"]).exitCode === 0;
+	} catch {
+		return false;
+	}
+})();
 
 describe("CLI command help metadata", () => {
 	it("renders the same root help as the loaded command classes", async () => {
@@ -172,16 +181,17 @@ describe("CLI command help metadata", () => {
 
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-compl-cwd-"));
 		const absDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-compl-abs-"));
+		const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-compl-home-"));
 		const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-compl-bin-"));
 		try {
 			fs.writeFileSync(path.join(cwd, "relative.ts"), "export {}\n");
 			fs.mkdirSync(path.join(cwd, "subdir"));
 			fs.writeFileSync(path.join(absDir, "policy.ts"), "export {}\n");
+			fs.writeFileSync(path.join(homeDir, "home-policy.ts"), "export {}\n");
 			const stub = path.join(binDir, "omp");
 			fs.writeFileSync(stub, "#!/bin/sh\nprintf '%s\\n' 'abc123' 'session-two'\n", { mode: 0o755 });
 			fs.chmodSync(stub, 0o755);
-			const offer = (words: string[]) => completeWithBash(bash, words, cwd, binDir);
-
+			const offer = (words: string[]) => completeWithBash(bash, words, cwd, binDir, homeDir);
 			const sessionDash = offer(["omp", "--session", "--mod"]);
 			expect(sessionDash).toContain("--model");
 			expect(sessionDash).not.toContain("abc123");
@@ -210,6 +220,9 @@ describe("CLI command help metadata", () => {
 			const absTrusted = offer(["omp", "--trusted-extension", `${absDir}/`]);
 			expect(absTrusted.some(reply => reply.startsWith("/") && reply.endsWith("/policy.ts"))).toBe(true);
 			expect(absTrusted.every(reply => reply.startsWith("/") || /^[A-Za-z]:[/\\]/.test(reply))).toBe(true);
+			const tildeTrusted = offer(["omp", "--trusted-extension", "~/"]);
+			expect(tildeTrusted).toContain("~/home-policy.ts");
+			expect(tildeTrusted).not.toContain("relative.ts");
 
 			expect(offer(["omp", "--provider-session-id", "rel"])).not.toContain("relative.ts");
 			const cacheKey = offer(["omp", "--prompt-cache-key", ""]);
@@ -221,7 +234,56 @@ describe("CLI command help metadata", () => {
 		} finally {
 			fs.rmSync(cwd, { recursive: true, force: true });
 			fs.rmSync(absDir, { recursive: true, force: true });
+			fs.rmSync(homeDir, { recursive: true, force: true });
 			fs.rmSync(binDir, { recursive: true, force: true });
 		}
 	}, 30_000);
+
+	it.skipIf(!hasFish)(
+		"runs __omp_absolute_files in fish without errors and completes only absolute or ~ paths",
+		async () => {
+			const fish = await generateLiveCompletion("fish");
+			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-fish-cwd-"));
+			const absDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-fish-abs-"));
+			const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-fish-home-"));
+			const scriptDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-fish-script-"));
+			try {
+				fs.writeFileSync(path.join(cwd, "relative.ts"), "export {}\n");
+				fs.writeFileSync(path.join(absDir, "policy.ts"), "export {}\n");
+				fs.writeFileSync(path.join(homeDir, "home-policy.ts"), "export {}\n");
+				const scriptPath = path.join(scriptDir, "omp.fish");
+				fs.writeFileSync(scriptPath, fish);
+
+				const completeFish = (cmdline: string): string[] => {
+					const result = Bun.spawnSync(
+						["fish", "--no-config", "-c", "source $argv[1]; complete -C$argv[2]", "--", scriptPath, cmdline],
+						{
+							cwd,
+							env: { ...process.env, HOME: homeDir },
+						},
+					);
+					expect(result.exitCode).toBe(0);
+					expect(result.stderr.toString()).toBe("");
+					return result.stdout
+						.toString()
+						.split("\n")
+						.filter(line => line.length > 0)
+						.map(line => line.split("\t")[0] ?? "");
+				};
+
+				expect(completeFish("omp --trusted-extension ")).toEqual([]);
+				expect(completeFish("omp --trusted-extension rel")).toEqual([]);
+				expect(completeFish("omp --trusted-extension C:rel")).toEqual([]);
+				expect(completeFish("omp --trusted-extension -r")).toEqual([]);
+				expect(completeFish(`omp --trusted-extension ${absDir}/`)).toContain(`${absDir}/policy.ts`);
+				expect(completeFish("omp --trusted-extension ~/")).toContain("~/home-policy.ts");
+			} finally {
+				fs.rmSync(cwd, { recursive: true, force: true });
+				fs.rmSync(absDir, { recursive: true, force: true });
+				fs.rmSync(homeDir, { recursive: true, force: true });
+				fs.rmSync(scriptDir, { recursive: true, force: true });
+			}
+		},
+		30_000,
+	);
 });
