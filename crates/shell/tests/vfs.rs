@@ -630,12 +630,10 @@ async fn non_omp_commands_naming_omp_receive_host_paths_for_url_arguments() {
 	let script = format!(
 		"PATH='{bin}':$PATH; probe omp virtual://docs/a.txt; probe ./omp virtual://docs/a.txt; nice \
 		 -n 5 probe omp virtual://docs/a.txt; env -u omp probe virtual://docs/a.txt; env -- \
-		 -flag=/opt/omp probe omp virtual://docs/a.txt; /usr/bin/env -S '{probe_bin} omp' \
-		 virtual://docs/a.txt; nice -n 5 omp read virtual://docs/a.txt; /usr/bin/env - '{omp}' read \
-		 virtual://docs/a.txt; /usr/bin/env -S '{omp} read' virtual://docs/a.txt",
+		 -flag=/opt/omp probe omp virtual://docs/a.txt; nice -n 5 omp read virtual://docs/a.txt; \
+		 /usr/bin/env - '{omp}' read virtual://docs/a.txt",
 		bin = bin.path().display(),
 		omp = omp.display(),
-		probe_bin = probe_bin.display(),
 	);
 	let run = run_virtual(directory.path(), &script).await;
 	assert_eq!(run.status, Some(0), "{}", run.stderr);
@@ -650,9 +648,6 @@ async fn non_omp_commands_naming_omp_receive_host_paths_for_url_arguments() {
 		format!("probe:{file}"),
 		"probe:omp".to_owned(),
 		format!("probe:{file}"),
-		"probe:omp".to_owned(),
-		format!("probe:{file}"),
-		"omp:read virtual://docs/a.txt".to_owned(),
 		"omp:read virtual://docs/a.txt".to_owned(),
 		"omp:read virtual://docs/a.txt".to_owned(),
 	];

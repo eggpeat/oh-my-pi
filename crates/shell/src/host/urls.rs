@@ -101,38 +101,228 @@ impl Rest {
 /// containing `://`, or an environment value that is one): then it resolves
 /// first, else it spawns as it is.
 pub(super) fn names_url(spec: &SpawnSpec<'_>) -> bool {
-	if is_url(spec.path) || is_url(spec.cwd) {
+	is_url(spec.path)
+		|| is_url(spec.cwd)
+		|| ((spec.argv.iter().skip(1).any(|arg| arg.contains_str("://"))
+			|| spec.env.iter().any(|(name, value)| env_url(name, value)))
+			&& !runs_omp(spec.path.as_bytes(), spec.argv))
+}
+
+#[derive(Clone, Copy)]
+enum Assignments {
+	None,
+	/// Leading `NAME=value` / `NAME+=value` assignments (`sudo`, `doas`,
+	/// `time`).
+	Shell,
+	/// Optional lone `-` followed by any `*=*` setting (`env`).
+	Env,
+}
+
+struct Wrapper {
+	names:       &'static [&'static str],
+	short_vals:  &'static [u8],
+	long_vals:   &'static [&'static str],
+	stop_shorts: &'static [u8],
+	stop_longs:  &'static [&'static str],
+	assignments: Assignments,
+	/// Positional operands consumed before the wrapped command (e.g. `timeout`'s
+	/// duration).
+	skip_args:   usize,
+}
+
+/// Wrappers that exec a target command, paired with the options that consume a
+/// following word.
+const WRAPPERS: &[Wrapper] = &[
+	Wrapper {
+		names:       &["env"],
+		short_vals:  b"uCSaP",
+		long_vals:   &["--unset", "--chdir", "--split-string", "--argv0", "--env0-from"],
+		stop_shorts: b"",
+		stop_longs:  &[],
+		assignments: Assignments::Env,
+		skip_args:   0,
+	},
+	Wrapper {
+		names:       &["sudo", "doas"],
+		short_vals:  b"ugCDhpRrTtUac",
+		long_vals:   &[
+			"--user",
+			"--group",
+			"--close-from",
+			"--chdir",
+			"--host",
+			"--prompt",
+			"--chroot",
+			"--role",
+			"--command-timeout",
+			"--type",
+			"--other-user",
+		],
+		stop_shorts: b"",
+		stop_longs:  &[],
+		assignments: Assignments::Shell,
+		skip_args:   0,
+	},
+	Wrapper {
+		names:       &["nice"],
+		short_vals:  b"n",
+		long_vals:   &["--adjustment"],
+		stop_shorts: b"",
+		stop_longs:  &[],
+		assignments: Assignments::None,
+		skip_args:   0,
+	},
+	Wrapper {
+		names:       &["nohup", "setsid", "ifne"],
+		short_vals:  b"",
+		long_vals:   &[],
+		stop_shorts: b"",
+		stop_longs:  &[],
+		assignments: Assignments::None,
+		skip_args:   0,
+	},
+	Wrapper {
+		names:       &["time"],
+		short_vals:  b"of",
+		long_vals:   &["--output", "--format"],
+		stop_shorts: b"",
+		stop_longs:  &[],
+		assignments: Assignments::Shell,
+		skip_args:   0,
+	},
+	Wrapper {
+		names:       &["timeout", "gtimeout"],
+		short_vals:  b"sk",
+		long_vals:   &["--signal", "--kill-after"],
+		stop_shorts: b"",
+		stop_longs:  &[],
+		assignments: Assignments::None,
+		skip_args:   1,
+	},
+	Wrapper {
+		names:       &["stdbuf"],
+		short_vals:  b"ioe",
+		long_vals:   &["--input", "--output", "--error"],
+		stop_shorts: b"",
+		stop_longs:  &[],
+		assignments: Assignments::None,
+		skip_args:   0,
+	},
+	Wrapper {
+		names:       &["command"],
+		short_vals:  b"",
+		long_vals:   &[],
+		stop_shorts: b"vV",
+		stop_longs:  &[],
+		assignments: Assignments::None,
+		skip_args:   0,
+	},
+	Wrapper {
+		names:       &["exec"],
+		short_vals:  b"a",
+		long_vals:   &[],
+		stop_shorts: b"",
+		stop_longs:  &[],
+		assignments: Assignments::None,
+		skip_args:   0,
+	},
+	Wrapper {
+		names:       &["xargs"],
+		short_vals:  b"adEILnPs",
+		long_vals:   &[
+			"--arg-file",
+			"--delimiter",
+			"--max-args",
+			"--max-procs",
+			"--max-chars",
+			"--process-slot-var",
+		],
+		stop_shorts: b"",
+		stop_longs:  &[],
+		assignments: Assignments::None,
+		skip_args:   0,
+	},
+	Wrapper {
+		names:       &["npx"],
+		short_vals:  b"pcw",
+		long_vals:   &[
+			"--package",
+			"--call",
+			"--cache",
+			"--userconfig",
+			"--prefix",
+			"--loglevel",
+			"--workspace",
+			"--shell",
+			"--registry",
+			"--node-options",
+		],
+		stop_shorts: b"c",
+		stop_longs:  &["--call"],
+		assignments: Assignments::None,
+		skip_args:   0,
+	},
+	Wrapper {
+		names:       &["bunx"],
+		short_vals:  b"pc",
+		long_vals:   &[
+			"--package",
+			"--shell",
+			"--registry",
+			"--minimum-release-age",
+			"--cwd",
+			"--config",
+		],
+		stop_shorts: b"c",
+		stop_longs:  &[],
+		assignments: Assignments::None,
+		skip_args:   0,
+	},
+];
+
+/// Whether `path`/`argv` runs `omp`: as the program itself, or as the target
+/// command behind known wrappers (`nice`, `nohup`, `npx`, `bunx`, `sudo`,
+/// `env`, `time`, …) and their options.
+fn runs_omp(path: &[u8], argv: &[BString]) -> bool {
+	if is_omp(path) {
 		return true;
 	}
-	let plan = ArgPlan::analyze(spec.path.as_bytes(), spec.argv);
-	let arg_url = spec
-		.argv
-		.iter()
-		.enumerate()
-		.skip(1)
-		.any(|(i, arg)| !plan.is_literal(i) && arg.contains_str("://"));
-	arg_url || (!plan.env_literal && spec.env.iter().any(|(name, value)| env_url(name, value)))
+	let mut i = 0;
+	while let Some(word) = argv.get(i) {
+		if is_omp(word) {
+			return true;
+		}
+		let Some(wrapper) = find_wrapper(word) else {
+			return false;
+		};
+		let Some(next) = skip_wrapper(argv, i + 1, wrapper) else {
+			return false;
+		};
+		i = next;
+	}
+	false
 }
 
 /// Whether `word` names the `omp` program, by any path.
 fn is_omp(word: &[u8]) -> bool {
-	let name = basename_bytes(word);
+	let name = basename(word);
 	name == b"omp" || (cfg!(windows) && name.eq_ignore_ascii_case(b"omp.exe"))
 }
 
-fn basename_bytes(word: &[u8]) -> &[u8] {
+fn basename(word: &[u8]) -> &[u8] {
 	word
 		.rsplit(|&b| b == b'/' || (cfg!(windows) && b == b'\\'))
 		.next()
 		.unwrap_or(word)
 }
 
-fn wrapper_name(word: &[u8]) -> Option<&str> {
-	let mut name = basename_bytes(word);
+fn find_wrapper(word: &[u8]) -> Option<&'static Wrapper> {
+	let mut name = basename(word);
 	if cfg!(windows) && name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(b".exe") {
 		name = &name[..name.len() - 4];
 	}
-	std::str::from_utf8(name).ok()
+	let name = std::str::from_utf8(name).ok()?;
+	WRAPPERS.iter().find(|w| w.names.contains(&name))
 }
 
 fn is_shell_assignment(word: &[u8]) -> bool {
@@ -147,849 +337,30 @@ fn is_shell_assignment(word: &[u8]) -> bool {
 			.all(|b| b.is_ascii_alphanumeric() || *b == b'_')
 }
 
-fn is_wrapper(name: &str) -> bool {
-	matches!(
-		name,
-		"env"
-			| "sudo"
-			| "doas"
-			| "nice"
-			| "ionice"
-			| "nohup"
-			| "setsid"
-			| "time"
-			| "gtime"
-			| "timeout"
-			| "gtimeout"
-			| "stdbuf"
-			| "chrt"
-			| "command"
-			| "exec"
-			| "xargs"
-			| "ifne"
-			| "npx"
-			| "npm"
-			| "bunx"
-			| "bun"
-			| "pnpx"
-			| "pnpm"
-			| "yarn"
-			| "uv"
-			| "ssh"
-			| "find"
-	)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ArgMode {
-	NoneLiteral,
-	AllLiteral,
-	Custom,
-}
-
-#[derive(Clone, Copy)]
-enum WordOrigin {
-	Argv(usize),
-	Split { split_id: usize, word_idx: usize },
-}
-
-#[derive(Clone)]
-struct PlanWord {
-	bytes:  BString,
-	origin: WordOrigin,
-}
-
-struct SplitEntry {
-	argv_idx: usize,
-	prefix:   BString,
-	words:    Vec<SplitItem>,
-}
-
-enum SplitItem {
-	Word { bytes: BString, literal: bool },
-	Child { split_id: usize },
-}
-
-struct ArgPlan {
-	mode:        ArgMode,
-	literal:     Vec<bool>,
-	env_literal: bool,
-	splits:      Vec<SplitEntry>,
-	root_splits: Vec<usize>,
-}
-
-impl ArgPlan {
-	fn analyze(path: &[u8], argv: &[BString]) -> Self {
-		if is_omp(path) || argv.first().is_some_and(|arg| is_omp(arg)) {
-			return Self {
-				mode:        ArgMode::AllLiteral,
-				literal:     Vec::new(),
-				env_literal: true,
-				splits:      Vec::new(),
-				root_splits: Vec::new(),
-			};
-		}
-		let Some(first) = argv.first().and_then(|arg| wrapper_name(arg)) else {
-			return Self {
-				mode:        ArgMode::NoneLiteral,
-				literal:     Vec::new(),
-				env_literal: false,
-				splits:      Vec::new(),
-				root_splits: Vec::new(),
-			};
-		};
-		if !is_wrapper(first) {
-			return Self {
-				mode:        ArgMode::NoneLiteral,
-				literal:     Vec::new(),
-				env_literal: false,
-				splits:      Vec::new(),
-				root_splits: Vec::new(),
-			};
-		}
-		let mut plan = Self {
-			mode:        ArgMode::Custom,
-			literal:     vec![false; argv.len()],
-			env_literal: false,
-			splits:      Vec::new(),
-			root_splits: Vec::new(),
-		};
-		let mut words: Vec<PlanWord> = argv
-			.iter()
-			.enumerate()
-			.map(|(i, arg)| PlanWord { bytes: arg.clone(), origin: WordOrigin::Argv(i) })
-			.collect();
-		let mut inherited_origins: Vec<WordOrigin> = Vec::new();
-		plan.env_literal = plan.walk(&mut words, 0, &mut inherited_origins, true);
-		plan
-	}
-
-	fn is_literal(&self, index: usize) -> bool {
-		match self.mode {
-			ArgMode::NoneLiteral => false,
-			ArgMode::AllLiteral => index > 0,
-			ArgMode::Custom => self.literal.get(index).copied().unwrap_or(false),
-		}
-	}
-
-	fn mark_literal(&mut self, origin: WordOrigin) {
-		match origin {
-			WordOrigin::Argv(idx) => {
-				if let Some(slot) = self.literal.get_mut(idx) {
-					*slot = true;
-				}
-			},
-			WordOrigin::Split { split_id, word_idx } => {
-				if let Some(entry) = self.splits.get_mut(split_id)
-					&& let Some(SplitItem::Word { literal, .. }) = entry.words.get_mut(word_idx)
-				{
-					*literal = true;
-				}
-			},
-		}
-	}
-
-	fn mark_command_word(&mut self, word: &PlanWord, allow_url_exec: bool) {
-		if allow_url_exec && as_path(&word.bytes).is_some_and(omp_vfs::is_virtual_path) {
-			return;
-		}
-		self.mark_literal(word.origin);
-	}
-
-	fn walk(
-		&mut self,
-		words: &mut Vec<PlanWord>,
-		mut idx: usize,
-		inherited: &mut Vec<WordOrigin>,
-		allow_url_exec: bool,
-	) -> bool {
-		while idx < words.len() {
-			if is_omp(&words[idx].bytes) {
-				self.mark_command_word(&words[idx], allow_url_exec);
-				for word in &words[idx + 1..] {
-					self.mark_literal(word.origin);
-				}
-				for origin in inherited.drain(..) {
-					self.mark_literal(origin);
-				}
-				return true;
-			}
-			let Some(name) = wrapper_name(&words[idx].bytes) else {
-				return false;
-			};
-			match name {
-				"env" => {
-					idx = self.advance_env(words, idx + 1, inherited);
-				},
-				"sudo" => {
-					let mut i = skip_opts(
-						words,
-						idx + 1,
-						b"ugCDhRrTtUac",
-						&[
-							"--user",
-							"--group",
-							"--close-from",
-							"--chdir",
-							"--host",
-							"--prompt",
-							"--chroot",
-							"--role",
-							"--command-timeout",
-							"--type",
-							"--other-user",
-						],
-						false,
-					);
-					while i < words.len() && is_shell_assignment(&words[i].bytes) {
-						inherited.push(words[i].origin);
-						i += 1;
-					}
-					idx = i;
-				},
-				"doas" => {
-					let mut i = skip_opts(words, idx + 1, b"Cu", &[], false);
-					while i < words.len() && is_shell_assignment(&words[i].bytes) {
-						inherited.push(words[i].origin);
-						i += 1;
-					}
-					idx = i;
-				},
-				"nice" => {
-					idx = skip_opts(words, idx + 1, b"n", &["--adjustment"], true);
-				},
-				"ionice" => {
-					let (i, pid_mode) = skip_opts_flag(
-						words,
-						idx + 1,
-						b"cnpPu",
-						&["--class", "--classdata", "--pid", "--pgid", "--uid"],
-						b"pPu",
-						&["--pid", "--pgid", "--uid"],
-					);
-					if pid_mode {
-						return false;
-					}
-					idx = i;
-				},
-				"nohup" | "setsid" | "ifne" => {
-					idx = skip_opts(words, idx + 1, b"", &[], false);
-				},
-				"time" | "gtime" => {
-					idx = skip_opts(words, idx + 1, b"of", &["--output", "--format"], false);
-				},
-				"timeout" | "gtimeout" => {
-					let i = skip_opts(words, idx + 1, b"sk", &["--signal", "--kill-after"], false);
-					idx = (i + 1).min(words.len());
-				},
-				"stdbuf" => {
-					idx = skip_opts(words, idx + 1, b"ioe", &["--input", "--output", "--error"], false);
-				},
-				"chrt" => {
-					let (i, pid_mode) = skip_opts_flag(words, idx + 1, b"", &[], b"p", &["--pid"]);
-					if pid_mode {
-						return false;
-					}
-					idx = (i + 1).min(words.len());
-				},
-				"command" => {
-					let (i, query) = skip_opts_flag(words, idx + 1, b"", &[], b"vV", &[]);
-					if query {
-						return false;
-					}
-					idx = i;
-				},
-				"exec" => {
-					idx = skip_opts(words, idx + 1, b"a", &[], false);
-				},
-				"xargs" => {
-					idx = skip_opts(
-						words,
-						idx + 1,
-						b"adEILnPs",
-						&[
-							"--arg-file",
-							"--delimiter",
-							"--max-args",
-							"--max-procs",
-							"--max-chars",
-							"--process-slot-var",
-						],
-						false,
-					);
-				},
-				"npx" => {
-					let (i, call_mode) = skip_opts_flag(
-						words,
-						idx + 1,
-						b"pcw",
-						&[
-							"--package",
-							"--call",
-							"--cache",
-							"--userconfig",
-							"--prefix",
-							"--loglevel",
-							"--workspace",
-							"--shell",
-							"--registry",
-							"--node-options",
-						],
-						b"c",
-						&["--call"],
-					);
-					if call_mode {
-						return false;
-					}
-					idx = i;
-				},
-				"npm" => {
-					let i = skip_opts(
-						words,
-						idx + 1,
-						b"Cw",
-						&[
-							"--prefix",
-							"--cache",
-							"--userconfig",
-							"--globalconfig",
-							"--loglevel",
-							"--workspace",
-							"--registry",
-							"--shell",
-							"--script-shell",
-							"--node-options",
-						],
-						false,
-					);
-					if !words
-						.get(i)
-						.is_some_and(|w| matches!(w.bytes.as_slice(), b"exec" | b"x"))
-					{
-						return false;
-					}
-					let (j, call_mode) = skip_opts_flag(
-						words,
-						i + 1,
-						b"Cwc",
-						&[
-							"--package",
-							"--call",
-							"--prefix",
-							"--cache",
-							"--userconfig",
-							"--globalconfig",
-							"--loglevel",
-							"--workspace",
-							"--registry",
-							"--shell",
-							"--script-shell",
-							"--node-options",
-						],
-						b"c",
-						&["--call"],
-					);
-					if call_mode {
-						return false;
-					}
-					idx = j;
-				},
-				"bunx" => {
-					let (i, call_mode) = skip_opts_flag(
-						words,
-						idx + 1,
-						b"pc",
-						&[
-							"--package",
-							"--shell",
-							"--registry",
-							"--minimum-release-age",
-							"--cwd",
-							"--config",
-						],
-						b"c",
-						&[],
-					);
-					if call_mode {
-						return false;
-					}
-					idx = i;
-				},
-				"bun" => {
-					let i = skip_opts(
-						words,
-						idx + 1,
-						b"cr",
-						&["--cwd", "--config", "--env-file", "--preload"],
-						false,
-					);
-					if words.get(i).is_none_or(|w| w.bytes != b"x") {
-						return false;
-					}
-					let (j, call_mode) = skip_opts_flag(
-						words,
-						i + 1,
-						b"pc",
-						&[
-							"--package",
-							"--shell",
-							"--registry",
-							"--minimum-release-age",
-							"--cwd",
-							"--config",
-						],
-						b"c",
-						&[],
-					);
-					if call_mode {
-						return false;
-					}
-					idx = j;
-				},
-				"pnpx" => {
-					let (i, call_mode) = skip_opts_flag(
-						words,
-						idx + 1,
-						b"cC",
-						&["--package", "--dir", "--filter", "--loglevel", "--registry", "--store-dir"],
-						b"c",
-						&[],
-					);
-					if call_mode {
-						return false;
-					}
-					idx = i;
-				},
-				"pnpm" => {
-					let i = skip_opts(
-						words,
-						idx + 1,
-						b"C",
-						&["--dir", "--filter", "--loglevel", "--registry", "--store-dir"],
-						false,
-					);
-					if !words
-						.get(i)
-						.is_some_and(|w| matches!(w.bytes.as_slice(), b"dlx" | b"exec"))
-					{
-						return false;
-					}
-					let (j, call_mode) = skip_opts_flag(
-						words,
-						i + 1,
-						b"cC",
-						&["--package", "--dir", "--filter", "--loglevel", "--registry", "--store-dir"],
-						b"c",
-						&[],
-					);
-					if call_mode {
-						return false;
-					}
-					idx = j;
-				},
-				"yarn" => {
-					let i = skip_opts(words, idx + 1, b"", &["--cwd"], false);
-					if !words
-						.get(i)
-						.is_some_and(|w| matches!(w.bytes.as_slice(), b"dlx" | b"exec"))
-					{
-						return false;
-					}
-					idx = skip_opts(words, i + 1, b"p", &["--package", "--cwd"], false);
-				},
-				"uv" => {
-					let i = skip_opts(
-						words,
-						idx + 1,
-						b"C",
-						&[
-							"--directory",
-							"--project",
-							"--config-file",
-							"--cache-dir",
-							"--color",
-							"--python-preference",
-							"--python-fetch",
-						],
-						false,
-					);
-					if words.get(i).is_none_or(|w| w.bytes != b"run") {
-						return false;
-					}
-					let (j, non_cmd) = skip_opts_flag(
-						words,
-						i + 1,
-						b"wpifPCm",
-						&[
-							"--with",
-							"--with-editable",
-							"--with-requirements",
-							"--python",
-							"--package",
-							"--project",
-							"--directory",
-							"--env-file",
-							"--extra",
-							"--group",
-							"--only-group",
-							"--no-group",
-							"--index",
-							"--default-index",
-							"--index-url",
-							"--extra-index-url",
-							"--find-links",
-							"--config-file",
-							"--cache-dir",
-							"--color",
-							"--python-preference",
-							"--python-fetch",
-							"--refresh-package",
-							"--reinstall-package",
-							"--upgrade-package",
-							"--resolution",
-							"--prerelease",
-							"--index-strategy",
-							"--keyring-provider",
-							"--link-mode",
-							"--exclude-newer",
-							"--max-concurrent-downloads",
-							"--max-concurrent-builds",
-							"--max-concurrent-installs",
-							"--module",
-							"--script",
-							"--gui-script",
-						],
-						b"m",
-						&["--module", "--script", "--gui-script"],
-					);
-					if non_cmd {
-						return false;
-					}
-					idx = j;
-				},
-				"ssh" => {
-					let i = skip_opts(words, idx + 1, b"BbcDEeFIiJLlmOopQRSWw", &[], false);
-					if i + 1 >= words.len() {
-						return false;
-					}
-					self.walk_ssh_remote(&words[i + 1..]);
-					return false;
-				},
-				"find" => {
-					self.walk_find(&words[idx + 1..]);
-					return false;
-				},
-				_ => return false,
-			}
-		}
-		false
-	}
-
-	fn advance_env(
-		&mut self,
-		words: &mut Vec<PlanWord>,
-		mut i: usize,
-		inherited: &mut Vec<WordOrigin>,
-	) -> usize {
-		while i < words.len() {
-			let w = words[i].bytes.as_slice();
-			if w == b"--" {
-				i += 1;
-				break;
-			}
-			if !w.starts_with(b"-") || w == b"-" {
-				break;
-			}
-			if w.starts_with(b"--") {
-				if let Some(val) = w.strip_prefix(b"--split-string=") {
-					let val = val.to_vec();
-					let origin = words[i].origin;
-					if self.splice_env_split(words, i, 1, origin, b"--split-string=", &val) {
-						continue;
-					}
-					i += 1;
-					continue;
-				}
-				if w == b"--split-string" {
-					if let Some(next) = words.get(i + 1) {
-						let val = next.bytes.clone();
-						let origin = next.origin;
-						if self.splice_env_split(words, i, 2, origin, b"", &val) {
-							continue;
-						}
-					}
-					i = (i + 2).min(words.len());
-					continue;
-				}
-				if w.contains(&b'=') {
-					i += 1;
-					continue;
-				}
-				if matches!(w, b"--unset" | b"--chdir" | b"--argv0" | b"--env0-from") {
-					i = (i + 2).min(words.len());
-				} else {
-					i += 1;
-				}
-				continue;
-			}
-			let mut consumed = false;
-			let mut spliced = false;
-			for k in 1..w.len() {
-				if w[k] == b'S' {
-					if k + 1 < w.len() {
-						let prefix = w[..=k].to_vec();
-						let val = w[k + 1..].to_vec();
-						let origin = words[i].origin;
-						if self.splice_env_split(words, i, 1, origin, &prefix, &val) {
-							spliced = true;
-							break;
-						}
-						consumed = true;
-						i += 1;
-						break;
-					}
-					if let Some(next) = words.get(i + 1) {
-						let val = next.bytes.clone();
-						let origin = next.origin;
-						if self.splice_env_split(words, i, 2, origin, b"", &val) {
-							spliced = true;
-							break;
-						}
-					}
-					consumed = true;
-					i = (i + 2).min(words.len());
-					break;
-				}
-				if matches!(w[k], b'u' | b'C' | b'a' | b'P') {
-					if k + 1 < w.len() {
-						i += 1;
-					} else {
-						i = (i + 2).min(words.len());
-					}
-					consumed = true;
-					break;
-				}
-			}
-			if !consumed && !spliced {
-				i += 1;
-			}
-		}
-		if words.get(i).is_some_and(|w| w.bytes == b"-") {
-			i += 1;
-		}
-		while words.get(i).is_some_and(|w| w.bytes.contains(&b'=')) {
-			inherited.push(words[i].origin);
-			i += 1;
-		}
-		i
-	}
-
-	fn splice_env_split(
-		&mut self,
-		words: &mut Vec<PlanWord>,
-		at: usize,
-		remove_count: usize,
-		target_origin: WordOrigin,
-		prefix: &[u8],
-		raw_val: &[u8],
-	) -> bool {
-		let Some(parts) = split_env_s(raw_val) else {
-			return false;
-		};
-		let split_id = self.splits.len();
-		let argv_idx = match target_origin {
-			WordOrigin::Argv(idx) => {
-				self.root_splits.push(split_id);
-				idx
-			},
-			WordOrigin::Split { split_id: parent_id, word_idx } => {
-				if let Some(parent) = self.splits.get_mut(parent_id)
-					&& let Some(slot) = parent.words.get_mut(word_idx)
-				{
-					*slot = SplitItem::Child { split_id };
-				}
-				parent_id
-			},
-		};
-		let items = parts
-			.iter()
-			.map(|b| SplitItem::Word { bytes: b.clone(), literal: false })
-			.collect();
-		self
-			.splits
-			.push(SplitEntry { argv_idx, prefix: BString::from(prefix), words: items });
-		let replacement: Vec<PlanWord> = parts
-			.into_iter()
-			.enumerate()
-			.map(|(word_idx, bytes)| PlanWord {
-				bytes,
-				origin: WordOrigin::Split { split_id, word_idx },
-			})
-			.collect();
-		words.splice(at..at + remove_count, replacement);
-		true
-	}
-
-	fn walk_ssh_remote(&mut self, remote: &[PlanWord]) {
-		let mut start = 0;
-		while start < remote.len() {
-			let end = remote[start..]
-				.iter()
-				.position(|w| matches!(w.bytes.as_slice(), b";" | b"|" | b"||" | b"&&" | b"&" | b"\n"))
-				.map_or(remote.len(), |pos| start + pos);
-			let mut seg = remote[start..end].to_vec();
-			// Strip leading redirections / trailing redirections and leading
-			// assignments in this segment.
-			let mut clean = Vec::with_capacity(seg.len());
-			let mut i = 0;
-			while i < seg.len() {
-				let w = seg[i].bytes.as_slice();
-				if is_ssh_standalone_redir(w) {
-					i += 2;
-					continue;
-				}
-				if is_ssh_attached_redir(w) {
-					i += 1;
-					continue;
-				}
-				clean.push(seg[i].clone());
-				i += 1;
-			}
-			seg = clean;
-			let mut cmd_at = 0;
-			let mut inherited = Vec::new();
-			while cmd_at < seg.len() && is_shell_assignment(&seg[cmd_at].bytes) {
-				inherited.push(seg[cmd_at].origin);
-				cmd_at += 1;
-			}
-			if cmd_at < seg.len() {
-				let mut sub: Vec<PlanWord> = seg[cmd_at..].to_vec();
-				let _ = self.walk(&mut sub, 0, &mut inherited, false);
-			}
-			start = end + 1;
-		}
-	}
-
-	fn walk_find(&mut self, args: &[PlanWord]) {
-		let mut i = 0;
-		while i < args.len() {
-			if matches!(args[i].bytes.as_slice(), b"-exec" | b"-execdir" | b"-ok" | b"-okdir") {
-				let start = i + 1;
-				let end = args[start..]
-					.iter()
-					.position(|w| matches!(w.bytes.as_slice(), b";" | b"+"))
-					.map_or(args.len(), |pos| start + pos);
-				if start < end {
-					let mut action = args[start..end].to_vec();
-					let mut inherited = Vec::new();
-					let _ = self.walk(&mut action, 0, &mut inherited, true);
-				}
-				i = end + 1;
-			} else {
-				i += 1;
-			}
-		}
-	}
-}
-
-fn strip_leading_digits(word: &[u8]) -> &[u8] {
-	let at = word
-		.iter()
-		.position(|b| !b.is_ascii_digit())
-		.unwrap_or(word.len());
-	&word[at..]
-}
-
-fn is_ssh_standalone_redir(word: &[u8]) -> bool {
-	let rest = strip_leading_digits(word);
-	matches!(rest, b"<" | b">" | b">>" | b">|" | b"<>" | b"&>" | b"&>>" | b"<<" | b"<<-" | b"<<<")
-}
-
-fn is_ssh_attached_redir(word: &[u8]) -> bool {
-	let rest = strip_leading_digits(word);
-	rest.len() > 1 && (rest.starts_with(b">") || rest.starts_with(b"<") || rest.starts_with(b"&>"))
-}
-
-fn skip_opts(
-	words: &[PlanWord],
-	from: usize,
-	short_vals: &[u8],
-	long_vals: &[&str],
-	allow_numeric_short: bool,
-) -> usize {
+fn skip_wrapper(argv: &[BString], from: usize, wrapper: &Wrapper) -> Option<usize> {
 	let mut i = from;
-	while i < words.len() {
-		let w = words[i].bytes.as_slice();
+	while let Some(arg) = argv.get(i) {
+		let w = arg.as_slice();
 		if w == b"--" {
-			return i + 1;
-		}
-		if !w.starts_with(b"-") || w == b"-" {
+			i += 1;
 			break;
-		}
-		if w.starts_with(b"--") {
-			if w.contains(&b'=') {
-				i += 1;
-				continue;
-			}
-			if long_vals.iter().any(|&opt| w == opt.as_bytes()) {
-				i = (i + 2).min(words.len());
-			} else {
-				i += 1;
-			}
-			continue;
-		}
-		if allow_numeric_short && w[1..].iter().all(u8::is_ascii_digit) {
-			i += 1;
-			continue;
-		}
-		let mut consumed = false;
-		for k in 1..w.len() {
-			if short_vals.contains(&w[k]) {
-				if k + 1 < w.len() {
-					i += 1;
-				} else {
-					i = (i + 2).min(words.len());
-				}
-				consumed = true;
-				break;
-			}
-		}
-		if !consumed {
-			i += 1;
-		}
-	}
-	i
-}
-
-fn skip_opts_flag(
-	words: &[PlanWord],
-	from: usize,
-	short_vals: &[u8],
-	long_vals: &[&str],
-	flag_shorts: &[u8],
-	flag_longs: &[&str],
-) -> (usize, bool) {
-	let mut i = from;
-	let mut flagged = false;
-	while i < words.len() {
-		let w = words[i].bytes.as_slice();
-		if w == b"--" {
-			return (i + 1, flagged);
 		}
 		if !w.starts_with(b"-") || w == b"-" {
 			break;
 		}
 		if w.starts_with(b"--") {
 			let opt_name = w.split_once_str("=").map_or(w, |(name, _)| name);
-			if flag_longs.iter().any(|&opt| opt_name == opt.as_bytes()) {
-				flagged = true;
+			if wrapper
+				.stop_longs
+				.iter()
+				.any(|&opt| opt_name == opt.as_bytes())
+			{
+				return None;
 			}
 			if w.contains(&b'=') {
 				i += 1;
-				continue;
-			}
-			if long_vals.iter().any(|&opt| w == opt.as_bytes()) {
-				i = (i + 2).min(words.len());
+			} else if wrapper.long_vals.iter().any(|&opt| w == opt.as_bytes()) {
+				i += 2;
 			} else {
 				i += 1;
 			}
@@ -997,15 +368,11 @@ fn skip_opts_flag(
 		}
 		let mut consumed = false;
 		for k in 1..w.len() {
-			if flag_shorts.contains(&w[k]) {
-				flagged = true;
+			if wrapper.stop_shorts.contains(&w[k]) {
+				return None;
 			}
-			if short_vals.contains(&w[k]) {
-				if k + 1 < w.len() {
-					i += 1;
-				} else {
-					i = (i + 2).min(words.len());
-				}
+			if wrapper.short_vals.contains(&w[k]) {
+				i += if k + 1 < w.len() { 1 } else { 2 };
 				consumed = true;
 				break;
 			}
@@ -1014,163 +381,25 @@ fn skip_opts_flag(
 			i += 1;
 		}
 	}
-	(i, flagged)
-}
-
-fn split_env_s(input: &[u8]) -> Option<Vec<BString>> {
-	let mut args: Vec<Vec<u8>> = Vec::new();
-	let (mut dq, mut sq, mut sep) = (false, false, true);
-	let mut i = 0;
-	let push_byte = |args: &mut Vec<Vec<u8>>, sep: &mut bool, byte: u8| {
-		if *sep {
-			*sep = false;
-			args.push(Vec::new());
-		}
-		args.last_mut().expect("started").push(byte);
-	};
-	let start_empty = |args: &mut Vec<Vec<u8>>, sep: &mut bool| {
-		if *sep {
-			*sep = false;
-			args.push(Vec::new());
-		}
-	};
-	while i < input.len() {
-		let ch = input[i];
-		match ch {
-			b'\'' if !dq => {
-				sq = !sq;
-				start_empty(&mut args, &mut sep);
+	match wrapper.assignments {
+		Assignments::None => {},
+		Assignments::Shell => {
+			while argv.get(i).is_some_and(|w| is_shell_assignment(w)) {
 				i += 1;
-			},
-			b'"' if !sq => {
-				dq = !dq;
-				start_empty(&mut args, &mut sep);
-				i += 1;
-			},
-			b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r' if !(sq || dq) => {
-				sep = true;
-				while input
-					.get(i)
-					.is_some_and(|b| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
-				{
-					i += 1;
-				}
-			},
-			b'#' if sep => return Some(args.into_iter().map(BString::from).collect()),
-			b'\\' if !sq || matches!(input.get(i + 1), Some(b'\\' | b'\'')) => {
-				i += 1;
-				let &escaped = input.get(i)?;
-				let mapped = match escaped {
-					b'"' | b'#' | b'$' | b'\'' | b'\\' => escaped,
-					b'_' if !dq => {
-						i += 1;
-						sep = true;
-						continue;
-					},
-					b'_' => b' ',
-					b'c' if dq => return None,
-					b'c' => return Some(args.into_iter().map(BString::from).collect()),
-					b'f' => 0x0c,
-					b'n' => b'\n',
-					b'r' => b'\r',
-					b't' => b'\t',
-					b'v' => 0x0b,
-					_ => return None,
-				};
-				push_byte(&mut args, &mut sep, mapped);
-				i += 1;
-			},
-			_ => {
-				push_byte(&mut args, &mut sep, ch);
-				i += 1;
-			},
-		}
-	}
-	if sq || dq {
-		return None;
-	}
-	Some(args.into_iter().map(BString::from).collect())
-}
-
-fn quote_env_s_word(word: &[u8]) -> BString {
-	let needs_quote = word.is_empty()
-		|| word.iter().any(|&b| {
-			matches!(
-				b,
-				b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b'\'' | b'"' | b'\\' | b'#' | b'$'
-			)
-		});
-	if !needs_quote {
-		return BString::from(word);
-	}
-	let mut out = Vec::with_capacity(word.len() + 4);
-	out.push(b'\'');
-	for &b in word {
-		if b == b'\'' || b == b'\\' {
-			out.push(b'\\');
-		}
-		out.push(b);
-	}
-	out.push(b'\'');
-	BString::from(out)
-}
-
-async fn resolve_splits(fs: &omp_vfs::Fs, splits: &[SplitEntry]) -> Vec<Option<BString>> {
-	let mut resolved: Vec<Option<BString>> = vec![None; splits.len()];
-	for split_id in (0..splits.len()).rev() {
-		let entry = &splits[split_id];
-		let mut changed = false;
-		let mut parts = Vec::with_capacity(entry.words.len());
-		for item in &entry.words {
-			match item {
-				SplitItem::Word { bytes, literal } => {
-					if !*literal && let Some(host) = host_arg(fs, bytes.as_bstr()).await {
-						changed = true;
-						parts.push(host);
-						continue;
-					}
-					parts.push(bytes.clone());
-				},
-				SplitItem::Child { split_id: child_id } => {
-					if let Some(rebuilt) = &resolved[*child_id] {
-						changed = true;
-						parts.push(rebuilt.clone());
-					} else {
-						parts.push(join_split_raw(splits, *child_id));
-					}
-				},
 			}
-		}
-		if changed {
-			let mut out = entry.prefix.clone();
-			for (idx, part) in parts.iter().enumerate() {
-				if idx > 0 {
-					out.push(b' ');
-				}
-				out.extend_from_slice(&quote_env_s_word(part));
+		},
+		Assignments::Env => {
+			if argv.get(i).is_some_and(|w| w == b"-") {
+				i += 1;
 			}
-			resolved[split_id] = Some(out);
-		}
+			while argv.get(i).is_some_and(|w| w.contains(&b'=')) {
+				i += 1;
+			}
+		},
 	}
-	resolved
+	Some(i.saturating_add(wrapper.skip_args))
 }
 
-fn join_split_raw(splits: &[SplitEntry], split_id: usize) -> BString {
-	let entry = &splits[split_id];
-	let mut out = entry.prefix.clone();
-	for (idx, item) in entry.words.iter().enumerate() {
-		if idx > 0 {
-			out.push(b' ');
-		}
-		match item {
-			SplitItem::Word { bytes, .. } => out.extend_from_slice(&quote_env_s_word(bytes)),
-			SplitItem::Child { split_id: child_id } => {
-				out.extend_from_slice(&quote_env_s_word(&join_split_raw(splits, *child_id)));
-			},
-		}
-	}
-	out
-}
 /// Whether the environment variable `name` holds a URL to resolve. `PWD`
 /// follows the working directory instead, and a web address aliases no file,
 /// so the provider is not asked about one on every spawn.
@@ -1283,34 +512,19 @@ pub(super) async fn resolve(fs: &omp_vfs::Fs, names: &Names) -> io::Result<Names
 		},
 		_ => names.path.clone(),
 	};
-	let plan = ArgPlan::analyze(&names.path, &names.argv);
-	let mut argv = names.argv.clone();
-	if !plan.splits.is_empty() {
-		let mut resolved_splits = resolve_splits(fs, &plan.splits).await;
-		for &split_id in &plan.root_splits {
-			let argv_idx = plan.splits[split_id].argv_idx;
-			if let Some(rebuilt) = resolved_splits[split_id].take() {
-				argv[argv_idx] = rebuilt;
-			}
-		}
-	}
-	for (i, arg) in argv.iter_mut().enumerate() {
-		if i == 0
-			|| plan.is_literal(i)
-			|| plan
-				.root_splits
-				.iter()
-				.any(|&id| plan.splits[id].argv_idx == i)
-		{
-			continue;
-		}
-		if let Some(host) = host_arg(fs, arg.as_bstr()).await {
-			*arg = host;
-		}
+	let literal = runs_omp(&names.path, &names.argv);
+	let mut argv = Vec::with_capacity(names.argv.len());
+	for (i, arg) in names.argv.iter().enumerate() {
+		let host = if i == 0 || literal {
+			None
+		} else {
+			host_arg(fs, arg.as_bstr()).await
+		};
+		argv.push(host.unwrap_or_else(|| arg.clone()));
 	}
 	// What the child's environment says differently from the shell's.
 	let mut hosted: Vec<(BString, BString)> = Vec::new();
-	if !plan.env_literal {
+	if !literal {
 		for (name, value) in names.env.iter() {
 			if env_url(name, value)
 				&& let Some(host) = host_arg(fs, value).await
@@ -1426,242 +640,52 @@ fn names_nothing(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-	use std::sync::Arc;
-
 	use super::*;
-
-	#[derive(Debug)]
-	struct MapFs {
-		root: PathBuf,
-	}
-
-	#[async_trait::async_trait]
-	impl omp_vfs::FileSystem for MapFs {
-		fn is_native_local(&self, path: &Path) -> bool {
-			!omp_vfs::is_virtual_path(path)
-		}
-
-		async fn backing_path(&self, path: &Path) -> io::Result<Option<PathBuf>> {
-			let Some(rel) = path.to_str().and_then(|s| s.strip_prefix("local://")) else {
-				return Ok(None);
-			};
-			Ok(Some(self.root.join(rel)))
-		}
-
-		async fn open(
-			&self,
-			_path: &Path,
-			_options: &omp_vfs::OpenOptions,
-		) -> io::Result<omp_vfs::File> {
-			Err(io::Error::from(io::ErrorKind::Unsupported))
-		}
-
-		async fn metadata(&self, _path: &Path) -> io::Result<omp_vfs::Metadata> {
-			Err(io::Error::from(io::ErrorKind::Unsupported))
-		}
-
-		async fn read_dir(&self, _path: &Path) -> io::Result<omp_vfs::ReadDir> {
-			Err(io::Error::from(io::ErrorKind::Unsupported))
-		}
-	}
 
 	fn bvec(items: &[&str]) -> Vec<BString> {
 		items.iter().map(|s| BString::from(*s)).collect()
 	}
 
-	fn make_names(argv: &[&str], env: &[(&str, &str)]) -> Names {
-		let pairs = env
-			.iter()
-			.map(|(k, v)| (BString::from(*k), BString::from(*v)))
-			.collect();
-		Names {
-			path: BString::from(argv.first().copied().unwrap_or("")),
-			argv: bvec(argv),
-			env:  EnvView::new(pairs),
-			cwd:  BString::from("/tmp"),
-		}
-	}
-
-	async fn resolved_argv(
-		argv: &[&str],
-		env: &[(&str, &str)],
-	) -> (Vec<String>, Vec<(String, String)>) {
-		let dir = tempfile::tempdir().expect("tempdir");
-		let fs = omp_vfs::Fs::new(Arc::new(MapFs { root: dir.path().to_path_buf() }));
-		let names = make_names(argv, env);
-		let out = resolve(&fs, &names).await.expect("resolve");
-		let root = dir.path().to_string_lossy().into_owned();
-		let norm = |b: &BStr| b.to_str_lossy().replace(&root, "/HOST");
-		let out_argv = out.argv.iter().map(|a| norm(a.as_bstr())).collect();
-		let out_env = out
-			.env
-			.iter()
-			.map(|(k, v)| (k.to_str_lossy().into_owned(), norm(v)))
-			.collect();
-		(out_argv, out_env)
-	}
-
 	#[test]
-	fn non_omp_commands_with_omp_arguments_do_not_skip_urls() {
-		for argv in [
+	fn runs_omp_matches_only_program_or_wrapped_command() {
+		for non_omp in [
 			&["grep", "omp", "local://out.txt"][..],
 			&["rg", "-n", "omp", "skill://x/SKILL.md"][..],
 			&["ls", "./omp", "local://dir"][..],
 			&["nice", "-n", "5", "grep", "omp", "local://out.txt"][..],
 			&["npx", "--cache", "omp", "eslint", "local://app.ts"][..],
 			&["npx", "-p", "omp", "eslint", "local://app.ts"][..],
+			&["npx", "-c", "omp read local://out.txt"][..],
 			&["env", "-u", "omp", "grep", "x", "local://out.txt"][..],
 			&["env", "--", "-flag=/opt/omp", "grep", "x", "local://out.txt"][..],
 			&["env", "-", "tool.name=/opt/omp", "grep", "x", "local://out.txt"][..],
-			&["env", "-S", "grep omp", "local://out.txt"][..],
-			&["uv", "run", "-m", "omp", "local://out.txt"][..],
+			&["timeout", "30", "grep", "omp", "local://out.txt"][..],
+			&["command", "-v", "omp", "local://out.txt"][..],
 			&["setsid", "grep", "omp", "local://out.txt"][..],
 		] {
-			let args = bvec(argv);
-			let plan = ArgPlan::analyze(args[0].as_bytes(), &args);
-			assert!(
-				!plan.is_literal(args.len() - 1),
-				"expected trailing URL to be resolved for {argv:?}"
-			);
-			assert!(!plan.env_literal, "expected env not literal for {argv:?}");
+			let args = bvec(non_omp);
+			assert!(!runs_omp(args[0].as_bytes(), &args), "expected false for {non_omp:?}");
 		}
-	}
 
-	#[tokio::test]
-	async fn wrapper_options_resolve_while_omp_arguments_stay_literal() {
-		let (argv, env) = resolved_argv(
-			&["npm", "--prefix", "local://tools", "exec", "--", "omp", "read", "local://book:1"],
-			&[("REF", "local://env")],
-		)
-		.await;
-		assert_eq!(argv, [
-			"npm",
-			"--prefix",
-			"/HOST/tools",
-			"exec",
-			"--",
-			"omp",
-			"read",
-			"local://book:1"
-		]);
-		assert_eq!(env, [("REF".to_owned(), "local://env".to_owned())]);
-
-		let (argv, _) =
-			resolved_argv(&["npm", "exec", "-p", "omp", "read", "local://book:1"], &[]).await;
-		assert_eq!(argv, ["npm", "exec", "-p", "omp", "read", "local://book:1"]);
-
-		let (argv, _) =
-			resolved_argv(&["npx", "--loglevel", "warn", "omp", "read", "local://book:1"], &[]).await;
-		assert_eq!(argv, ["npx", "--loglevel", "warn", "omp", "read", "local://book:1"]);
-
-		let (argv, _) = resolved_argv(
-			&[
-				"bunx",
-				"--minimum-release-age",
-				"86400",
-				"--registry",
-				"https://r.test",
-				"omp",
-				"read",
-				"local://book:1",
-			],
-			&[],
-		)
-		.await;
-		assert_eq!(argv, [
-			"bunx",
-			"--minimum-release-age",
-			"86400",
-			"--registry",
-			"https://r.test",
-			"omp",
-			"read",
-			"local://book:1"
-		]);
-
-		let (argv, _) =
-			resolved_argv(&["uv", "run", "-w", "requests", "omp", "read", "local://book:1"], &[])
-				.await;
-		assert_eq!(argv, ["uv", "run", "-w", "requests", "omp", "read", "local://book:1"]);
-	}
-
-	#[tokio::test]
-	async fn env_split_string_ssh_and_find_scope_omp_arguments_per_command() {
-		let (argv, _) =
-			resolved_argv(&["/usr/bin/env", "-", "omp", "read", "local://book:1"], &[]).await;
-		assert_eq!(argv, ["/usr/bin/env", "-", "omp", "read", "local://book:1"]);
-
-		let (argv, _) =
-			resolved_argv(&["nice", "/usr/bin/env", "-S", "omp read", "local://book:1"], &[]).await;
-		assert_eq!(argv, ["nice", "/usr/bin/env", "-S", "omp read", "local://book:1"]);
-
-		let (argv, _) = resolved_argv(
-			&["/usr/bin/env", "-S", "env -S 'local://bin/omp read'", "local://book:1"],
-			&[],
-		)
-		.await;
-		assert_eq!(argv, ["/usr/bin/env", "-S", "env -S '/HOST/bin/omp read'", "local://book:1"]);
-
-		let (argv, _) = resolved_argv(
-			&[
-				"ssh",
-				"-F",
-				"local://cfg",
-				"host",
-				"LANG=C",
-				"omp",
-				"read",
-				"local://book",
-				"|",
-				"cat",
-				"local://other",
-			],
-			&[],
-		)
-		.await;
-		assert_eq!(argv, [
-			"ssh",
-			"-F",
-			"/HOST/cfg",
-			"host",
-			"LANG=C",
-			"omp",
-			"read",
-			"local://book",
-			"|",
-			"cat",
-			"/HOST/other"
-		]);
-
-		let (argv, _) = resolved_argv(
-			&[
-				"find",
-				"local://dir",
-				"-exec",
-				"omp",
-				"read",
-				"local://x",
-				";",
-				"-exec",
-				"cat",
-				"local://y",
-				";",
-			],
-			&[],
-		)
-		.await;
-		assert_eq!(argv, [
-			"find",
-			"/HOST/dir",
-			"-exec",
-			"omp",
-			"read",
-			"local://x",
-			";",
-			"-exec",
-			"cat",
-			"/HOST/y",
-			";"
-		]);
+		for omp_cmd in [
+			&["omp", "read", "local://out.txt"][..],
+			&["/usr/local/bin/omp", "read", "local://out.txt"][..],
+			&["nice", "-n", "5", "omp", "read", "local://out.txt"][..],
+			&["nice", "-10", "omp", "read", "local://out.txt"][..],
+			&["sudo", "-u", "root", "FOO=bar", "nice", "omp", "read", "local://out.txt"][..],
+			&["/usr/bin/env", "-", "FOO=local://a", "omp", "read", "local://out.txt"][..],
+			&["npx", "--loglevel", "warn", "omp", "read", "local://out.txt"][..],
+			&["bunx", "--minimum-release-age", "86400", "omp", "read", "local://out.txt"][..],
+			&["timeout", "-k", "5", "30", "omp", "read", "local://out.txt"][..],
+			&["nohup", "omp", "read", "local://out.txt"][..],
+			&["setsid", "omp", "read", "local://out.txt"][..],
+			&["time", "FOO=bar", "omp", "read", "local://out.txt"][..],
+			&["stdbuf", "-oL", "omp", "read", "local://out.txt"][..],
+			&["xargs", "-n", "1", "omp", "read", "local://out.txt"][..],
+			&["ifne", "omp", "read", "local://out.txt"][..],
+		] {
+			let args = bvec(omp_cmd);
+			assert!(runs_omp(args[0].as_bytes(), &args), "expected true for {omp_cmd:?}");
+		}
 	}
 }

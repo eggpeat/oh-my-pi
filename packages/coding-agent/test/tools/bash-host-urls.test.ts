@@ -98,16 +98,8 @@ describe("hostCommandUrls", () => {
 		expect(await host("npx --loglevel warn omp read local://x.md:1")).toBe(
 			"npx --loglevel warn omp read local://x.md:1",
 		);
-		expect(await host("npm --prefix local://tools exec -- omp read local://book.md:1")).toBe(
-			"npm --prefix /host/tools exec -- omp read local://book.md:1",
-		);
-		expect(await host("npm exec -p omp read local://x.md:1")).toBe("npm exec -p omp read local://x.md:1");
 		expect(await host("bunx --minimum-release-age 86400 --registry https://r.test omp read local://book.md:1")).toBe(
 			"bunx --minimum-release-age 86400 --registry https://r.test omp read local://book.md:1",
-		);
-		expect(await host("uv run -m omp local://x.py")).toBe("uv run -m omp /host/x.py");
-		expect(await host("uv run -w requests omp read local://book.md:1")).toBe(
-			"uv run -w requests omp read local://book.md:1",
 		);
 		expect(await host("env -u omp grep x local://out.txt")).toBe("env -u omp grep x /host/out.txt");
 		expect(await host("env -- -flag=/opt/omp grep x local://out.txt")).toBe(
@@ -117,6 +109,9 @@ describe("hostCommandUrls", () => {
 			"env - tool.name=/opt/omp grep x /host/out.txt",
 		);
 		expect(await host("env - omp read local://x.md:1")).toBe("env - omp read local://x.md:1");
+		expect(await host("timeout -k 5 30 omp read local://x.md && timeout 30 grep omp local://x.md")).toBe(
+			"timeout -k 5 30 omp read local://x.md && timeout 30 grep omp /host/x.md",
+		);
 		expect(await host("setsid omp read local://x.md:1 && setsid grep omp local://x.md")).toBe(
 			"setsid omp read local://x.md:1 && setsid grep omp /host/x.md",
 		);
@@ -126,70 +121,14 @@ describe("hostCommandUrls", () => {
 		expect(await host("ifne omp read local://x.md && ifne grep omp local://x.md")).toBe(
 			"ifne omp read local://x.md && ifne grep omp /host/x.md",
 		);
-	});
-
-	it("handles shell prefixes, redirections, substitutions, case, find, ssh, and env -S around omp", async () => {
+		expect(await host("REF=local://ref.txt omp read local://x.md && REF=local://ref.txt cat local://x.md")).toBe(
+			"REF=local://ref.txt omp read local://x.md && REF=/host/ref.txt cat /host/x.md",
+		);
 		expect(await host("if omp read local://x.md; then cat local://y.md; fi")).toBe(
 			"if omp read local://x.md; then cat /host/y.md; fi",
 		);
 		expect(await host("if grep omp local://x.md; then :; fi")).toBe("if grep omp /host/x.md; then :; fi");
-		expect(await host("! omp read local://x.md && >/dev/null omp read local://y.md")).toBe(
-			"! omp read local://x.md && >/dev/null omp read local://y.md",
-		);
-		expect(await host("env 2>/dev/null omp read local://x.md")).toBe("env 2>/dev/null omp read local://x.md");
-		expect(await host("omp>local://out.txt read local://in.txt")).toBe("omp>/host/out.txt read local://in.txt");
-		expect(await host("omp read local://in.txt > local://out.txt 2>&1")).toBe(
-			"omp read local://in.txt > /host/out.txt 2>&1",
-		);
-		expect(await host("omp read &>/dev/null local://in.txt")).toBe("omp read &>/dev/null local://in.txt");
-		expect(await host("2>&$(cat local://fd.txt) omp read local://in.txt")).toBe(
-			"2>&$(cat /host/fd.txt) omp read local://in.txt",
-		);
-		expect(await host(`REF=local://ref.txt omp read "$(cat local://in.txt)" $(echo hi) local://out.txt`)).toBe(
-			`REF=local://ref.txt omp read "$(cat /host/in.txt)" $(echo hi) local://out.txt`,
-		);
-		expect(await host(`REF=local://ref.txt cat local://in.txt`)).toBe("REF=/host/ref.txt cat /host/in.txt");
-		expect(await host("case x in x) cat local://a.txt;; y) omp read local://b.txt;; esac")).toBe(
-			"case x in x) cat /host/a.txt;; y) omp read local://b.txt;; esac",
-		);
-		expect(await host(`echo "$(case x in x) cat local://a.txt;; esac)"`)).toBe(
-			`echo "$(case x in x) cat /host/a.txt;; esac)"`,
-		);
-		expect(
-			await host(`REF=local://x.txt find local://dir -exec omp read local://y.txt \\; -exec cat local://z.txt \\;`),
-		).toBe(`REF=/host/x.txt find /host/dir -exec omp read local://y.txt \\; -exec cat /host/z.txt \\;`);
-		expect(await host(`ssh -F local://cfg server omp read local://book.md "|" cat local://other.md`)).toBe(
-			`ssh -F /host/cfg server omp read local://book.md "|" cat /host/other.md`,
-		);
-		expect(await host("ssh server grep omp local://book.md")).toBe("ssh server grep omp /host/book.md");
-		expect(await host("ssh server LANG=C omp read local://book.md")).toBe(
-			"ssh server LANG=C omp read local://book.md",
-		);
-		expect(await host(`nice env -S "omp read" local://x.md`)).toBe(`nice env -S "omp read" local://x.md`);
-		expect(await host(`env -S "grep omp" local://x.md`)).toBe(`env -S "grep omp" /host/x.md`);
-		expect(await host(`env -S 'local://bin/omp read' local://file.md`)).toBe(
-			`env -S '/host/bin/omp read' local://file.md`,
-		);
-		expect(await host(`env -S "env -S 'local://bin/omp read'" local://in.md`)).toBe(
-			`env -S 'env -S '\\''/host/bin/omp read'\\''' local://in.md`,
-		);
-		expect(await host(`env -S "echo $label local://in.md"`)).toBe(`env -S "echo $label /host/in.md"`);
-	});
-
-	it("does not confuse here-strings, arithmetic shifts, composite delimiters, or nested heredocs with command text", async () => {
-		expect(await host("omp << 'local://done'\nhello\nlocal://done\ncat local://after.txt")).toBe(
-			"omp << 'local://done'\nhello\nlocal://done\ncat /host/after.txt",
-		);
-		expect(await host('cat <<END"MARK"\nEND\nlocal://inside.txt\nENDMARK\ncat local://after.txt')).toBe(
-			'cat <<END"MARK"\nEND\nlocal://inside.txt\nENDMARK\ncat /host/after.txt',
-		);
-		expect(await host("cat <<< local://text\nif ((1 << 2)); then cat local://in.txt; fi")).toBe(
-			"cat <<< local://text\nif ((1 << 2)); then cat /host/in.txt; fi",
-		);
-		expect(await host("((x << y))\ncat local://after.txt")).toBe("((x << y))\ncat /host/after.txt");
-		expect(await host('cat <<<"$(cat <<EOF\nlocal://body.txt\nEOF\n) $(cat local://after.txt)"')).toBe(
-			'cat <<<"$(cat <<EOF\nlocal://body.txt\nEOF\n) $(cat /host/after.txt)"',
-		);
+		expect(await host("echo hi >& local://out.txt")).toBe("echo hi >& /host/out.txt");
 	});
 
 	it("treats a here-document body as input, not command text", async () => {
