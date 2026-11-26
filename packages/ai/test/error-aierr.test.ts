@@ -1,6 +1,5 @@
 import { describe, expect, it } from "bun:test";
 import * as AIError from "@oh-my-pi/pi-ai/error";
-import { createAbortSourceTracker } from "@oh-my-pi/pi-ai/utils/abort";
 
 describe("AIError.classify — structural provider errors", () => {
 	it("classifies an Anthropic connection timeout as timeout + transient (no regex)", () => {
@@ -166,19 +165,6 @@ describe("AIError.finalize", () => {
 		expect(result.stopReason).toBe("aborted");
 		expect(result.status).toBe(404);
 		expect(result.message).toBe("Request was aborted");
-	});
-
-	it("uses the supplied caller signal when a tracker has no caller signal", async () => {
-		const controller = new AbortController();
-		controller.abort("Interrupted by user");
-		const result = await AIError.finalize(new Error("fetch failed"), {
-			signal: controller.signal,
-			abortTracker: createAbortSourceTracker(),
-		});
-
-		expect(result.stopReason).toBe("aborted");
-		expect(result.message).toBe("Interrupted by user");
-		expect(AIError.is(result.id, AIError.Flag.Abort)).toBe(false);
 	});
 
 	it("surfaces the HTTP status from a ProviderHttpError", async () => {

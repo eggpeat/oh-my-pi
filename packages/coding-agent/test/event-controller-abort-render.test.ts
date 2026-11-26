@@ -163,25 +163,6 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		expect(arg.stopReason).toBe("aborted");
 	});
 
-	it("C2c: a custom AbortError label stays visible even with the Abort flag", async () => {
-		const message = makeAssistantMessage({
-			stopReason: "aborted",
-			errorMessage: "Stopped for maintenance",
-			errorId: AIError.create(AIError.Flag.Abort),
-		});
-		const { controller, updateContent } = createFixture({ streamingMessage: message });
-
-		await controller.handleEvent({ type: "message_end", message });
-
-		expect(message.errorMessage).toBe("Stopped for maintenance");
-		expect(updateContent).toHaveBeenCalledTimes(1);
-		expect(resolveAssistantErrorPresentation(message)).toEqual({
-			kind: "full",
-			text: "Stopped for maintenance",
-			isError: true,
-		});
-	});
-
 	it("C3: a TTSR abort (SilentAbort flag + rule reason) is suppressed live and on rebuild", async () => {
 		// AgentSession stamps the SilentAbort flag on TTSR aborts while keeping the
 		// rule reason text on the message. The controller must downgrade the display

@@ -129,9 +129,8 @@ export function shouldRenderAbortReason(message: Pick<AssistantMessage, "errorId
 export const GENERIC_ABORT_SENTINEL = "Request was aborted";
 
 /** Resolve the operator-facing label for an aborted assistant turn. A custom
- *  abort reason threaded onto `errorMessage` is returned verbatim, even when
- *  its original error also carried the Abort flag; aborts with no threaded
- *  reason fall back to the retry-aware generic label. Call
+ *  abort reason threaded onto `errorMessage` is returned verbatim; aborts with
+ *  no threaded reason fall back to the retry-aware generic label. Call
  *  `shouldRenderAbortReason` before rendering when user interrupts should stay
  *  visually quiet. */
 export function resolveAbortLabel(
@@ -139,7 +138,10 @@ export function resolveAbortLabel(
 	retryAttempt = 0,
 ): string {
 	const genericAbort =
-		!message.errorMessage || message.errorMessage === GENERIC_ABORT_SENTINEL || isSilentAbort(message);
+		AIError.is(message.errorId, AIError.Flag.Abort) ||
+		!message.errorMessage ||
+		message.errorMessage === GENERIC_ABORT_SENTINEL ||
+		isSilentAbort(message);
 	if (!genericAbort) {
 		return message.errorMessage!;
 	}

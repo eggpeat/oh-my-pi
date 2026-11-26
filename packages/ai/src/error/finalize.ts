@@ -13,7 +13,7 @@ export interface FinalizeOptions {
 	provider?: string;
 	/** Requested model id; paired with provider for model-entitlement classification. */
 	model?: string;
-	/** Caller signal; also used when an abort tracker does not retain its original signal. */
+	/** Caller signal, for providers that don't run an abort tracker. */
 	signal?: AbortSignal;
 	/** Abort tracker, preferred over `signal`: distinguishes caller vs. local aborts. */
 	abortTracker?: AbortSourceTracker;
@@ -48,9 +48,7 @@ export interface FinalizeResult {
  * so a formatter throw can never skip the caller's `stream.end()`.
  */
 export async function finalize(error: unknown, opts: FinalizeOptions = {}): Promise<FinalizeResult> {
-	const aborted = opts.abortTracker
-		? opts.abortTracker.wasCallerAbort() || opts.signal?.aborted === true
-		: opts.signal?.aborted === true;
+	const aborted = opts.abortTracker ? opts.abortTracker.wasCallerAbort() : opts.signal?.aborted === true;
 	const errorStatus = status(error);
 	let callerReason: string | undefined;
 	let callerError: unknown;
@@ -58,16 +56,13 @@ export async function finalize(error: unknown, opts: FinalizeOptions = {}): Prom
 	let message: string;
 	try {
 		const localReason = opts.abortTracker?.getLocalAbortReason();
-		const callerSignal = opts.signal?.aborted ? opts.signal : (opts.abortTracker?.callerSignal ?? opts.signal);
-		const signalCallerReason = callerAbortReason(callerSignal);
-		const trackedCallerReason = opts.abortTracker?.getCallerAbortReason();
-		callerReason = signalCallerReason ?? trackedCallerReason;
-		callerError =
-			signalCallerReason !== undefined || trackedCallerReason === undefined
-				? callerSignal?.reason
-				: trackedCallerReason;
+		// The tracker keeps the caller's own signal, so the caller's reason and any
+		// flags attached to it survive; providers without a tracker pass the signal.
+		const callerSignal = opts.abortTracker ? opts.abortTracker.callerSignal : opts.signal;
+		callerReason = opts.abortTracker ? opts.abortTracker.getCallerAbortReason() : callerAbortReason(opts.signal);
+		callerError = callerSignal?.reason;
 		message =
-			localReason?.message ?? (aborted ? (callerReason ?? "Request was aborted") : await formatMessage(error, opts));
+			localReason?.message ?? callerReason ?? (aborted ? "Request was aborted" : await formatMessage(error, opts));
 	} catch {
 		message = aborted
 			? (callerReason ?? "Request was aborted")
@@ -76,8 +71,7 @@ export async function finalize(error: unknown, opts: FinalizeOptions = {}): Prom
 				: String(error);
 	}
 
-	const callerStatus = aborted ? status(callerError) : undefined;
-	const currentStatus = callerStatus ?? errorStatus ?? opts.capturedErrorResponse?.status;
+	const currentStatus = errorStatus ?? opts.capturedErrorResponse?.status;
 
 	// A captured status is transport context for the original error. Put it at
 	// the root of the classification cause chain so terminal 4xx policy governs

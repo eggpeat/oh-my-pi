@@ -123,44 +123,6 @@ describe("register-builtins lazy streams", () => {
 		expect(result).toEqual(finalMessage);
 	});
 
-	it("snapshots caller signal and timeout getters once for the provider and watchdog", async () => {
-		const finalMessage = createAssistantMessage("stop");
-		const partialMessage = createAssistantMessage("stop");
-		const abortController = new AbortController();
-		let signalReads = 0;
-		let idleTimeoutReads = 0;
-		let firstEventTimeoutReads = 0;
-		const source = {
-			async *[Symbol.asyncIterator]() {
-				yield { type: "start", partial: partialMessage } as const;
-			},
-			result: async () => finalMessage,
-		} as unknown as AssistantMessageEventStream;
-
-		setBedrockProviderModule({ streamBedrock: () => source });
-		const result = await streamBedrock(createModel(), baseContext, {
-			get signal() {
-				signalReads++;
-				return abortController.signal;
-			},
-			get streamIdleTimeoutMs() {
-				idleTimeoutReads++;
-				return 0;
-			},
-			get streamFirstEventTimeoutMs() {
-				firstEventTimeoutReads++;
-				return 0;
-			},
-		}).result();
-
-		expect(result).toEqual(finalMessage);
-		expect({ signalReads, idleTimeoutReads, firstEventTimeoutReads }).toEqual({
-			signalReads: 1,
-			idleTimeoutReads: 1,
-			firstEventTimeoutReads: 1,
-		});
-	});
-
 	it("turns iterator failures into terminal error results", async () => {
 		const partialMessage = createAssistantMessage("stop");
 		const source = {
@@ -393,14 +355,7 @@ describe("register-builtins lazy streams", () => {
 		expect(AIError.is(result.errorId, AIError.Flag.Abort)).toBe(true);
 	});
 
-	it("reads custom messages from AbortError and tool-scoped caller reasons", async () => {
-		const abortErrorResult = await resultAfterCallerAbort(new DOMException("Stopped for maintenance", "AbortError"));
-		expect(abortErrorResult.errorMessage).toBe("Stopped for maintenance");
-
-		const classifiedAbortResult = await resultAfterCallerAbort(new AIError.AbortError("Stopped for maintenance"));
-		expect(classifiedAbortResult.errorMessage).toBe("Stopped for maintenance");
-		expect(AIError.is(classifiedAbortResult.errorId, AIError.Flag.Abort)).toBe(true);
-
+	it("reads a tool-scoped caller reason", async () => {
 		const toolScopedResult = await resultAfterCallerAbort({
 			kind: "tool-scoped-abort",
 			message: "Streaming edit preview failed",

@@ -98,7 +98,6 @@ function forwardStream<TApi extends Api>(
 	source: AsyncIterable<AssistantMessageEvent>,
 	model: Model<TApi>,
 	options: OptionsForApi<TApi>,
-	callerSignal: AbortSignal | undefined,
 	abortTracker: AbortSourceTracker,
 	limits?: StreamLimits,
 ): void {
@@ -142,7 +141,7 @@ function forwardStream<TApi extends Api>(
 				onIdle: () => abortTracker.abortLocally(new AIError.StreamTimeoutError(STREAM_IDLE_TIMEOUT_ERROR)),
 				onFirstItemTimeout: () =>
 					abortTracker.abortLocally(new AIError.StreamTimeoutError(STREAM_FIRST_EVENT_TIMEOUT_ERROR)),
-				abortSignal: callerSignal,
+				abortSignal: abortTracker.callerSignal,
 				// The synthetic `start` event is yielded immediately by every provider before
 				// the upstream model has emitted any tokens. Treating it as the first "real"
 				// item would flip the watchdog from `firstItemTimeoutMs` to the much shorter
@@ -161,7 +160,7 @@ function forwardStream<TApi extends Api>(
 				target.end();
 			}
 		} catch (error) {
-			const message = await createProviderStreamError(model, error, abortTracker, callerSignal);
+			const message = await createProviderStreamError(model, error, abortTracker);
 			target.push({ type: "error", reason: message.stopReason, error: message });
 			target.end(message);
 		}
@@ -171,15 +170,13 @@ function forwardStream<TApi extends Api>(
 async function createProviderStreamError<TApi extends Api>(
 	model: Model<TApi>,
 	error: unknown,
-	abortTracker?: AbortSourceTracker,
-	signal?: AbortSignal,
+	abortTracker: AbortSourceTracker,
 ): Promise<AssistantMessage & { stopReason: "aborted" | "error" }> {
 	const finalized = await AIError.finalize(error, {
 		api: model.api,
 		provider: model.provider,
 		model: model.id,
 		abortTracker,
-		signal,
 	});
 	return {
 		role: "assistant",
@@ -221,8 +218,6 @@ function createLazyProviderStream<TModule, TApi extends Api>(
 ): (model: Model<TApi>, context: Context, options: OptionsForApi<TApi>) => EventStreamImpl {
 	return (model, context, options) => {
 		const outer = new EventStreamImpl();
-		// Snapshot caller options once: hosts may expose signal/timeout options via
-		// getters, and the watchdog and provider must observe the same values.
 		const { signal: callerSignal, ...streamOptions } = options ?? {};
 		const abortTracker = createAbortSourceTracker(callerSignal);
 		const providerOptions: OptionsForApi<TApi> = { ...streamOptions, signal: abortTracker.requestSignal };
@@ -230,10 +225,10 @@ function createLazyProviderStream<TModule, TApi extends Api>(
 		load()
 			.then(mod => {
 				const inner = pick(mod)(model, context, providerOptions);
-				forwardStream(outer, inner, model, streamOptions, callerSignal, abortTracker, limits);
+				forwardStream(outer, inner, model, streamOptions, abortTracker, limits);
 			})
 			.catch(async error => {
-				const message = await createProviderStreamError(model, error, abortTracker, callerSignal);
+				const message = await createProviderStreamError(model, error, abortTracker);
 				outer.push({ type: "error", reason: message.stopReason, error: message });
 				outer.end(message);
 			});
