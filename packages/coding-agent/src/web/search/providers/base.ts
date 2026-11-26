@@ -1,6 +1,7 @@
 import type { Api, AuthStorage, FetchImpl, Model } from "@oh-my-pi/pi-ai";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { ModelRegistry } from "../../../config/model-registry";
+import type { Settings } from "../../../config/settings";
 import type { StructuredQuery } from "../query";
 import type { SearchProviderId, SearchResponse } from "../types";
 
@@ -79,6 +80,8 @@ export interface SearchParams {
 	 * caller's agent session when available; otherwise omit.
 	 */
 	sessionId?: string;
+	/** Opaque manager owner used to look up borrowed session Exa keys. */
+	keyOwner?: object;
 	antigravityEndpointMode?: "auto" | "production" | "sandbox";
 }
 
@@ -96,7 +99,11 @@ export abstract class SearchProvider {
 	 * Explicit selection uses {@link isExplicitlyAvailable} instead. The model
 	 * is supplied for providers whose authentication depends on its transport.
 	 */
-	abstract isAvailable(authStorage: AuthStorage, model?: Model<Api>): Promise<boolean> | boolean;
+	abstract isAvailable(
+		authStorage: AuthStorage,
+		model?: Model<Api>,
+		activeSettings?: Settings,
+	): Promise<boolean> | boolean;
 
 	/**
 	 * Returns `true` when this provider should run when the user explicitly
@@ -107,8 +114,12 @@ export abstract class SearchProvider {
 	 *
 	 * Defaults to mirroring {@link isAvailable}.
 	 */
-	isExplicitlyAvailable(authStorage: AuthStorage, model?: Model<Api>): Promise<boolean> | boolean {
-		return this.isAvailable(authStorage, model);
+	isExplicitlyAvailable(
+		authStorage: AuthStorage,
+		model?: Model<Api>,
+		activeSettings?: Settings,
+	): Promise<boolean> | boolean {
+		return this.isAvailable(authStorage, model, activeSettings);
 	}
 
 	/**
@@ -120,7 +131,12 @@ export abstract class SearchProvider {
 	 * Defaults to `false`, which holds for providers that only run on the
 	 * user's own credential; every provider with a keyless path MUST override it.
 	 */
-	isKeyless(_authStorage: AuthStorage, _model?: Model<Api>): Promise<boolean> | boolean {
+	isKeyless(
+		_authStorage: AuthStorage,
+		_model?: Model<Api>,
+		_sessionId?: string,
+		_keyOwner?: object,
+	): Promise<boolean> | boolean {
 		return false;
 	}
 

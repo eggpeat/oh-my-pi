@@ -6,6 +6,7 @@ import type { Settings } from "../../../config/settings";
 import { getAllProvidersInfo, isForeignUserProvider, isUserSourceEnabled } from "../../../discovery";
 import type { CustomTool } from "../../../extensibility/custom-tools/types";
 import { setMcpServerEnabled } from "../../../mcp/config-writer";
+import type { LoadMCPConfigsOptions } from "../../../mcp/config";
 import type { MCPManager } from "../../../mcp/manager";
 import { MCP_CONNECTION_STATUS_EVENT_CHANNEL } from "../../../mcp/startup-events";
 import type { EventBus } from "../../../utils/event-bus";
@@ -26,8 +27,22 @@ export function createExtensionDashboardRuntime(options: {
 	eventBus?: EventBus;
 	onMcpToolsChanged?: (tools: CustomTool[]) => Promise<void> | void;
 	browserMcpFilterEnabled?: () => boolean;
+	/**
+	 * Exa-fold context matching session startup. Omitted: a keyed server enabled
+	 * here stays mounted instead of folding into a search that never gets its key.
+	 */
+	exaDiscovery?: Pick<LoadMCPConfigsOptions, "authStorage" | "modelRegistry" | "webSearchActive" | "installExaApiKey">;
 }): ExtensionDashboardRuntime {
-	const { cwd, settings, extensionRoots, mcpManager, eventBus, onMcpToolsChanged, browserMcpFilterEnabled } = options;
+	const {
+		cwd,
+		settings,
+		extensionRoots,
+		mcpManager,
+		eventBus,
+		onMcpToolsChanged,
+		browserMcpFilterEnabled,
+		exaDiscovery,
+	} = options;
 	return {
 		getDisabledExtensions: () => cfgDisabledExtensions.get(settings),
 		setDisabledExtensions: ids => cfgDisabledExtensions.set(settings, ids),
@@ -62,6 +77,7 @@ export function createExtensionDashboardRuntime(options: {
 					filterExa: true,
 					filterBrowser: browserMcpFilterEnabled?.() ?? false,
 					settings,
+					...exaDiscovery,
 				},
 				onStatus: event => eventBus?.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, event),
 			}),

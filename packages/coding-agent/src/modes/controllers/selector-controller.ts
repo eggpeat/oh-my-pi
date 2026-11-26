@@ -106,6 +106,7 @@ import { HistorySearchComponent } from "@oh-my-pi/pi-tui/overlays/history-search
 import { HookEditorComponent } from "@oh-my-pi/pi-tui/overlays/hook-editor";
 import { ModelHubComponent, type ModelRoleSelectionScope } from "@oh-my-pi/pi-tui/overlays/model-hub";
 import { createModelBrowserSource } from "../model-browser-source";
+import { setManagerExaApiKey, setSessionExaApiKey } from "../../web/search/exa-session-key";
 import { formatSessionContinuationNotice } from "../persistence-failure";
 import { ModelPickerComponent } from "@oh-my-pi/pi-tui/overlays/model-picker";
 import { PluginSelectorComponent } from "@oh-my-pi/pi-tui/overlays/plugin-selector";
@@ -610,6 +611,15 @@ export class SelectorController {
 				onMcpToolsChanged: tools => this.ctx.session.refreshMCPTools(tools),
 				browserMcpFilterEnabled: () =>
 					this.ctx.session.getEvalPreludes().some(definition => definition.name === "browser"),
+				exaDiscovery: {
+					authStorage: this.ctx.session.modelRegistry.authStorage,
+					modelRegistry: this.ctx.session.modelRegistry,
+					webSearchActive: () => this.ctx.session.getEnabledToolNames().includes("web_search"),
+					installExaApiKey: key => {
+						setSessionExaApiKey(this.ctx.sessionManager.getSessionId(), key);
+						setManagerExaApiKey(this.ctx.mcpManager, key);
+					},
+				},
 			}),
 			terminalHeight: this.ctx.ui.terminal.rows,
 			toolSource: {

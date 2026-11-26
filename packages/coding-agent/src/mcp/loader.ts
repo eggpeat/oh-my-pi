@@ -3,7 +3,6 @@
  *
  * Integrates MCP tool discovery with the custom tools system.
  */
-import type { Settings } from "../config/settings";
 import type { LoadedCustomTool } from "../extensibility/custom-tools/types";
 import type { AuthStorage } from "../session/auth-storage";
 import { type MCPDiscoverOptions, type MCPLoadResult, MCPManager } from "./manager";
@@ -22,22 +21,6 @@ export interface MCPToolsLoadResult {
 	exaApiKeys: string[];
 }
 
-/** Options for loading MCP tools */
-export interface MCPToolsLoadOptions {
-	/** Called when MCP server connection state changes. */
-	onStatus?: (event: McpConnectionStatusEvent) => void;
-	/** Initial non-blocking discovery window in milliseconds (environment override wins). */
-	startupTimeoutMs?: number;
-	/** Whether to load project-level config (default: true) */
-	enableProjectConfig?: boolean;
-	/** Whether to filter out Exa MCP servers (default: true) */
-	filterExa?: boolean;
-	/** Whether to filter out browser MCP servers when the built-in browser capability is enabled (default: false) */
-	filterBrowser?: boolean;
-	/** What the session offers natively, for built-in transforms; omitted: none applies. */
-	builtinTransforms?: MCPTransformContext;
-	/** Settings scope for the Exa fold's `providers.webKeyless` read (default: the global settings). */
-	settings?: Settings;
 /** Options for loading MCP tools: discovery options plus manager setup. */
 export interface MCPToolsLoadOptions extends MCPDiscoverOptions {
 	/** Linger of an unused shared server in milliseconds (`mcp.idleStopMinutes`); the manager default when absent. */
@@ -61,16 +44,8 @@ export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoa
 
 	let result: MCPLoadResult;
 	try {
-		result = await manager.discoverAndConnect({
-			onStatus: options?.onStatus,
-			startupTimeoutMs: options?.startupTimeoutMs,
-			enableProjectConfig: options?.enableProjectConfig,
-			filterExa: options?.filterExa,
-			filterBrowser: options?.filterBrowser,
-			extensionRoots: options?.extensionRoots,
-			builtinTransforms: options?.builtinTransforms,
-			settings: options?.settings,
-		});
+		const { idleStopMs: _idleStopMs, authStorage: _authStorage, ...discoverOptions } = options ?? {};
+		result = await manager.discoverAndConnect(discoverOptions);
 	} catch (error) {
 		// If discovery fails entirely, return empty result
 		const message = error instanceof Error ? error.message : String(error);

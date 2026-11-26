@@ -6,15 +6,24 @@
  * Requests per-result summaries via `contents.summary` and synthesizes
  * them into a combined `answer` string on the SearchResponse.
  */
-import { type ApiKey, type AuthStorage, type FetchImpl, getEnvApiKey, withAuth } from "@oh-my-pi/pi-ai";
+import {
+	type Api,
+	type ApiKey,
+	type AuthStorage,
+	type FetchImpl,
+	type Model,
+	getEnvApiKey,
+	withAuth,
+} from "@oh-my-pi/pi-ai";
 import { $env, asRecord } from "@oh-my-pi/pi-utils";
-import { settings } from "../../../config/settings";
+import { settings, type Settings } from "../../../config/settings";
 import { normalizeMcpToolPayload } from "../../../exa/mcp-client";
 import { readMcpJsonRpcResponse } from "../../../mcp/json-rpc";
 import type { SearchResponse, SearchSource } from "../types";
 import { SearchProviderError } from "../../../web/search/types";
 import { formatQuery, parseSearchQuery, type StructuredQuery } from "../query";
 import { dateToAgeSeconds } from "../utils";
+import { getSessionExaApiKey } from "../exa-session-key";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
@@ -129,6 +138,8 @@ export interface ExaSearchParams {
 	 */
 	authStorage?: AuthStorage;
 	sessionId?: string;
+	/** Opaque manager owner used to look up borrowed session keys. */
+	keyOwner?: object;
 }
 
 interface ExaSearchResult {
@@ -400,7 +411,7 @@ export async function searchExa(params: ExaSearchParams): Promise<SearchResponse
 	const keyOrResolver: ApiKey | undefined =
 		storedKey && params.authStorage
 			? params.authStorage.keys.resolver("exa", { sessionId: params.sessionId })
-			: getEnvApiKey("exa");
+			: (getSessionExaApiKey(params.sessionId, params.keyOwner) ?? getEnvApiKey("exa"));
 	// A failed credential lookup must not downgrade a configured user to the anonymous MCP.
 	if (!keyOrResolver && params.authStorage?.keys.source("exa") !== undefined) {
 		throw new SearchProviderError(
@@ -455,9 +466,9 @@ export class ExaProvider extends SearchProvider {
 	 * Available unless disabled in settings: without a credential, search runs
 	 * through Exa's unauthenticated public MCP.
 	 */
-	isAvailable(_authStorage: AuthStorage): boolean {
+	isAvailable(_authStorage: AuthStorage, _model?: Model<Api>, activeSettings?: Settings): boolean {
 		try {
-			if (cfgExaEnabled.get(settings) === false) {
+			if (cfgExaEnabled.get(activeSettings ?? settings) === false) {
 				return false;
 			}
 		} catch {
@@ -466,8 +477,8 @@ export class ExaProvider extends SearchProvider {
 		return true;
 	}
 
-	override isKeyless(authStorage: AuthStorage): boolean {
-		return authStorage.keys.source("exa") === undefined;
+	override isKeyless(authStorage: AuthStorage, _model?: Model<Api>, sessionId?: string, keyOwner?: object): boolean {
+		return authStorage.keys.source("exa") === undefined && getSessionExaApiKey(sessionId, keyOwner) === undefined;
 	}
 
 	search(params: SearchParams): Promise<SearchResponse> {
@@ -479,6 +490,7 @@ export class ExaProvider extends SearchProvider {
 			timeoutMs: params.timeoutMs,
 			authStorage: params.authStorage,
 			sessionId: params.sessionId,
+			keyOwner: params.keyOwner,
 			fetch: params.fetch,
 		});
 	}

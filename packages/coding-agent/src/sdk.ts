@@ -385,6 +385,7 @@ import { buildNamedToolChoice } from "./utils/tool-choice";
 import { VibeSessionRegistry } from "./vibe/runtime";
 import { registerLocalInferenceApi } from "./tiny/local-inference-api";
 import { shutdownTinyTitleClient } from "./tiny/title-client";
+import { clearSessionExaApiKey, setSessionExaApiKey } from "./web/search/exa-session-key";
 import { buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 
 import {
@@ -619,12 +620,6 @@ function collectPendingMCPToolNames(explicitToolNames: readonly string[] | undef
 function logMCPLoadErrors(errors: MCPLoadResult["errors"]): void {
 	for (const [serverName, error] of errors) {
 		logger.error("MCP tool load failed", { path: `mcp:${serverName}`, error });
-	}
-}
-
-function applyMCPEnvironment(result: { exaApiKeys: string[] }): void {
-	if (result.exaApiKeys.length > 0 && !$env.EXA_API_KEY) {
-		Bun.env.EXA_API_KEY = result.exaApiKeys[0];
 	}
 }
 
@@ -3049,7 +3044,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			}),
 			extensionRoots: buildSessionExtensionRoots(),
 			settings,
+			modelRegistry,
+			webSearchActive: () =>
+				toolRegistry.has("web_search") &&
+				(activeToolNames.has("web_search") || (toolSession.toolCommands?.mountedNames.has("web_search") ?? false)),
+			installExaApiKey: (key: string | undefined) => setSessionExaApiKey(sessionManager.getSessionId(), key),
 		};
+		const clearExaKey = (): void => {
+			clearSessionExaApiKey(sessionManager.getSessionId(), ownedMcpManager ?? undefined);
+		};
+		startupCleanup.defer(clearExaKey);
+		disposeCallbacks.add(clearExaKey);
 		if (enableMCP && !mcpManager && isMainThread()) {
 			if (deferMCPDiscoveryForUI) {
 				const deferredMCPManager = new MCPManager(cwd, undefined, mcpIdleStopMs);
@@ -3077,7 +3082,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 								await deferredMCPManager.disconnectAll();
 								return;
 							}
-							applyMCPEnvironment(mcpResult);
 							logMCPLoadErrors(mcpResult.errors);
 							// Connected MCP tools are
 							// enabled and mounted as tool commands right away, so a turn whose
@@ -3118,7 +3122,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				if (cfgMcpNotifications.get(settings)) {
 					discoveredMCPManager.setNotificationsEnabled(true);
 				}
-				applyMCPEnvironment(mcpResult);
 
 				// Log MCP errors
 				for (const { path, error } of mcpResult.errors) {
@@ -5463,7 +5466,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							await owningMcpManager.disconnectAll();
 							return undefined;
 						}
-						applyMCPEnvironment(result);
 						logMCPLoadErrors(result.errors);
 						return result;
 					};

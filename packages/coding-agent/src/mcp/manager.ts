@@ -11,6 +11,7 @@ import type { Settings } from "../config/settings";
 import { invalidateCommandConfig, isCommandConfigValue, resolveConfigValue } from "../config/resolve-config-value";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { AuthStorage } from "../session/auth-storage";
+import { setManagerExaApiKey } from "../web/search/exa-session-key";
 import {
 	buildServerSpec,
 	connectToServer,
@@ -219,6 +220,15 @@ export interface MCPDiscoverOptions {
 	builtinTransforms?: MCPTransformContext;
 	/** Settings scope for the Exa fold's `providers.webKeyless` read (default: the global settings). */
 	settings?: Settings;
+	/** Registry the web role chain resolves against for the Exa fold. */
+	modelRegistry?: LoadMCPConfigsOptions["modelRegistry"];
+	/** Whether the session currently exposes native web search. A function is read per load. */
+	webSearchActive?: boolean | (() => boolean);
+	/**
+	 * Receives the Exa key this load installs (`undefined` revokes). The manager
+	 * also registers itself so subagents sharing it resolve the borrowed key.
+	 */
+	installExaApiKey?: (key: string | undefined) => void;
 	/** Called when MCP server connection state changes. */
 	onStatus?: (event: McpConnectionStatusEvent) => void;
 	/** Non-blocking discovery window in milliseconds; environment override wins. */
@@ -771,6 +781,9 @@ export class MCPManager implements MCPManagerApi {
 				extensionRoots: options?.extensionRoots,
 				builtinTransforms: options?.builtinTransforms,
 				settings: options?.settings,
+				modelRegistry: options?.modelRegistry,
+				webSearchActive: options?.webSearchActive,
+				installExaApiKey: options?.installExaApiKey,
 			});
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -787,7 +800,18 @@ export class MCPManager implements MCPManagerApi {
 
 	/** Load configs and remember which servers built-in transforms dropped. */
 	async #discoverConfigs(options: LoadMCPConfigsOptions): Promise<LoadMCPConfigsResult> {
-		const loaded = await this.loadConfigs(this.cwd, { authStorage: this.#authStorage ?? undefined, ...options });
+		const installExaApiKey = options.installExaApiKey;
+		const managedInstall = installExaApiKey
+			? (key: string | undefined): void => {
+					setManagerExaApiKey(this, key);
+					installExaApiKey(key);
+				}
+			: undefined;
+		const loaded = await this.loadConfigs(this.cwd, {
+			authStorage: this.#authStorage ?? undefined,
+			...options,
+			installExaApiKey: managedInstall,
+		});
 		this.#builtinDrops.clear();
 		const dropped = loaded.dropped ?? {};
 		for (const name in dropped) {
@@ -832,6 +856,9 @@ export class MCPManager implements MCPManagerApi {
 			extensionRoots: options.extensionRoots,
 			builtinTransforms: options.builtinTransforms,
 			settings: options.settings,
+			modelRegistry: options.modelRegistry,
+			webSearchActive: options.webSearchActive,
+			installExaApiKey: options.installExaApiKey,
 		});
 		// Every server whose resolution depends on the flag: project-level ones
 		// known now, plus project-level ones the enabled load resolves.
@@ -868,6 +895,9 @@ export class MCPManager implements MCPManagerApi {
 			extensionRoots: options?.extensionRoots,
 			builtinTransforms: options?.builtinTransforms,
 			settings: options?.settings,
+			modelRegistry: options?.modelRegistry,
+			webSearchActive: options?.webSearchActive,
+			installExaApiKey: options?.installExaApiKey,
 		});
 		const browserConfigs: Record<string, MCPServerConfig> = {};
 		const browserSources: Record<string, SourceMeta> = {};

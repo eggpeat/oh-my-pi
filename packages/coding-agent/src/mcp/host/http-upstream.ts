@@ -14,6 +14,7 @@
  * attaches to the unit those headers identify.
  */
 import { isRecord, logger, postmortem, readSseEvents, readSseJson } from "@oh-my-pi/pi-utils";
+import { redactUrlForLog } from "../../utils/redact-url";
 import {
 	createMCPJsonRpcError,
 	type MCPFailureStage,
@@ -213,7 +214,7 @@ export class HttpUpstream implements MCPTransport {
 		const handled = drain.catch(error => {
 			if (error instanceof Error && error.name === "AbortError") return;
 			logger.debug("MCP HTTP background drain failed", {
-				url: this.#spec.url,
+				url: redactUrlForLog(this.#spec.url),
 				error: error instanceof Error ? error.message : String(error),
 			});
 		});
@@ -324,7 +325,7 @@ export class HttpUpstream implements MCPTransport {
 			}
 		} catch (error) {
 			if (error instanceof Error && error.name !== "AbortError") {
-				logger.debug("HTTP SSE stream error", { url: this.#spec.url, error: error.message });
+				logger.debug("HTTP SSE stream error", { url: redactUrlForLog(this.#spec.url), error: error.message });
 				this.onError?.(error);
 			}
 		}
@@ -354,7 +355,7 @@ export class HttpUpstream implements MCPTransport {
 			} catch (error) {
 				if (signal.aborted) return;
 				logger.debug("HTTP SSE stream error", {
-					url: this.#spec.url,
+					url: redactUrlForLog(this.#spec.url),
 					error: error instanceof Error ? error.message : String(error),
 				});
 				if (resume.lastEventId === null) {
@@ -369,7 +370,7 @@ export class HttpUpstream implements MCPTransport {
 			} catch (error) {
 				if (!signal.aborted) {
 					logger.debug("HTTP SSE listener resume failed", {
-						url: this.#spec.url,
+						url: redactUrlForLog(this.#spec.url),
 						error: error instanceof Error ? error.message : String(error),
 					});
 				}
@@ -720,7 +721,7 @@ export class HttpUpstream implements MCPTransport {
 						if (captured) return;
 						if (signal.aborted || resume.lastEventId === null) throw error;
 						logger.debug("MCP SSE response stream dropped; resuming", {
-							url: this.#spec.url,
+							url: redactUrlForLog(this.#spec.url),
 							error: error instanceof Error ? error.message : String(error),
 						});
 					}
@@ -907,7 +908,7 @@ export class HttpUpstream implements MCPTransport {
 			onClose?.();
 		} catch (error) {
 			logger.debug("MCP HTTP onClose callback failed during teardown", {
-				url: this.#spec.url,
+				url: redactUrlForLog(this.#spec.url),
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}

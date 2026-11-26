@@ -5,6 +5,7 @@
  * speaks it.
  */
 import { isRecord, logger, postmortem, readSseEvents } from "@oh-my-pi/pi-utils";
+import { redactUrlForLog } from "../../utils/redact-url";
 import {
 	createMCPJsonRpcError,
 	MCPTransportError,
@@ -199,7 +200,7 @@ export class SseUpstream implements MCPTransport {
 				const failure = nonRetryableMCPTransportError(
 					normalizeMCPTransportError(error, { transport: "http", stage: "receive" }),
 				);
-				logger.debug("Legacy SSE stream error", { url: this.#spec.url, error: failure.message });
+				logger.debug("Legacy SSE stream error", { url: redactUrlForLog(this.#spec.url), error: failure.message });
 				this.onError?.(failure);
 				this.#rejectPending(failure);
 			}

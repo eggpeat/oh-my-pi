@@ -4,18 +4,23 @@
  * Uses the capability system to load MCP servers from multiple sources.
  */
 
-import { type AuthStorage, getEnvApiKey } from "@oh-my-pi/pi-ai";
-import { $env, getMCPConfigPath, logger } from "@oh-my-pi/pi-utils";
+import { type Api, type AuthStorage, type Model, getEnvApiKey } from "@oh-my-pi/pi-ai";
+import { $env, $envExact, getMCPConfigPath, logger } from "@oh-my-pi/pi-utils";
 import { mcpCapability } from "../capability/mcp";
 import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
+import { cfgOffline } from "../config/auxiliary-model-policy";
+import { getRoleInfo } from "../config/model-roles";
+import { resolveRoleChain } from "../config/model-resolver";
+import { isCommandConfigValue } from "../config/resolve-config-value";
 import { type Settings, settings } from "../config/settings";
 import type { MCPServer } from "../discovery";
 import { loadCapability } from "../discovery";
 import { cfgProvidersWebKeyless } from "../session/settings";
+import { cfgWebSearchEnabled } from "../tools/settings";
 import { cfgExaEnabled } from "../web/settings";
 import { readMCPConfigFile } from "./config-writer";
 import { builtinDropFor, type MCPDroppedServer, type MCPTransformContext } from "./transforms";
-import type { MCPConfigFile, MCPServerConfig } from "./types";
+import type { MCPConfigFile, MCPServerConfig, MCPStdioServerConfig } from "./types";
 
 /** Options for loading MCP configs */
 export interface LoadMCPConfigsOptions {
@@ -33,9 +38,10 @@ export interface LoadMCPConfigsOptions {
 	 */
 	builtinTransforms?: MCPTransformContext;
 	/**
-	 * Settings scope for the `providers.webKeyless` read of the Exa fold (default:
-	 * the global settings). Pass the session's settings so a session-scoped
-	 * opt-out is honored the way `web_search` sees it.
+	 * Settings scope for the Exa fold (`exa.enabled`, `web_search.enabled`,
+	 * `models.offline`, `providers.webKeyless`, and the web role chain all read
+	 * it; default: the global settings). Pass the session's settings so a
+	 * session-scoped opt-out is honored the way `web_search` sees it.
 	 */
 	settings?: Settings;
 	/**
@@ -44,6 +50,23 @@ export interface LoadMCPConfigsOptions {
 	 * environment counts.
 	 */
 	authStorage?: AuthStorage;
+	/**
+	 * Registry the `web` role chain resolves against. Omitted: the chain cannot
+	 * be verified, so Exa servers stay mounted.
+	 */
+	modelRegistry?: ExaFoldRegistry;
+	/**
+	 * Whether the session currently exposes `web_search` natively. A function
+	 * is evaluated per load, so deferred discovery sees the same answer startup
+	 * does. Omitted: assumed active.
+	 */
+	webSearchActive?: boolean | (() => boolean);
+	/**
+	 * Receives the Exa key this load installs for the session's native search —
+	 * `undefined` when the load installs nothing, so callers can revoke a key a
+	 * previous load installed. Omitted: keys are only reported on `exaApiKeys`.
+	 */
+	installExaApiKey?: (key: string | undefined) => void;
 }
 
 /** Result of loading MCP configs */
@@ -210,13 +233,11 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	let exaApiKeys: string[] = [];
 
 	if (filterExa) {
-		const exaResult = filterExaMCPServers(configs, sources, {
-			nativeEnabled: nativeExaEnabled(),
-			keylessCovered: nativeExaCoversKeyless(options?.settings, options?.authStorage),
-		});
+		const exaResult = filterExaMCPServers(configs, sources, resolveNativeExaCoverage(options));
 		configs = exaResult.configs;
 		sources = exaResult.sources;
 		exaApiKeys = exaResult.exaApiKeys;
+		options?.installExaApiKey?.(exaApiKeys[0]);
 	}
 
 	if (filterBrowser) {
@@ -263,38 +284,57 @@ export function isExaMCPServer(name: string, config: MCPServerConfig): boolean {
 }
 
 /**
- * Extract Exa API key from an MCP server config.
+ * Catalog surface the Exa fold needs. Kept local so discovery does not import
+ * the model-browser module, whose path differs across releases.
  */
-export function extractExaApiKey(config: MCPServerConfig): string | undefined {
-	// Check URL for HTTP/SSE servers
+interface ExaFoldRegistry {
+	getAvailable(kind: "all"): readonly Model<Api>[];
+}
+
+/**
+ * How an Exa API key reference in an MCP server config classifies.
+ *
+ * - `none`: no key configured.
+ * - `literal`: the config carries the key itself.
+ * - `unresolved`: the value needs MCP connect-time resolution — a `!command`,
+ *   a bare environment-variable name, or a dollar-brace placeholder. None of
+ *   these may be passed to native `web_search` as a key, so the server stays.
+ */
+export interface ExaApiKeyInspection {
+	kind: "none" | "literal" | "unresolved";
+	/** Present when `kind` is `literal`. */
+	key?: string;
+}
+
+function classifyExaApiKeyValue(raw: string | undefined, connectResolved: boolean): ExaApiKeyInspection {
+	if (raw === undefined) return { kind: "none" };
+	const trimmed = raw.trim();
+	if (trimmed === "") return { kind: "none" };
+	if (trimmed.includes("${")) return { kind: "unresolved" };
+	if (connectResolved && (isCommandConfigValue(trimmed) || $envExact(trimmed) !== undefined)) {
+		return { kind: "unresolved" };
+	}
+	return { kind: "literal", key: trimmed };
+}
+
+function inspectExaApiKey(config: MCPServerConfig): ExaApiKeyInspection {
 	if (config.type === "http" || config.type === "sse") {
-		const httpConfig = config as { url?: string };
-		if (httpConfig.url) {
-			const match = EXA_API_KEY_PATTERN.exec(httpConfig.url);
-			if (match) return match[1];
-		}
+		const match = EXA_API_KEY_PATTERN.exec(config.url);
+		if (match) return classifyExaApiKeyValue(match[1], false);
 	}
-
-	// Check args for stdio servers
 	if (!config.type || config.type === "stdio") {
-		const stdioConfig = config as { args?: string[] };
-		if (stdioConfig.args) {
-			for (const arg of stdioConfig.args) {
-				const match = EXA_API_KEY_PATTERN.exec(arg);
-				if (match) return match[1];
-			}
+		for (const arg of config.args ?? []) {
+			const match = EXA_API_KEY_PATTERN.exec(arg);
+			if (match) return classifyExaApiKeyValue(match[1], false);
 		}
 	}
-
-	// Check env vars
-	if ("env" in config && config.env) {
-		const envConfig = config as { env: Record<string, string> };
-		if (envConfig.env.EXA_API_KEY) {
-			return envConfig.env.EXA_API_KEY;
-		}
+	if ("env" in config && config.env?.EXA_API_KEY !== undefined) {
+		const stdio = config as MCPStdioServerConfig;
+		const literalKeys = new Set(stdio.envLiteralKeys);
+		const resolvedAtConnect = stdio.envPolicy !== "literal" && !literalKeys.has("EXA_API_KEY");
+		return classifyExaApiKeyValue(config.env.EXA_API_KEY, resolvedAtConnect);
 	}
-
-	return undefined;
+	return { kind: "none" };
 }
 
 /** Exa MCP tools already covered by the native Exa integration. */
@@ -346,99 +386,110 @@ export interface ExaFilterResult {
 
 /** What the native Exa search integration can serve for this fold. */
 export interface ExaFilterOptions {
-	/**
-	 * `exa.enabled` is not off, so native `web/exa` may answer `web_search` at
-	 * all. False: every Exa MCP server stays — folding it would leave Exa
-	 * unreachable through either path — and no key is extracted.
-	 */
+	/** Native `web/exa` may answer `web_search` for this session at all. */
 	nativeEnabled?: boolean;
-	/**
-	 * Native `web/exa` reaches the keyless public MCP or a configured
-	 * credential, so a keyless Exa MCP server adds nothing. False: keyless
-	 * servers stay (their keyed counterparts still fold: the extracted key is
-	 * what lets native search serve them).
-	 */
+	/** Native search reaches the keyless endpoint or a configured credential. */
 	keylessCovered?: boolean;
+	/** Native search already has its own Exa credential. */
+	hasNativeCredential?: boolean;
+	/** This load hands extracted keys to the session. True preserves direct calls. */
+	installsExaApiKeys?: boolean;
 }
 
-/**
- * Whether native `web/exa` may run at all, mirroring `ExaProvider.isAvailable`:
- * `exa.enabled` is a discovery toggle, so it reads the process settings.
- * Uninitialized settings mean "not disabled", same as the provider.
- */
-function nativeExaEnabled(): boolean {
+function nativeExaCredential(authStorage: AuthStorage | undefined): boolean {
 	try {
-		return cfgExaEnabled.get(settings) !== false;
-	} catch {
-		return true;
-	}
-}
-
-/**
- * Whether native `web/exa` can serve a search without borrowing a key from an
- * MCP config: the user allows keyless third-party services, or an Exa
- * credential exists. Mirrors `web_search`'s admission (`providers.webKeyless`
- * read on the active scope, `isKeyless` on `authStorage`); both default to
- * "covered" when unreadable so a missing context keeps the historical fold.
- */
-function nativeExaCoversKeyless(scope: Settings | undefined, authStorage: AuthStorage | undefined): boolean {
-	try {
-		if (cfgProvidersWebKeyless.get(scope ?? settings)) return true;
-	} catch {
-		return true;
-	}
-	try {
-		if (authStorage) return authStorage.keys.source("exa") !== undefined;
+		if (authStorage?.keys.source("exa") !== undefined) return true;
 	} catch {
 		// Storage unavailable: fall back to the environment check below.
 	}
 	return Boolean(getEnvApiKey("exa") ?? $env.EXA_API_KEY?.trim());
 }
 
+function nativeExaSearchOffered(scope: Settings | undefined, options: LoadMCPConfigsOptions | undefined): boolean {
+	const active = options?.webSearchActive;
+	if (typeof active === "function" ? !active() : active === false) return false;
+	try {
+		if (cfgExaEnabled.get(scope ?? settings) === false) return false;
+		if (cfgWebSearchEnabled.get(scope ?? settings) === false) return false;
+		if (cfgOffline.get(scope ?? settings) === true) return false;
+	} catch {
+		// Uninitialized settings read as defaults: both toggles on, online.
+	}
+	const registry = options?.modelRegistry;
+	if (!registry) return false;
+	try {
+		const activeSettings = scope ?? settings;
+		const pool = [...registry.getAvailable("all")].filter(getRoleInfo("web", activeSettings).accepts);
+		const chain = resolveRoleChain("web", activeSettings, pool);
+		return chain.some(candidate => candidate.model.provider === "web" && candidate.model.id === "exa");
+	} catch {
+		return false;
+	}
+}
+
+function resolveNativeExaCoverage(options: LoadMCPConfigsOptions | undefined): Required<ExaFilterOptions> {
+	const scope = options?.settings;
+	const hasNativeCredential = nativeExaCredential(options?.authStorage);
+	let keylessCovered = hasNativeCredential;
+	if (!keylessCovered) {
+		try {
+			keylessCovered = cfgProvidersWebKeyless.get(scope ?? settings);
+		} catch {
+			keylessCovered = true;
+		}
+	}
+	return {
+		nativeEnabled: nativeExaSearchOffered(scope, options),
+		keylessCovered,
+		hasNativeCredential,
+		installsExaApiKeys: typeof options?.installExaApiKey === "function",
+	};
+}
+
 /**
- * Filter out Exa MCP servers and extract their API keys.
- * Since we have native Exa integration, we don't need the MCP server —
- * unless the config explicitly requests Exa tools the native integration
- * does not provide (e.g. `web_fetch_exa`, `web_search_advanced_exa`), the
- * native provider is disabled (`exa.enabled: false`), or the server is
- * keyless while native keyless search is off or unreachable
- * (`providers.webKeyless: false` without any Exa credential): folding then
- * leaves Exa unavailable through both the MCP tool and `web_search`.
+ * Filter out Exa MCP servers native search can actually serve, and collect the
+ * literal keys this load can lend to that session.
  */
 export function filterExaMCPServers(
 	configs: Record<string, MCPServerConfig>,
 	sources: Record<string, SourceMeta>,
 	options?: ExaFilterOptions,
 ): ExaFilterResult {
-	const filtered: Record<string, MCPServerConfig> = {};
-	const filteredSources: Record<string, SourceMeta> = {};
-	const exaApiKeys: string[] = [];
 	const nativeEnabled = options?.nativeEnabled ?? true;
 	const keylessCovered = options?.keylessCovered ?? true;
-
-	for (const [name, config] of Object.entries(configs)) {
-		if (isExaMCPServer(name, config) && nativeEnabled) {
-			// Extract API key for the native Exa integration even when the MCP
-			// server is kept below for its extra tools.
-			const apiKey = extractExaApiKey(config);
-			if (apiKey) {
-				exaApiKeys.push(apiKey);
-			}
+	const hasNativeCredential = options?.hasNativeCredential ?? false;
+	const installsExaApiKeys = options?.installsExaApiKeys ?? true;
+	const inspections = new Map<string, { inspection: ExaApiKeyInspection; hasExtraTools: boolean }>();
+	const exaApiKeys: string[] = [];
+	if (nativeEnabled) {
+		for (const [name, config] of Object.entries(configs)) {
+			if (!isExaMCPServer(name, config)) continue;
+			const inspection = inspectExaApiKey(config);
+			if (inspection.kind === "literal" && inspection.key !== undefined) exaApiKeys.push(inspection.key);
 			const requested = getRequestedExaMcpTools(config);
 			const hasExtraTools = requested?.some(tool => !NATIVE_EXA_MCP_TOOLS[tool.toLowerCase()]) ?? false;
-			// A keyed server folds whenever native search runs: the extracted key
-			// is exported for it. A keyless server folds only when native search
-			// can serve it too — keyless allowed or an Exa credential exists.
-			if (!hasExtraTools && (apiKey !== undefined || keylessCovered)) {
-				continue;
-			}
-		}
-		filtered[name] = config;
-		if (sources[name]) {
-			filteredSources[name] = sources[name];
+			inspections.set(name, { inspection, hasExtraTools });
 		}
 	}
-
+	const installedKey = installsExaApiKeys ? exaApiKeys[0] : undefined;
+	const willInstall = installsExaApiKeys && exaApiKeys.length > 0;
+	const filtered: Record<string, MCPServerConfig> = {};
+	const filteredSources: Record<string, SourceMeta> = {};
+	for (const [name, config] of Object.entries(configs)) {
+		const exa = inspections.get(name);
+		if (exa && !exa.hasExtraTools) {
+			const { inspection } = exa;
+			const fold =
+				inspection.kind === "literal"
+					? inspection.key === installedKey || hasNativeCredential
+					: inspection.kind === "none"
+						? willInstall || keylessCovered
+						: false;
+			if (fold) continue;
+		}
+		filtered[name] = config;
+		if (sources[name]) filteredSources[name] = sources[name];
+	}
 	return { configs: filtered, exaApiKeys, sources: filteredSources };
 }
 

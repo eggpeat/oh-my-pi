@@ -82,7 +82,8 @@ export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
 			authStorage ??= await discoverAuthStorage(undefined, { settings });
 			const result = await discoverAndLoadMCPTools(cwd, {
 				enableProjectConfig: cfgMcpEnableProjectConfig.get(settings),
-				filterExa: true,
+				// `omp read` does not expose web search, so folding Exa servers would strand them.
+				filterExa: false,
 				settings,
 				// `omp read` has no Eval prelude, so browser MCP remains available.
 				filterBrowser: false,

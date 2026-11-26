@@ -31,6 +31,9 @@ import {
 	type McpOAuthFlowPresentation,
 	type OAuthFlowResult,
 } from "../../mcp/oauth-reauth";
+import type { LoadMCPConfigsOptions } from "../../mcp/config";
+import { logger } from "@oh-my-pi/pi-utils";
+import { setManagerExaApiKey, setSessionExaApiKey } from "../../web/search/exa-session-key";
 import { connectToServer, disconnectServer, listTools } from "../../mcp/client";
 import type { McpUpstreamStatus } from "../../mcp/host/contract";
 import {
@@ -1463,6 +1466,7 @@ export class MCPCommandController {
 					);
 				} else {
 					await this.ctx.mcpManager?.disconnectServer(name);
+					await this.#refreshSessionExaKey();
 					await this.ctx.session.refreshMCPTools(this.ctx.mcpManager?.getTools() ?? []);
 					this.#showMessage(["", theme.fg("muted", `${theme.status.disabled} Disabled "${name}"`), ""].join("\n"));
 				}
@@ -1484,6 +1488,7 @@ export class MCPCommandController {
 				await this.#connectEnabledMCPServer(name);
 			} else {
 				await this.ctx.mcpManager?.disconnectServer(name);
+				await this.#refreshSessionExaKey();
 				await this.ctx.session.refreshMCPTools(this.ctx.mcpManager?.getTools() ?? []);
 			}
 
@@ -1730,15 +1735,43 @@ export class MCPCommandController {
 		}
 	}
 
+	#webSearchActive(): boolean {
+		return this.ctx.session.getEnabledToolNames().includes("web_search");
+	}
+
+	#installSessionExaApiKey(key: string | undefined): void {
+		setSessionExaApiKey(this.ctx.sessionManager.getSessionId(), key);
+		setManagerExaApiKey(this.ctx.mcpManager, key);
+	}
+
+	#exaLoadOptions(): LoadMCPConfigsOptions {
+		return {
+			enableProjectConfig: cfgMcpEnableProjectConfig.get(this.ctx.settings),
+			extensionRoots: this.ctx.session.effectiveExtensionRoots,
+			settings: this.ctx.settings,
+			authStorage: this.ctx.session.modelRegistry.authStorage,
+			modelRegistry: this.ctx.session.modelRegistry,
+			webSearchActive: () => this.#webSearchActive(),
+			installExaApiKey: key => this.#installSessionExaApiKey(key),
+		};
+	}
+
+	async #refreshSessionExaKey(): Promise<void> {
+		try {
+			await loadAllMCPConfigs(getProjectDir(), this.#exaLoadOptions());
+		} catch (error) {
+			logger.debug("MCP config reload for Exa key refresh failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
 	async #connectEnabledMCPServer(name: string): Promise<void> {
 		if (!this.ctx.mcpManager) {
 			return;
 		}
 
-		const { configs, sources } = await loadAllMCPConfigs(getProjectDir(), {
-			extensionRoots: this.ctx.session.effectiveExtensionRoots,
-			settings: this.ctx.settings,
-		});
+		const { configs, sources } = await loadAllMCPConfigs(getProjectDir(), this.#exaLoadOptions());
 		const config = configs[name];
 		if (!config) {
 			await this.ctx.session.refreshMCPTools(this.ctx.mcpManager.getTools());
@@ -1791,6 +1824,9 @@ export class MCPCommandController {
 			}),
 			extensionRoots: this.ctx.session.effectiveExtensionRoots,
 			settings: this.ctx.settings,
+			modelRegistry: this.ctx.session.modelRegistry,
+			webSearchActive: () => this.#webSearchActive(),
+			installExaApiKey: key => this.#installSessionExaApiKey(key),
 		});
 
 		this.#showMCPConnectionErrors(result.errors);

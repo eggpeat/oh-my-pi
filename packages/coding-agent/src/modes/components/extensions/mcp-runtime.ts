@@ -1,4 +1,5 @@
 import type { SourceMeta } from "../../../capability/types";
+import { logger } from "@oh-my-pi/pi-utils";
 import type { CustomTool } from "../../../extensibility/custom-tools/types";
 import { type LoadMCPConfigsOptions, loadAllMCPConfigs } from "../../../mcp/config";
 import type { MCPLoadResult } from "../../../mcp/manager";
@@ -44,6 +45,15 @@ export async function applyMcpToggleRuntime(options: ApplyMcpToggleRuntimeOption
 
 	if (!enabled) {
 		await manager.disconnectServer(name);
+		if (discovery?.installExaApiKey) {
+			try {
+				await loadConfigs(cwd, discovery);
+			} catch (error) {
+				logger.debug("MCP config reload for Exa key refresh failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 		await session?.refreshMCPTools(manager.getTools());
 		return;
 	}

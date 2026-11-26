@@ -168,6 +168,8 @@ interface ExecuteSearchOptions {
 	authStorage: AuthStorage;
 	modelRegistry?: ModelRegistry;
 	sessionId?: string;
+	/** Opaque manager owner the session's MCP manager supplies for borrowed Exa keys. */
+	keyOwner?: object;
 	/** The session's active model; `web/hosted` searches through it. */
 	sessionModel?: Model<Api>;
 	settings?: Settings;
@@ -268,7 +270,7 @@ async function executeSearch(
 	params: SearchQueryParams,
 	options: ExecuteSearchOptions,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchResultDetails }> {
-	const { authStorage, sessionId, signal } = options;
+	const { authStorage, sessionId, signal, keyOwner } = options;
 	// The session's own settings (an ACP session's project, a subagent overlay) win over the process global.
 	const activeSettings = options.settings ?? settings;
 	const modelRegistry =
@@ -368,14 +370,14 @@ async function executeSearch(
 			} else {
 				throw new Error(`Model ${model.provider}/${model.id} does not support web search`);
 			}
-			if (!keylessAllowed && (await provider.isKeyless(authStorage, model))) {
+			if (!keylessAllowed && (await provider.isKeyless(authStorage, model, sessionId, keyOwner))) {
 				keylessSkipped = true;
 				continue;
 			}
 			lastProvider = provider;
 			const available = candidate.explicit
-				? await provider.isExplicitlyAvailable(authStorage, model)
-				: await provider.isAvailable(authStorage, model);
+				? await provider.isExplicitlyAvailable(authStorage, model, activeSettings)
+				: await provider.isAvailable(authStorage, model, activeSettings);
 			if (!available && !candidate.explicit) continue;
 			if (!available && candidate.explicit) {
 				throw new SearchProviderError(
@@ -404,6 +406,7 @@ async function executeSearch(
 				modelRegistry,
 				explicit: candidate.explicit,
 				sessionId,
+				keyOwner,
 				antigravityEndpointMode,
 			};
 			// An extension may own the request for its provider's models; availability stays the backend's.
@@ -550,6 +553,7 @@ export async function runSearchQuery(
 		authStorage?: AuthStorage;
 		modelRegistry?: ModelRegistry;
 		sessionId?: string;
+		keyOwner?: object;
 		sessionModel?: Model<Api>;
 		settings?: Settings;
 		signal?: AbortSignal;
@@ -565,6 +569,7 @@ export async function runSearchQuery(
 			authStorage,
 			modelRegistry: options.modelRegistry,
 			sessionId: options.sessionId,
+			keyOwner: options.keyOwner,
 			sessionModel: options.sessionModel,
 			settings: options.settings,
 			signal: options.signal,
@@ -625,6 +630,7 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 			authStorage,
 			modelRegistry: this.#session.modelRegistry,
 			sessionId,
+			keyOwner: this.#session.mcpManager,
 			sessionModel: this.#session.getActiveModel?.(),
 			settings: this.#session.settings,
 			signal,
@@ -655,6 +661,7 @@ export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchResul
 			modelRegistry: ctx.modelRegistry,
 			sessionId,
 			sessionModel: ctx.model,
+			settings: ctx.settings,
 			signal,
 		});
 	},
