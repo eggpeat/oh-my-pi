@@ -16,6 +16,7 @@
  */
 import type { ArgDescriptor, CliConfig, CommandMetadata, FlagDescriptor } from "@oh-my-pi/pi-utils/cli";
 import { BUILTIN_TOOL_NAMES } from "../tools/builtin-names";
+import { OPTIONAL_VALUE_FLAGS } from "./flag-tables";
 
 export type Shell = "bash" | "zsh" | "fish";
 
@@ -27,7 +28,8 @@ export type ValueSource =
 	| { kind: "list"; values: readonly string[] } // static comma-separated list
 	| { kind: "models"; multiple: boolean } // dynamic: live model catalog
 	| { kind: "sessions" } // dynamic: on-disk sessions
-	| { kind: "file" }
+	| { kind: "file" } // any path
+	| { kind: "absoluteFile" } // path that must be absolute (e.g. `--trusted-extension`)
 	| { kind: "dir" };
 
 export interface CompletionFlag {
@@ -39,6 +41,8 @@ export interface CompletionFlag {
 	value: ValueSource;
 	/** Flag may appear multiple times (oclif `multiple`). */
 	repeatable: boolean;
+	/** The value may be omitted (e.g. a bare `--session` opens the picker). */
+	optional?: boolean;
 }
 
 export interface CompletionArg {
@@ -70,6 +74,10 @@ const MODEL_FLAGS: Record<string, true> = { model: true, smol: true, slow: true,
 const SESSION_FLAGS: Record<string, true> = { resume: true, restore: true, fork: true, session: true };
 /** Flags whose value is a directory path. */
 const DIR_FLAGS: Record<string, true> = { "session-dir": true, "plugin-dir": true };
+/** Flags whose value is a literal string, not a path — never complete filenames. */
+const LITERAL_VALUE_FLAGS: Record<string, true> = { "provider-session-id": true, "prompt-cache-key": true };
+/** Flags whose value must be an absolute path — relative paths are rejected. */
+const ABSOLUTE_PATH_FLAGS: Record<string, true> = { "trusted-extension": true };
 
 function flagValue(name: string, desc: FlagDescriptor): ValueSource {
 	if (desc.kind === "boolean") return { kind: "flag" };
@@ -79,6 +87,8 @@ function flagValue(name: string, desc: FlagDescriptor): ValueSource {
 	if (SESSION_FLAGS[name]) return { kind: "sessions" };
 	if (name === "tools") return { kind: "list", values: BUILTIN_TOOL_NAMES };
 	if (DIR_FLAGS[name]) return { kind: "dir" };
+	if (LITERAL_VALUE_FLAGS[name]) return { kind: "value" };
+	if (ABSOLUTE_PATH_FLAGS[name]) return { kind: "absoluteFile" };
 	if (desc.kind === "integer") return { kind: "value" };
 	return { kind: "file" };
 }
@@ -99,6 +109,7 @@ function buildFlags(command: CommandMetadata): CompletionFlag[] {
 			description: desc.description ?? "",
 			value: flagValue(name, desc),
 			repeatable: Boolean(desc.multiple),
+			optional: OPTIONAL_VALUE_FLAGS.has(`--${name}`),
 		});
 	}
 	return out;
@@ -179,36 +190,48 @@ function bashWords(values: readonly string[]): string {
 	return values.join(" ").replace(/"/g, '\\"');
 }
 
-/** bash snippet that fills COMPREPLY for a flag value, then `return 0`. */
+/** bash snippet that fills COMPREPLY for a flag value (without the trailing `return`). */
 function bashValueBranch(bin: string, v: ValueSource): string {
 	switch (v.kind) {
 		case "flag":
 		case "value":
-			return "return 0";
+			return "";
 		case "enum":
-			return `COMPREPLY=( $(compgen -W "${bashWords(v.values)}" -- "$cur") ); return 0`;
+			return `COMPREPLY=( $(compgen -W "${bashWords(v.values)}" -- "$cur") )`;
 		case "list":
-			return `_omp_comma "${bashWords(v.values)}"; return 0`;
+			return `_omp_comma "${bashWords(v.values)}"`;
 		case "models":
 			return v.multiple
-				? `_omp_comma "$(command ${bin} __complete models 2>/dev/null | cut -f1)"; return 0`
-				: `COMPREPLY=( $(compgen -W "$(command ${bin} __complete models -- "$cur" 2>/dev/null | cut -f1)" -- "$cur") ); return 0`;
+				? `_omp_comma "$(command ${bin} __complete models 2>/dev/null | cut -f1)"`
+				: `COMPREPLY=( $(compgen -W "$(command ${bin} __complete models -- "$cur" 2>/dev/null | cut -f1)" -- "$cur") )`;
 		case "sessions":
-			return `COMPREPLY=( $(compgen -W "$(command ${bin} __complete sessions -- "$cur" 2>/dev/null | cut -f1)" -- "$cur") ); return 0`;
+			return `COMPREPLY=( $(compgen -W "$(command ${bin} __complete sessions -- "$cur" 2>/dev/null | cut -f1)" -- "$cur") )`;
 		case "file":
-			return "_omp_path -f; return 0";
+			return "_omp_path -f";
 		case "dir":
-			return "_omp_path -d; return 0";
+			return "_omp_path -d";
+		case "absoluteFile":
+			// Only absolute paths are accepted, so a relative word yields nothing.
+			return `if [[ "$cur" == /* ]]; then _omp_path -f; fi`;
 	}
 }
 
 /** Build the `case "$prev" in …` arms for every value-taking flag in scope. */
 function bashFlagCase(bin: string, flags: CompletionFlag[]): string {
 	const lines: string[] = [];
+	const scopeWords = bashFlagWords(flags);
 	for (const f of flags) {
 		if (!takesValue(f.value)) continue;
 		const labels = [`--${f.name}`, ...(f.char ? [`-${f.char}`] : [])];
-		lines.push(`\t\t${labels.join("|")})\n\t\t\t${bashValueBranch(bin, f.value)}\n\t\t\t;;`);
+		// A flag with an optional value (`--session`) must not swallow the next
+		// word when that word is another flag: offer the flags of this scope for
+		// a dash-prefixed word, and the flag's values otherwise.
+		const value = bashValueBranch(bin, f.value);
+		const branch = f.optional
+			? `if [[ "$cur" == -* ]]; then COMPREPLY=( $(compgen -W "${scopeWords}" -- "$cur") ); else ${value}; fi`
+			: value;
+		const body = branch ? `${branch}; ` : "";
+		lines.push(`\t\t${labels.join("|")})\n\t\t\t${body}return 0\n\t\t\t;;`);
 	}
 	return lines.join("\n");
 }
@@ -351,11 +374,17 @@ function zshAction(v: ValueSource): string {
 			return ":file:_files";
 		case "dir":
 			return ":dir:_files -/";
+		case "absoluteFile":
+			return ":file:_omp_abs_files";
 	}
 }
 
 function zshFlagSpec(f: CompletionFlag): string {
-	const body = `[${zshDesc(f.description)}]${zshAction(f.value)}`;
+	const description = `[${zshDesc(f.description)}]`;
+	const action = zshAction(f.value);
+	// `::` marks the value as optional, so zsh keeps offering the option names
+	// when the next word starts with a dash (`omp --session --model`).
+	const body = f.optional && action.startsWith(":") ? `${description}::${action.slice(1)}` : `${description}${action}`;
 	if (f.char && f.repeatable) return `'*'{-${f.char},--${f.name}}'${body}'`;
 	if (f.char) return `'(-${f.char} --${f.name})'{-${f.char},--${f.name}}'${body}'`;
 	if (f.repeatable) return `'*--${f.name}${body}'`;
@@ -407,7 +436,14 @@ _omp_models_list() {
 	done
 	_values -s , 'models' $items
 }
-_omp_tools() { _values -s , 'tools' ${toolNames} }`);
+_omp_tools() { _values -s , 'tools' ${toolNames} }
+# Only absolute paths are accepted by the flags that use this action, so a
+# relative word completes to nothing.
+_omp_abs_files() {
+	local -a expl
+	[[ "$PREFIX" == /* ]] || return 1
+	_wanted files expl file _files
+}`);
 	parts.push("");
 
 	// Subcommand description table.
@@ -476,7 +512,7 @@ function fishDesc(s: string): string {
 		.trim();
 }
 
-function fishValue(bin: string, v: ValueSource): string {
+function fishValue(bin: string, v: ValueSource, optional: boolean): string {
 	switch (v.kind) {
 		case "flag":
 			return "";
@@ -488,11 +524,18 @@ function fishValue(bin: string, v: ValueSource): string {
 		case "models":
 			return `-x -a '(command ${bin} __complete models -- (commandline -ct))'`;
 		case "sessions":
-			return `-x -a '(command ${bin} __complete sessions -- (commandline -ct))'`;
+			// An optional value must not hide the option names, so the flag keeps
+			// its candidates but loses the exclusive (`-x`) argument requirement.
+			return optional
+				? `-f -a '(command ${bin} __complete sessions -- (commandline -ct))'`
+				: `-x -a '(command ${bin} __complete sessions -- (commandline -ct))'`;
 		case "file":
 			return "-r -F";
 		case "dir":
-			return "-x -a '(__fish_complete_directories (commandline -ct))'";
+			return `-x -a '(__fish_complete_directories (commandline -ct))'`;
+		case "absoluteFile":
+			// Only absolute paths are accepted, so a relative word completes to nothing.
+			return `-f -a '(string match -q -- "/" (commandline -ct); and __fish_complete_path)'`;
 	}
 }
 
@@ -501,7 +544,7 @@ function fishFlagLine(bin: string, cond: string, f: CompletionFlag): string {
 	if (f.char) segs.push(`-s ${f.char}`);
 	segs.push(`-l ${f.name}`);
 	if (f.description) segs.push(`-d '${fishDesc(f.description)}'`);
-	const val = fishValue(bin, f.value);
+	const val = fishValue(bin, f.value, f.optional === true);
 	if (val) segs.push(val);
 	return segs.join(" ");
 }
