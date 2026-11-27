@@ -15,7 +15,7 @@ import { cfgOffline } from "../../config/auxiliary-model-policy";
 import { ModelRegistry } from "../../config/model-registry";
 import { type RoleChainCandidate, resolveModelRoleValue, resolveRoleChain } from "../../config/model-resolver";
 import { roleCandidatePool } from "../../config/model-roles";
-import { settings, type Settings } from "../../config/settings";
+import { resolveSettings, type Settings } from "../../config/settings";
 import type { CustomTool, CustomToolContext } from "../../extensibility/custom-tools/types";
 import webSearchSystemPrompt from "../../prompts/system/web-search.md" with { type: "text" };
 import webSearchDescription from "../../prompts/tools/web-search.md" with { type: "text" };
@@ -270,7 +270,7 @@ async function executeSearch(
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchResultDetails }> {
 	const { authStorage, sessionId, signal } = options;
 	// The session's own settings (an ACP session's project, a subagent overlay) win over the process global.
-	const activeSettings = options.settings ?? settings;
+	const activeSettings = resolveSettings(options.settings);
 	const modelRegistry =
 		options.modelRegistry ?? new ModelRegistry(authStorage, undefined, { settings: activeSettings });
 	const pool = roleCandidatePool("web", activeSettings, modelRegistry);
@@ -374,8 +374,8 @@ async function executeSearch(
 			}
 			lastProvider = provider;
 			const available = candidate.explicit
-				? await provider.isExplicitlyAvailable(authStorage, model)
-				: await provider.isAvailable(authStorage, model);
+				? await provider.isExplicitlyAvailable(authStorage, model, activeSettings)
+				: await provider.isAvailable(authStorage, model, activeSettings);
 			if (!available && !candidate.explicit) continue;
 			if (!available && candidate.explicit) {
 				throw new SearchProviderError(
@@ -394,6 +394,7 @@ async function executeSearch(
 				recency: params.recency,
 				systemPrompt: webSearchSystemPrompt,
 				maxOutputTokens: params.max_tokens,
+				settings: activeSettings,
 				numSearchResults: params.num_search_results,
 				temperature: params.temperature,
 				signal,
@@ -654,6 +655,7 @@ export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchResul
 			authStorage,
 			modelRegistry: ctx.modelRegistry,
 			sessionId,
+			settings: ctx.settings,
 			sessionModel: ctx.model,
 			signal,
 		});

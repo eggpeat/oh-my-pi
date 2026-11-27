@@ -37,6 +37,7 @@
 
 ### Fixed
 
+- `web_search` and the SDK's `runSearchQuery` now use the session's settings instead of the process-global singleton: per-session `modelRoles.web`, `retry.fallbackChains.web`, provider toggles and SearXNG/Exa config are honored, and calls no longer fail with "Settings not initialized" for embedders that never call `Settings.init()` ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 - `edit` on `ssh://` files no longer contacts the host before the call is approved, and refuses to overwrite a file that changed on the host after the edit fetched it. Writable RPC host URIs get the same check as a read just before the write, so a change landing between that read and the write is not caught ([#16631](https://github.com/can1357/oh-my-pi/pull/16631) by [@lHyperionl](https://github.com/lHyperionl))
 - `edit` refuses `ssh://` symbolic links instead of replacing them with a regular file, and refuses creating, deleting or moving `ssh://` files before its preview ([#16631](https://github.com/can1357/oh-my-pi/pull/16631) by [@lHyperionl](https://github.com/lHyperionl))
 - `read` and `edit` give `ssh://host/~/x` and its absolute spelling one tag, and `read` shows `ssh://` notebooks as cells like local ones ([#16631](https://github.com/can1357/oh-my-pi/pull/16631) by [@lHyperionl](https://github.com/lHyperionl))
