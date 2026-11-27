@@ -5,7 +5,7 @@
  * crash, per-scope caps, idle daemon exit, and the unit env.
  */
 import { afterEach, describe, expect, it } from "bun:test";
-import { DAEMON_IDLE_EXIT_GRACE_ENV, DAEMON_RESUME_LEASE_GRACE_ENV } from "../../src/daemon/protocol";
+import { DAEMON_IDLE_GRACE_ENV, DAEMON_RESUME_LEASE_GRACE_ENV } from "../../src/daemon/protocol";
 import { type DaemonConn, pidAlive, rejection, shProc, TestDaemon, until } from "../fixtures/daemon-proc-harness";
 
 const TEST_TIMEOUT_MS = 30_000;
@@ -16,7 +16,7 @@ const TEST_TIMEOUT_MS = 30_000;
 const LEASE_GRACE_MS = 750;
 const LEASE_GRACE_ENV = { [DAEMON_RESUME_LEASE_GRACE_ENV]: String(LEASE_GRACE_MS) };
 /**
- * Idle-exit grace of the daemon whose test waits it out (`DAEMON_IDLE_EXIT_GRACE_ENV`; 3 s by default):
+ * Idle-exit grace of the daemon whose test waits it out (`DAEMON_IDLE_GRACE_ENV`; 3 s by default):
  * long enough for the harness's first connect to land before the fresh daemon idles out.
  */
 const IDLE_EXIT_GRACE_MS = 300;
@@ -128,7 +128,7 @@ describe.skipIf(process.platform === "win32")("daemon unit lifecycle", () => {
 				daemon: d,
 				conn,
 				root,
-			} = await startDaemon({ [DAEMON_IDLE_EXIT_GRACE_ENV]: String(IDLE_EXIT_GRACE_MS) });
+			} = await startDaemon({ [DAEMON_IDLE_GRACE_ENV]: String(IDLE_EXIT_GRACE_MS) });
 			const opened = await conn.openProc("keeper", shProc("exec sleep 60", root), { policy: { hold: "persist" } });
 			await conn.close();
 

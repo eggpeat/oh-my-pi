@@ -37,6 +37,7 @@
 
 ### Fixed
 
+- The daemon now honours `OMP_DAEMON_IDLE_GRACE_MS`: it waits that long after its last client disconnects before shutting down and stopping the services it supervises, instead of always waiting 3 seconds ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 - A local page embedded with a `#fragment` or `?query` (`<iframe src="demo/index.html#B">`) now opens at that fragment instead of failing with "No such file or directory"
 - Browser helper calls (`tab.goto`, `tab.click`, `tab.evaluate`, etc.) and tab reuse on Tern, WebKit, and cmux tabs no longer queue behind another tab's long-running `tab.run()`, and queued `tab.run()` timeouts now name the tab and agent holding the queue
 - The resume picker's **All projects** scope shows each session's folder in rows and the preview, and search matches folder paths there ([#20746](https://github.com/can1357/oh-my-pi/issues/20746))
