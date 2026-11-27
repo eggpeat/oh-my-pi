@@ -1,6 +1,7 @@
 import type { Api, AuthStorage, FetchImpl, Model } from "@oh-my-pi/pi-ai";
 import type { ConfiguredThinkingLevel } from "../../../utils/render-utils";
 import type { ModelRegistry } from "../../../config/model-registry";
+import type { Settings } from "../../../config/settings";
 import type { StructuredQuery } from "../query";
 import type { SearchProviderId, SearchResponse } from "../types";
 
@@ -79,6 +80,12 @@ export interface SearchParams {
 	 * caller's agent session when available; otherwise omit.
 	 */
 	sessionId?: string;
+	/**
+	 * The session's settings instance for settings-driven provider config
+	 * (SearXNG endpoint/auth, Exa pacing). Always resolved by the caller;
+	 * providers MUST prefer it over the global singleton.
+	 */
+	settings?: Settings;
 	antigravityEndpointMode?: "auto" | "production" | "sandbox";
 }
 
@@ -94,9 +101,12 @@ export abstract class SearchProvider {
 	 *
 	 * Drives role-chain admission: providers that return `false` are skipped.
 	 * Explicit selection uses {@link isExplicitlyAvailable} instead. The model
-	 * is supplied for providers whose authentication depends on its transport.
+	 * is supplied for providers whose authentication depends on its transport;
+	 * `scope` is the caller's settings instance — providers reading settings
+	 * MUST use it, never the global singleton (a one-shot host may not have
+	 * initialized it).
 	 */
-	abstract isAvailable(authStorage: AuthStorage, model?: Model<Api>): Promise<boolean> | boolean;
+	abstract isAvailable(authStorage: AuthStorage, model?: Model<Api>, scope?: Settings): Promise<boolean> | boolean;
 
 	/**
 	 * Returns `true` when this provider should run when the user explicitly
@@ -107,8 +117,8 @@ export abstract class SearchProvider {
 	 *
 	 * Defaults to mirroring {@link isAvailable}.
 	 */
-	isExplicitlyAvailable(authStorage: AuthStorage, model?: Model<Api>): Promise<boolean> | boolean {
-		return this.isAvailable(authStorage, model);
+	isExplicitlyAvailable(authStorage: AuthStorage, model?: Model<Api>, scope?: Settings): Promise<boolean> | boolean {
+		return this.isAvailable(authStorage, model, scope);
 	}
 
 	/**

@@ -4533,6 +4533,16 @@ export function isSettingsInitialized(): boolean {
 }
 
 /**
+ * Resolve the effective settings for a feature that accepts an optional per-session
+ * instance: the caller's instance when given, the global singleton when initialized,
+ * else a detached in-memory instance (env and defaults still apply) so one-shot hosts
+ * never touch the throwing {@link settings} proxy.
+ */
+export function resolveSettings(instance?: Settings): Settings {
+	return instance ?? globalInstance ?? Settings.isolated();
+}
+
+/**
  * Resolve the settings visible to a legacy Pi `SettingsManager.create()` call.
  *
  * An active extension session is authoritative because `cwd`/`agentDir` cannot

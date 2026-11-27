@@ -33,10 +33,10 @@
  * Reference: https://docs.searxng.org/dev/search_api.html
  */
 
-import type { AuthStorage, FetchImpl } from "@oh-my-pi/pi-ai";
+import type { Api, AuthStorage, FetchImpl, Model } from "@oh-my-pi/pi-ai";
 
 import type { Setting } from "../../../config/registry";
-import { isSettingsInitialized, settings } from "../../../config/settings";
+import { resolveSettings, type Settings } from "../../../config/settings";
 import type { SearchResponse, SearchSource } from "../types";
 import { SearchProviderError } from "../../../web/search/types";
 import type { StructuredQuery } from "../query";
@@ -102,9 +102,9 @@ interface SearXNGConfig {
 	engines?: Array<{ name?: string; shortcut?: string }>;
 }
 
-/** SearXNG connection value from settings (env fallback declared on the definition); env only before settings load. */
-function findSetting(handle: Setting<string | undefined>): string | null {
-	return (isSettingsInitialized() ? handle.get(settings) : handle.envValue()) ?? null;
+/** SearXNG connection value from the caller's settings (env fallback declared on the definition). */
+function findSetting(handle: Setting<string | undefined>, scope: Settings): string | null {
+	return handle.get(scope) ?? null;
 }
 
 /** Build the RFC 7617 Basic auth credential using UTF-8 bytes. */
@@ -118,9 +118,9 @@ function hasControlCharacters(value: string): boolean {
 }
 
 /** Find SearXNG authentication from settings or environment. Basic auth takes precedence over bearer tokens. */
-function findAuth(): SearXNGAuth | null {
-	const basicUsername = findSetting(cfgSearxngBasicUsername);
-	const basicPassword = findSetting(cfgSearxngBasicPassword);
+function findAuth(scope: Settings): SearXNGAuth | null {
+	const basicUsername = findSetting(cfgSearxngBasicUsername, scope);
+	const basicPassword = findSetting(cfgSearxngBasicPassword, scope);
 	if (basicUsername !== null || basicPassword !== null) {
 		if (basicUsername === null || basicPassword === null) {
 			throw new Error(
@@ -135,20 +135,8 @@ function findAuth(): SearXNGAuth | null {
 		}
 		return { type: "basic", value: buildBasicAuthValue(basicUsername, basicPassword) };
 	}
-
-	const token = findSetting(cfgSearxngToken);
+	const token = findSetting(cfgSearxngToken, scope);
 	return token ? { type: "bearer", value: token } : null;
-}
-
-/** Find configured engine names/shortcuts from settings. */
-function findEngines(): string | null {
-	try {
-		const engines = cfgSearxngEngines.get(settings);
-		if (engines) return engines;
-	} catch {
-		// Settings not initialized yet
-	}
-	return null;
 }
 
 /** Build request headers including authentication. */
@@ -394,38 +382,28 @@ export async function searchSearXNG(params: {
 	signal?: AbortSignal;
 	timeoutMs?: number;
 	fetch?: FetchImpl;
+	/** The caller's settings instance; endpoint, credentials, and filters are read from it. */
+	settings?: Settings;
 }): Promise<SearchResponse> {
 	const numResults = clampNumResults(params.num_results, DEFAULT_NUM_RESULTS, MAX_NUM_RESULTS);
 
-	const endpoint = findSetting(cfgSearxngEndpoint);
+	const scope = resolveSettings(params.settings);
+	const endpoint = findSetting(cfgSearxngEndpoint, scope);
 	if (!endpoint) {
 		throw new Error(
 			"SearXNG endpoint not configured. Set searxng.endpoint in settings or SEARXNG_ENDPOINT in environment.",
 		);
 	}
 
-	const auth = findAuth();
+	const auth = findAuth(scope);
 
-	let categories: string | undefined;
-	let language: string | undefined;
-	let configuredSafesearch: number | undefined;
-	try {
-		categories = cfgSearxngCategories.get(settings) ?? undefined;
-		language = cfgSearxngLanguage.get(settings) ?? undefined;
-		configuredSafesearch = cfgSearxngSafesearch.get(settings);
-	} catch {
-		// Settings not initialized yet
-	}
-	if (
-		configuredSafesearch !== undefined &&
-		configuredSafesearch !== 0 &&
-		configuredSafesearch !== 1 &&
-		configuredSafesearch !== 2
-	) {
+	const categories = cfgSearxngCategories.get(scope) ?? undefined;
+	let language = cfgSearxngLanguage.get(scope) ?? undefined;
+	const safesearch = cfgSearxngSafesearch.get(scope);
+	if (safesearch !== undefined && safesearch !== 0 && safesearch !== 1 && safesearch !== 2) {
 		throw new Error("searxng.safesearch must be 0 (off), 1 (moderate), or 2 (strict).");
 	}
-	const safesearch = configuredSafesearch;
-	const configuredEngines = findEngines();
+	const configuredEngines = findSetting(cfgSearxngEngines, scope);
 
 	// SearXNG forwards `q` to downstream engines, so build it with the shared
 	// scraper formatter: operators are canonicalized and scraper-hostile ones
@@ -494,8 +472,8 @@ export class SearXNGProvider extends SearchProvider {
 	readonly id = "searxng";
 	readonly label = "SearXNG";
 
-	isAvailable(_authStorage: AuthStorage): boolean {
-		return !!findSetting(cfgSearxngEndpoint);
+	isAvailable(_authStorage: AuthStorage, _model?: Model<Api>, scope?: Settings): boolean {
+		return !!findSetting(cfgSearxngEndpoint, resolveSettings(scope));
 	}
 
 	search(params: SearchParams): Promise<SearchResponse> {
@@ -507,6 +485,7 @@ export class SearXNGProvider extends SearchProvider {
 			signal: params.signal,
 			timeoutMs: params.timeoutMs,
 			fetch: params.fetch,
+			settings: params.settings,
 		});
 	}
 }
