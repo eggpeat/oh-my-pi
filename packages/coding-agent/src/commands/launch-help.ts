@@ -64,13 +64,19 @@ export const launchHelp = {
 		print: Flags.boolean({ char: "p", description: "Non-interactive mode: process prompt and exit" }),
 		continue: Flags.boolean({ char: "c", description: "Continue previous session" }),
 		resume: Flags.string({ char: "r", description: "Resume a session (by ID prefix, path, or picker if omitted)" }),
+		session: Flags.string({ description: "Alias for --resume" }),
 		restore: Flags.string({
 			description:
 				"Resume a session as --resume does, then go on with what its last process left unfinished (the interrupted turn and the subagents it was running)",
 		}),
+		fork: Flags.string({ description: "Fork a saved session (by ID prefix or path) into a new session" }),
 		"from-claude": Flags.boolean({ description: "Import a Claude Code session into OMP" }),
 		"from-codex": Flags.boolean({ description: "Import a Codex session into OMP" }),
 		"session-dir": Flags.string({ description: "Directory for session storage and lookup" }),
+		"provider-session-id": Flags.string({
+			description: "Reuse a specific provider-side session id for continuity and cache scoping",
+		}),
+		"prompt-cache-key": Flags.string({ description: "Override the provider prompt-cache key for this session" }),
 		"no-session": Flags.boolean({ description: "Don't save session (ephemeral)" }),
 		models: Flags.string({
 			description: `Comma-separated model patterns for ${formatKey("ctrl+p", { preset: "ascii", platform: keyHintPlatform() })} cycling`,
@@ -118,6 +124,12 @@ export const launchHelp = {
 			description: "Load an extension file (can be used multiple times)",
 			multiple: true,
 		}),
+		"trusted-extension": Flags.string({
+			description:
+				"Load only these absolute extension module paths (repeatable; disables extension discovery; not combinable with --extension/--hook)",
+			multiple: true,
+		}),
+		"plugin-dir": Flags.string({ description: "Load plugin from directory (repeatable)", multiple: true }),
 		"no-extensions": Flags.boolean({
 			description: "Disable extension discovery (explicit -e paths still work)",
 		}),

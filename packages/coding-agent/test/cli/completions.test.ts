@@ -304,4 +304,17 @@ describe("live completion surface", () => {
 		expect(stdout).not.toContain("_omp_cmd_launch");
 		expect(stdout).not.toContain("_omp_cmd___complete");
 	}, 30_000);
+
+	it("completes every launch flag the argv parser accepts, with dynamic values where they apply", async () => {
+		const stdout = await generateLiveCompletion("zsh");
+
+		expect(stdout).toContain(
+			"'--fork[Fork a saved session (by ID prefix or path) into a new session]:session:_omp_call sessions'",
+		);
+		expect(stdout).toContain("'--session[Alias for --resume]:session:_omp_call sessions'");
+		expect(stdout).toContain("'*--plugin-dir[Load plugin from directory (repeatable)]:dir:_files -/'");
+		expect(stdout).toMatch(/'\*--trusted-extension\[[^\]]*\]:file:_files'/);
+		expect(stdout).toMatch(/'--provider-session-id\[[^\]]*\]:/);
+		expect(stdout).toMatch(/'--prompt-cache-key\[[^\]]*\]:/);
+	}, 30_000);
 });
