@@ -1,6 +1,7 @@
 /**
  * The daemon's idle-exit grace (`OMP_DAEMON_IDLE_GRACE_MS`): how long the daemon waits after its
- * last client disconnects before it shuts down and stops the services it supervises. Read once when
+ * last client disconnects before it shuts down. The wait only starts once nothing holds the daemon
+ * open, so a supervised service that keeps it alive is never stopped by this timer. Read once when
  * the daemon starts, with the base-10 `parseInt` prefix; `0` exits at once, negative values and
  * values without leading digits use the default (3 s).
  */

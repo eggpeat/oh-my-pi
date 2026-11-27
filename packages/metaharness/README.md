@@ -300,8 +300,9 @@ known-correct fix for a failed task), `--concurrency` (default 8).
   first (the version sentinel must match).
 - **Agent-started services outlive omp.** The verifier runs after omp exits,
   in the same container or VM. Non-interactive omp keeps the services the agent
-  started with the bash tool's `name` alive by itself (they hold the daemon
-  broker open), and both runners also set `OMP_DAEMON_IDLE_GRACE_MS` to 24 h for
-  the omp process, so the broker does not shut down - and take those services
-  with it - in the meantime. An explicit `--env OMP_DAEMON_IDLE_GRACE_MS=<ms>`
+  started with the bash tool's `name` alive on its own: `launch.persist` makes
+  them hold the daemon broker open, so they stay up even with a grace of `0`.
+  `OMP_DAEMON_IDLE_GRACE_MS` only decides how long the broker waits before it
+  exits once nothing holds it open; both runners set it to 24 h so the broker
+  lingers until teardown. An explicit `--env OMP_DAEMON_IDLE_GRACE_MS=<ms>`
   wins.

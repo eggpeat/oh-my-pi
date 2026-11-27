@@ -123,11 +123,12 @@ _CONFIG_DST = "/tmp/omp-config.yml"
 _OUTPUT_FILENAME = "omp.txt"
 
 # Non-interactive omp keeps the services the agent started (bash `name` +
-# `ready`) alive by itself: they hold the daemon broker open. The runners also
-# raise OMP_DAEMON_IDLE_GRACE_MS (default 3 s) so the broker does not shut
-# down, and take those services with it, in the meantime. The verifier runs
-# after omp exits, in the same container, and grades those services, so they
-# must stay alive until the container is torn down.
+# `ready`) alive on its own: launch.persist makes them hold the daemon broker
+# open, so they stay up even with a grace of `0`. OMP_DAEMON_IDLE_GRACE_MS only
+# decides how long the broker waits before it exits once nothing holds it open;
+# the runners raise it (default 3 s) so the broker lingers until the container
+# is torn down, where the verifier runs after omp exits and grades those
+# services.
 _SERVICE_GRACE_ENV = {"OMP_DAEMON_IDLE_GRACE_MS": str(24 * 60 * 60 * 1000)}
 
 # Provider → host env vars used in --no-gateway (direct-auth) mode only.
