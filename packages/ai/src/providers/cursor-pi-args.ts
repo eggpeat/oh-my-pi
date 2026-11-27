@@ -20,6 +20,7 @@
  */
 
 import * as path from "node:path";
+import { LINE_RANGE_CHUNK_SOURCE } from "@oh-my-pi/pi-utils/read-selector";
 
 /**
  * A `pi_read` range composed onto the path as `read`'s inline `:raw:N+K`
@@ -44,7 +45,7 @@ export function piReadPath(readPath: string, offset?: number, limit?: number): s
 	return count === undefined ? `${base}:${start}-` : `${base}:${start}+${count}`;
 }
 
-const READ_RANGE_CHUNK_RE = /^L?(\d+)(?:(\.\.|[-+])L?(\d+)?)?$/i;
+const READ_RANGE_CHUNK_RE = new RegExp(`^${LINE_RANGE_CHUNK_SOURCE}$`, "i");
 
 function isReadRangeList(value: string): boolean {
 	return value.split(",").every(chunk => {

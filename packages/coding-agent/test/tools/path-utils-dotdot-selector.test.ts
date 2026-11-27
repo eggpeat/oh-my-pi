@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { isFilesystemSourcePath } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { parseLineRangeChunk, parseLineRanges } from "@oh-my-pi/pi-coding-agent/tools/line-ranges";
-import { splitPathAndSel } from "@oh-my-pi/pi-coding-agent/tools/details/read";
+import { splitPathAndSel } from "@oh-my-pi/pi-utils/read-selector";
 import { ToolError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 
 describe("`..` range selector alias", () => {

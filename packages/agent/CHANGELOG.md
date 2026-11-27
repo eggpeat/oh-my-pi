@@ -6,6 +6,7 @@
 
 - Reduced the size of authentication-gateway requests by preventing tool definitions from including internal host state.
 - Corrected OpenTelemetry chat spans to report the model that actually served the response.
+- Compaction file lists and stale-read pruning now recognize tail (`:-60`), `:img`, and per-chunk `:raw` read selectors, so a plain full-file read supersedes earlier partial reads and selector reads merge into one file entry. ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 
 ## [19.2.1] - 2026-11-25
 

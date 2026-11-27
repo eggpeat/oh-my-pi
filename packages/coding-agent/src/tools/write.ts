@@ -56,7 +56,7 @@ import { recoverConflictUriPrefix } from "./conflict-detect";
 import { unwrapHashlineHeaderPath } from "./hashline-header-path";
 import { outputMeta } from "./output-meta";
 import { formatPathRelativeToCwd, probeLiteralPathExists, resolveToCwd, specialFileKind } from "./path-utils";
-import { splitPathAndSel } from "./details/read";
+import { splitPathAndSel } from "@oh-my-pi/pi-utils/read-selector";
 import { enforcePlanModeWrite, resolvePlanPath } from "./plan-mode-guard";
 import { decodeUtf8Text } from "./read-format";
 import { routeReadThroughBridge } from "./read-summary";

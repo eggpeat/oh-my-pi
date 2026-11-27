@@ -1,7 +1,8 @@
 import type { ToolTier } from "@oh-my-pi/pi-agent-core";
 import { extractUriScheme } from "../internal-urls/parse";
 import { type LineRange } from "./line-ranges";
-import { splitPathAndSel, isReadableUrlPath } from "./details/read";
+import { splitPathAndSel } from "@oh-my-pi/pi-utils/read-selector";
+import { isReadableUrlPath } from "./details/read";
 import {
 	type DelimitedPathSplitMode,
 	isDelimitedPathSeparator,

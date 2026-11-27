@@ -9,6 +9,7 @@
 ### Added
 
 - Added `getBunStubDir()` to expose the cache directory used for the `bun` executable stub in compiled applications.
+- Added `@oh-my-pi/pi-utils/read-selector`, the shared read-tool selector grammar and `splitPathAndSel` splitter (with `isAlternateFormReadSelector`) now consumed by the read tool and compaction. ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 
 ### Fixed
 

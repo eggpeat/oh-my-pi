@@ -7,7 +7,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { parseSel, resolveTailSelector } from "@oh-my-pi/pi-coding-agent/tools/read-selector";
 import { splitInternalUrlSel } from "@oh-my-pi/pi-coding-agent/tools/details/read";
-import { splitPathAndSel } from "@oh-my-pi/pi-coding-agent/tools/details/read";
+import { splitPathAndSel } from "@oh-my-pi/pi-utils/read-selector";
 import { currentTheme, setCurrentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
 
 const restoreTheme = currentTheme();

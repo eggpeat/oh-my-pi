@@ -3,6 +3,7 @@
  */
 
 import type { ToolResultMessage } from "@oh-my-pi/pi-ai";
+import { isAlternateFormReadSelector, splitPathAndSel } from "@oh-my-pi/pi-utils/read-selector";
 import type { Tokenizer } from "../tokenizer";
 import type { AgentMessage, AgentToolCall } from "../types";
 import type { SessionEntry, SessionMessageEntry } from "./entries";
@@ -15,7 +16,6 @@ import {
 	isSkillReadToolResult,
 	type ProtectedToolMatcher,
 } from "./tool-protection";
-import { isAlternateFormReadSelector, splitReadSelector } from "./utils";
 
 /** Bound warm-cache pruning by the provider's prompt-cache lookback window. */
 export interface CacheLookbackConfig {
@@ -667,21 +667,22 @@ export function pruneToolOutputs(
 
 /**
  * Supersede key for the `read` tool: the file path with the trailing line/raw
- * selector stripped (the read tool's own splitter grammar via
- * {@link splitReadSelector}, e.g. `src/foo.ts:50-200`, `:2-4:raw`).
+ * selector stripped (the read tool's own splitter, {@link splitPathAndSel},
+ * e.g. `src/foo.ts:50-200`, `:-60`, `:img`, `:2-4:raw`).
  * Internal/URL-scheme paths (`skill://…`, `https://…`) are exempt.
  * Selector-free reads key on the bare path; line-range reads key on
  * `path + "\u0000" + selector`, so a complete bare-path read can supersede them.
- * `raw` and `conflicts` reads show a different form than a plain read (e.g. raw
- * notebook JSON vs converted notebook text), so they key on
- * `path + "\u0001" + selector` and are superseded only by the same selector.
+ * `raw`, `conflicts`, and `img` reads show a different form than a plain read
+ * (e.g. raw notebook JSON vs converted notebook text, or a rasterized SVG vs its
+ * source), so they key on `path + "\u0001" + selector` and are superseded only
+ * by the same selector.
  */
 export function readToolSupersedeKey(toolName: string, args: Record<string, unknown>): string | undefined {
 	if (toolName !== "read") return undefined;
 	const path = args.path;
 	if (typeof path !== "string" || path.length === 0) return undefined;
 	if (path.includes("://")) return undefined;
-	const { path: base, sel } = splitReadSelector(path);
+	const { path: base, sel } = splitPathAndSel(path);
 	if (sel === undefined) return base;
 	return `${base}${isAlternateFormReadSelector(sel) ? "\u0001" : "\u0000"}${sel}`;
 }

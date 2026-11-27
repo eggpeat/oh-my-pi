@@ -1,0 +1,201 @@
+import { describe, expect, test } from "bun:test";
+import { type AgentMessage, Tokenizer } from "@oh-my-pi/pi-agent-core";
+import {
+	pruneSupersededToolResults,
+	readToolSupersedeKey,
+	type SessionEntry,
+	type SessionMessageEntry,
+	type SupersedeCompleteFn,
+	type SupersedePruneConfig,
+} from "@oh-my-pi/pi-agent-core/compaction";
+import type { AssistantMessage, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import * as snapcompact from "@oh-my-pi/snapcompact";
+import { extractFileOpsFromMessage, stripReadSelector } from "../src/compaction/utils";
+import { createAssistantMessage } from "./helpers";
+
+/** Key separator for line-selector reads (superseded by a complete bare-path read). */
+const SEL_KEY = String.fromCharCode(0);
+/** Key separator for alternate-form reads (`raw`, `conflicts`, `img` — same-selector only). */
+const ALT_KEY = String.fromCharCode(1);
+
+function readCall(id: string, path: string) {
+	return { type: "toolCall" as const, id, name: "read", arguments: { path } };
+}
+
+describe("stripReadSelector — selector shapes the read tool accepts", () => {
+	test("strips tail selectors and tail chunks inside comma lists", () => {
+		expect(stripReadSelector("src/foo.ts:-60")).toBe("src/foo.ts");
+		expect(stripReadSelector("src/foo.ts:1-12,-15")).toBe("src/foo.ts");
+		expect(stripReadSelector("src/foo.ts:raw:-60")).toBe("src/foo.ts");
+		expect(stripReadSelector("src/foo.ts:-60:raw")).toBe("src/foo.ts");
+	});
+
+	test("strips img and per-chunk raw selectors", () => {
+		expect(stripReadSelector("logo.svg:img")).toBe("logo.svg");
+		expect(stripReadSelector("src/foo.ts:1-3:raw,9:raw")).toBe("src/foo.ts");
+		expect(stripReadSelector("src/foo.ts:raw:5,raw:9-12")).toBe("src/foo.ts");
+	});
+
+	test("strips colons folded back into a comma list", () => {
+		expect(stripReadSelector("src/foo.ts:1-30,:-30")).toBe("src/foo.ts");
+		expect(stripReadSelector("src/foo.ts:20:40,85:100")).toBe("src/foo.ts");
+	});
+});
+
+describe("extractFileOpsFromMessage — selector dedupe", () => {
+	test("tail, img, and per-chunk raw reads dedupe onto the plain path", () => {
+		const fileOps = snapcompact.createFileOps();
+		const message = createAssistantMessage([
+			readCall("r1", "src/app.ts:-60"),
+			readCall("r2", "src/app.ts"),
+			readCall("r3", "src/app.ts:1-3:raw,9:raw"),
+			readCall("r4", "logo.svg:img"),
+			readCall("r5", "logo.svg"),
+		]);
+		extractFileOpsFromMessage(message, fileOps);
+		expect([...fileOps.read].sort()).toEqual(["logo.svg", "src/app.ts"]);
+	});
+
+	test("a selector read merges with a write of the same file", () => {
+		const fileOps = snapcompact.createFileOps();
+		const message = createAssistantMessage([
+			readCall("r1", "src/app.ts:-60"),
+			{ type: "toolCall" as const, id: "w1", name: "write", arguments: { path: "src/app.ts" } },
+		]);
+		extractFileOpsFromMessage(message, fileOps);
+		const { readFiles, modifiedFiles } = snapcompact.computeFileLists(fileOps);
+		expect(readFiles).toEqual([]);
+		expect(modifiedFiles).toEqual(["src/app.ts"]);
+	});
+});
+
+describe("readToolSupersedeKey — selector shapes the read tool accepts", () => {
+	test("tail selectors key under the bare path like other line selectors", () => {
+		expect(readToolSupersedeKey("read", { path: "src/foo.ts:-60" })).toBe(`src/foo.ts${SEL_KEY}-60`);
+		expect(readToolSupersedeKey("read", { path: "src/foo.ts:1-12,-15" })).toBe(`src/foo.ts${SEL_KEY}1-12,-15`);
+	});
+
+	test("img and raw compounds key as alternate forms apart from the bare path", () => {
+		expect(readToolSupersedeKey("read", { path: "logo.svg:img" })).toBe(`logo.svg${ALT_KEY}img`);
+		expect(readToolSupersedeKey("read", { path: "src/foo.ts:-60:raw" })).toBe(`src/foo.ts${ALT_KEY}-60:raw`);
+		expect(readToolSupersedeKey("read", { path: "src/foo.ts:1-3:raw,9:raw" })).toBe(`src/foo.ts${ALT_KEY}1-3,9:raw`);
+	});
+});
+
+const T0 = Date.UTC(2026, 5, 10, 12, 0, 0);
+const FILE_CONTENT = "export function alpha() { return 1; }\n".repeat(50);
+const tokenizer = new Tokenizer();
+
+let idCounter = 0;
+function nextId(): string {
+	return `sel-entry-${idCounter++}`;
+}
+
+function messageEntry(message: AgentMessage, timestamp: number): SessionMessageEntry {
+	return {
+		type: "message",
+		id: nextId(),
+		parentId: null,
+		timestamp: new Date(timestamp).toISOString(),
+		message,
+	};
+}
+
+function assistantMessage(content: AssistantMessage["content"], timestamp: number): AssistantMessage {
+	return {
+		role: "assistant",
+		content,
+		timestamp,
+		provider: "mock",
+		model: "mock",
+		api: "mock",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+	};
+}
+
+function toolResultMessage(toolName: string, toolCallId: string, text: string, timestamp: number): ToolResultMessage {
+	return {
+		role: "toolResult",
+		toolCallId,
+		toolName,
+		content: [{ type: "text", text }],
+		isError: false,
+		timestamp,
+	};
+}
+
+/** Assistant toolCall entry + paired toolResult entry for one read. */
+function readPair(path: string, text: string, timestamp: number): [SessionMessageEntry, SessionMessageEntry] {
+	const callId = `sel-call-${idCounter++}`;
+	return [
+		messageEntry(
+			assistantMessage([{ type: "toolCall", id: callId, name: "read", arguments: { path } }], timestamp),
+			timestamp,
+		),
+		messageEntry(toolResultMessage("read", callId, text, timestamp), timestamp),
+	];
+}
+
+function resultText(entry: SessionEntry): string {
+	const message = (entry as SessionMessageEntry).message as ToolResultMessage;
+	return (message.content[0] as TextContent).text;
+}
+
+/** Every result counts complete here; partial-result mechanics live in supersede-prune.test.ts. */
+const testComplete: SupersedeCompleteFn = () => true;
+
+function pruneStale(entries: SessionEntry[], now: number) {
+	const config: SupersedePruneConfig = {
+		supersedeKey: readToolSupersedeKey,
+		supersedeComplete: testComplete,
+		protectedTools: [],
+		now,
+	};
+	return pruneSupersededToolResults(entries, tokenizer, config);
+}
+
+describe("pruneSupersededToolResults — selector supersession", () => {
+	test("a complete plain read supersedes an earlier tail read of the same file", () => {
+		const [call1, result1] = readPair("src/foo.ts:-60", FILE_CONTENT, T0);
+		const [call2, result2] = readPair("src/foo.ts", FILE_CONTENT, T0 + 1_000);
+		const entries: SessionEntry[] = [call1, result1, call2, result2];
+
+		const result = pruneStale(entries, T0 + 1_000);
+
+		expect(result.prunedCount).toBe(1);
+		expect(resultText(result1)).toBe("[Superseded by a newer read of this file]");
+		expect(resultText(result2)).toBe(FILE_CONTENT);
+	});
+
+	test("a complete plain read does not supersede an earlier :img read", () => {
+		const [call1, result1] = readPair("logo.svg:img", FILE_CONTENT, T0);
+		const [call2, result2] = readPair("logo.svg", FILE_CONTENT, T0 + 1_000);
+		const entries: SessionEntry[] = [call1, result1, call2, result2];
+
+		const result = pruneStale(entries, T0 + 1_000);
+
+		expect(result.prunedCount).toBe(0);
+		expect(resultText(result1)).toBe(FILE_CONTENT);
+		expect(resultText(result2)).toBe(FILE_CONTENT);
+	});
+
+	test("a newer :img read supersedes the earlier one only through the same selector", () => {
+		const [call1, result1] = readPair("logo.svg:img", FILE_CONTENT, T0);
+		const [call2, result2] = readPair("logo.svg:img", FILE_CONTENT, T0 + 1_000);
+		const entries: SessionEntry[] = [call1, result1, call2, result2];
+
+		const result = pruneStale(entries, T0 + 1_000);
+
+		expect(result.prunedCount).toBe(1);
+		expect(resultText(result1)).toBe("[Superseded by a newer read of this file]");
+		expect(resultText(result2)).toBe(FILE_CONTENT);
+	});
+});

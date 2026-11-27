@@ -16,7 +16,8 @@ import { type JSXNode, nativeSupports } from "@oh-my-pi/pi-tui";
 import { registerBlob } from "@oh-my-pi/pi-tui/native/blobs";
 import { languageFromPath } from "@oh-my-pi/pi-tui/text/lang";
 import { splitUrlScheme } from "../../internal-urls/url-scheme";
-import { type ReadToolDetails, readSelectorRangeStart, splitPathAndSel } from "../../tools/details/read";
+import { splitPathAndSel } from "@oh-my-pi/pi-utils/read-selector";
+import { type ReadToolDetails, readSelectorRangeStart } from "../../tools/details/read";
 import {
 	formatArtifactErrorNotice,
 	formatFullOutputReference,

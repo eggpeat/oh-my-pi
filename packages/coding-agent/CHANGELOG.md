@@ -6,6 +6,7 @@
 
 - The `providers.fetch` configuration values `native`, `trafilatura`, and `lynx` have been replaced by the single `local` value for the in-process reader engine.
 - Removed unused `parse*Args` and `print*Help` exports from the CLI configuration, grep, plugin, setup, shell, web-search, and update modules.
+- Moved `splitPathAndSel` and the read-selector grammar constants from `tools/details/read` and `tools/line-ranges` to `@oh-my-pi/pi-utils/read-selector`; `splitInternalUrlSel`, `isReadableUrlPath`, `readSelectorRangeStart`, and `ReadToolDetails` stay put. ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 
 ### Added
 

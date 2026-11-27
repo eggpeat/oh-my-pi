@@ -62,7 +62,8 @@ import {
 	searchApprovalCacheTargets,
 } from "./search-approval-targets";
 import { type LineRange, parseLineRanges, selectorLineRanges } from "./line-ranges";
-import { isReadableUrlPath, splitPathAndSel } from "./details/read";
+import { splitPathAndSel } from "@oh-my-pi/pi-utils/read-selector";
+import { isReadableUrlPath } from "./details/read";
 import { toPathList } from "../utils/render-utils";
 import { isRawSelector } from "./read-selector";
 import { formatCodeFrameLine } from "../utils/render-utils";

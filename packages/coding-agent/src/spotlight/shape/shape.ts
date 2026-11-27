@@ -15,7 +15,7 @@ import { Tokenizer } from "@oh-my-pi/pi-agent-core";
 import { countNewlines, spillUrl } from "@oh-my-pi/pi-utils";
 import { reasonShows, type SpotlightReason } from "../../tools/details/spotlight";
 import { isMarkdownPath } from "../../utils/lang-from-path";
-import { splitPathAndSel } from "../../tools/details/read";
+import { splitPathAndSel } from "@oh-my-pi/pi-utils/read-selector";
 import shapeProbe from "../../prompts/spotlight/shape-probe.md" with { type: "text" };
 import shapeRule from "../../prompts/spotlight/shape-rule.md" with { type: "text" };
 import { parseSel } from "../../tools/read-selector";

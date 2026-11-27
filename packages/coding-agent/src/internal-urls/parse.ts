@@ -9,6 +9,7 @@
  * All code that parses internal URLs (router, protocol handlers, tools)
  * MUST use this function instead of calling `new URL()` directly.
  */
+import { RANGE_LIST_SRC } from "@oh-my-pi/pi-utils/read-selector";
 import type { InternalUrl } from "./types";
 
 const SCHEME_HOST_RE = /^([a-z][a-z0-9+.-]*):\/\/([^/?#]*)/i;
@@ -16,11 +17,13 @@ const PATHNAME_RE = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*(\/[^?#]*)?/i;
 // Opaque URI form (`urn:example:document`, `custom:item`) — an RFC 3986 scheme
 // followed by `:` without `//`. Guarded separately in `extractUriScheme`.
 const OPAQUE_URI_RE = /^([a-z][a-z0-9+.-]*):(.+)$/is;
-// A read-tool selector chain (`12`, `1-20,30+5`, `raw`, `raw:2-4`, `conflicts`)
-// so `Makefile:12` or `notes:raw` is not mistaken for an opaque URI.
-const SELECTOR_CHUNK_SRC = String.raw`(?:raw|conflicts|-?\d+(?:[-+]\d+)?(?:,\d+(?:[-+]\d+)?)*)`;
+// A read-tool selector chain (`12`, `1-20,30+5`, `img`, `raw`, `raw:2-4`, `conflicts`)
+// so `Makefile:12` or `notes:raw` is not mistaken for an opaque URI. Mirrors the
+// tolerant part alternation the URL splitter peels (`INTERNAL_URL_SELECTOR_PART_RE`),
+// plus the loose pre-share chunk so nothing that was a non-URI before becomes one.
+const SELECTOR_CHAIN_SRC = String.raw`(?:raw|conflicts|img|${RANGE_LIST_SRC}|-?\d+(?:[-+]\d+)?(?:,\d+(?:[-+]\d+)?)*)`;
 // A `;` after the chain means a path list (`Dockerfile:198-220;a.yml:1-60`), not an opaque URI.
-const SELECTOR_CHAIN_RE = new RegExp(`^${SELECTOR_CHUNK_SRC}(?::${SELECTOR_CHUNK_SRC})*(?:;|$)`, "i");
+const SELECTOR_CHAIN_RE = new RegExp(`^${SELECTOR_CHAIN_SRC}(?::${SELECTOR_CHAIN_SRC})*(?:;|$)`, "i");
 
 /**
  * Extract the lowercased scheme from a URI-shaped input, or `undefined` when

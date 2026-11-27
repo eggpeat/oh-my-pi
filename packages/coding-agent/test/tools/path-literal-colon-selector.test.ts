@@ -12,7 +12,7 @@ import {
 	splitPathAndSelPreferringLiteral,
 	splitPathAndSelPreferringLiteralSync,
 } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
-import { splitPathAndSel } from "@oh-my-pi/pi-coding-agent/tools/details/read";
+import { splitPathAndSel } from "@oh-my-pi/pi-utils/read-selector";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { GrepOutputMode } from "@oh-my-pi/pi-natives";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";

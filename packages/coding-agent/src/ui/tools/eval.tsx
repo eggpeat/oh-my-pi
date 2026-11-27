@@ -23,7 +23,7 @@ import {
 	type StatusEventLog,
 	splitEvalOutput,
 } from "../../tools/details/eval";
-import { splitPathAndSel } from "../../tools/details/read";
+import { splitPathAndSel } from "@oh-my-pi/pi-utils/read-selector";
 import { formatEvalCodeForDisplay } from "../../tools/eval-format";
 import { type OutputMeta, stripOutputNotice } from "../../tools/output-meta-format";
 import type { ToolHead, ToolPresenter, ToolResult, ToolView, ToolViewState } from "./contract";

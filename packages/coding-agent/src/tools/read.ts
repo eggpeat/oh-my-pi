@@ -107,7 +107,7 @@ import {
 	splitPathAndSelPreferringLiteralSync,
 } from "./path-utils";
 import { type LineRange } from "./line-ranges";
-import { splitPathAndSel } from "./details/read";
+import { splitPathAndSel } from "@oh-my-pi/pi-utils/read-selector";
 import { readArchive, resolveArchiveReadPath } from "./read-archive";
 import {
 	appendReadNotice,
