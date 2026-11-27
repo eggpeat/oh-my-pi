@@ -126,7 +126,7 @@ function extractFileOperations(
 	messages: AgentMessage[],
 	entries: SessionEntry[],
 	prevCompactionIndex: number,
-	recordedReads?: ReadonlyMap<string, string>,
+	recordedReads?: ReadonlyMap<object, string | null>,
 ): snapcompact.FileOperations {
 	const fileOps = snapcompact.createFileOps();
 

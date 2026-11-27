@@ -154,10 +154,11 @@ export function splitPathAndSel(
 
 /**
  * Whether a selector from {@link splitPathAndSel} shows the file in a form other
- * than its plain lines: verbatim `raw` bytes, the merge `conflicts` view, or a
- * rasterized `img`. Alternate-form reads supersede only the same selector, so a
- * plain full-file read never retires a raw/conflicts/img copy.
+ * than its plain lines: verbatim `raw` bytes, the merge `conflicts` view, a
+ * rasterized `img`, or a `?`-prefixed selector (each `?q=` answer is its own
+ * view). Alternate-form reads supersede only the same selector, so a plain
+ * full-file read never retires a raw/conflicts/img/question copy.
  */
 export function isAlternateFormReadSelector(sel: string): boolean {
-	return sel.split(":").some(part => READ_ALTERNATE_FORM_RE.test(part));
+	return sel.split(":").some(part => part.startsWith("?") || READ_ALTERNATE_FORM_RE.test(part));
 }

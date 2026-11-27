@@ -233,4 +233,47 @@ describe("literal colon filename beside the file it looks like a selector of", (
 		});
 		expect(pruned.prunedCount).toBe(1);
 	});
+
+	test("a suffix-resolved tail read is not erased when a different file with the asked name is read", async () => {
+		await fs.mkdir(path.join(cwd, "docs"), { recursive: true });
+		await Bun.write(
+			path.join(cwd, "docs", "report.txt"),
+			Array.from({ length: 20 }, (_, i) => `docs report ${i + 1}`).join("\n"),
+		);
+		try {
+			const older = await reader.execute("suffix-tail", { path: "report.txt:-5" });
+			expect(older.details?.readTarget).toEqual({ path: path.join("docs", "report.txt"), sel: "-5" });
+			// A different `report.txt` now exists at the root; reading it must not
+			// supersede the earlier result, which came from docs/report.txt.
+			await Bun.write(path.join(cwd, "report.txt"), "a different file\n");
+			const newer = await reader.execute("root-plain", { path: "report.txt" });
+			const entries = [
+				...readEntries("suffix-tail", "report.txt:-5", older),
+				...readEntries("root-plain", "report.txt", newer),
+			];
+			const pruned = pruneSupersededToolResults(entries, new Tokenizer(), {
+				supersedeKey: readToolSupersedeKey,
+				supersedeComplete: isCompleteReadResult,
+				protectedTools: [],
+				now: Date.now(),
+			});
+			expect(pruned.prunedCount).toBe(0);
+
+			const direct = await reader.execute("docs-plain", { path: "docs/report.txt" });
+			const paired = [
+				...readEntries("suffix-tail-2", "report.txt:-5", older),
+				...readEntries("docs-plain", "docs/report.txt", direct),
+			];
+			const prunedDirect = pruneSupersededToolResults(paired, new Tokenizer(), {
+				supersedeKey: readToolSupersedeKey,
+				supersedeComplete: isCompleteReadResult,
+				protectedTools: [],
+				now: Date.now(),
+			});
+			expect(prunedDirect.prunedCount).toBe(1);
+		} finally {
+			await fs.rm(path.join(cwd, "report.txt"), { force: true });
+			await fs.rm(path.join(cwd, "docs"), { recursive: true, force: true });
+		}
+	});
 });

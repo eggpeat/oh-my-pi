@@ -44,24 +44,61 @@ export function stripReadSelector(path: string): string {
 	return splitPathAndSel(path).path;
 }
 
-/** Path a read result says it opened, keyed by the tool call id. */
-export function recordedReadPath(message: AgentMessage): { toolCallId: string; path: string } | undefined {
+/** Path a read result says it opened — `null` when a resource server (not a file) answered. */
+export function recordedReadPath(message: AgentMessage): { toolCallId: string; path: string | null } | undefined {
 	if (message.role !== "toolResult" || message.toolName !== "read") return undefined;
 	const details = message.details;
 	if (!details || typeof details !== "object") return undefined;
 	const target = (details as { readTarget?: unknown }).readTarget;
-	if (!target || typeof target !== "object") return undefined;
-	const path = (target as { path?: unknown }).path;
-	if (typeof path !== "string" || path.length === 0) return undefined;
-	return { toolCallId: message.toolCallId, path };
+	if (target && typeof target === "object") {
+		const t = target as { path?: unknown; external?: unknown };
+		if (t.external === true) return { toolCallId: message.toolCallId, path: null };
+		if (typeof t.path === "string" && t.path.length > 0) return { toolCallId: message.toolCallId, path: t.path };
+	}
+	// Results written before `readTarget` recorded the opened file as `resolvedPath`.
+	const resolved = (details as { resolvedPath?: unknown }).resolvedPath;
+	if (typeof resolved === "string" && resolved.length > 0 && !resolved.includes("://")) {
+		return { toolCallId: message.toolCallId, path: resolved };
+	}
+	return undefined;
 }
 
-/** toolCallId → path the read actually opened, for calls whose result recorded one. */
-export function indexRecordedReadPaths(messages: Iterable<AgentMessage>): ReadonlyMap<string, string> {
-	const recorded = new Map<string, string>();
+/**
+ * Map each read call block to the path its result recorded, pairing the k-th
+ * result for a tool call id with the k-th call in message order, so ids reused
+ * across prompts keep their own paths. `null` marks a served resource (no file
+ * produced it); an absent entry means the result recorded nothing.
+ */
+export function indexRecordedReadPaths(messages: Iterable<AgentMessage>): ReadonlyMap<object, string | null> {
+	const callsById = new Map<string, object[]>();
+	const resultsById = new Map<string, Array<string | null>>();
 	for (const message of messages) {
+		if (message.role === "assistant" && "content" in message && Array.isArray(message.content)) {
+			for (const block of message.content) {
+				if (typeof block !== "object" || block === null) continue;
+				if (!("type" in block) || block.type !== "toolCall" || !("name" in block)) continue;
+				if (block.name !== "read") continue;
+				const id = (block as { id?: unknown }).id;
+				if (typeof id !== "string" || id.length === 0) continue;
+				const list = callsById.get(id) ?? [];
+				if (list.length === 0) callsById.set(id, list);
+				list.push(block);
+			}
+			continue;
+		}
 		const hit = recordedReadPath(message);
-		if (hit) recorded.set(hit.toolCallId, hit.path);
+		if (!hit) continue;
+		const list = resultsById.get(hit.toolCallId) ?? [];
+		if (list.length === 0) resultsById.set(hit.toolCallId, list);
+		list.push(hit.path);
+	}
+	const recorded = new Map<object, string | null>();
+	for (const [id, calls] of callsById) {
+		const results = resultsById.get(id);
+		if (!results) continue;
+		for (let i = 0; i < Math.min(calls.length, results.length); i++) {
+			recorded.set(calls[i], results[i]);
+		}
 	}
 	return recorded;
 }
@@ -83,12 +120,13 @@ export function addPriorReadFiles(
 
 /**
  * Extract file operations from tool calls in an assistant message.
- * `recordedReads` maps a read call id to the path the tool actually opened.
+ * `recordedReads` maps each read call block to the path its result recorded
+ * (`null` for a served resource, which adds nothing to the list).
  */
 export function extractFileOpsFromMessage(
 	message: AgentMessage,
 	fileOps: snapcompact.FileOperations,
-	recordedReads?: ReadonlyMap<string, string>,
+	recordedReads?: ReadonlyMap<object, string | null>,
 ): void {
 	if (message.role !== "assistant") return;
 	if (!("content" in message) || !Array.isArray(message.content)) return;
@@ -110,7 +148,8 @@ export function extractFileOpsFromMessage(
 
 		switch (block.name) {
 			case "read": {
-				const recorded = typeof block.id === "string" ? recordedReads?.get(block.id) : undefined;
+				const recorded = recordedReads?.get(block);
+				if (recorded === null) break;
 				fileOps.read.add(recorded ?? stripReadSelector(path));
 				break;
 			}

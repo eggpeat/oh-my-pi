@@ -76,10 +76,11 @@ export interface ReadToolDetails {
 	 * colon filename over a trailing selector. Compaction file lists and
 	 * stale-read pruning use it instead of re-splitting the call argument, so a
 	 * real file named `notes.txt:-60` is not treated as the last 60 lines of
-	 * `notes.txt`. Unset for speculative reads (the call still names the asked
-	 * path) and for URL reads (the call path stays the URL).
+	 * `notes.txt`. `question` keeps each `?q=` answer keyed apart; `external`
+	 * marks reads a resource server (not a local file) answered. Unset for
+	 * speculative reads (the call still names the asked path).
 	 */
-	readTarget?: { path: string; sel?: string };
+	readTarget?: { path: string; sel?: string; question?: string; external?: boolean };
 }
 
 /** Selector facts of an internal URL scheme ({@link splitInternalUrlSel}). */

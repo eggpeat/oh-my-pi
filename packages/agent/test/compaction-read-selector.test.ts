@@ -263,3 +263,110 @@ describe("literal colon filenames", () => {
 		expect([...prepareBranchEntries([entry(undefined)], tokenizer).fileOps.read]).toEqual(["notes.txt"]);
 	});
 });
+
+describe("results recorded before readTarget (resolvedPath)", () => {
+	test("an upgraded session keeps the literal file result when its plain file is re-read", () => {
+		// Result details as older versions persisted them: resolvedPath, no readTarget.
+		const [call1, result1] = readPair("notes.txt:-60", "literal\n", T0);
+		(result1.message as ToolResultMessage).details = { resolvedPath: "/work/notes.txt:-60" };
+		const [call2, result2] = readPair("notes.txt", FILE_CONTENT, T0 + 1_000);
+		(result2.message as ToolResultMessage).details = { resolvedPath: "/work/notes.txt" };
+
+		const result = pruneStale([call1, result1, call2, result2], T0 + 1_000);
+
+		expect(result.prunedCount).toBe(0);
+		expect(resultText(result1)).toBe("literal\n");
+	});
+
+	test("an upgraded session still supersedes a real tail read", () => {
+		const [call1, result1] = readPair("notes.txt:-5", "tail\n", T0);
+		(result1.message as ToolResultMessage).details = { resolvedPath: "/work/notes.txt" };
+		const [call2, result2] = readPair("notes.txt", FILE_CONTENT, T0 + 1_000);
+		(result2.message as ToolResultMessage).details = { resolvedPath: "/work/notes.txt" };
+
+		const result = pruneStale([call1, result1, call2, result2], T0 + 1_000);
+
+		expect(result.prunedCount).toBe(1);
+		expect(resultText(result1)).toBe("[Superseded by a newer read of this file]");
+	});
+
+	test("file lists in an upgraded session name the recorded file, not a re-split", () => {
+		const call = createAssistantMessage([readCall("r1", "notes.txt:-60"), readCall("r2", "notes.txt")]);
+		const opened = {
+			role: "toolResult",
+			toolCallId: "r1",
+			toolName: "read",
+			content: [{ type: "text", text: "literal" }],
+			isError: false,
+			timestamp: T0,
+			details: { resolvedPath: "notes.txt:-60" },
+		} as ToolResultMessage;
+		const fileOps = snapcompact.createFileOps();
+		extractFileOpsFromMessage(call, fileOps, indexRecordedReadPaths([call, opened]));
+		expect([...fileOps.read].sort()).toEqual(["notes.txt", "notes.txt:-60"]);
+	});
+});
+
+describe("question, external, and reused-id reads", () => {
+	test("different ?q= answers about one image do not supersede each other or a plain read", () => {
+		const [call1, result1] = readPair("photo.png?q=what is in the image", "a cat\n", T0);
+		(result1.message as ToolResultMessage).details = {
+			resolvedPath: "/work/photo.png",
+			readTarget: { path: "photo.png", question: "what is in the image" },
+		};
+		const [call2, result2] = readPair("photo.png?q=how many cats", "two cats\n", T0 + 1_000);
+		(result2.message as ToolResultMessage).details = {
+			resolvedPath: "/work/photo.png",
+			readTarget: { path: "photo.png", question: "how many cats" },
+		};
+		const [call3, result3] = readPair("photo.png", FILE_CONTENT, T0 + 2_000);
+		(result3.message as ToolResultMessage).details = {
+			resolvedPath: "/work/photo.png",
+			readTarget: { path: "photo.png" },
+		};
+
+		const result = pruneStale([call1, result1, call2, result2, call3, result3], T0 + 2_000);
+
+		expect(result.prunedCount).toBe(0);
+	});
+
+	test("a served resource read leaves no file in lists and joins no pruning", () => {
+		const call = createAssistantMessage([readCall("r1", "asset:img")]);
+		const served = {
+			role: "toolResult",
+			toolCallId: "r1",
+			toolName: "read",
+			content: [{ type: "text", text: "resource bytes" }],
+			isError: false,
+			timestamp: T0,
+			details: { readTarget: { path: "asset:img", external: true } },
+		} as ToolResultMessage;
+		const fileOps = snapcompact.createFileOps();
+		extractFileOpsFromMessage(call, fileOps, indexRecordedReadPaths([call, served]));
+		expect([...fileOps.read]).toEqual([]);
+		expect(readToolSupersedeKey("read", { path: "asset:img" }, served)).toBeUndefined();
+	});
+
+	test("tool call ids reused across prompts keep each call's own opened path", () => {
+		const call1 = createAssistantMessage([readCall("shared", "a.txt")]);
+		const result1 = {
+			role: "toolResult",
+			toolCallId: "shared",
+			toolName: "read",
+			content: [{ type: "text", text: "a" }],
+			isError: false,
+			timestamp: T0,
+			details: { readTarget: { path: "a.txt" } },
+		} as ToolResultMessage;
+		const call2 = createAssistantMessage([readCall("shared", "b.txt")]);
+		const result2 = {
+			...result1,
+			details: { readTarget: { path: "b.txt" } },
+		} as ToolResultMessage;
+		const recorded = indexRecordedReadPaths([call1, result1, call2, result2]);
+		const fileOps = snapcompact.createFileOps();
+		extractFileOpsFromMessage(call1, fileOps, recorded);
+		extractFileOpsFromMessage(call2, fileOps, recorded);
+		expect([...fileOps.read].sort()).toEqual(["a.txt", "b.txt"]);
+	});
+});

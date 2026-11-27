@@ -675,17 +675,19 @@ export function pruneToolOutputs(
 
 /**
  * Supersede key for the `read` tool: the file the read actually opened.
- * When the result records `readTarget` (the path and selector chosen at read
- * time), that wins, so a real file named `notes.txt:-60` is not keyed as the
- * last 60 lines of `notes.txt`. Otherwise the call path is split with the read
- * tool's own splitter ({@link splitPathAndSel}).
+ * A result that recorded the opened file (`resolvedPath`, or `readTarget` with
+ * the path and selector chosen at read time) wins over re-splitting the call
+ * argument, so a real file named `notes.txt:-60` is not keyed as the last 60
+ * lines of `notes.txt` — including results written before `readTarget` existed.
+ * Results a resource server answered (`readTarget.external`) never join pruning,
+ * and `?q=` image answers key on the question, so a different question and a
+ * plain read of the same file each keep their own result.
  * Internal/URL-scheme paths (`skill://…`, `https://…`) are exempt.
  * Selector-free reads key on the bare path; line-range reads key on
  * `path + "\u0000" + selector`, so a complete bare-path read can supersede them.
- * `raw`, `conflicts`, and `img` reads show a different form than a plain read
- * (e.g. raw notebook JSON vs converted notebook text, or a rasterized SVG vs its
- * source), so they key on `path + "\u0001" + selector` and are superseded only
- * by the same selector.
+ * `raw`, `conflicts`, `img`, and `?q=` reads show a different form than a plain
+ * read, so they key on `path + "\u0001" + selector` and are superseded only by
+ * the same selector.
  */
 export function readToolSupersedeKey(
 	toolName: string,
@@ -696,21 +698,47 @@ export function readToolSupersedeKey(
 	const path = args.path;
 	if (typeof path !== "string" || path.length === 0) return undefined;
 	if (path.includes("://")) return undefined;
-	const recorded = result ? recordedReadSplit(result) : undefined;
-	const split = recorded ?? splitPathAndSel(path);
+	const argSplit = splitPathAndSel(path);
+	const recorded = result ? recordedReadSplit(result, argSplit) : undefined;
+	if (recorded === null) return undefined;
+	if (recorded === undefined && path.includes("?")) return undefined;
+	const split = recorded ?? argSplit;
 	if (split.sel === undefined) return split.path;
 	return `${split.path}${isAlternateFormReadSelector(split.sel) ? "\u0001" : "\u0000"}${split.sel}`;
 }
 
-/** Path and selector a read result says it opened, when the tool recorded one. */
-function recordedReadSplit(result: ToolResultMessage): { path: string; sel?: string } | undefined {
+/**
+ * Path and selector a read result says it opened, when the tool recorded them.
+ * `null` marks an external resource read; `undefined` means nothing was
+ * recorded. `resolvedPath` (the opened file as the result persisted it) beats
+ * `readTarget.path`: both name the same file, and `resolvedPath` is present on
+ * results written before `readTarget` existed. Such results still take their
+ * selector from the call argument — unless `resolvedPath` already carries it
+ * verbatim, the literal tail of a real colon filename. A `?q=` answer keys on
+ * the question through the `?` selector prefix.
+ */
+function recordedReadSplit(
+	result: ToolResultMessage,
+	argSplit: { path: string; sel?: string },
+): { path: string; sel?: string } | null | undefined {
 	const details = result.details;
 	if (!details || typeof details !== "object") return undefined;
 	const target = (details as { readTarget?: unknown }).readTarget;
-	if (!target || typeof target !== "object") return undefined;
-	const recordedPath = (target as { path?: unknown }).path;
-	if (typeof recordedPath !== "string" || recordedPath.length === 0) return undefined;
-	const sel = (target as { sel?: unknown }).sel;
-	if (sel !== undefined && typeof sel !== "string") return undefined;
-	return typeof sel === "string" && sel.length > 0 ? { path: recordedPath, sel } : { path: recordedPath };
+	const t = target && typeof target === "object" ? (target as Record<string, unknown>) : undefined;
+	if (t?.external === true) return null;
+	const resolved = (details as { resolvedPath?: unknown }).resolvedPath;
+	const base = typeof resolved === "string" && resolved.length > 0 ? resolved : undefined;
+	const recordedPath = base ?? (typeof t?.path === "string" && t.path.length > 0 ? t.path : undefined);
+	if (recordedPath === undefined) return undefined;
+	const question = t?.question;
+	if (typeof question === "string" && question.length > 0) {
+		return { path: recordedPath, sel: `?${question}` };
+	}
+	const sel = t?.sel;
+	if (typeof sel === "string" && sel.length > 0) return { path: recordedPath, sel };
+	const argSel = argSplit.sel;
+	if (argSel !== undefined && !recordedPath.endsWith(`:${argSel}`)) {
+		return { path: recordedPath, sel: argSel };
+	}
+	return { path: recordedPath };
 }

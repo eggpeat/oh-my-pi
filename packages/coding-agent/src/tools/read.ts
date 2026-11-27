@@ -861,6 +861,8 @@ interface FilesystemReadOptions {
 /** Filled with the path/selector the pipeline chose, before PDF/video rewrites. */
 interface ChosenReadSplit {
 	split?: { path: string; sel?: string };
+	/** Vision `?q=` question the read answered, when it read an image instead of text. */
+	question?: string;
 }
 
 function rememberReadSplit(chosen: ChosenReadSplit, split: { path: string; sel?: string }): void {
@@ -2333,13 +2335,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				? result
 				: { ...result, details: { ...result.details, mediaPath: media.path } };
 		// Speculative reads open an absolute path; the call still names the asked path.
-		// Located URL reads keep the URL as their identity. PDF page pictures and video
-		// timestamps stay on `chosen` (the selector decision), not the later byte rewrite,
-		// so a full read of the container does not erase them.
 		if (options.lexicalAbsolutePath !== undefined || options.located || !chosen.split) return withMedia;
-		return { ...withMedia, details: { ...withMedia.details, readTarget: chosen.split } };
+		const readTarget: NonNullable<ReadToolDetails["readTarget"]> = { ...chosen.split };
+		if (chosen.question !== undefined) readTarget.question = chosen.question;
+		return { ...withMedia, details: { ...withMedia.details, readTarget } };
 	}
-
 	/** {@link #readFilesystemPath}'s body; sets `media.path` once the read is known to be a whole Tern-viewable file. */
 	async #readFilesystemPipeline(
 		readPath: string,
@@ -2446,7 +2446,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					rememberReadSplit(chosen, literalSplit);
 				}
 			}
-
+			if (question !== undefined) chosen.question = question;
 			// `bin:main`, `bin:imports`, `bin:main:10-40`: an executable/IDB prefix
 			// routes to a disassembler view; `:raw` keeps the byte-verbatim escape hatch.
 			// Video frame selectors (`:0`) are no line selectors, and a video is no executable.
@@ -2581,6 +2581,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		// lexical path, so this is identical to absolutePath for them.
 		const renderAbsolutePath = lexicalAbsolutePath ?? absolutePath;
 		markRawSuffixResolution(suffixResolution, isRawSelector(parsed));
+		// `notes.txt:-5` resolved by suffix to `docs/notes.txt` records that file, so a
+		// later read of a different `notes.txt` cannot claim or erase this result.
+		if (suffixResolution && chosen.split?.path === suffixResolution.from) {
+			chosen.split = { ...chosen.split, path: suffixResolution.to };
+		}
 
 		if (isDirectory) {
 			if (question !== undefined) throw new ToolError(IMAGE_QUESTION_SELECTOR_ERROR);
@@ -3567,6 +3572,19 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	 * line selectors; byte content reads as a file of the same name and type.
 	 */
 	async #handleInternalUrl(
+		target: Pick<LocatedRead, "url" | "spec" | "sel">,
+		parsedSel: ParsedSelector,
+		question: string | undefined,
+		signal?: AbortSignal,
+		toolContext?: AgentToolContext,
+	): Promise<AgentToolResult<ReadToolDetails>> {
+		// Resource servers, not the workspace, serve these reads: mark the result
+		// external so pruning keys and file lists never treat the URL as a file.
+		const result = await this.#resolveInternalUrlResource(target, parsedSel, question, signal, toolContext);
+		return { ...result, details: { ...result.details, readTarget: { path: target.url, external: true } } };
+	}
+
+	async #resolveInternalUrlResource(
 		target: Pick<LocatedRead, "url" | "spec" | "sel">,
 		parsedSel: ParsedSelector,
 		question: string | undefined,

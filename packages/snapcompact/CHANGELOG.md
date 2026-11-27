@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Saved compaction file lists now mark resolved file paths (`readFilesResolved`) so literal colon filenames (a real `notes.txt:-60`) survive re-extraction instead of being split as selectors. ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
+
 ## [19.1.1] - 2026-11-23
 
 ### Fixed
