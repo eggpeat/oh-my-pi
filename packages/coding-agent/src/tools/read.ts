@@ -858,6 +858,15 @@ interface FilesystemReadOptions {
 	plainWindow?: boolean;
 }
 
+/** Filled with the path/selector the pipeline chose, before PDF/video rewrites. */
+interface ChosenReadSplit {
+	split?: { path: string; sel?: string };
+}
+
+function rememberReadSplit(chosen: ChosenReadSplit, split: { path: string; sel?: string }): void {
+	chosen.split = split.sel !== undefined ? { path: split.path, sel: split.sel } : { path: split.path };
+}
+
 /**
  * Workflow hint for a large located file: page it through its URL, search/copy its backing
  * file. `rawBlocked` explains a refused whole-file `:raw` read.
@@ -2317,9 +2326,18 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		options: FilesystemReadOptions,
 	): Promise<AgentToolResult<ReadToolDetails>> {
 		const media: { path?: string } = {};
-		const result = await this.#readFilesystemPipeline(readPath, options, media);
-		if (media.path === undefined || result.isError) return result;
-		return { ...result, details: { ...result.details, mediaPath: media.path } };
+		const chosen: ChosenReadSplit = {};
+		const result = await this.#readFilesystemPipeline(readPath, options, media, chosen);
+		const withMedia =
+			media.path === undefined || result.isError
+				? result
+				: { ...result, details: { ...result.details, mediaPath: media.path } };
+		// Speculative reads open an absolute path; the call still names the asked path.
+		// Located URL reads keep the URL as their identity. PDF page pictures and video
+		// timestamps stay on `chosen` (the selector decision), not the later byte rewrite,
+		// so a full read of the container does not erase them.
+		if (options.lexicalAbsolutePath !== undefined || options.located || !chosen.split) return withMedia;
+		return { ...withMedia, details: { ...withMedia.details, readTarget: chosen.split } };
 	}
 
 	/** {@link #readFilesystemPath}'s body; sets `media.path` once the read is known to be a whole Tern-viewable file. */
@@ -2327,6 +2345,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		readPath: string,
 		options: FilesystemReadOptions,
 		media: { path?: string },
+		chosen: ChosenReadSplit,
 	): Promise<AgentToolResult<ReadToolDetails>> {
 		const {
 			located,
@@ -2357,6 +2376,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		let literalSplit = located
 			? { path: readPath, sel: located.sel }
 			: await splitPathAndSelPreferringLiteral(readPath, this.session.cwd);
+		rememberReadSplit(chosen, literalSplit);
 		const rawPathIsLiteral =
 			!located &&
 			literalSplit.sel === undefined &&
@@ -2423,6 +2443,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				if (!located) {
 					readPath = questionTarget.jsonPath;
 					literalSplit = await splitPathAndSelPreferringLiteral(readPath, this.session.cwd);
+					rememberReadSplit(chosen, literalSplit);
 				}
 			}
 

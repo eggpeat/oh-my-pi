@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { type AgentMessage, Tokenizer } from "@oh-my-pi/pi-agent-core";
 import {
+	prepareBranchEntries,
 	pruneSupersededToolResults,
 	readToolSupersedeKey,
 	type SessionEntry,
@@ -10,7 +11,7 @@ import {
 } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import * as snapcompact from "@oh-my-pi/snapcompact";
-import { extractFileOpsFromMessage, stripReadSelector } from "../src/compaction/utils";
+import { extractFileOpsFromMessage, indexRecordedReadPaths, stripReadSelector } from "../src/compaction/utils";
 import { createAssistantMessage } from "./helpers";
 
 /** Key separator for line-selector reads (superseded by a complete bare-path read). */
@@ -197,5 +198,68 @@ describe("pruneSupersededToolResults — selector supersession", () => {
 		expect(result.prunedCount).toBe(1);
 		expect(resultText(result1)).toBe("[Superseded by a newer read of this file]");
 		expect(resultText(result2)).toBe(FILE_CONTENT);
+	});
+});
+
+describe("literal colon filenames", () => {
+	test("readToolSupersedeKey uses the path the read opened, not a fresh split of the argument", () => {
+		const opened = {
+			role: "toolResult",
+			toolCallId: "c",
+			toolName: "read",
+			content: [],
+			isError: false,
+			timestamp: T0,
+			details: { readTarget: { path: "notes.txt:-60" } },
+		} as ToolResultMessage;
+		expect(readToolSupersedeKey("read", { path: "notes.txt:-60" }, opened)).toBe("notes.txt:-60");
+		expect(readToolSupersedeKey("read", { path: "notes.txt:-60" })).toBe(`notes.txt${SEL_KEY}-60`);
+	});
+
+	test("a full read does not erase a result the tool opened as a different literal file", () => {
+		const [call1, result1] = readPair("notes.txt:-60", "literal file\n", T0);
+		(result1.message as ToolResultMessage).details = { readTarget: { path: "notes.txt:-60" } };
+		const [call2, result2] = readPair("notes.txt", FILE_CONTENT, T0 + 1_000);
+		(result2.message as ToolResultMessage).details = { readTarget: { path: "notes.txt" } };
+
+		const result = pruneStale([call1, result1, call2, result2], T0 + 1_000);
+
+		expect(result.prunedCount).toBe(0);
+		expect(resultText(result1)).toBe("literal file\n");
+		expect(resultText(result2)).toBe(FILE_CONTENT);
+	});
+
+	test("file lists keep the opened literal name beside the plain file", () => {
+		const call = createAssistantMessage([readCall("r1", "notes.txt:-60"), readCall("r2", "notes.txt")]);
+		const opened = {
+			role: "toolResult",
+			toolCallId: "r1",
+			toolName: "read",
+			content: [{ type: "text", text: "literal" }],
+			isError: false,
+			details: { readTarget: { path: "notes.txt:-60" } },
+		} as ToolResultMessage;
+		const fileOps = snapcompact.createFileOps();
+		extractFileOpsFromMessage(call, fileOps, indexRecordedReadPaths([call, opened]));
+		expect([...fileOps.read].sort()).toEqual(["notes.txt", "notes.txt:-60"]);
+	});
+
+	test("a saved file list keeps a literal colon name only when it was already resolved", () => {
+		const entry = (resolved: boolean | undefined) =>
+			({
+				type: "branch_summary",
+				id: "b1",
+				parentId: null,
+				timestamp: new Date(T0).toISOString(),
+				fromId: "from",
+				summary: "sum",
+				details: {
+					readFiles: ["notes.txt:-60"],
+					modifiedFiles: [],
+					...(resolved ? { readFilesResolved: true } : {}),
+				},
+			}) as SessionEntry;
+		expect([...prepareBranchEntries([entry(true)], tokenizer).fileOps.read]).toEqual(["notes.txt:-60"]);
+		expect([...prepareBranchEntries([entry(undefined)], tokenizer).fileOps.read]).toEqual(["notes.txt"]);
 	});
 });

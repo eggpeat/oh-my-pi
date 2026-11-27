@@ -71,6 +71,15 @@ export interface ReadToolDetails {
 	 * delimited part has no linkable fs path. Lets the TUI hyperlink each grouped row the same way a standalone read row is.
 	 */
 	displayReadTargetLinks?: Array<string | null>;
+	/**
+	 * Path and selector this read actually opened, after preferring a literal
+	 * colon filename over a trailing selector. Compaction file lists and
+	 * stale-read pruning use it instead of re-splitting the call argument, so a
+	 * real file named `notes.txt:-60` is not treated as the last 60 lines of
+	 * `notes.txt`. Unset for speculative reads (the call still names the asked
+	 * path) and for URL reads (the call path stays the URL).
+	 */
+	readTarget?: { path: string; sel?: string };
 }
 
 /** Selector facts of an internal URL scheme ({@link splitInternalUrlSel}). */

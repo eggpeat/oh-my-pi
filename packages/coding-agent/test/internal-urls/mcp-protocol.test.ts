@@ -7,7 +7,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { loadSkillsFromDir } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { readMcpResource } from "@oh-my-pi/pi-coding-agent/internal-urls/mcp-protocol";
-import { parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
+import { extractUriScheme, parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
 import { InternalUrlFilesystem } from "@oh-my-pi/pi-coding-agent/internal-urls/url-filesystem";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import type { MCPResource, MCPResourceReadResult, MCPResourceTemplate } from "@oh-my-pi/pi-coding-agent/mcp/types";
@@ -274,6 +274,36 @@ describe("McpProtocolHandler", () => {
 		expect(router.canResolve("Makefile:12")).toBe(false);
 		expect(router.canResolve("foo.ts:50-80")).toBe(false);
 		expect(router.canResolve("README:raw")).toBe(false);
+		// Advertised opaque resources stay on the resource server. Widening the
+		// selector guard to `:img` would send `asset:img` to the filesystem, while
+		// a per-chunk raw list still looked like a resource.
+		expect(router.canResolve("asset:img")).toBe(true);
+		expect(router.canResolve("Makefile:1-3:raw,9:raw")).toBe(true);
+	});
+
+	it("reads an advertised asset:img resource instead of a local file", async () => {
+		const resources = new Map<string, { resources: MCPResource[]; templates: MCPResourceTemplate[] }>();
+		resources.set("registry", {
+			resources: [{ uri: "asset:img", name: "picture" }],
+			templates: [],
+		});
+		MCPManager.setInstance(
+			createMockManager({
+				servers: ["registry"],
+				resources,
+				readResult: { contents: [{ uri: "asset:img", text: "resource bytes" }] },
+			}),
+		);
+		const result = await new ReadTool(createToolSession()).execute("read-asset-img", { path: "asset:img" });
+		const output = result.content.find(block => block.type === "text");
+		expect(output?.type).toBe("text");
+		if (output?.type !== "text") throw new Error("Expected text output");
+		expect(output.text).toContain("resource bytes");
+	});
+
+	it("classifies a long invalid colon chain without retrying every split", () => {
+		const chain = `Makefile:${"1:".repeat(40)}nope`;
+		expect(extractUriScheme(chain)).toBe("makefile");
 	});
 
 	it("preserves query parameters in MCP resource URI", async () => {

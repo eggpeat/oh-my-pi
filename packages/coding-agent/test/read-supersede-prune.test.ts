@@ -8,6 +8,8 @@ import {
 	readToolSupersedeKey,
 	type SessionEntry,
 } from "@oh-my-pi/pi-agent-core/compaction";
+import { extractFileOpsFromMessage, indexRecordedReadPaths } from "@oh-my-pi/pi-agent-core/compaction/utils";
+import * as snapcompact from "@oh-my-pi/snapcompact";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
@@ -169,5 +171,66 @@ describe("real read results through the supersede pass", () => {
 		});
 
 		expect(result.prunedCount).toBe(pruned);
+	});
+});
+
+describe("literal colon filename beside the file it looks like a selector of", () => {
+	test.skipIf(process.platform === "win32")(
+		"a full read of notes.txt does not erase the result of reading the real file notes.txt:-60",
+		async () => {
+			const literalName = "notes.txt:-60";
+			const literalText = "contents of the colon file\n";
+			await Bun.write(path.join(cwd, literalName), literalText);
+			try {
+				const literal = await reader.execute("literal", { path: literalName });
+				const plain = await reader.execute("plain", { path: "notes.txt" });
+				expect(literal.details?.readTarget).toEqual({ path: literalName });
+				expect(plain.details?.readTarget).toEqual({ path: "notes.txt" });
+				expect(
+					literal.content.some(block => block.type === "text" && block.text.includes(literalText.trim())),
+				).toBe(true);
+
+				const entries = [
+					...readEntries("literal", literalName, literal),
+					...readEntries("plain", "notes.txt", plain),
+				];
+				const pruned = pruneSupersededToolResults(entries, new Tokenizer(), {
+					supersedeKey: readToolSupersedeKey,
+					supersedeComplete: isCompleteReadResult,
+					protectedTools: [],
+					now: Date.now(),
+				});
+				expect(pruned.prunedCount).toBe(0);
+				const literalResult = entries[1];
+				if (literalResult.type !== "message" || literalResult.message.role !== "toolResult") {
+					throw new Error("expected a tool result");
+				}
+				expect(
+					literalResult.message.content.some(block => block.type === "text" && block.text.includes("colon file")),
+				).toBe(true);
+
+				const messages = entries.flatMap(entry => (entry.type === "message" ? [entry.message] : []));
+				const fileOps = snapcompact.createFileOps();
+				const recorded = indexRecordedReadPaths(messages);
+				for (const message of messages) extractFileOpsFromMessage(message, fileOps, recorded);
+				expect([...fileOps.read].sort()).toEqual(["notes.txt", literalName]);
+			} finally {
+				await fs.rm(path.join(cwd, literalName), { force: true });
+			}
+		},
+	);
+
+	test("a tail read of a file that has no literal colon sibling is still superseded by a full read", async () => {
+		const older = await reader.execute("tail", { path: "notes.txt:-5" });
+		const newer = await reader.execute("whole", { path: "notes.txt" });
+		expect(older.details?.readTarget).toEqual({ path: "notes.txt", sel: "-5" });
+		const entries = [...readEntries("tail", "notes.txt:-5", older), ...readEntries("whole", "notes.txt", newer)];
+		const pruned = pruneSupersededToolResults(entries, new Tokenizer(), {
+			supersedeKey: readToolSupersedeKey,
+			supersedeComplete: isCompleteReadResult,
+			protectedTools: [],
+			now: Date.now(),
+		});
+		expect(pruned.prunedCount).toBe(1);
 	});
 });

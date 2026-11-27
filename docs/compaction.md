@@ -385,7 +385,7 @@ Cumulative behavior:
 
 - Includes prior compaction details only when prior entry is pi-generated (`fromExtension !== true`).
 - In split turns, includes turn-prefix file ops too.
-- `details.readFiles` excludes files also modified; `details.modifiedFiles` carries the rest (persisted shape is unchanged).
+- `details.readFiles` excludes files also modified; `details.modifiedFiles` carries the rest. A read of a real file whose name looks like a selector (`notes.txt:-60`) stays that filename: the read tool records the path it opened, and file lists use that instead of splitting the call argument again. `details.readFilesResolved` is set on entries written with that choice. Older entries omit it, and their selector tails are still stripped so lists from before the change self-heal.
 
 The file list is a grouped, prefix-folded directory tree (find-tool shape) with a per-file access marker — `(Read)` for read-only files, `(Write)` for modified files never read, `(RW)` for modified files also present in the cumulative read set. Capped at 20 files with an `[…N files elided…]` line. LLM-summary strategies append it as a `<files>` tag (via `upsertFileOperations`); snapcompact renders it inside its summary template as a `FILES` section instead.
 
@@ -470,7 +470,7 @@ Branch summarization:
 5. Prepends `branch-summary-preamble.md`.
 6. Appends file-operation tags.
 
-Result is stored as `BranchSummaryEntry` with optional details (`readFiles`, `modifiedFiles`).
+Result is stored as `BranchSummaryEntry` with optional details (`readFiles`, `modifiedFiles`, and `readFilesResolved` once paths are the files actually opened — see file-operation context above).
 
 ## Extension and hook touchpoints
 

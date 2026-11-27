@@ -44,10 +44,52 @@ export function stripReadSelector(path: string): string {
 	return splitPathAndSel(path).path;
 }
 
+/** Path a read result says it opened, keyed by the tool call id. */
+export function recordedReadPath(message: AgentMessage): { toolCallId: string; path: string } | undefined {
+	if (message.role !== "toolResult" || message.toolName !== "read") return undefined;
+	const details = message.details;
+	if (!details || typeof details !== "object") return undefined;
+	const target = (details as { readTarget?: unknown }).readTarget;
+	if (!target || typeof target !== "object") return undefined;
+	const path = (target as { path?: unknown }).path;
+	if (typeof path !== "string" || path.length === 0) return undefined;
+	return { toolCallId: message.toolCallId, path };
+}
+
+/** toolCallId → path the read actually opened, for calls whose result recorded one. */
+export function indexRecordedReadPaths(messages: Iterable<AgentMessage>): ReadonlyMap<string, string> {
+	const recorded = new Map<string, string>();
+	for (const message of messages) {
+		const hit = recordedReadPath(message);
+		if (hit) recorded.set(hit.toolCallId, hit.path);
+	}
+	return recorded;
+}
+
+/**
+ * Add paths from a prior compaction or branch summary. `resolved` means they
+ * are already the paths reads opened (including literal colon filenames) and
+ * must not be split again. Older entries omit the flag; their selector tails
+ * are still stripped so lists written before that choice self-heal.
+ */
+export function addPriorReadFiles(
+	fileOps: snapcompact.FileOperations,
+	readFiles: readonly string[] | undefined,
+	resolved: boolean | undefined,
+): void {
+	if (!readFiles) return;
+	for (const file of readFiles) fileOps.read.add(resolved ? file : stripReadSelector(file));
+}
+
 /**
  * Extract file operations from tool calls in an assistant message.
+ * `recordedReads` maps a read call id to the path the tool actually opened.
  */
-export function extractFileOpsFromMessage(message: AgentMessage, fileOps: snapcompact.FileOperations): void {
+export function extractFileOpsFromMessage(
+	message: AgentMessage,
+	fileOps: snapcompact.FileOperations,
+	recordedReads?: ReadonlyMap<string, string>,
+): void {
 	if (message.role !== "assistant") return;
 	if (!("content" in message) || !Array.isArray(message.content)) return;
 
@@ -67,9 +109,11 @@ export function extractFileOpsFromMessage(message: AgentMessage, fileOps: snapco
 		if (snapcompact.isUrlSchemePath(path)) continue;
 
 		switch (block.name) {
-			case "read":
-				fileOps.read.add(stripReadSelector(path));
+			case "read": {
+				const recorded = typeof block.id === "string" ? recordedReads?.get(block.id) : undefined;
+				fileOps.read.add(recorded ?? stripReadSelector(path));
 				break;
+			}
 			case "write":
 				fileOps.written.add(path);
 				break;

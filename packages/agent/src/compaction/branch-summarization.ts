@@ -24,11 +24,12 @@ import {
 import branchSummaryPrompt from "./prompts/branch-summary.md" with { type: "text" };
 import branchSummaryPreamble from "./prompts/branch-summary-preamble.md" with { type: "text" };
 import {
+	addPriorReadFiles,
 	extractFileOpsFromMessage,
 	incompleteOutputError,
+	indexRecordedReadPaths,
 	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversationForSummary,
-	stripReadSelector,
 	truncateToolResultForSummary,
 } from "./utils";
 
@@ -48,6 +49,8 @@ export interface BranchSummaryResult {
 export interface BranchSummaryDetails {
 	readFiles: string[];
 	modifiedFiles: string[];
+	/** See {@link CompactionDetails.readFilesResolved}. */
+	readFilesResolved?: boolean;
 }
 
 export interface BranchPreparation {
@@ -257,9 +260,11 @@ export function prepareBranchEntries(
 	for (const entry of entries) {
 		if (entry.type === "branch_summary" && !entry.fromExtension && entry.details) {
 			const details = entry.details as BranchSummaryDetails;
-			if (Array.isArray(details.readFiles)) {
-				for (const f of details.readFiles) fileOps.read.add(stripReadSelector(f));
-			}
+			addPriorReadFiles(
+				fileOps,
+				Array.isArray(details.readFiles) ? details.readFiles : undefined,
+				details.readFilesResolved,
+			);
 			if (Array.isArray(details.modifiedFiles)) {
 				// Modified files go into both edited and written for proper deduplication
 				for (const f of details.modifiedFiles) {
@@ -269,6 +274,13 @@ export function prepareBranchEntries(
 		}
 	}
 
+	const recordedReads = indexRecordedReadPaths(
+		entries.flatMap(entry => {
+			const message = getMessageFromEntry(entry);
+			return message ? [message] : [];
+		}),
+	);
+
 	// Second pass: walk from newest to oldest, adding messages until token budget
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
@@ -276,7 +288,7 @@ export function prepareBranchEntries(
 		if (!message) continue;
 
 		// Extract file ops from assistant messages (tool calls)
-		extractFileOpsFromMessage(message, fileOps);
+		extractFileOpsFromMessage(message, fileOps, recordedReads);
 
 		const tokens = estimateBranchSummaryTokens(message, tokenizer);
 

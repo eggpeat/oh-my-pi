@@ -94,12 +94,13 @@ import handoffDocumentPrompt from "./prompts/handoff-document.md" with { type: "
 import snapcompactArchiveContextPrompt from "./prompts/snapcompact-archive-context.md" with { type: "text" };
 
 import {
+	addPriorReadFiles,
 	escapeSummaryBoundaryTags,
 	extractFileOpsFromMessage,
 	incompleteOutputError,
+	indexRecordedReadPaths,
 	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversationForSummary,
-	stripReadSelector,
 } from "./utils";
 
 // ============================================================================
@@ -110,6 +111,12 @@ import {
 export interface CompactionDetails {
 	readFiles: string[];
 	modifiedFiles: string[];
+	/**
+	 * `readFiles` are already the paths reads opened, including a literal colon
+	 * filename such as `notes.txt:-60`. Absent on entries written before that
+	 * choice; those lists are still selector-stripped so they self-heal.
+	 */
+	readFilesResolved?: boolean;
 }
 
 /**
@@ -119,6 +126,7 @@ function extractFileOperations(
 	messages: AgentMessage[],
 	entries: SessionEntry[],
 	prevCompactionIndex: number,
+	recordedReads?: ReadonlyMap<string, string>,
 ): snapcompact.FileOperations {
 	const fileOps = snapcompact.createFileOps();
 
@@ -127,18 +135,22 @@ function extractFileOperations(
 		const prevCompaction = entries[prevCompactionIndex] as CompactionEntry;
 		if (!prevCompaction.fromExtension && prevCompaction.details) {
 			const details = prevCompaction.details as CompactionDetails;
-			if (Array.isArray(details.readFiles)) {
-				for (const f of details.readFiles) fileOps.read.add(stripReadSelector(f));
-			}
+			addPriorReadFiles(
+				fileOps,
+				Array.isArray(details.readFiles) ? details.readFiles : undefined,
+				details.readFilesResolved,
+			);
 			if (Array.isArray(details.modifiedFiles)) {
 				for (const f of details.modifiedFiles) fileOps.edited.add(f);
 			}
 		}
 	}
 
-	// Extract from tool calls in messages
+	// Extract from tool calls in messages. A recorded read target (the path the
+	// tool opened) wins over re-splitting the call argument.
+	const recorded = recordedReads ?? indexRecordedReadPaths(messages);
 	for (const msg of messages) {
-		extractFileOpsFromMessage(msg, fileOps);
+		extractFileOpsFromMessage(msg, fileOps, recorded);
 	}
 
 	return fileOps;
@@ -1685,13 +1697,16 @@ function prepareCompactionUnlabeled(
 		recentEntryIds.push(compactionEntries[i].id);
 	}
 
-	// Extract file operations from messages and previous compaction
-	const fileOps = extractFileOperations(messagesToSummarize, pathEntries, prevCompactionIndex);
+	// Extract file operations from messages and previous compaction. Index read
+	// targets across the turn prefix too, so a call and its result can sit on
+	// opposite sides of a split and still name the file that was opened.
+	const recordedReads = indexRecordedReadPaths([...messagesToSummarize, ...turnPrefixMessages]);
+	const fileOps = extractFileOperations(messagesToSummarize, pathEntries, prevCompactionIndex, recordedReads);
 
 	// Also extract file ops from turn prefix if splitting
 	if (cutPoint.isSplitTurn) {
 		for (const msg of turnPrefixMessages) {
-			extractFileOpsFromMessage(msg, fileOps);
+			extractFileOpsFromMessage(msg, fileOps, recordedReads);
 		}
 	}
 
@@ -2299,7 +2314,8 @@ export async function compact(
 				: safeCut === originalCut
 					? firstKeptEntryId
 					: (recentEntryIds?.[safeCut - originalCut] ?? "");
-		for (let i = originalCut; i < safeCut; i++) extractFileOpsFromMessage(allMessages[i], fileOps);
+		const lateReads = indexRecordedReadPaths(allMessages);
+		for (let i = originalCut; i < safeCut; i++) extractFileOpsFromMessage(allMessages[i], fileOps, lateReads);
 		const summarizedMessages = [
 			...(previousSummaryMessage ? [previousSummaryMessage] : []),
 			...allMessages.slice(0, safeCut),
@@ -2497,7 +2513,7 @@ export async function compact(
 		...(shortSummary !== undefined ? { shortSummary } : {}),
 		firstKeptEntryId: nativeSummary !== undefined ? nativeFirstKeptEntryId : firstKeptEntryId,
 		tokensBefore,
-		details: { readFiles, modifiedFiles } as CompactionDetails,
+		details: { readFiles, modifiedFiles, readFilesResolved: true } as CompactionDetails,
 		preserveData: finalPreserveData,
 		...(remoteReplayThroughEntryId ? { providerReplayThroughEntryId: remoteReplayThroughEntryId } : {}),
 	};

@@ -127,8 +127,16 @@ export const USELESS_NOTICE = "[Uneventful result elided]";
  * newest successful result for `K` is complete (see
  * {@link SupersedeCompleteFn}). Return `undefined` to exempt a call from
  * supersede grouping.
+ *
+ * `result`, when passed, is the tool result being keyed. Read pruning uses it
+ * for the path and selector the tool actually opened, which can differ from a
+ * fresh split of `args` when a colon filename is a real file.
  */
-export type SupersedeKeyFn = (toolName: string, args: Record<string, unknown>) => string | undefined;
+export type SupersedeKeyFn = (
+	toolName: string,
+	args: Record<string, unknown>,
+	result?: ToolResultMessage,
+) => string | undefined;
 
 /**
  * Whether a successful keyed result shows its whole target, so a result for a
@@ -385,7 +393,7 @@ function collectSupersededResults(
 		const toolCall = toolCalls.get(message.toolCallId);
 		if (!toolCall) continue;
 		if (isProtectedToolResult(message, toolCall, protectedTools)) continue;
-		const key = supersedeKey(toolCall.name, toolCall.arguments as Record<string, unknown>);
+		const key = supersedeKey(toolCall.name, toolCall.arguments as Record<string, unknown>, message);
 		if (key === undefined) continue;
 		const separator = key.indexOf("\u0000");
 		const sameKey = newerByKey.get(key);
@@ -666,9 +674,11 @@ export function pruneToolOutputs(
 }
 
 /**
- * Supersede key for the `read` tool: the file path with the trailing line/raw
- * selector stripped (the read tool's own splitter, {@link splitPathAndSel},
- * e.g. `src/foo.ts:50-200`, `:-60`, `:img`, `:2-4:raw`).
+ * Supersede key for the `read` tool: the file the read actually opened.
+ * When the result records `readTarget` (the path and selector chosen at read
+ * time), that wins, so a real file named `notes.txt:-60` is not keyed as the
+ * last 60 lines of `notes.txt`. Otherwise the call path is split with the read
+ * tool's own splitter ({@link splitPathAndSel}).
  * Internal/URL-scheme paths (`skill://…`, `https://…`) are exempt.
  * Selector-free reads key on the bare path; line-range reads key on
  * `path + "\u0000" + selector`, so a complete bare-path read can supersede them.
@@ -677,12 +687,30 @@ export function pruneToolOutputs(
  * source), so they key on `path + "\u0001" + selector` and are superseded only
  * by the same selector.
  */
-export function readToolSupersedeKey(toolName: string, args: Record<string, unknown>): string | undefined {
+export function readToolSupersedeKey(
+	toolName: string,
+	args: Record<string, unknown>,
+	result?: ToolResultMessage,
+): string | undefined {
 	if (toolName !== "read") return undefined;
 	const path = args.path;
 	if (typeof path !== "string" || path.length === 0) return undefined;
 	if (path.includes("://")) return undefined;
-	const { path: base, sel } = splitPathAndSel(path);
-	if (sel === undefined) return base;
-	return `${base}${isAlternateFormReadSelector(sel) ? "\u0001" : "\u0000"}${sel}`;
+	const recorded = result ? recordedReadSplit(result) : undefined;
+	const split = recorded ?? splitPathAndSel(path);
+	if (split.sel === undefined) return split.path;
+	return `${split.path}${isAlternateFormReadSelector(split.sel) ? "\u0001" : "\u0000"}${split.sel}`;
+}
+
+/** Path and selector a read result says it opened, when the tool recorded one. */
+function recordedReadSplit(result: ToolResultMessage): { path: string; sel?: string } | undefined {
+	const details = result.details;
+	if (!details || typeof details !== "object") return undefined;
+	const target = (details as { readTarget?: unknown }).readTarget;
+	if (!target || typeof target !== "object") return undefined;
+	const recordedPath = (target as { path?: unknown }).path;
+	if (typeof recordedPath !== "string" || recordedPath.length === 0) return undefined;
+	const sel = (target as { sel?: unknown }).sel;
+	if (sel !== undefined && typeof sel !== "string") return undefined;
+	return typeof sel === "string" && sel.length > 0 ? { path: recordedPath, sel } : { path: recordedPath };
 }

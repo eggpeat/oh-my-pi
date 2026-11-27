@@ -739,6 +739,11 @@ export interface FileOperations {
 export interface CompactionDetails {
 	readFiles: string[];
 	modifiedFiles: string[];
+	/**
+	 * `readFiles` are already the paths reads opened. Absent on older entries,
+	 * whose selector tails are still stripped when a later compaction reloads them.
+	 */
+	readFilesResolved?: boolean;
 }
 
 export interface CompactionPreparation<TMessage = Message> {
@@ -2715,7 +2720,7 @@ export async function compact<TMessage = Message>(
 		shortSummary: `Archived ${totalChars.toLocaleString()} chars of history onto ${frames.length} snapcompact frame${frames.length === 1 ? "" : "s"}${textNote}`,
 		firstKeptEntryId,
 		tokensBefore,
-		details: { readFiles, modifiedFiles },
+		details: { readFiles, modifiedFiles, readFilesResolved: true },
 		preserveData: { ...basePreserve, [PRESERVE_KEY]: archive },
 	};
 }

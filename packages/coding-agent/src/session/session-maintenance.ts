@@ -449,7 +449,7 @@ function handoffSummaryFromDocument(
 	const { readFiles, modifiedFiles } = snapcompact.computeFileLists(preparation.fileOps);
 	return {
 		summary: snapcompact.upsertFileOperations(document, readFiles, modifiedFiles, preparation.fileOps.read),
-		details: { readFiles, modifiedFiles },
+		details: { readFiles, modifiedFiles, readFilesResolved: true },
 	};
 }
 
