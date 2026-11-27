@@ -29,9 +29,9 @@ async function startedDaemon(grace: string): Promise<TestDaemon> {
 	return started.daemon;
 }
 
-/** Whether the daemon is gone within `timeoutMs`. */
-async function exitedWithin(daemon: TestDaemon, timeoutMs: number): Promise<boolean> {
-	return await Promise.race([daemon.exited.then(() => true), Bun.sleep(timeoutMs).then(() => false)]);
+/** Whether the daemon is gone within `timeoutMs`, with its exit code. */
+async function exitCodeWithin(daemon: TestDaemon, timeoutMs: number): Promise<number | undefined> {
+	return await Promise.race([daemon.exited, Bun.sleep(timeoutMs).then(() => undefined)]);
 }
 
 describe.skipIf(process.platform === "win32")("daemon idle grace", () => {
@@ -40,18 +40,20 @@ describe.skipIf(process.platform === "win32")("daemon idle grace", () => {
 		async () => {
 			const daemon = await startedDaemon("0");
 
-			expect(await exitedWithin(daemon, DEFAULT_GRACE_MS / 2)).toBe(true);
+			expect(await exitCodeWithin(daemon, DEFAULT_GRACE_MS / 2)).toBe(0);
 		},
 		TEST_TIMEOUT_MS,
 	);
 
 	it(
-		"keeps running past the default grace when a longer grace is configured",
+		"keeps running past the default grace and shuts down after a longer grace",
 		async () => {
-			const daemon = await startedDaemon("30000");
+			// A numeric prefix: only the leading digits count.
+			const daemon = await startedDaemon("6000ms");
 
-			await Bun.sleep(DEFAULT_GRACE_MS + 1_000);
+			await Bun.sleep(DEFAULT_GRACE_MS + 500);
 			expect(daemon.running).toBe(true);
+			expect(await exitCodeWithin(daemon, 10_000)).toBe(0);
 		},
 		TEST_TIMEOUT_MS,
 	);
@@ -63,7 +65,18 @@ describe.skipIf(process.platform === "win32")("daemon idle grace", () => {
 
 			await Bun.sleep(DEFAULT_GRACE_MS / 2);
 			expect(daemon.running).toBe(true);
-			expect(await exitedWithin(daemon, DEFAULT_GRACE_MS * 2)).toBe(true);
+			expect(await exitCodeWithin(daemon, DEFAULT_GRACE_MS * 2)).toBe(0);
+		},
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"caps a grace that overflows instead of falling back to the default",
+		async () => {
+			const daemon = await startedDaemon("9".repeat(320));
+
+			await Bun.sleep(DEFAULT_GRACE_MS + 500);
+			expect(daemon.running).toBe(true);
 		},
 		TEST_TIMEOUT_MS,
 	);

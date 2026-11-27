@@ -6,7 +6,15 @@
  */
 import * as fs from "node:fs/promises";
 import { execReplace, FileLock, type IpcConnection, IpcServer } from "@oh-my-pi/pi-natives";
-import { errorMessage, isEnoent, isRecord, logger, postmortem, setProcessName } from "@oh-my-pi/pi-utils";
+import {
+	errorMessage,
+	isEnoent,
+	isRecord,
+	logger,
+	MAX_TIMER_DELAY_MS,
+	postmortem,
+	setProcessName,
+} from "@oh-my-pi/pi-utils";
 import { daemonBuildId } from "./build";
 import { isSameProcess, processStartTime } from "./children";
 import type { ModuleClient, ModuleTunnel } from "./module";
@@ -46,8 +54,6 @@ const LISTEN_OPTIONS = { framing: "lines", maxFrameBytes: MAX_FRAME_BYTES } as c
 const LOCK_HANDOVER_TIMEOUT_MS = 10_000;
 /** A handover record older than this is stale even when its pid is alive. */
 const HANDOVER_MAX_AGE_MS = 60_000;
-/** Largest delay a single timer can hold; a longer wait would fire at once instead. */
-const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 /** Daemon side of one tunnelled connection. */
 class ConnectionTunnel implements ModuleTunnel {
@@ -542,16 +548,22 @@ async function acquireDaemonLock(retryMs: number): Promise<FileLock | undefined>
 
 /**
  * Milliseconds from env var `name`: the base-10 `parseInt` prefix (`5s` reads as `5`, `2.5` as `2`),
- * `0` honoured, negative values and values without leading digits fall back to `fallback`. Longer
- * waits are capped at {@link MAX_TIMER_DELAY_MS}, the largest delay a timer can hold, so a big
- * value never collapses into a 1 ms wait.
+ * `0` honoured, negative values and values without leading digits fall back to `fallback`. A wait
+ * longer than {@link MAX_TIMER_DELAY_MS}, the largest delay a timer can hold, is capped there so a
+ * big value never collapses into a 1 ms wait.
  */
-function graceMsFromEnv(name: string, fallback: number): number {
+function idleGraceMsFromEnv(name: string, fallback: number): number {
 	const raw = process.env[name];
 	if (raw === undefined) return fallback;
 	const graceMs = Number.parseInt(raw, 10);
-	if (!Number.isFinite(graceMs) || graceMs < 0) return fallback;
+	if (Number.isNaN(graceMs) || graceMs < 0) return fallback;
 	return Math.min(graceMs, MAX_TIMER_DELAY_MS);
+}
+
+/** Milliseconds from env var `name` when positive, else `fallback` (the reconnect lease grace). */
+function leaseGraceMsFromEnv(name: string, fallback: number): number {
+	const graceMs = Number(process.env[name]);
+	return graceMs > 0 ? graceMs : fallback;
 }
 
 /** Run the daemon until it goes idle, is shut down, or replaces itself. Returns at once when another daemon holds the lock. */
@@ -576,8 +588,8 @@ export async function startDaemonFromEnvironment(): Promise<void> {
 			lock,
 			store,
 			resumed,
-			graceMsFromEnv(DAEMON_RESUME_LEASE_GRACE_ENV, DAEMON_RESUME_LEASE_GRACE_MS),
-			graceMsFromEnv(DAEMON_IDLE_GRACE_ENV, DAEMON_IDLE_EXIT_GRACE_MS),
+			leaseGraceMsFromEnv(DAEMON_RESUME_LEASE_GRACE_ENV, DAEMON_RESUME_LEASE_GRACE_MS),
+			idleGraceMsFromEnv(DAEMON_IDLE_GRACE_ENV, DAEMON_IDLE_EXIT_GRACE_MS),
 		);
 		const cancelCleanup = postmortem.register("omp-daemon", () => daemon?.shutdown());
 		try {
