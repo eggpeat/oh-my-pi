@@ -22,8 +22,8 @@ import {
 } from "./paths";
 import {
 	compareDaemonBuilds,
-	DAEMON_IDLE_EXIT_GRACE_ENV,
 	DAEMON_IDLE_EXIT_GRACE_MS,
+	DAEMON_IDLE_GRACE_ENV,
 	DAEMON_PROTOCOL_VERSION,
 	DAEMON_RESUME_ENV,
 	DAEMON_RESUME_LEASE_GRACE_ENV,
@@ -46,6 +46,8 @@ const LISTEN_OPTIONS = { framing: "lines", maxFrameBytes: MAX_FRAME_BYTES } as c
 const LOCK_HANDOVER_TIMEOUT_MS = 10_000;
 /** A handover record older than this is stale even when its pid is alive. */
 const HANDOVER_MAX_AGE_MS = 60_000;
+/** Largest delay a single timer can hold; a longer wait would fire at once instead. */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 /** Daemon side of one tunnelled connection. */
 class ConnectionTunnel implements ModuleTunnel {
@@ -176,6 +178,8 @@ class Daemon {
 	readonly #finished = Promise.withResolvers<void>();
 	#server: IpcServer | undefined;
 	#idleTimer: NodeJS.Timeout | undefined;
+	/** Whether a client already completed the hello handshake; before that the daemon waits for its first client with the default grace. */
+	#sawClient = false;
 	/** `upgrade` or `shutdown` began: new requests are rejected. */
 	#closing = false;
 	#shutdown: Promise<void> | undefined;
@@ -274,6 +278,7 @@ class Daemon {
 				if (hello.token !== this.#token) throw new Error("Daemon authentication failed");
 				if (this.#closing) throw new Error("Daemon is shutting down");
 				state.hello = hello;
+				this.#sawClient = true;
 				state.client = {
 					connectionId: state.client.connectionId,
 					pid: hello.client.pid,
@@ -474,11 +479,14 @@ class Daemon {
 			return;
 		}
 		if (this.#idleTimer) return;
+		// The configured grace counts from the last client's disconnect; a daemon nobody has
+		// talked to yet waits the default grace for its first client.
+		const graceMs = this.#sawClient ? this.#idleExitGraceMs : DAEMON_IDLE_EXIT_GRACE_MS;
 		this.#idleTimer = setTimeout(() => {
 			this.#idleTimer = undefined;
 			if (this.#closing || this.#connections.size > 0 || this.#units.keepsDaemonAlive()) return;
 			void this.shutdown();
-		}, this.#idleExitGraceMs);
+		}, graceMs);
 	}
 }
 
@@ -532,10 +540,18 @@ async function acquireDaemonLock(retryMs: number): Promise<FileLock | undefined>
 	}
 }
 
-/** Milliseconds from env var `name` when positive, else `fallback`. */
+/**
+ * Milliseconds from env var `name`: the base-10 `parseInt` prefix (`5s` reads as `5`, `2.5` as `2`),
+ * `0` honoured, negative values and values without leading digits fall back to `fallback`. Longer
+ * waits are capped at {@link MAX_TIMER_DELAY_MS}, the largest delay a timer can hold, so a big
+ * value never collapses into a 1 ms wait.
+ */
 function graceMsFromEnv(name: string, fallback: number): number {
-	const graceMs = Number(process.env[name]);
-	return graceMs > 0 ? graceMs : fallback;
+	const raw = process.env[name];
+	if (raw === undefined) return fallback;
+	const graceMs = Number.parseInt(raw, 10);
+	if (!Number.isFinite(graceMs) || graceMs < 0) return fallback;
+	return Math.min(graceMs, MAX_TIMER_DELAY_MS);
 }
 
 /** Run the daemon until it goes idle, is shut down, or replaces itself. Returns at once when another daemon holds the lock. */
@@ -561,7 +577,7 @@ export async function startDaemonFromEnvironment(): Promise<void> {
 			store,
 			resumed,
 			graceMsFromEnv(DAEMON_RESUME_LEASE_GRACE_ENV, DAEMON_RESUME_LEASE_GRACE_MS),
-			graceMsFromEnv(DAEMON_IDLE_EXIT_GRACE_ENV, DAEMON_IDLE_EXIT_GRACE_MS),
+			graceMsFromEnv(DAEMON_IDLE_GRACE_ENV, DAEMON_IDLE_EXIT_GRACE_MS),
 		);
 		const cancelCleanup = postmortem.register("omp-daemon", () => daemon?.shutdown());
 		try {

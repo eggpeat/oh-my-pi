@@ -34,8 +34,12 @@ export const DAEMON_RESUME_LEASE_GRACE_MS = 15_000;
 export const DAEMON_RESUME_LEASE_GRACE_ENV = "OMP_DAEMON_RESUME_LEASE_GRACE_MS";
 /** How long an idle daemon (no connection, no unit holding it) lingers before it exits. */
 export const DAEMON_IDLE_EXIT_GRACE_MS = 3_000;
-/** Env var overriding {@link DAEMON_IDLE_EXIT_GRACE_MS} (milliseconds) in the daemon; for tests. */
-export const DAEMON_IDLE_EXIT_GRACE_ENV = "OMP_DAEMON_IDLE_EXIT_GRACE_MS";
+/**
+ * Env var overriding {@link DAEMON_IDLE_EXIT_GRACE_MS} (milliseconds) in the daemon; read once at
+ * daemon start, base-10 `parseInt` prefix, `0` exits at once. Documented in
+ * `docs/environment-variables.md`.
+ */
+export const DAEMON_IDLE_GRACE_ENV = "OMP_DAEMON_IDLE_GRACE_MS";
 
 export type DaemonSignal = "SIGINT" | "SIGTERM" | "SIGHUP" | "SIGQUIT" | "SIGKILL";
 
