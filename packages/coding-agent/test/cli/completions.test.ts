@@ -304,4 +304,65 @@ describe("live completion surface", () => {
 		expect(stdout).not.toContain("_omp_cmd_launch");
 		expect(stdout).not.toContain("_omp_cmd___complete");
 	}, 30_000);
+
+	it("completes every launch flag the argv parser accepts, with the value kind each one takes", async () => {
+		const stdout = await generateLiveCompletion("zsh");
+
+		// Match the flag name, repeatability and completion action — not the
+		// English description, which is free to change.
+		expect(stdout).toMatch(/'--fork\[[^\]]*\]:session:_omp_call sessions'/);
+		// `--session` takes an optional value, so its action is optional (`::`).
+		expect(stdout).toMatch(/'--session\[[^\]]*\]::session:_omp_call sessions'/);
+		expect(stdout).toMatch(/'\*--plugin-dir\[[^\]]*\]:dir:_files -\/'/);
+		// An absolute path is required, so only absolute paths are suggested.
+		expect(stdout).toMatch(/'\*--trusted-extension\[[^\]]*\]:file:_omp_abs_files'/);
+		// Literal values never complete filenames.
+		expect(stdout).toMatch(/'--provider-session-id\[[^\]]*\]:value:/);
+		expect(stdout).toMatch(/'--prompt-cache-key\[[^\]]*\]:value:/);
+	}, 30_000);
+});
+
+describe.skipIf(!hasBash)("live bash completion", () => {
+	/** Drive the generated dispatcher with Bash's completion variables. */
+	async function complete(words: string[]): Promise<string[]> {
+		const completion = await generateLiveCompletion("bash");
+		await using dir = await TempDir.create("@omp-bash-completion-");
+		// A stub `omp` on PATH: the dynamic session lookup must not run a real CLI.
+		const stub = dir.join("omp");
+		await Bun.write(stub, "#!/bin/sh\nprintf 'abc123\\tsession\\n'\n");
+		await fs.promises.chmod(stub, 0o755);
+		await Bun.write(dir.join("README.md"), "");
+		const script = `${completion}
+compopt() { :; }
+COMP_WORDS=(omp "$@")
+COMP_CWORD=$((\${#COMP_WORDS[@]} - 1))
+_omp
+printf '%s\\n' "\${COMPREPLY[@]}"
+`;
+		const result = Bun.spawnSync(["bash", "--noprofile", "--norc", "-c", script, "bash", ...words], {
+			cwd: dir.path(),
+			env: { ...process.env, PATH: `${dir.path()}:${process.env.PATH}`, BASH_ENV: "" },
+		});
+		expect(result.exitCode, result.stderr.toString()).toBe(0);
+		return result.stdout.toString().split("\n").filter(Boolean);
+	}
+
+	it("completes a session id for --session and still offers the flag names for a dash word", async () => {
+		expect(await complete(["--session", "abc"])).toEqual(["abc123"]);
+		expect(await complete(["--session", "--mo"])).toContain("--model");
+	});
+
+	it("offers no file names for flags that take a literal value", async () => {
+		expect(await complete(["--provider-session-id", ""])).toEqual([]);
+		expect(await complete(["--prompt-cache-key", ""])).toEqual([]);
+		expect(await complete(["--provider-session-id", "READ"])).toEqual([]);
+	});
+
+	it("offers only absolute paths for a flag that requires an absolute path", async () => {
+		expect(await complete(["--trusted-extension", ""])).toEqual([]);
+		expect(await complete(["--trusted-extension", "./"])).toEqual([]);
+		const absolute = await complete(["--trusted-extension", "/et"]);
+		expect(absolute.length).toBeGreaterThan(0);
+		for (const candidate of absolute) expect(candidate.startsWith("/")).toBe(true);
+	});
 });
