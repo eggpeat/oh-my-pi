@@ -22,6 +22,7 @@ import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { isEstimateCacheable, messageEstimateVersion } from "./compaction/message-cache";
 import { base64ImageSize, estimateImageTokens, type ImageDetail, type ImageSize } from "./image-tokens";
+import { isExcludedFromContext } from "./message-context";
 import type { AgentMessage } from "./types";
 
 const testEnv = Bun.env.NODE_ENV === "test";
@@ -479,6 +480,7 @@ export class Tokenizer {
 	}
 
 	#measureMessage(message: AgentMessage, excludeEncryptedReasoning: boolean, latestTurn: boolean): number {
+		if (isExcludedFromContext(message)) return 0;
 		const appTokens = this.#measureAppMessage(message);
 		if (appTokens !== undefined) return appTokens;
 		const fragments: string[] = [];
@@ -703,7 +705,6 @@ export class Tokenizer {
 		const role: string = message.role;
 		const execution = role === "bashExecution" || role === "pythonExecution";
 		if (!execution && role !== "fileMention") return undefined;
-		if (execution && "excludeFromContext" in message && message.excludeFromContext) return 0;
 		const fragments: string[] = [];
 		let extra = 0;
 		if (execution) {

@@ -6,6 +6,7 @@ import {
 	type CustomMessageEntry,
 	DEFAULT_COMPACTION_SETTINGS,
 	findCutPoint,
+	isTurnStartEntry,
 	prepareCompaction,
 	type SessionMessageEntry,
 } from "@oh-my-pi/pi-agent-core/compaction";
@@ -44,6 +45,27 @@ function branchSummaryEntry(summary: string): BranchSummaryEntry {
 		type: "branch_summary",
 		fromId: "branch-root",
 		summary,
+	};
+}
+
+function userEntry(text: string): SessionMessageEntry {
+	return { ...base("message"), type: "message", message: createUserMessage(text) };
+}
+
+function executionEntry(role: "bashExecution" | "pythonExecution", excludeFromContext = false): SessionMessageEntry {
+	return {
+		...base("message"),
+		type: "message",
+		message: {
+			role,
+			...(role === "bashExecution" ? { command: "cat build.log" } : { code: "print(open('build.log').read())" }),
+			output: "build step finished without warnings",
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+			timestamp: 0,
+			...(excludeFromContext ? { excludeFromContext: true } : {}),
+		} as unknown as SessionMessageEntry["message"],
 	};
 }
 
@@ -96,6 +118,40 @@ describe("findCutPoint backward scan boundaries", () => {
 		expect(preparation?.messagesToSummarize).toEqual([oldAssistant.message]);
 		expect(preparation?.turnPrefixMessages).toEqual([]);
 		expect(preparation?.recentMessages).toHaveLength(2);
+	});
+
+	test("ignores excluded bash executions for both cut points and turn boundaries", () => {
+		const user = userEntry("Review the build");
+		const assistant = assistantEntry("x".repeat(100_000));
+		const excluded = executionEntry("bashExecution", true);
+		const entries = [user, assistant, excluded];
+
+		expect(isTurnStartEntry(excluded)).toBe(false);
+		const cut = findCutPoint(entries, tokenizer, 0, entries.length, 20_000);
+		expect(cut).toEqual({ firstKeptEntryIndex: 1, turnStartIndex: 0, isSplitTurn: true });
+
+		const preparation = prepareCompaction(entries, { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 20_000 });
+		expect(preparation?.firstKeptEntryId).toBe(assistant.id);
+		expect(preparation?.messagesToSummarize).toEqual([]);
+		expect(preparation?.turnPrefixMessages).toEqual([user.message]);
+		expect(preparation?.recentMessages).toEqual([assistant.message]);
+	});
+
+	test("treats a Python execution as the start of a retainable turn", () => {
+		const user = userEntry("Review the old build");
+		const oldAssistant = assistantEntry("x".repeat(100_000));
+		const python = executionEntry("pythonExecution");
+		const assistant = assistantEntry("small answer");
+		const entries = [user, oldAssistant, python, assistant];
+
+		const cut = findCutPoint(entries, tokenizer, 0, entries.length, 20_000);
+		expect(cut).toEqual({ firstKeptEntryIndex: 2, turnStartIndex: -1, isSplitTurn: false });
+
+		const preparation = prepareCompaction(entries, { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 20_000 });
+		expect(preparation?.firstKeptEntryId).toBe(python.id);
+		expect(preparation?.messagesToSummarize).toEqual([user.message, oldAssistant.message]);
+		expect(preparation?.turnPrefixMessages).toEqual([]);
+		expect(preparation?.recentMessages).toEqual([python.message, assistant.message]);
 	});
 
 	describe("counts the reasoning the latest turn replays when its tool calls were abandoned", () => {

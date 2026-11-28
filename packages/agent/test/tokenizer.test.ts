@@ -232,6 +232,21 @@ describe("countMessage", () => {
 		expect(textOnly).toBeGreaterThan(0);
 		expect(withImage).toBe(textOnly + inToolResultImageEstimate(tokenizer));
 	});
+
+	test("counts 0 for a custom message no request carries", () => {
+		const tokenizer = new Tokenizer();
+		const included = {
+			role: "custom",
+			customType: "note",
+			content: TEXT,
+			display: true,
+			timestamp: 0,
+		} as AgentMessage;
+		const excluded = { ...included, excludeFromContext: true } as AgentMessage;
+
+		expect(tokenizer.countMessage(included)).toBeGreaterThan(0);
+		expect(tokenizer.countMessage(excluded)).toBe(0);
+	});
 });
 
 // Contract: the coding-agent's app roles count what its `convertToLlm` sends
