@@ -103,7 +103,11 @@ fn parse_with_options(
 	patch_text: &str,
 	streaming: bool,
 ) -> Result<Vec<ApplyPatchEntry>, EditError> {
-	let mut lines = js_trim(patch_text).split('\n').collect::<Vec<_>>();
+	// A payload written on Windows (or by a model emitting `\r\n`) splits on
+	// `\n` into rows that keep a trailing `\r`, which would land in a path
+	// (`*** Move to: dest\r`) or in every added line. Normalize first.
+	let normalized = normalize_to_lf(patch_text);
+	let mut lines = js_trim(&normalized).split('\n').collect::<Vec<_>>();
 	if lines.len() >= 2
 		&& matches!(lines[0], "<<EOF" | "<<'EOF'" | "<<\"EOF\"")
 		&& js_trim(lines[lines.len() - 1]) == "EOF"
@@ -491,10 +495,13 @@ fn stage_entries(
 }
 
 fn natural_order_previews(input: &str) -> Vec<PreviewFile> {
+	// Same `\r\n` payloads the parser normalizes: a body row would otherwise
+	// preview an addition with a trailing `\r` that the applied file lacks.
+	let normalized = normalize_to_lf(input);
 	let mut order = Vec::<String>::new();
 	let mut groups = HashMap::<String, Vec<String>>::new();
 	let mut current = None::<String>;
-	for raw in input.split('\n') {
+	for raw in normalized.split('\n') {
 		let trimmed = raw.trim_end();
 		if matches!(trimmed, BEGIN_PATCH_MARKER | END_PATCH_MARKER | "*** Abort Patch") {
 			continue;

@@ -184,3 +184,34 @@ async fn streaming_preview_keeps_body_rows_in_input_order() {
 	assert_eq!(preview.files.len(), 1);
 	assert_eq!(preview.files[0].diff.as_deref(), Some("@@\n-old one\n+new one\n-old two\n+new two"));
 }
+
+#[tokio::test]
+async fn crlf_envelope_writes_lf_content_and_a_lf_destination_path() {
+	let workspace = common::Workspace::new(EditMode::ApplyPatch);
+	workspace.write("a.txt", "old\n");
+	let writer = common::DiskWriter::default();
+	workspace
+		.apply_raw(
+			"*** Begin Patch\r\n*** Update File: a.txt\r\n*** Move to: \
+			 b.txt\r\n@@\r\n-old\r\n+moved\r\n*** Add File: added.txt\r\n+hello\r\n+world\r\n*** End \
+			 Patch\r\n",
+			&writer,
+		)
+		.await
+		.unwrap();
+	assert_eq!(workspace.read("b.txt").as_deref(), Some("moved\n"));
+	assert_eq!(workspace.read("added.txt").as_deref(), Some("hello\nworld\n"));
+	assert!(workspace.read("b.txt\r").is_none(), "a CR must not land in a file name");
+}
+
+#[tokio::test]
+async fn crlf_streaming_preview_shows_the_rows_the_applied_file_gets() {
+	let mut workspace = common::Workspace::new(EditMode::ApplyPatch);
+	workspace.config.raw_input = true;
+	workspace.write("a.txt", "old\n");
+	let mut session = workspace.session();
+	session.push("*** Begin Patch\r\n*** Update File: a.txt\r\n@@\r\n-old\r\n+moved\r\n");
+	let preview = session.preview();
+	assert!(preview.streaming);
+	assert_eq!(preview.files[0].diff.as_deref(), Some("@@\n-old\n+moved"));
+}
