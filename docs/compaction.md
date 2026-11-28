@@ -377,9 +377,9 @@ When `compaction.handoffSaveToDisk` is enabled, an **automatically triggered** h
 
 ### File-operation context in summaries
 
-Compaction tracks cumulative file activity using assistant tool calls:
+Compaction tracks cumulative file activity using assistant tool calls and the read results paired with them:
 
-- `read(path)` → read set
+- `read(path)` → read set. The recorded result decides the file over the asked path: `details.readTarget` (the read tool's resolved target), then an old result's `suffixResolution`/`meta.source`, then the `path` argument split with the read tool's selector grammar (line ranges, tails, `raw`, `conflicts`, `img`, per-chunk-`raw` lists). Server resources and web pages (`meta.source` internal/url) never enter the read set.
 - `write(path)` → modified set
 - `edit(path)` → modified set
 
@@ -387,9 +387,7 @@ Cumulative behavior:
 
 - Includes prior compaction details only when prior entry is pi-generated (`fromExtension !== true`).
 - In split turns, includes turn-prefix file ops too.
-- `details.readFiles` excludes files also modified; `details.modifiedFiles` carries the rest (persisted shape is unchanged).
-
-The file list is a grouped, prefix-folded directory tree (find-tool shape) with a per-file access marker — `(Read)` for read-only files, `(Write)` for modified files never read, `(RW)` for modified files also present in the cumulative read set. Capped at 20 files with an `[…N files elided…]` line. LLM-summary strategies append it as a `<files>` tag (via `upsertFileOperations`); snapcompact renders it inside its summary template as a `FILES` section instead.
+- `details.readFiles` excludes files also modified; `details.modifiedFiles` carries the rest. `details.readFilesResolved` marks entries already carrying resolved targets (no re-split needed); absent on older entries, whose selector-bearing paths are stripped again on merge.
 
 ```xml
 <files>
@@ -472,7 +470,7 @@ Branch summarization:
 5. Prepends `branch-summary-preamble.md`.
 6. Appends file-operation tags.
 
-Result is stored as `BranchSummaryEntry` with optional details (`readFiles`, `modifiedFiles`).
+Result is stored as `BranchSummaryEntry` with optional details (`readFiles`, `modifiedFiles`, `readFilesResolved` — same contract as `CompactionDetails`: entries already carry resolved read targets).
 
 ## Extension and hook touchpoints
 

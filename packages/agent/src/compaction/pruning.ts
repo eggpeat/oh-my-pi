@@ -15,7 +15,8 @@ import {
 	isSkillReadToolResult,
 	type ProtectedToolMatcher,
 } from "./tool-protection";
-import { isAlternateFormReadSelector, splitReadSelector } from "./utils";
+import { isAlternateFormReadSelector } from "@oh-my-pi/pi-utils";
+import { isRemoteReadResult, resolveReadTarget } from "./utils";
 
 /** Bound warm-cache pruning by the provider's prompt-cache lookback window. */
 export interface CacheLookbackConfig {
@@ -126,9 +127,15 @@ export const USELESS_NOTICE = "[Uneventful result elided]";
  * covers keys with prefix `K + "\u0000"`: they are superseded only when the
  * newest successful result for `K` is complete (see
  * {@link SupersedeCompleteFn}). Return `undefined` to exempt a call from
- * supersede grouping.
+ * supersede grouping. `result` is the tool-result message the call produced —
+ * tools that resolve their target (the read tool records `details.readTarget`)
+ * key on what was actually read, not only on the raw arguments.
  */
-export type SupersedeKeyFn = (toolName: string, args: Record<string, unknown>) => string | undefined;
+export type SupersedeKeyFn = (
+	toolName: string,
+	args: Record<string, unknown>,
+	result: ToolResultMessage,
+) => string | undefined;
 
 /**
  * Whether a successful keyed result shows its whole target, so a result for a
@@ -385,7 +392,7 @@ function collectSupersededResults(
 		const toolCall = toolCalls.get(message.toolCallId);
 		if (!toolCall) continue;
 		if (isProtectedToolResult(message, toolCall, protectedTools)) continue;
-		const key = supersedeKey(toolCall.name, toolCall.arguments as Record<string, unknown>);
+		const key = supersedeKey(toolCall.name, toolCall.arguments as Record<string, unknown>, message);
 		if (key === undefined) continue;
 		const separator = key.indexOf("\u0000");
 		const sameKey = newerByKey.get(key);
@@ -666,22 +673,36 @@ export function pruneToolOutputs(
 }
 
 /**
- * Supersede key for the `read` tool: the file path with the trailing line/raw
- * selector stripped (the read tool's own splitter grammar via
- * {@link splitReadSelector}, e.g. `src/foo.ts:50-200`, `:2-4:raw`).
- * Internal/URL-scheme paths (`skill://…`, `https://…`) are exempt.
+ * Supersede key for the `read` tool: the file the read actually targeted, with
+ * its selector split by the read tool's own grammar (`src/foo.ts:50-200`,
+ * `:-60`, `:2-4:raw`, `:img`). The recorded `details.readTarget` names that
+ * file when the read resolved it — a literal `notes.txt:-60` file, a
+ * suffix-glob match, an archive member — so argument-shaped ambiguities never
+ * cross-supersede a different file's result. Results marked as server
+ * resources or web pages (`meta.source` internal/url), `skill://`-style args,
+ * and `?q=` questions on separate files stay exempt.
+ *
  * Selector-free reads key on the bare path; line-range reads key on
  * `path + "\u0000" + selector`, so a complete bare-path read can supersede them.
- * `raw` and `conflicts` reads show a different form than a plain read (e.g. raw
- * notebook JSON vs converted notebook text), so they key on
- * `path + "\u0001" + selector` and are superseded only by the same selector.
+ * `raw`, `conflicts`, `img`, and non-line selectors (video frames) show a
+ * different form than a plain read, so they key on `path + "\u0001" + selector`
+ * and are superseded only by the same selector. A `?q=` image answer keys on
+ * `path + "\u0001" + "q=" + question`, so another question or a plain image
+ * read never replaces it.
  */
-export function readToolSupersedeKey(toolName: string, args: Record<string, unknown>): string | undefined {
+export function readToolSupersedeKey(
+	toolName: string,
+	args: Record<string, unknown>,
+	result?: ToolResultMessage,
+): string | undefined {
 	if (toolName !== "read") return undefined;
 	const path = args.path;
 	if (typeof path !== "string" || path.length === 0) return undefined;
 	if (path.includes("://")) return undefined;
-	const { path: base, sel } = splitReadSelector(path);
-	if (sel === undefined) return base;
-	return `${base}${isAlternateFormReadSelector(sel) ? "\u0001" : "\u0000"}${sel}`;
+	if (result !== undefined && isRemoteReadResult(result)) return undefined;
+	const { path: base, sel, kind, question } = resolveReadTarget(path, result);
+	if (base.includes("://")) return undefined;
+	const alternate = kind !== undefined ? kind === "alt" : sel !== undefined && isAlternateFormReadSelector(sel);
+	const key = sel === undefined ? base : `${base}${alternate ? "\u0001" : "\u0000"}${sel}`;
+	return question === undefined ? key : `${key}\u0001q=${question}`;
 }

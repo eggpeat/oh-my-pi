@@ -24,7 +24,7 @@ import {
 import branchSummaryPrompt from "./prompts/branch-summary.md" with { type: "text" };
 import branchSummaryPreamble from "./prompts/branch-summary-preamble.md" with { type: "text" };
 import {
-	extractFileOpsFromMessage,
+	extractFileOpsFromMessages,
 	incompleteOutputError,
 	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversationForSummary,
@@ -48,6 +48,8 @@ export interface BranchSummaryResult {
 export interface BranchSummaryDetails {
 	readFiles: string[];
 	modifiedFiles: string[];
+	/** Same contract as `CompactionDetails.readFilesResolved`: entries carry resolved read targets. */
+	readFilesResolved?: boolean;
 }
 
 export interface BranchPreparation {
@@ -258,7 +260,8 @@ export function prepareBranchEntries(
 		if (entry.type === "branch_summary" && !entry.fromExtension && entry.details) {
 			const details = entry.details as BranchSummaryDetails;
 			if (Array.isArray(details.readFiles)) {
-				for (const f of details.readFiles) fileOps.read.add(stripReadSelector(f));
+				const toFile = details.readFilesResolved === true ? (f: string) => f : stripReadSelector;
+				for (const f of details.readFiles) fileOps.read.add(toFile(f));
 			}
 			if (Array.isArray(details.modifiedFiles)) {
 				// Modified files go into both edited and written for proper deduplication
@@ -269,15 +272,16 @@ export function prepareBranchEntries(
 		}
 	}
 
-	// Second pass: walk from newest to oldest, adding messages until token budget
+	// Second pass: walk from newest to oldest, adding messages until token budget.
+	// Visited messages are replayed oldest → newest at the end so every read call
+	// pairs with the result that followed it (ids can repeat across the range).
+	const visited: AgentMessage[] = [];
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
 		const message = getMessageFromEntry(entry);
 		if (!message) continue;
 
-		// Extract file ops from assistant messages (tool calls)
-		extractFileOpsFromMessage(message, fileOps);
-
+		visited.unshift(message);
 		const tokens = estimateBranchSummaryTokens(message, tokenizer);
 
 		// Check budget before adding
@@ -296,6 +300,9 @@ export function prepareBranchEntries(
 		messages.unshift(message);
 		totalTokens += tokens;
 	}
+
+	// Extract file ops from assistant tool calls and their paired results.
+	extractFileOpsFromMessages(visited, fileOps);
 
 	return { messages, fileOps, totalTokens };
 }

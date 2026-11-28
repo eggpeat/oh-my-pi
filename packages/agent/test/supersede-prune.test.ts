@@ -56,29 +56,40 @@ function assistantMessage(content: AssistantMessage["content"], timestamp: numbe
 	};
 }
 
-function toolResultMessage(toolName: string, toolCallId: string, text: string, timestamp: number): ToolResultMessage {
+function toolResultMessage(
+	toolName: string,
+	toolCallId: string,
+	text: string,
+	timestamp: number,
+	details?: ToolResultMessage["details"],
+): ToolResultMessage {
 	return {
 		role: "toolResult",
 		toolCallId,
 		toolName,
 		content: [{ type: "text", text }],
+		details,
 		isError: false,
 		timestamp,
 	};
 }
 
-/** Assistant toolCall entry + paired toolResult entry for one read. */
-function readPair(path: string, text: string, timestamp: number): [SessionMessageEntry, SessionMessageEntry] {
+/** Assistant toolCall entry + paired toolResult entry for one read. `details` is the read tool's own record. */
+function readPair(
+	path: string,
+	text: string,
+	timestamp: number,
+	details?: ToolResultMessage["details"],
+): [SessionMessageEntry, SessionMessageEntry] {
 	const callId = `call-${idCounter++}`;
 	return [
 		messageEntry(
 			assistantMessage([{ type: "toolCall", id: callId, name: "read", arguments: { path } }], timestamp),
 			timestamp,
 		),
-		messageEntry(toolResultMessage("read", callId, text, timestamp), timestamp),
+		messageEntry(toolResultMessage("read", callId, text, timestamp, details), timestamp),
 	];
 }
-
 /** Read pair whose result {@link testComplete} reports as incomplete (a summary, page, or notice). */
 function partialPair(path: string, timestamp: number): [SessionMessageEntry, SessionMessageEntry] {
 	const [call, result] = readPair(path, FILE_CONTENT, timestamp);
@@ -180,6 +191,160 @@ describe("readToolSupersedeKey", () => {
 	test("does not strip non-selector colon segments", () => {
 		expect(readToolSupersedeKey("read", { path: "db.sqlite:users" })).toBe("db.sqlite:users");
 		expect(readToolSupersedeKey("read", { path: "db.sqlite:users:42" })).toBe("db.sqlite:users\u000042");
+	});
+
+	test("keys tail, img, and per-chunk raw selectors like the read tool's own grammar", () => {
+		expect(readToolSupersedeKey("read", { path: "src/foo.ts:-60" })).toBe("src/foo.ts\u0000-60");
+		expect(readToolSupersedeKey("read", { path: "src/foo.ts:1-12,-15" })).toBe("src/foo.ts\u00001-12,-15");
+		expect(readToolSupersedeKey("read", { path: "src/foo.ts:raw:-60" })).toBe("src/foo.ts\u0001raw:-60");
+		expect(readToolSupersedeKey("read", { path: "src/foo.ts:-60:raw" })).toBe("src/foo.ts\u0001-60:raw");
+		expect(readToolSupersedeKey("read", { path: "logo.svg:img" })).toBe("logo.svg\u0001img");
+		expect(readToolSupersedeKey("read", { path: "src/foo.ts:1-3:raw,9:raw" })).toBe("src/foo.ts\u00011-3,9:raw");
+		// Colon-folded ranges a list wrote as `1-30,:-30` key like `1-30,-30`.
+		expect(readToolSupersedeKey("read", { path: "src/foo.ts:1-30,:-30" })).toBe("src/foo.ts\u00001-30,-30");
+	});
+
+	test("a real file named like a selector keeps its own key via meta.source", () => {
+		const literal: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "c1",
+			toolName: "read",
+			content: [{ type: "text", text: "x" }],
+			details: { meta: { source: { type: "path", value: "/tmp/notes.txt:-60" } } },
+			isError: false,
+			timestamp: 0,
+		};
+		expect(readToolSupersedeKey("read", { path: "notes.txt:-60" }, literal)).toBe("/tmp/notes.txt:-60");
+	});
+
+	test("a recorded readTarget decides the key over the raw arguments", () => {
+		const suffixMatched: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "c1",
+			toolName: "read",
+			content: [{ type: "text", text: "x" }],
+			details: { readTarget: { path: "docs/notes.txt", sel: "5-9", kind: "range" } },
+			isError: false,
+			timestamp: 0,
+		};
+		expect(readToolSupersedeKey("read", { path: "notes.txt:5-9" }, suffixMatched)).toBe("docs/notes.txt\u00005-9");
+	});
+
+	test("an internal or web read is exempt even when its path has no scheme", () => {
+		const internal: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "c1",
+			toolName: "read",
+			content: [{ type: "text", text: "x" }],
+			details: { meta: { source: { type: "internal", value: "asset" } } },
+			isError: false,
+			timestamp: 0,
+		};
+		expect(readToolSupersedeKey("read", { path: "asset:img" }, internal)).toBeUndefined();
+	});
+});
+
+describe("pruneSupersededToolResults — resolved read targets", () => {
+	test("a later bare read supersedes an earlier tail-selector read of the same file", () => {
+		const [callA, resultA] = readPair("src/foo.ts:-60", FILE_CONTENT, T0);
+		const [callB, resultB] = readPair("src/foo.ts", FILE_CONTENT, T0 + 1_000);
+		const entries: SessionEntry[] = [callA, resultA, callB, resultB];
+
+		const result = pruneSupersededToolResults(entries, tokenizer, cfg({ now: T0 + 1_000 }));
+
+		expect(result.prunedCount).toBe(1);
+		expect(resultText(resultA)).toBe(SUPERSEDED_NOTICE);
+		expect(resultText(resultB)).toBe(FILE_CONTENT);
+	});
+
+	test("a recorded readTarget makes the asked path moot: a real `notes.txt:-60` file survives a bare read", () => {
+		const [callA, resultA] = readPair("notes.txt:-60", FILE_CONTENT, T0, {
+			readTarget: { path: "notes.txt:-60" },
+		});
+		const [callB, resultB] = readPair("notes.txt", FILE_CONTENT, T0 + 1_000);
+		const entries: SessionEntry[] = [callA, resultA, callB, resultB];
+
+		const result = pruneSupersededToolResults(entries, tokenizer, cfg({ now: T0 + 1_000 }));
+
+		expect(result.prunedCount).toBe(0);
+		expect(resultText(resultA)).toBe(FILE_CONTENT);
+		expect(resultText(resultB)).toBe(FILE_CONTENT);
+	});
+
+	test("an old unrecorded `notes.txt:-60` file read survives via its saved meta.source", () => {
+		const [callA, resultA] = readPair("notes.txt:-60", FILE_CONTENT, T0, {
+			meta: { source: { type: "path", value: "/repo/notes.txt:-60" } },
+		});
+		const [callB, resultB] = readPair("notes.txt", FILE_CONTENT, T0 + 1_000);
+		const entries: SessionEntry[] = [callA, resultA, callB, resultB];
+
+		const result = pruneSupersededToolResults(entries, tokenizer, cfg({ now: T0 + 1_000 }));
+
+		expect(result.prunedCount).toBe(0);
+		expect(resultText(resultA)).toBe(FILE_CONTENT);
+	});
+
+	test("a suffix-resolved read supersedes a later read of the resolved file, not the asked name", () => {
+		// `notes.txt:5-9` resolved to `docs/notes.txt`; a bare `notes.txt` read must not erase it.
+		const [callA, resultA] = readPair("notes.txt:5-9", FILE_CONTENT, T0, {
+			suffixResolution: { from: "notes.txt", to: "docs/notes.txt" },
+		});
+		const [callB, resultB] = readPair("notes.txt", FILE_CONTENT, T0 + 1_000);
+		const entries: SessionEntry[] = [callA, resultA, callB, resultB];
+
+		const result = pruneSupersededToolResults(entries, tokenizer, cfg({ now: T0 + 1_000 }));
+		expect(result.prunedCount).toBe(0);
+		expect(resultText(resultA)).toBe(FILE_CONTENT);
+
+		// But a bare `docs/notes.txt` read does supersede it.
+		const [callC, resultC] = readPair("docs/notes.txt", FILE_CONTENT, T0 + 2_000);
+		const result2 = pruneSupersededToolResults([...entries, callC, resultC], tokenizer, cfg({ now: T0 + 2_000 }));
+		expect(result2.prunedCount).toBe(1);
+		expect(resultText(resultA)).toBe(SUPERSEDED_NOTICE);
+		expect(resultText(resultC)).toBe(FILE_CONTENT);
+	});
+
+	test("two different `?q=` image answers keep both results", () => {
+		const [callA, resultA] = readPair("photo.png?q=A", FILE_CONTENT, T0, {
+			readTarget: { path: "photo.png", question: "A" },
+		});
+		const [callB, resultB] = readPair("photo.png?q=B", FILE_CONTENT, T0 + 1_000, {
+			readTarget: { path: "photo.png", question: "B" },
+		});
+		const entries: SessionEntry[] = [callA, resultA, callB, resultB];
+
+		const result = pruneSupersededToolResults(entries, tokenizer, cfg({ now: T0 + 1_000 }));
+
+		expect(result.prunedCount).toBe(0);
+		expect(resultText(resultA)).toBe(FILE_CONTENT);
+		expect(resultText(resultB)).toBe(FILE_CONTENT);
+	});
+
+	test("an unrecorded `?q=` image read keeps its question in the key too", () => {
+		const [callA, resultA] = readPair("photo.png?q=A", FILE_CONTENT, T0);
+		const [callB, resultB] = readPair("photo.png?q=B", FILE_CONTENT, T0 + 1_000);
+		const [callC, resultC] = readPair("photo.png?q=A", FILE_CONTENT, T0 + 2_000);
+		const entries: SessionEntry[] = [callA, resultA, callB, resultB, callC, resultC];
+
+		const result = pruneSupersededToolResults(entries, tokenizer, cfg({ now: T0 + 2_000 }));
+
+		expect(result.prunedCount).toBe(1);
+		expect(resultText(resultA)).toBe(SUPERSEDED_NOTICE);
+		expect(resultText(resultB)).toBe(FILE_CONTENT);
+		expect(resultText(resultC)).toBe(FILE_CONTENT);
+	});
+
+	test("an internal-resource read result is never pruned as a stale file read", () => {
+		const [callA, resultA] = readPair("asset:img", FILE_CONTENT, T0, {
+			meta: { source: { type: "internal", value: "asset" } },
+		});
+		const [callB, resultB] = readPair("asset", FILE_CONTENT, T0 + 1_000);
+		const entries: SessionEntry[] = [callA, resultA, callB, resultB];
+
+		const result = pruneSupersededToolResults(entries, tokenizer, cfg({ now: T0 + 1_000 }));
+
+		expect(result.prunedCount).toBe(0);
+		expect(resultText(resultA)).toBe(FILE_CONTENT);
 	});
 });
 

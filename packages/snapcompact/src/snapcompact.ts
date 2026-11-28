@@ -697,6 +697,12 @@ export interface FileOperations {
 export interface CompactionDetails {
 	readFiles: string[];
 	modifiedFiles: string[];
+	/**
+	 * True when `readFiles` entries already carry the read tool's resolved
+	 * target form; absent in pre-readTarget sessions, whose entries get
+	 * selector-stripped again on merge.
+	 */
+	readFilesResolved?: boolean;
 }
 
 export interface CompactionPreparation<TMessage = Message> {
@@ -2614,7 +2620,7 @@ export async function compact<TMessage = Message>(
 		shortSummary: `Archived ${totalChars.toLocaleString()} chars of history onto ${frames.length} snapcompact frame${frames.length === 1 ? "" : "s"}${textNote}`,
 		firstKeptEntryId,
 		tokensBefore,
-		details: { readFiles, modifiedFiles },
+		details: { readFiles, modifiedFiles, readFilesResolved: true },
 		preserveData: { ...basePreserve, [PRESERVE_KEY]: archive },
 	};
 }

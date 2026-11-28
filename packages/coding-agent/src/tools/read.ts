@@ -97,7 +97,7 @@ import {
 	splitPathAndSelPreferringLiteralSync,
 } from "./path-utils";
 import { type LineRange } from "./line-ranges";
-import { splitPathAndSel } from "./details/read";
+import { type ReadFileTarget, splitPathAndSel } from "./details/read";
 import { resolveArchiveReadPath } from "./read-archive-path";
 import {
 	appendReadNotice,
@@ -2045,23 +2045,38 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	 * images, documents, notebooks, and streamed/paged text. `located` carries
 	 * the URL a routed read resolved to `readPath`; its hints name that URL.
 	 * A whole read of a file Tern's media viewer shows records it as display-only
-	 * `details.mediaPath`, whatever content the model receives.
+	 * `details.mediaPath`, whatever content the model receives. `readTarget`
+	 * receives the file the pipeline resolved, so compaction file lists and
+	 * stale-read pruning name the resolved target instead of re-parsing the
+	 * asked-for path.
 	 */
 	async #readFilesystemPath(
 		readPath: string,
 		options: FilesystemReadOptions,
 	): Promise<AgentToolResult<ReadToolDetails>> {
 		const media: { path?: string } = {};
-		const result = await this.#readFilesystemPipeline(readPath, options, media);
-		if (media.path === undefined || result.isError) return result;
-		return { ...result, details: { ...result.details, mediaPath: media.path } };
+		const readTarget: { value?: ReadFileTarget } = {};
+		const result = await this.#readFilesystemPipeline(readPath, options, media, readTarget);
+		const details = result.details;
+		if (readTarget.value !== undefined || (media.path !== undefined && !result.isError)) {
+			return {
+				...result,
+				details: {
+					...details,
+					readTarget: readTarget.value ?? details?.readTarget,
+					...(media.path !== undefined && !result.isError ? { mediaPath: media.path } : {}),
+				},
+			};
+		}
+		return result;
 	}
 
-	/** {@link #readFilesystemPath}'s body; sets `media.path` once the read is known to be a whole Tern-viewable file. */
+	/** {@link #readFilesystemPath}'s body; sets `media.path` once the read is known to be a whole Tern-viewable file, `readTarget.value` once the target is resolved. */
 	async #readFilesystemPipeline(
 		readPath: string,
 		options: FilesystemReadOptions,
 		media: { path?: string },
+		readTarget: { value?: ReadFileTarget },
 	): Promise<AgentToolResult<ReadToolDetails>> {
 		const { located, questionPath, signal, toolContext, plainWindow } = options;
 		let { question } = options;
@@ -2114,6 +2129,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						return toolResult(details).content(content).sourcePath(sourcePath).done();
 					},
 					signal,
+					readTarget,
 				);
 			}
 
@@ -2281,6 +2297,27 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			);
 		}
 		markRawSuffixResolution(suffixResolution, isRawSelector(parsed));
+
+		// Record the target as resolved so compaction file lists and stale-read
+		// pruning name the file actually read — a literal `notes.txt:-60` file
+		// (selector-shaped but real), a suffix-glob match, or a PDF page member —
+		// instead of the ambiguous asked-for path. Line selectors bucket as
+		// `range`; raw/conflicts/img, video frames and PDF page members bucket as
+		// `alt` since they show a different form than plain lines.
+		readTarget.value = {
+			path: `${formatPathRelativeToCwd(absolutePath, this.session.cwd)}${
+				pdfImageRead ? `:${pdfImageRead.member}` : ""
+			}`,
+			sel: pdfImageRead ? undefined : localTarget.sel,
+			kind: pdfImageRead
+				? "alt"
+				: localTarget.sel === undefined
+					? undefined
+					: parsed.kind === "lines" || parsed.kind === "tail"
+						? "range"
+						: "alt",
+			question,
+		};
 
 		if (isDirectory) {
 			if (question !== undefined) throw new ToolError(IMAGE_QUESTION_SELECTOR_ERROR);

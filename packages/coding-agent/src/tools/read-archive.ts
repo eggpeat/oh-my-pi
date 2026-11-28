@@ -17,6 +17,8 @@ import {
 } from "./read-format";
 import { isMultiRange, type ParsedSelector, parseSel, resolveTailSelector, selToOffsetLimit } from "./read-selector";
 import { type PdfImageReadTarget, type PdfPageReadOptions, splitPdfImageReadPath } from "./read-pdf";
+import { formatPathRelativeToCwd } from "./path-utils";
+import type { ReadFileTarget } from "./details/read";
 import { cfgReadRenderMarkdown } from "./settings";
 import { formatBytes } from "@oh-my-pi/pi-utils";
 import { throwIfAborted } from "./tool-errors";
@@ -148,6 +150,8 @@ export async function readArchive(
 	readPdfPage: (options: PdfPageReadOptions) => Promise<AgentToolResult<ReadToolDetails>>,
 	readImage: (options: ArchiveImageReadOptions) => Promise<AgentToolResult<ReadToolDetails>>,
 	signal?: AbortSignal,
+	/** Receives the archive + member identity once resolved (compaction file lists and stale-read pruning name it). */
+	readTarget?: { value?: ReadFileTarget },
 ): Promise<AgentToolResult<ReadToolDetails>> {
 	throwIfAborted(signal);
 	const archive = await openArchiveCached(resolvedArchivePath.absolutePath, resolvedArchivePath.format);
@@ -166,12 +170,20 @@ export async function readArchive(
 	let sel = parseSel(lineSelector);
 	let pdfImageRead: PdfImageReadTarget | null = null;
 	let node = archive.getNode(archiveSubPath);
+	// Selector text/kind the recorded target reports: the member's own selector,
+	// a JSON query, or a selector the whole subPath turned out to be.
+	let selText = lineSelector;
+	let selKind: ReadFileTarget["kind"] =
+		sel.kind === "lines" || sel.kind === "tail" ? "range" : sel.kind === "none" ? undefined : "alt";
 	// A literal member containing `?` wins; only a miss admits a JSON query.
 	const jsonTarget = node ? null : splitJsonQueryTarget(archiveSubPath);
 	const jsonSelector = jsonTarget ? parseJsonSelector(jsonTarget.queryString) : null;
 	if (jsonTarget && jsonSelector) {
 		archiveSubPath = jsonTarget.jsonPath;
 		node = archive.getNode(archiveSubPath);
+		// The query is the member's view identity; a member line selector still applies after it.
+		selText = `${jsonTarget.queryString}${lineSelector ? `:${lineSelector}` : ""}`;
+		selKind = "alt";
 	}
 	if (!node && archiveSubPath) {
 		// `archive.zip:500` / `archive.zip:raw`: the whole subPath is a
@@ -180,8 +192,10 @@ export async function readArchive(
 		const wholeSel = parseSel(archiveSubPath);
 		if (wholeSel.kind !== "none") {
 			node = archive.getNode("");
+			selText = archiveSubPath;
 			archiveSubPath = "";
 			sel = wholeSel;
+			selKind = wholeSel.kind === "lines" || wholeSel.kind === "tail" ? "range" : "alt";
 		}
 	}
 	if (!node && sel.kind === "none") {
@@ -197,6 +211,20 @@ export async function readArchive(
 		throw new ToolError(`Path '${readPath}' not found inside archive`);
 	}
 
+	// Report the archive + member identity the read resolved so file lists and
+	// stale-read pruning name the member itself, never the bare archive path.
+	const recordTarget = (member: string): void => {
+		if (!readTarget) return;
+		const archiveDisplay =
+			resolvedArchivePath.suffixResolution?.to ??
+			formatPathRelativeToCwd(resolvedArchivePath.absolutePath, session.cwd);
+		readTarget.value = {
+			path: member ? `${archiveDisplay}:${member}` : archiveDisplay,
+			sel: pdfImageRead ? undefined : selText,
+			kind: pdfImageRead ? "alt" : selKind,
+		};
+	};
+
 	if (node.isDirectory) {
 		if (jsonSelector) {
 			throw new ToolError("JSON selectors require a text archive member, not a directory.");
@@ -204,11 +232,14 @@ export async function readArchive(
 		if (isMultiRange(sel)) {
 			throw new ToolError("Multi-range line selectors are not supported for archive directory listings.");
 		}
+		recordTarget(archiveSubPath);
 		return readArchiveDirectory(archive, resolvedArchivePath.absolutePath, archiveSubPath, sel, details, signal);
 	}
 
 	const entry = await archive.readFile(archiveSubPath);
 	throwIfAborted(signal);
+	recordTarget(pdfImageRead ? `${entry.path}:${pdfImageRead.member}` : entry.path);
+
 	if (entry.path.toLowerCase().endsWith(".pdf")) {
 		if (jsonSelector) {
 			throw new ToolError("JSON selectors require a text archive member, not a PDF.");

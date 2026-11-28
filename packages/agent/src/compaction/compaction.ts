@@ -94,7 +94,7 @@ import snapcompactArchiveContextPrompt from "./prompts/snapcompact-archive-conte
 
 import {
 	escapeSummaryBoundaryTags,
-	extractFileOpsFromMessage,
+	extractFileOpsFromMessages,
 	incompleteOutputError,
 	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversationForSummary,
@@ -109,6 +109,14 @@ import {
 export interface CompactionDetails {
 	readFiles: string[];
 	modifiedFiles: string[];
+	/**
+	 * True when `readFiles` entries already carry the read tool's resolved
+	 * target form: selector-stripped where the read applied one, member specs and
+	 * resolved literal filenames kept verbatim. Persisted entries without the
+	 * flag (pre-readTarget sessions) still get their `readFiles` selector-stripped
+	 * on merge so `<files>` dedupes old selector-bearing rows.
+	 */
+	readFilesResolved?: boolean;
 }
 
 /**
@@ -127,7 +135,10 @@ function extractFileOperations(
 		if (!prevCompaction.fromExtension && prevCompaction.details) {
 			const details = prevCompaction.details as CompactionDetails;
 			if (Array.isArray(details.readFiles)) {
-				for (const f of details.readFiles) fileOps.read.add(stripReadSelector(f));
+				// Entries written before `readFilesResolved` carry call-argument paths
+				// (selector-bearing); resolved entries are already in final form.
+				const toFile = details.readFilesResolved === true ? (f: string) => f : stripReadSelector;
+				for (const f of details.readFiles) fileOps.read.add(toFile(f));
 			}
 			if (Array.isArray(details.modifiedFiles)) {
 				for (const f of details.modifiedFiles) fileOps.edited.add(f);
@@ -135,10 +146,8 @@ function extractFileOperations(
 		}
 	}
 
-	// Extract from tool calls in messages
-	for (const msg of messages) {
-		extractFileOpsFromMessage(msg, fileOps);
-	}
+	// Extract from tool calls and their paired results in messages
+	extractFileOpsFromMessages(messages, fileOps);
 
 	return fileOps;
 }
@@ -1697,9 +1706,7 @@ function prepareCompactionUnlabeled(
 
 	// Also extract file ops from turn prefix if splitting
 	if (cutPoint.isSplitTurn) {
-		for (const msg of turnPrefixMessages) {
-			extractFileOpsFromMessage(msg, fileOps);
-		}
+		extractFileOpsFromMessages(turnPrefixMessages, fileOps);
 	}
 
 	return {
@@ -2307,7 +2314,7 @@ export async function compact(
 				: safeCut === originalCut
 					? firstKeptEntryId
 					: (recentEntryIds?.[safeCut - originalCut] ?? "");
-		for (let i = originalCut; i < safeCut; i++) extractFileOpsFromMessage(allMessages[i], fileOps);
+		extractFileOpsFromMessages(allMessages.slice(originalCut, safeCut), fileOps);
 		const summarizedMessages = [
 			...(previousSummaryMessage ? [previousSummaryMessage] : []),
 			...allMessages.slice(0, safeCut),
@@ -2516,7 +2523,7 @@ export async function compact(
 		...(shortSummary !== undefined ? { shortSummary } : {}),
 		firstKeptEntryId: nativeSummary !== undefined ? nativeFirstKeptEntryId : firstKeptEntryId,
 		tokensBefore,
-		details: { readFiles, modifiedFiles } as CompactionDetails,
+		details: { readFiles, modifiedFiles, readFilesResolved: true } as CompactionDetails,
 		preserveData: finalPreserveData,
 		...(remoteReplayThroughEntryId ? { providerReplayThroughEntryId: remoteReplayThroughEntryId } : {}),
 	};

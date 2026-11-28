@@ -26,6 +26,17 @@ describe("stripReadSelector", () => {
 		expect(stripReadSelector("src/foo.ts:raw:2-4")).toBe("src/foo.ts");
 	});
 
+	it("strips tail, img, and per-chunk raw selectors like the read tool's own grammar", () => {
+		expect(stripReadSelector("src/foo.ts:-60")).toBe("src/foo.ts");
+		expect(stripReadSelector("src/foo.ts:1-12,-15")).toBe("src/foo.ts");
+		expect(stripReadSelector("src/foo.ts:raw:-60")).toBe("src/foo.ts");
+		expect(stripReadSelector("src/foo.ts:-60:raw")).toBe("src/foo.ts");
+		expect(stripReadSelector("logo.svg:img")).toBe("logo.svg");
+		expect(stripReadSelector("src/foo.ts:1-3:raw,9:raw")).toBe("src/foo.ts");
+		// Colon-folded range chunks a list read writes as `1-30,:-30`.
+		expect(stripReadSelector("src/foo.ts:1-30,:-30")).toBe("src/foo.ts");
+	});
+
 	it("keeps archive member paths, stripping only the trailing selector", () => {
 		expect(stripReadSelector("archive.zip:dir/file.ts:50-60")).toBe("archive.zip:dir/file.ts");
 		expect(stripReadSelector("archive.zip:dir/file.ts")).toBe("archive.zip:dir/file.ts");
@@ -50,6 +61,33 @@ describe("extractFileOpsFromMessage", () => {
 		]);
 		extractFileOpsFromMessage(message, fileOps);
 		expect([...fileOps.read]).toEqual(["docs/compaction.md"]);
+	});
+
+	it("dedupes tail and img selector reads to the underlying file", () => {
+		const fileOps = snapcompact.createFileOps();
+		const message = createAssistantMessage([
+			readCall("r1", "src/app.ts:-60"),
+			readCall("r2", "src/app.ts:1-3:raw,9:raw"),
+			readCall("r3", "logo.svg:img"),
+		]);
+		extractFileOpsFromMessage(message, fileOps);
+		expect([...fileOps.read]).toEqual(["src/app.ts", "logo.svg"]);
+	});
+
+	it("matches tail-selector reads against modified paths", () => {
+		const fileOps = snapcompact.createFileOps();
+		const message = createAssistantMessage([readCall("r1", "src/login.ts:-30"), writeCall("w1", "src/login.ts")]);
+		extractFileOpsFromMessage(message, fileOps);
+		const { readFiles, modifiedFiles } = snapcompact.computeFileLists(fileOps);
+		expect(readFiles).toEqual([]);
+		expect(modifiedFiles).toEqual(["src/login.ts"]);
+	});
+
+	it("keeps a `?q=` image read out of the file's path entirely", () => {
+		const fileOps = snapcompact.createFileOps();
+		const message = createAssistantMessage([readCall("r1", "photo.png?q=A")]);
+		extractFileOpsFromMessage(message, fileOps);
+		expect([...fileOps.read]).toEqual(["photo.png"]);
 	});
 
 	it("matches selector-suffixed reads against modified paths", () => {

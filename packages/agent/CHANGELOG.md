@@ -7,6 +7,7 @@
 - Fixed turn-end hooks being unable to tell which tool calls named no tool: `AgentTurnEndContext.unresolvedToolCallIds` now lists them ([#10876](https://github.com/can1357/oh-my-pi/issues/10876))
 - Fixed `generateHandoffFromContext` sending no output limit, so a server without its own limit could stream a handoff forever; the request is now capped at `MAX_SUMMARY_TOKENS` and ends as an incomplete-output failure ([#18031](https://github.com/can1357/oh-my-pi/issues/18031))
 - Reduced the size of authentication-gateway requests by preventing tool definitions from including internal host state.
+- Fixed stale-read pruning and compaction file lists losing track of reads with tail, `img`, and per-chunk-`raw` selectors, and of resolved targets like suffix-matched files, real selector-named files, archive members, and `?q=` image answers ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 - Corrected OpenTelemetry chat spans to report the model that actually served the response.
 - Fixed shake replacing tool results smaller than its recovery placeholder, which grew context instead of shrinking it ([#7204](https://github.com/can1357/oh-my-pi/issues/7204))
 - Fixed the context figure that the status line and compaction read leaving out `$` Python output, `@file` mentions and a `!` command's terminal images, and counting `!!` output that no request carries ([#20834](https://github.com/can1357/oh-my-pi/pull/20834) by [@sjawhar](https://github.com/sjawhar))

@@ -47,6 +47,7 @@ import {
 	type SummaryOptions,
 	shouldCompact,
 	shouldUseProviderNativeCompaction,
+	stripReadSelector,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import {
 	DEFAULT_PRUNE_CONFIG,
@@ -455,7 +456,7 @@ function handoffSummaryFromDocument(
 	const { readFiles, modifiedFiles } = snapcompact.computeFileLists(preparation.fileOps);
 	return {
 		summary: snapcompact.upsertFileOperations(document, readFiles, modifiedFiles, preparation.fileOps.read),
-		details: { readFiles, modifiedFiles },
+		details: { readFiles, modifiedFiles, readFilesResolved: true },
 	};
 }
 
@@ -5239,7 +5240,9 @@ export class SessionMaintenance {
 	): Promise<snapcompact.CompactionResult> {
 		const details = entry.details as snapcompact.CompactionDetails | undefined;
 		const fileOps = snapcompact.createFileOps();
-		for (const file of details?.readFiles ?? []) fileOps.read.add(file);
+		for (const file of details?.readFiles ?? []) {
+			fileOps.read.add(details?.readFilesResolved === true ? file : stripReadSelector(file));
+		}
 		for (const file of details?.modifiedFiles ?? []) fileOps.edited.add(file);
 		const shapeSetting = cfgSnapcompactShape.get(this.#host.settings);
 		return await snapcompact.compact(
