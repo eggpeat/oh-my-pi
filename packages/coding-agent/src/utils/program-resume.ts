@@ -21,7 +21,7 @@ import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { writeTerminalSequence } from "@oh-my-pi/pi-tui/driver/session";
 import { getActiveProfile, isTerminalHeadless } from "@oh-my-pi/pi-utils";
-import { restartArgv } from "../cli/flag-tables";
+import { flagConsumesValue, restartArgv } from "../cli/flag-tables";
 import { resolveRestartCmd } from "../subprocess/worker-client";
 
 import {
@@ -75,24 +75,45 @@ const runtime: {
 	disposed: false,
 };
 
+function hasLaunchCwd(argv: readonly string[]): boolean {
+	let hasCwd = false;
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i]!;
+		if (arg === "--") break;
+		if (!arg.startsWith("-")) continue;
+		if (arg === "--cwd") {
+			hasCwd = Boolean(argv[++i]);
+			continue;
+		}
+		if (arg.startsWith("--cwd=")) {
+			hasCwd = arg.length > "--cwd=".length;
+			continue;
+		}
+		if (flagConsumesValue(arg, argv[i + 1])) i++;
+	}
+	return hasCwd;
+}
+
 /**
  * Build the argv to relaunch/resume omp with its current flags, active profile,
- * and optional on-disk `sessionFile` (`--restore`). Shared by `/restart` and
- * OSC 7577 reporting.
+ * current working directory (when `--cwd` was supplied at launch), and optional
+ * on-disk `sessionFile` (`--restore`). Shared by `/restart` and OSC 7577 reporting.
  */
 export function buildResumeArgv(
 	sessionFile: string | undefined,
+	cwd: string,
 	options?: { launchArgs?: string[]; baseCmd?: string[] },
 ): string[] {
+	const launchArgs = options?.launchArgs ?? process.argv.slice(2);
 	const activeProfile = getActiveProfile();
 	const cmd = [
 		...(options?.baseCmd ?? resolveRestartCmd()),
-		...restartArgv(
-			options?.launchArgs ?? process.argv.slice(2),
-			sessionFile ? path.resolve(sessionFile) : undefined,
-			activeProfile ? { "--profile": true } : undefined,
-		),
+		...restartArgv(launchArgs, sessionFile ? path.resolve(sessionFile) : undefined, {
+			"--cwd": true,
+			...(activeProfile ? { "--profile": true } : undefined),
+		}),
 	];
+	if (hasLaunchCwd(launchArgs)) cmd.push("--cwd", path.resolve(cwd));
 	if (activeProfile) cmd.push("--profile", activeProfile);
 	return cmd;
 }
@@ -179,7 +200,7 @@ export function reportProgramResume(): void {
 	if (!process.stdout.isTTY || isTerminalHeadless()) return;
 	const sessionFile = runtime.source.sessionFile();
 	const cwd = path.resolve(runtime.source.cwd());
-	const argv = buildResumeArgv(sessionFile, {
+	const argv = buildResumeArgv(sessionFile, cwd, {
 		launchArgs: runtime.source.launchArgs?.(),
 		baseCmd: runtime.source.baseCmd?.(),
 	});
