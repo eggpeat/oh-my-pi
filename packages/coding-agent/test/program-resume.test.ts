@@ -200,4 +200,55 @@ describe("OSC 7577 program resume reporting", () => {
 		expect(process.env[OSC_7577_TOKEN_ENV]).toBeUndefined();
 		expect(writes).toHaveLength(0);
 	});
+
+	it("replaces a startup --cwd flag with the current session directory without touching non-cwd tokens", () => {
+		process.env[OSC_7577_TOKEN_ENV] = SPEC_TOKEN;
+		const state = {
+			sessionFile: "/tmp/sessions/moved.jsonl" as string | undefined,
+			cwd: "/tmp/orig/subdir",
+			launchArgs: ["--cwd", "subdir", "--model", "opus"],
+		};
+
+		initProgramResume({
+			sessionFile: () => state.sessionFile,
+			cwd: () => state.cwd,
+			baseCmd: () => ["/usr/local/bin/omp"],
+			launchArgs: () => state.launchArgs,
+			nowSeconds: () => SPEC_TIME,
+		});
+		expect(writes).toHaveLength(1);
+		expect(decodeArgv(parseOsc7577(writes[0], SPEC_TOKEN).argv)).toEqual([
+			"/usr/local/bin/omp",
+			"--model",
+			"opus",
+			"--restore",
+			"/tmp/sessions/moved.jsonl",
+			"--cwd",
+			"/tmp/orig/subdir",
+		]);
+
+		state.cwd = "/tmp/relocated";
+		reportProgramResume();
+		expect(writes).toHaveLength(2);
+		expect(decodeArgv(parseOsc7577(writes[1], SPEC_TOKEN).argv)).toEqual([
+			"/usr/local/bin/omp",
+			"--model",
+			"opus",
+			"--restore",
+			"/tmp/sessions/moved.jsonl",
+			"--cwd",
+			"/tmp/relocated",
+		]);
+
+		state.launchArgs = ["--system-prompt", "--cwd", "--", "--cwd", "subdir"];
+		reportProgramResume();
+		expect(writes).toHaveLength(3);
+		expect(decodeArgv(parseOsc7577(writes[2], SPEC_TOKEN).argv)).toEqual([
+			"/usr/local/bin/omp",
+			"--system-prompt",
+			"--cwd",
+			"--restore",
+			"/tmp/sessions/moved.jsonl",
+		]);
+	});
 });

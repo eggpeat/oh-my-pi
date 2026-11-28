@@ -7154,7 +7154,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 
 		const sessionFile = this.sessionManager.isSessionOnDisk() ? this.sessionManager.getSessionFile() : undefined;
-		const cmd = buildResumeArgv(sessionFile);
+		const cmd = buildResumeArgv(sessionFile, this.sessionManager.getCwd());
 		const resumeToken = getProgramResumeToken();
 		await postmortem.cleanup();
 		await postmortem.drainStdout();
