@@ -23,7 +23,8 @@ use crate::{
 	stream_json::{ArgSnapshot, EditEntry},
 	text::{
 		adjust_indentation, convert_leading_tabs_to_spaces, count_leading_whitespace,
-		get_leading_whitespace, js_trim, js_trim_end, normalize_for_fuzzy, normalize_unicode,
+		get_leading_whitespace, js_trim, js_trim_end, normalize_for_fuzzy, normalize_to_lf,
+		normalize_unicode,
 	},
 };
 
@@ -1950,10 +1951,13 @@ impl ModeEngine for PatchEngine {
 		for entry in &args.edits {
 			if let Some(diff) = &entry.diff {
 				// Create bodies may omit `+` prefixes; their digest is then the
-				// whole text.
+				// whole text. The digest describes the lines the file will hold,
+				// so it reads the same LF-normalized text the engines apply.
+				let normalized = normalize_to_lf(diff);
+				let diff = normalized.as_ref();
 				let added = super::added_lines(diff.split('\n')).unwrap_or_else(|| {
 					if entry.op.as_deref() == Some("create") {
-						diff.clone()
+						diff.to_owned()
 					} else {
 						String::new()
 					}

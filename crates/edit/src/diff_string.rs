@@ -8,6 +8,7 @@ use omp_diff::HunkLine;
 use crate::{
 	error::EditError,
 	scan::{digits, keyword, space},
+	text::normalize_to_lf,
 };
 
 const DIFF_GAP_ROW: &str = "";
@@ -843,6 +844,11 @@ pub fn normalize_diff(diff: &str) -> String {
 
 /// Strip a uniform `+` prefix from create-file content.
 pub fn normalize_create_content(content: &str) -> String {
+	// Authored text reaching any engine is LF-normalized (see `replace`); a
+	// `\r\n`-framed create body must not write carriage returns into the new
+	// file.
+	let normalized = normalize_to_lf(content);
+	let content = normalized.as_ref();
 	let lines = content.split('\n').collect::<Vec<_>>();
 	let non_empty_lines = lines
 		.iter()
@@ -1227,6 +1233,11 @@ pub(crate) fn parse_apply_patch_hunks(diff: &str) -> Result<Vec<DiffHunk>, EditE
 }
 
 fn parse_hunks(diff: &str, recover_line_numbers: bool) -> Result<Vec<DiffHunk>, EditError> {
+	// A diff written on Windows (or by a model emitting `\r\n`) would otherwise
+	// keep a trailing `\r` on every row: an old line then never matches exactly
+	// and the `\r` is written into the file as content.
+	let diff = normalize_to_lf(diff);
+	let diff = diff.as_ref();
 	let multi_file_count = count_multi_file_markers(diff);
 	if multi_file_count > 1 {
 		return Err(EditError::Apply(format!(
