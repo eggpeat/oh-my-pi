@@ -83,6 +83,7 @@ export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
 			const result = await discoverAndLoadMCPTools(cwd, {
 				enableProjectConfig: cfgMcpEnableProjectConfig.get(settings),
 				filterExa: true,
+				settings,
 				// `omp read` has no Eval prelude, so browser MCP remains available.
 				filterBrowser: false,
 				authStorage,

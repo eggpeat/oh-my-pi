@@ -8,6 +8,7 @@ import type { TSchema } from "@oh-my-pi/pi-ai";
 import { logger, untilAborted } from "@oh-my-pi/pi-utils";
 import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
 import { invalidateCommandConfig, isCommandConfigValue, resolveConfigValue } from "../config/resolve-config-value";
+import type { Settings } from "../config/settings";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { AuthStorage } from "../session/auth-storage";
 import {
@@ -210,6 +211,8 @@ export interface MCPDiscoverOptions {
 	enableProjectConfig?: boolean;
 	/** Whether to filter out Exa MCP servers (default: true) */
 	filterExa?: boolean;
+	/** Effective session settings used to decide whether native Exa can replace MCP servers. */
+	settings?: Settings;
 	/** Whether to filter out browser MCP servers when the built-in browser capability is enabled (default: false) */
 	filterBrowser?: boolean;
 	/** Session-local extension roots for post-startup rediscovery (explicit + mode + configured). */
@@ -773,6 +776,7 @@ export class MCPManager implements MCPManagerApi {
 			loadedConfigs = await this.#discoverConfigs({
 				enableProjectConfig: options?.enableProjectConfig,
 				filterExa: options?.filterExa,
+				settings: options?.settings,
 				filterBrowser: options?.filterBrowser,
 				extensionRoots: options?.extensionRoots,
 				builtinTransforms: options?.builtinTransforms,
@@ -839,6 +843,7 @@ export class MCPManager implements MCPManagerApi {
 		const loaded = await this.#discoverConfigs({
 			enableProjectConfig: enabled,
 			filterExa: options.filterExa,
+			settings: options.settings,
 			filterBrowser: options.filterBrowser,
 			extensionRoots: options.extensionRoots,
 			builtinTransforms: options.builtinTransforms,
@@ -874,6 +879,7 @@ export class MCPManager implements MCPManagerApi {
 		const loaded = await this.#discoverConfigs({
 			enableProjectConfig: options?.enableProjectConfig,
 			filterExa: options?.filterExa,
+			settings: options?.settings,
 			filterBrowser: false,
 			extensionRoots: options?.extensionRoots,
 			builtinTransforms: options?.builtinTransforms,

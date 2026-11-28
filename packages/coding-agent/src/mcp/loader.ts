@@ -49,6 +49,7 @@ export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoa
 			startupTimeoutMs: options?.startupTimeoutMs,
 			enableProjectConfig: options?.enableProjectConfig,
 			filterExa: options?.filterExa,
+			settings: options?.settings,
 			filterBrowser: options?.filterBrowser,
 			extensionRoots: options?.extensionRoots,
 			builtinTransforms: options?.builtinTransforms,
