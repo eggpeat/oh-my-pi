@@ -728,7 +728,7 @@ export function lastContextMessage(messages: readonly AgentMessage[]): AgentMess
  * qualify: their trailing call arguments may be incomplete.
  */
 export function unpairedToolCallTail(messages: readonly AgentMessage[]): AssistantMessage | undefined {
-	const tail = messages[messages.length - 1];
+	const tail = lastContextMessage(messages);
 	if (tail?.role !== "assistant") return undefined;
 	// Mirrors the loop's `runnableStop` rule for fresh turns.
 	if (tail.stopReason !== "toolUse" && tail.stopReason !== "stop") return undefined;

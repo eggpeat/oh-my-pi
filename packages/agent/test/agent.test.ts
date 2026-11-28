@@ -210,6 +210,74 @@ describe("Agent", () => {
 		expect(result.content).toContainEqual({ type: "text", text: "ok:again" });
 	});
 
+	it("continue() re-executes unpaired tool calls behind trailing excludeFromContext rows before queued input", async () => {
+		const toolSchema = type({ value: type("string") });
+		const executed: string[] = [];
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "probe",
+			label: "Probe",
+			description: "Probe tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executed.push(params.value);
+				return { content: [{ type: "text", text: `ok:${params.value}` }], details: params };
+			},
+		};
+		const mock = createMockModel({ responses: [{ content: ["done after replay"] }] });
+		const agent = new Agent({
+			initialState: {
+				model: mock.model,
+				systemPrompt: ["Test"],
+				tools: [tool],
+				messages: [
+					createUserMessage("run the probe"),
+					createAssistantMessage(
+						[{ type: "toolCall", id: "call_1", name: "probe", arguments: { value: "again" } }],
+						"toolUse",
+					),
+					{
+						role: "custom",
+						customType: "plugin-stats",
+						content: "[stats]",
+						display: true,
+						excludeFromContext: true,
+						timestamp: 1,
+					},
+				],
+			},
+			streamFn: mock.stream,
+		});
+		agent.steer(createUserMessage("after tool"));
+		const events: AgentEvent[] = [];
+		const unsubscribe = agent.subscribe(event => events.push(event));
+
+		await agent.continue();
+		unsubscribe();
+
+		const agentStart = events.find(
+			(event): event is Extract<AgentEvent, { type: "agent_start" }> => event.type === "agent_start",
+		);
+		expect(agentStart?.resumedToolCallIds).toEqual(["call_1"]);
+		expect(executed).toEqual(["again"]);
+		expect(mock.calls.length).toBe(1);
+		expect(mock.calls[0]?.context.messages.map(message => message.role)).toEqual([
+			"user",
+			"assistant",
+			"toolResult",
+			"user",
+		]);
+		expect(JSON.stringify(mock.calls[0]?.context.messages)).not.toContain("[stats]");
+		expect(agent.hasQueuedMessages()).toBe(false);
+		expect(agent.state.messages.map(message => message.role)).toEqual([
+			"user",
+			"assistant",
+			"custom",
+			"toolResult",
+			"user",
+			"assistant",
+		]);
+	});
+
 	it("classifies one-at-a-time steering from the next queued mixed source", async () => {
 		const cases = [
 			{
