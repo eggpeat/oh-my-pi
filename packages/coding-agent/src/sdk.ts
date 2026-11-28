@@ -3014,8 +3014,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			onStatus: onMCPStatus,
 			startupTimeoutMs: cfgMcpStartupTimeoutMs.get(settings),
 			enableProjectConfig: cfgMcpEnableProjectConfig.get(settings),
-			// Always filter Exa - we have native integration
+			// Always filter Exa when native Exa and keyless search can replace it.
 			filterExa: true,
+			settings,
 			// Filter browser MCP only when Eval can expose the built-in browser prelude.
 			filterBrowser: initialBrowserPreludeAvailable,
 			builtinTransforms: resolveMCPTransformContext(settings, {

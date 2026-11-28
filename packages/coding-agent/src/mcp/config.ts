@@ -7,8 +7,11 @@
 import { getMCPConfigPath, logger } from "@oh-my-pi/pi-utils";
 import { mcpCapability } from "../capability/mcp";
 import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
+import type { Settings } from "../config/settings";
 import type { MCPServer } from "../discovery";
 import { loadCapability } from "../discovery";
+import { cfgProvidersWebKeyless } from "../session/settings";
+import { cfgExaEnabled } from "../web/settings";
 import { readMCPConfigFile } from "./config-writer";
 import { builtinDropFor, type MCPDroppedServer, type MCPTransformContext } from "./transforms";
 import type { MCPConfigFile, MCPServerConfig } from "./types";
@@ -19,6 +22,8 @@ export interface LoadMCPConfigsOptions {
 	enableProjectConfig?: boolean;
 	/** Whether to filter out Exa MCP servers (default: true) */
 	filterExa?: boolean;
+	/** Effective session settings; native Exa and keyless-search opt-outs preserve Exa MCP servers. */
+	settings?: Settings;
 	/** Whether to filter out browser MCP servers when the built-in browser capability is enabled (default: false) */
 	filterBrowser?: boolean;
 	/** Session-local extension roots for post-startup rediscovery (explicit + mode + configured). */
@@ -213,7 +218,7 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	let exaApiKeys: string[] = [];
 
 	if (filterExa) {
-		const exaResult = filterExaMCPServers(configs, sources);
+		const exaResult = filterExaMCPServers(configs, sources, options?.settings);
 		configs = exaResult.configs;
 		sources = exaResult.sources;
 		exaApiKeys = exaResult.exaApiKeys;
@@ -353,7 +358,16 @@ export interface ExaFilterResult {
 export function filterExaMCPServers(
 	configs: Record<string, MCPServerConfig>,
 	sources: Record<string, SourceMeta>,
+	settings?: Settings,
 ): ExaFilterResult {
+	// Filtering is safe only while native Exa can replace every configured entry.
+	// With native Exa off there is no replacement. With keyless web services off,
+	// reload and enable paths do not install extracted keys, so folding even a
+	// keyed entry can remove the only Exa connection that path can serve.
+	if (settings && (!cfgExaEnabled.get(settings) || !cfgProvidersWebKeyless.get(settings))) {
+		return { configs, exaApiKeys: [], sources };
+	}
+
 	const filtered: Record<string, MCPServerConfig> = {};
 	const filteredSources: Record<string, SourceMeta> = {};
 	const exaApiKeys: string[] = [];

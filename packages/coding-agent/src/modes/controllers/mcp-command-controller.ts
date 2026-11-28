@@ -1583,6 +1583,7 @@ export class MCPCommandController {
 
 		const { configs, sources } = await loadAllMCPConfigs(getProjectDir(), {
 			extensionRoots: this.ctx.session.effectiveExtensionRoots,
+			settings: this.ctx.settings,
 		});
 		const config = configs[name];
 		if (!config) {
@@ -1630,6 +1631,7 @@ export class MCPCommandController {
 		const result = await reconnectMCPServers(this.ctx.mcpManager, this.ctx.session, {
 			enableProjectConfig: cfgMcpEnableProjectConfig.get(this.ctx.settings),
 			filterExa: true,
+			settings: this.ctx.settings,
 			filterBrowser: this.ctx.session.getEvalPreludes().some(definition => definition.name === "browser"),
 			builtinTransforms: resolveMCPTransformContext(this.ctx.settings, {
 				evalActive: this.ctx.session.getActiveToolNames().includes("eval"),
