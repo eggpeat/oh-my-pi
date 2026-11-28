@@ -144,6 +144,42 @@ fn replace_matcher_omits_incomplete_entries() {
 }
 
 #[test]
+fn replace_matcher_entries_join_batch_new_strings() {
+	let engine = ReplaceEngine { allow_fuzzy: true, fuzzy_threshold: 0.95 };
+	let deleted = omp_edit::stream_json::snapshot_from_text(
+		&json!({
+			"path": "secret.ts",
+			"edits": [{ "old_string": "FORBIDDEN_PATTERN", "new_string": "" }]
+		})
+		.to_string(),
+		false,
+		true,
+	);
+	assert!(deleted.has_edits);
+	assert_eq!(engine.inspect(&deleted).paths, vec!["secret.ts"]);
+	assert_eq!(engine.inspect(&deleted).entries, vec![("secret.ts".into(), String::new())]);
+
+	let batch = omp_edit::stream_json::snapshot_from_text(
+		&json!({
+			"path": "src/foo.ts",
+			"new_string": "ignored top-level",
+			"edits": [
+				{ "old_string": "FORBIDDEN_PATTERN", "new_string": "" },
+				{ "old_string": "also forbidden", "new_string": "line two\nstill safe" },
+				{ "old_string": "pending" }
+			]
+		})
+		.to_string(),
+		false,
+		true,
+	);
+	assert!(batch.has_edits);
+	let inspection = engine.inspect(&batch);
+	assert_eq!(inspection.paths, vec!["src/foo.ts"]);
+	assert_eq!(inspection.entries, vec![("src/foo.ts".into(), "\nline two\nstill safe".into())]);
+}
+
+#[test]
 fn streaming_preview_waits_until_new_string_is_present() {
 	let workspace = Workspace::new(EditMode::Replace);
 	workspace.write("a.txt", "alpha\n");

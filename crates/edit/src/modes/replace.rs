@@ -239,12 +239,26 @@ impl ModeEngine for ReplaceEngine {
 		let Some(path) = args.path.as_ref().filter(|path| !path.is_empty()) else {
 			return Inspection::default();
 		};
+		// Introduced text only. Batch `edits[]` hold the replacements;
+		// `old_string` is removed text and must not be matched.
+		let mut digest = None::<String>;
+		for entry in Self::entries(args) {
+			let Some(new_string) = entry.new_string else {
+				continue;
+			};
+			match &mut digest {
+				Some(current) => {
+					current.push('\n');
+					current.push_str(new_string);
+				},
+				None => {
+					digest = Some(new_string.to_owned());
+				},
+			}
+		}
 		Inspection {
 			paths:    vec![path.clone()],
-			entries:  args
-				.new_string
-				.as_ref()
-				.map_or_default(|new_string| vec![(path.clone(), new_string.clone())]),
+			entries:  digest.map_or_default(|value| vec![(path.clone(), value)]),
 			file_ops: Vec::new(),
 		}
 	}
