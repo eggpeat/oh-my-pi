@@ -217,6 +217,9 @@ class Computation<T> extends Owner implements Source {
 		if (this.state === CHECK) {
 			for (const source of this.sources ?? []) {
 				source.refresh();
+				// A source refresh may dispose this (an owner pulling it removes an entry): stop checking
+				// the stale source list and never run a dead computation.
+				if (this.disposed) return;
 				if ((this.state as State) === DIRTY) break;
 			}
 			if (this.state === CHECK) {
