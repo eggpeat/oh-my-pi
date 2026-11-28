@@ -277,6 +277,7 @@ export class SessionStatusLine implements StatusLineModel {
 		this.#live = signal(!options?.deferStartupReads);
 		this.#saved = signal(statusLineHost.getSettings());
 		this.#attach(session);
+		this.#syncClock();
 	}
 
 	/** Start reading context, checkout and account usage once startup can spare the event loop. */

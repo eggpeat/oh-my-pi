@@ -7,7 +7,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:te
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { CUSTOM_STATUS_LINE_DEFAULTS } from "@oh-my-pi/pi-coding-agent/config/status-line-schema";
 import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
-import { cfgGitEnabled } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { cfgGitEnabled, cfgStatusLinePreset } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import type { PromptCacheStatus } from "@oh-my-pi/pi-coding-agent/modes/view-model/status-line/host";
 import type { VcsGitRepo, VcsRepo } from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
@@ -29,6 +29,7 @@ afterAll(() => {
 
 afterEach(() => {
 	disposeStatusLines();
+	cfgStatusLinePreset.clearOverride(Settings.instance);
 	cfgGitEnabled.clearOverride(Settings.instance);
 	vi.useRealTimers();
 	vi.restoreAllMocks();
@@ -54,9 +55,10 @@ describe("status line built-in preset segments", () => {
 		expect(line.facts().promptCache).toEqual(promptCache);
 	});
 
-	it("advances the full preset's wall clock", () => {
+	it("advances the full preset's wall clock from startup without a settings change", () => {
 		vi.useFakeTimers({ now: 1_000_000_000 });
-		const line = statusLine(statusSession(), { ...rawCustomDefaults, preset: "full" });
+		cfgStatusLinePreset.override(Settings.instance, "full");
+		const line = statusLine(statusSession());
 		line.setCheckoutHomed(true);
 		const initial = line.facts().now;
 
