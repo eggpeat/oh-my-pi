@@ -783,16 +783,27 @@ impl<'a> Writer<'a> {
 	/// character has one (`τ²`), an ordinal suffix as plain text (`1st`), and
 	/// otherwise `^x` / `_x`, parenthesised when the content has spaces.
 	fn script(&mut self, el: &'a Element, sup: bool) {
+		// An empty opener leaves a pending emphasis closer at this same offset.
+		// Decide whether to unwrap it from the script's rendered first character.
+		let pending = self.pending_close.take();
 		let mark = self.open("");
 		let before = self.inline[..mark.after].chars().next_back();
 		self.inline_only += 1;
 		self.content(el);
 		self.inline_only -= 1;
 		if !self.close(mark, "") {
+			self.pending_close = pending;
 			return;
 		}
 		let body = self.inline.split_off(mark.after);
-		self.inline.push_str(&script_text(&body, sup, before));
+		let rendered = script_text(&body, sup, before);
+		if let Some(close) = pending
+			&& self.inline.len() == close.end
+			&& rendered.chars().next().is_some_and(char::is_alphanumeric)
+		{
+			self.unwrap_markers(close);
+		}
+		self.inline.push_str(&rendered);
 	}
 
 	/// A Tufte-style side or margin note: parenthesised in prose, written

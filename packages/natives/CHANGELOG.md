@@ -23,6 +23,7 @@
 
 ### Fixed
 
+- Fixed `renderHtml` and `Reader` crashing or corrupting superscripts and subscripts after emphasized punctuation ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 - Reduced Snapcompact frame sizes with indexed PNGs while retaining antialiased text.
 - Improved URL reading to preserve model tables, source-code indentation, linked content cards, meaningful button labels, and sign-in instructions while removing unrelated news, footer content, and empty whitespace-only paragraphs.
 - Fixed `Process.terminate` so descendants that start their own sessions are still terminated reliably.
