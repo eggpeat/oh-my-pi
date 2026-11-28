@@ -42,6 +42,7 @@ import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking"
 import { isRecord, logger, prompt, withLoopPhase } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { countContextOverrun } from "../output-budget";
+import { isExcludedFromContext } from "../message-context";
 import { type AgentTelemetry, instrumentedCompleteSimple } from "../telemetry";
 import { ThinkingLevel } from "../thinking";
 import { Tokenizer } from "../tokenizer";
@@ -471,11 +472,11 @@ export function resolveThresholdTokens(contextWindow: number, settings: Compacti
 // ============================================================================
 
 /**
- * Find valid cut points: indices of user, assistant, custom, or bashExecution messages.
+ * Find valid cut points: indices of context-visible user, assistant, custom, or execution messages.
  * Never cut at tool results (they must follow their tool call).
  * When we cut at an assistant message with tool calls, its tool results follow it
  * and will be kept.
- * BashExecutionMessage is treated like a user message (user-initiated context).
+ * BashExecutionMessage and PythonExecutionMessage are treated like user messages (user-initiated context).
  */
 function findValidCutPoints(entries: SessionEntry[], startIndex: number, endIndex: number): number[] {
 	const cutPoints: number[] = [];
@@ -483,9 +484,11 @@ function findValidCutPoints(entries: SessionEntry[], startIndex: number, endInde
 		const entry = entries[i];
 		switch (entry.type) {
 			case "message": {
+				if (isExcludedFromContext(entry.message)) break;
 				const role = entry.message.role as string;
 				switch (role) {
 					case "bashExecution":
+					case "pythonExecution":
 					case "hookMessage":
 					case "branchSummary":
 					case "compactionSummary":
@@ -516,8 +519,8 @@ function findValidCutPoints(entries: SessionEntry[], startIndex: number, endInde
 }
 
 /**
- * True for entries that begin a conversational turn (a user request, a
- * bash-execution card, a branch summary, or a custom user-role message).
+ * True for entries that begin a conversational turn (a user request, a shell or
+ * Python execution card, a branch summary, or a custom user-role message).
  * Compaction cut alignment, turn discovery, and the collapsed display
  * transcript's orphan-head trim all share this boundary definition.
  */
@@ -526,16 +529,17 @@ export function isTurnStartEntry(entry: SessionEntry): boolean {
 		return true;
 	}
 	if (entry.type === "message") {
+		if (isExcludedFromContext(entry.message)) return false;
 		const role = entry.message.role as string;
-		return role === "user" || role === "bashExecution";
+		return role === "user" || role === "bashExecution" || role === "pythonExecution";
 	}
 	return false;
 }
 
 /**
- * Find the user message (or bashExecution) that starts the turn containing the given entry index.
+ * Find the user message (or shell/Python execution) that starts the turn containing the given entry index.
  * Returns -1 if no turn start found before the index.
- * BashExecutionMessage is treated like a user message for turn boundaries.
+ * Execution messages are treated like user messages for turn boundaries.
  */
 export function findTurnStartIndex(entries: SessionEntry[], entryIndex: number, startIndex: number): number {
 	for (let i = entryIndex; i >= startIndex; i--) {

@@ -57,6 +57,7 @@ import {
 import { isDsmlLeakRecoveryTarget, removeDsmlToolMarkupLeak } from "@oh-my-pi/pi-ai/utils/dsml-leak";
 import { cloneJsonTree, Laps, logger, sanitizeText, structuredCloneJSON, toError } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
+import { isExcludedFromContext } from "./message-context";
 import { LiveSteeringChannel } from "./live-steering";
 import { agentPauseGate } from "./pause";
 import { type AgentRunCoverage, type AgentRunSummary, ToolCallBlockedError } from "./run-collector";
@@ -697,13 +698,7 @@ export function agentLoop(
 	return stream;
 }
 
-/**
- * Whether `message` is kept out of model context: drawn and saved, never sent (a `!!` bash run, a
- * custom row sent with `excludeFromContext`).
- */
-export function isExcludedFromContext(message: AgentMessage): boolean {
-	return "excludeFromContext" in message && message.excludeFromContext === true;
-}
+export { isExcludedFromContext } from "./message-context";
 
 /** Index of the last message the model sees, or -1; rows kept out of context after it do not change the request tail. */
 export function lastContextIndex(messages: readonly AgentMessage[]): number {

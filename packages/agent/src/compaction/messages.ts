@@ -7,6 +7,7 @@ import type {
 	ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
+import { isExcludedFromContext } from "../message-context";
 import type { AgentMessage } from "../types";
 import type { SessionEntry } from "./entries";
 import branchSummaryContextPrompt from "./prompts/branch-summary-context.md" with { type: "text" };
@@ -307,7 +308,7 @@ export function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
  */
 export function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 	if (entry.type === "message") {
-		return entry.message;
+		return isExcludedFromContext(entry.message) ? undefined : entry.message;
 	}
 	if (entry.type === "custom_message" && !entry.excludeFromContext) {
 		return createCustomMessage(
