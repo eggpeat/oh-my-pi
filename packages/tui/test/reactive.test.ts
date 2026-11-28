@@ -290,4 +290,63 @@ describe("reactive tracking", () => {
 		s.set(1);
 		expect(runs).toBe(1);
 	});
+	it("never runs a computation disposed by a source refresh while checking", () => {
+		const s = signal(0);
+		const t = signal(0);
+		let runs = 0;
+		let disposeOwner = () => {};
+		const source = computed(() => {
+			if (s() === 1) {
+				// Dirty the dependent (it also reads `t`), then dispose its owner —
+				// the For/Index shape: a structural rerun updates a reused signal and
+				// disposes the removed entry's computations.
+				t.set(5);
+				disposeOwner();
+			}
+			return s();
+		});
+		const derived = createRoot(disposeRoot => {
+			disposeOwner = disposeRoot;
+			return computed(() => {
+				runs++;
+				source();
+				return t() * 2;
+			});
+		});
+		derived();
+		s.set(1);
+		// The pull refreshes `source`, which dirties and disposes `derived`: the pull
+		// must return the last value, never a run of the dead computation.
+		expect(derived()).toBe(0);
+		expect(runs).toBe(1);
+	});
+
+	it("stops refreshing its remaining sources once a source refresh disposed it", () => {
+		const s = signal(0);
+		const u = signal(0);
+		let downstreamRuns = 0;
+		let disposeOwner = () => {};
+		const disposer = computed(() => {
+			if (s() === 1) disposeOwner();
+			return s();
+		});
+		const downstream = computed(() => {
+			downstreamRuns++;
+			return u();
+		});
+		const derived = createRoot(disposeRoot => {
+			disposeOwner = disposeRoot;
+			return computed(() => {
+				disposer();
+				return downstream();
+			});
+		});
+		derived();
+		s.set(1);
+		u.set(1);
+		// `disposer` disposes `derived` without dirtying it; the check must stop instead
+		// of refreshing `downstream` for a dead observer.
+		derived();
+		expect(downstreamRuns).toBe(1);
+	});
 });
